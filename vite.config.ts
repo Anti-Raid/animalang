@@ -16,7 +16,7 @@ export default defineConfig({
       entry: resolve(__dirname, 'ts/index.ts'),
       name: 'animalang',
       // Output formats to generate
-      formats: ['es', 'cjs'],
+      formats: ['es'],
       fileName: (format) => `index.${format}.js`,
     },
     rollupOptions: {
