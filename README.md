@@ -93,11 +93,12 @@ otheriwse checks pointer equality. Arity: 2
 
 #### Mathematics
 - +, -, *, / (expr...): Evaluates sequentially from left to right. Arity: >= 2.
-- modulo (expr1, expr2): Returns the mathematical remainder. Arity: 2.
+- ``(modulo expr1 expr2)``: Returns the mathematical modulo of ``expr1`` with ``expr2``
+- ``(remainder expr1 expr2)``: Returns the mathematical remainder of ``expr1`` with ``expr2``
 
 #### Misc
-- apply (proc args... rem-lst): Same as Scheme specification on apply. Calls ``proc`` with the packed ``args... rem-lst`` as arguments for ``proc`` 
-- try (proc args... rem-lst): Calls ``proc`` with the packed ``args... rem-lst`` as arguments for ``proc``. If ``proc`` errors, ``try`` evaluates to an
+- ``(apply proc args... rem-lst)``: Same as Scheme specification on apply. Calls ``proc`` with the packed ``args... rem-lst`` as arguments for ``proc`` 
+- ``(try proc args... rem-lst)``: Calls ``proc`` with the packed ``args... rem-lst`` as arguments for ``proc``. If ``proc`` errors, ``try`` evaluates to an
 ``res`` of type ``ErrorObject`` (whose ``type? res`` is ``error``, ``error? res`` yielding ``#t`` and ``error-message res`` containing the error caught by ``try`` while evaluating ``proc``)
 - map: Same as Scheme specification on map (TODO: Write docs here for this as well)
 - pget (props str-key): Given `props` (which must be an instance of `ExposedProps`), returns the value of the property keyed by `str-key` in props, or `#<void>` if not found in `props`
