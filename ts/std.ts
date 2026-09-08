@@ -1,4 +1,4 @@
-import { ErrorObject, ExposedProps, Globals, IProcedure, isDeepEqual, isTruthy } from "./common";
+import { ErrorObject, ExposedProps, Globals, IProcedure, isDeepEqual, isTruthy, symGen } from "./common";
 import { Cons } from "./list";
 
 /** 
@@ -450,8 +450,17 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc)[] = [
         return props.get(keyStr)
     }),
     new ApplyProc(),
-    new TryProc()
-
+    new TryProc(),
+    new BuiltinFunction(Symbol.for("gensym"), (regs, startReg, nargs) => {
+        if (nargs > 1) throw new Error("gensym requires 0 or 1 arguments");
+        switch (nargs) {
+        case 0:
+            return symGen('g')
+        case 1:
+            if (typeof regs[startReg] !== 'string') throw new Error("gensym requires the first argument to be a string")
+            return symGen(regs[startReg])
+        }
+    }),
 ]
 
 export const IBUILTINS_IDX_MAP = new Map<symbol, number>()

@@ -1,4 +1,4 @@
-import { DottedPair, OP_AND, OP_BEGIN, OP_DEFINE, OP_IF, OP_LAMBDA, OP_OR, OP_QUOTE, OP_SET, wrapMulti } from "../common";
+import { DottedPair, OP_AND, OP_BEGIN, OP_DEFINE, OP_IF, OP_LAMBDA, OP_OR, OP_QUOTE, OP_SET, symGen, wrapMulti } from "../common";
 import { OP_CONT, OP_CONT_BASECONT } from "./vm";
 
 type SrcMap = Map<any, any>
@@ -247,11 +247,6 @@ const cpsList = (exprs: any[], env: Map<symbol, symbol>, srcMap: SrcMap, buildAp
     return T(first, (val_sym) => {
         return cpsList(rest, env, srcMap, (rest_vals) => buildApplication([val_sym, ...rest_vals]))
     }, env, srcMap)
-}
-
-let n = 0
-const symGen = (base: string) => {
-    return Symbol.for(`${base}${n++}`)
 }
 
 // test

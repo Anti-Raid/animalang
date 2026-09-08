@@ -512,6 +512,9 @@ export class BS {
     #length: number = 0;
     #textEncoder = new TextEncoder();
 
+    #lastUniqueSym: number = 1;
+    #uniqueSymMap: Map<symbol, number> = new Map();
+
     static readonly U32 = 0x01
     static readonly U32ARR = 0x02
     static readonly STR = 0x03
@@ -522,6 +525,7 @@ export class BS {
     static readonly NULL = 0x08
     static readonly BOOL = 0x09
     static readonly CLASS = 0x0A
+    static readonly UNIQUESYMBOL = 0x0B
     static readonly UNDEFINED = 0xFF
 
     constructor(initialCapacity: number = 1024) {
@@ -565,21 +569,35 @@ export class BS {
         return this.#writeString(str, BS.STR)
     }
 
-    /** Writes a non-unique/interned/Symbol.for() symbol */
+    #internUniqueSymbol(sym: symbol): number {
+        let old = this.#uniqueSymMap.get(sym)
+        if(old) return old
+        let newId = this.#lastUniqueSym++
+        this.#uniqueSymMap.set(sym, newId)
+        return newId
+    }
+
+    /** Writes a symbol */
     writeSymbol(sym: symbol): void {
         const str = Symbol.keyFor(sym);
-        if (str === undefined) throw new Error("Cannot write unique symbol")
+        if (str === undefined) {
+            return this.#writeString(sym.description || String(sym), BS.UNIQUESYMBOL, this.#internUniqueSymbol(sym))
+        }
         return this.#writeString(str, BS.SYMBOL)
     }
 
     /** * Writes a string (for symbols/constants). 
-     * Format: <STR (op)><length><utf8 packed into 32-bit words>
+     * Format: <STR (op)><length><[if unique symbol, the symbol id]><utf8 packed into 32-bit words>
      */
-    #writeString(str: string, strop: number): void {
+    #writeString(str: string, strop: number, symbolid?: number): void {
         const bytes = this.#textEncoder.encode(str);
         const wordsNeeded = Math.ceil(bytes.length / 4);
         this.#ensureCapacity(2 + wordsNeeded);
         this.#buffer[this.#length++] = strop
+        if(strop === BS.UNIQUESYMBOL) {
+            if (!symbolid) throw new Error("no symbol id found for uniquesymbol")
+            this.#buffer[this.#length++] = symbolid
+        }
         this.#buffer[this.#length++] = bytes.length
         
         for (let i = 0; i < bytes.length; i += 4) {
@@ -697,6 +715,7 @@ export class BSReader {
     #cursor: number = 0;
     #textDecoder = new TextDecoder();
     #factories = new Map<string, (r: BSReader) => any>();
+    #uniqueSymbolIds = new Map<number, symbol>()
 
     constructor(buffer: Uint32Array) {
         this.#buffer = buffer;
@@ -704,6 +723,14 @@ export class BSReader {
 
     get hasMore(): boolean {
         return this.#cursor < this.#buffer.length;
+    }
+
+    #internUniqueSymbolFromId(id: number, desc: string) {
+        let sym = this.#uniqueSymbolIds.get(id)
+        if (sym) return sym
+        let newSym = Symbol(desc)
+        this.#uniqueSymbolIds.set(id, newSym)
+        return newSym
     }
 
     /**
@@ -744,7 +771,10 @@ export class BSReader {
             }
             
             case BS.STR:
-            case BS.SYMBOL: {
+            case BS.SYMBOL: 
+            case BS.UNIQUESYMBOL: {
+                let symId = -1
+                if (tag === BS.UNIQUESYMBOL) symId = this.#buffer[this.#cursor++];
                 const byteLen = this.#buffer[this.#cursor++];
                 const wordsToRead = Math.ceil(byteLen / 4);
                 const bytes = new Uint8Array(byteLen);
@@ -759,7 +789,7 @@ export class BSReader {
                 }
                 
                 const str = this.#textDecoder.decode(bytes);
-                return tag === BS.SYMBOL ? Symbol.for(str) : str;
+                return tag === BS.UNIQUESYMBOL ? this.#internUniqueSymbolFromId(symId, str) : tag === BS.SYMBOL ? Symbol.for(str) : str;
             }
 
             case BS.ARR: {
@@ -840,7 +870,7 @@ export class BSReader {
 
     /** Helper to explicitly expect a string */
     readSymbol(): symbol {
-        if (this.peekTag() !== BS.SYMBOL) throw new Error("Expected string");
+        if (this.peekTag() !== BS.SYMBOL && this.peekTag() !== BS.UNIQUESYMBOL) throw new Error("Expected symbol");
         return this.read() as symbol;
     }
 
@@ -986,4 +1016,9 @@ export class Globals {
         if (this.frozen) throw new Error(`Variable '${String(varname)}' cannot be set in a frozen scope.`);
         this.data.set(varname, data)
     }
+}
+
+let n = 0
+export const symGen = (base: string) => {
+    return Symbol(`${base}${n++}`)
 }
