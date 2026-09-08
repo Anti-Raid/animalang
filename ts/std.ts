@@ -300,22 +300,8 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc)[] = [
         // TODO: Add string-length? for strings specifically like scheme does
         return (Array.isArray(val) || val instanceof Cons) ? val.length : (typeof val === "string" ? val.length : 0)
     }),
-    new BuiltinFunction(Symbol.for("empty?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("empty? requires 1 argument");
-        const val = regs[startReg]
-        if (val === null) {
-            return true // empty list
-        }
-        return (Array.isArray(val) || val instanceof Cons) ? (val.length == 0) : (typeof val === "string" ? (val.length == 0) : false);
-    }),
-    new BuiltinFunction(Symbol.for("contains?"), (regs, startReg, nargs) => {
-        if (nargs != 2) throw new Error("contains? requires 2 arguments");
-        const list = regs[startReg]
-        const item = regs[startReg+1]
-        return (Array.isArray(list) || list instanceof Cons) ? list.includes(item) : false;
-    }),
     new BuiltinFunction(Symbol.for("member"), (regs, startReg, nargs) => {
-        if (nargs != 2) throw new Error("member? requires 2 arguments");
+        if (nargs != 2) throw new Error("member requires 2 arguments");
         let list = regs[startReg] as (any[] | Cons | null)
         const item = regs[startReg+1]
         if (Array.isArray(list)) {
@@ -363,25 +349,98 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc)[] = [
         if(!(regs[startReg] instanceof ErrorObject)) throw new Error("error-message requires the first argument to be an instance of ErrorObject")
         return regs[startReg].error?.message?.toString() || "<unknown>"
     }),
-    new BuiltinFunction(Symbol.for("type?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("type? requires 1 argument");
-        const val = regs[startReg]
-        if (val === null) return "list";
-        switch(typeof val) {
-            case "string": return "string"
-            case "number": return "number"
-            case "boolean": return "boolean"
-            case "undefined": return "null"
-            case "symbol": return "symbol";
-            default: {
-                if (val instanceof IProcedure) return "procedure";
-                if(Array.isArray(val) || val instanceof Cons) return "list"
-                if (val instanceof ErrorObject) return "error";
-                if (val instanceof ExposedProps) return "exposed-props";
-                return "object" // to allow consistency across all js engines/custom sv2 impls etc.
-            }
-        }
+    // Builtin predicates
+    new BuiltinFunction(Symbol.for("number?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("number? requires 1 argument");
+        return typeof regs[startReg] == "number"
     }),
+    new BuiltinFunction(Symbol.for("integer?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("integer? requires 1 argument");
+        return typeof regs[startReg] == "number" && Number.isInteger(regs[startReg])
+    }),
+    new BuiltinFunction(Symbol.for("positive?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("positive? requires 1 argument");
+        return typeof regs[startReg] == "number" && regs[startReg] > 0
+    }),
+    new BuiltinFunction(Symbol.for("negative?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("negative? requires 1 argument");
+        return typeof regs[startReg] == "number" && regs[startReg] < 0
+    }),
+    new BuiltinFunction(Symbol.for("zero?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("zero? requires 1 argument");
+        return typeof regs[startReg] == "number" && regs[startReg] == 0
+    }),
+    new BuiltinFunction(Symbol.for("even?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("even? requires 1 argument");
+        const val = regs[startReg];
+        if (typeof val !== "number" || !Number.isInteger(val)) throw new Error("even? requires an integer");
+        return val % 2 === 0;
+    }),
+    new BuiltinFunction(Symbol.for("odd?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("odd? requires 1 argument");
+        const val = regs[startReg];
+        if (typeof val !== "number" || !Number.isInteger(val)) throw new Error("odd? requires an integer");
+        return Math.abs(val % 2) === 1; 
+    }),
+    new BuiltinFunction(Symbol.for("boolean?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("boolean? requires 1 argument");
+        return typeof regs[startReg] == "boolean"
+    }),
+    new BuiltinFunction(Symbol.for("void?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("void? requires 1 argument");
+        return typeof regs[startReg] == "undefined"
+    }),
+    new BuiltinFunction(Symbol.for("list?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("list? requires 1 argument");
+        const val = regs[startReg]
+        
+        if (Cons.isNull(val)) return true;
+        if (Array.isArray(val)) return true; // js arrays are always proper lists
+        if (val instanceof Cons) return val.isProper;
+        return false;
+    }),
+    new BuiltinFunction(Symbol.for("pair?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("pair? requires 1 argument");
+        const val = regs[startReg];
+        // apparently, the empty list is not a pair
+        if (Cons.isNull(val)) return false; 
+        return val instanceof Cons || Array.isArray(val);
+    }),
+    new BuiltinFunction(Symbol.for("null?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("null? requires 1 argument");
+        return Cons.isNull(regs[startReg])
+    }),
+    new BuiltinFunction(Symbol.for("empty?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("empty? requires 1 argument");
+        return Cons.isNull(regs[startReg])
+    }),
+    new BuiltinFunction(Symbol.for("contains?"), (regs, startReg, nargs) => {
+        if (nargs != 2) throw new Error("contains? requires 2 arguments");
+        const list = regs[startReg]
+        const item = regs[startReg+1]
+        return (Array.isArray(list) || list instanceof Cons) ? list.includes(item) : false;
+    }),
+    new BuiltinFunction(Symbol.for("symbol?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("symbol? requires 1 argument");
+        return typeof regs[startReg] == "symbol"
+    }),
+    new BuiltinFunction(Symbol.for("string?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("string? requires 1 argument");
+        return typeof regs[startReg] == "string"
+    }),
+    new BuiltinFunction(Symbol.for("procedure?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("procedure? requires 1 argument");
+        return regs[startReg] instanceof IProcedure
+    }),
+    new BuiltinFunction(Symbol.for("error?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("error? requires 1 argument");
+        return regs[startReg] instanceof ErrorObject
+    }),
+    new BuiltinFunction(Symbol.for("exposed-props?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("exposed-props? requires 1 argument");
+        return regs[startReg] instanceof ExposedProps
+    }),
+    // Exposed props
     new BuiltinFunction(Symbol.for("pget"), (regs, startReg, nargs) => {
         if (nargs != 2) throw new Error("pget requires 2 arguments (pget props key-str)");
         const props = regs[startReg]

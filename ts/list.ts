@@ -1,4 +1,5 @@
 export class Cons {
+    public readonly isProper: boolean; // optimization for list?
     private constructor(
         private readonly _isView: boolean, // if our cons represents a view to an array or not
         private readonly _head: any,
@@ -6,7 +7,16 @@ export class Cons {
         private readonly _array: any[] | null,
         private readonly _offset: number,
         public readonly length: number
-    ) {}
+    ) {
+        if (this._isView) {
+            this.isProper = true
+        } else {
+            // A Cons is proper if: 
+            // - its tail is null
+            // - if its tail is another proper Cons.
+            this.isProper = Cons.isNull(this._tail) || (this._tail instanceof Cons && this._tail.isProper);
+        }
+    }
 
     // construct a non-view cons representing a linked list pair
     static pair(head: any, tail: any): Cons {
@@ -98,6 +108,10 @@ export class Cons {
         }
 
         return undefined;
+    }
+
+    static isNull(val: any) {
+        return (val === null) || (Array.isArray(val) || val instanceof Cons) && (val.length == 0)
     }
 }
 
