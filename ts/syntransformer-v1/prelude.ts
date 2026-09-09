@@ -1,6 +1,8 @@
 import {
     OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, 
-    OP_SET, OP_LETREC, OP_LETSTAR, DottedPair, ensureCanBind
+    OP_SET, OP_LETREC, OP_LETSTAR, DottedPair, ensureCanBind,
+    OP_AND,
+    OP_OR
 } from "../common";
 import { MacroEvaluator, TransformState } from "./macro"; // update with your path
 
@@ -202,5 +204,48 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             expanded: [OP_LAMBDA, args, letrecExpr], 
             state: TransformState.DoChildren 
         };
+    });
+
+    evaluator.registerTransform(OP_AND, (evaluator, expr, orig) => {
+        if (expr.length === 0) {
+            return { expanded: true, state: TransformState.ReturnImm };
+        }
+        if (expr.length === 1) {
+            return { expanded: expr[0], state: TransformState.Recurse };
+        }
+
+        // Similar to cond, start with last expr and keep wrapping in OP_IF's
+        let result = expr[expr.length - 1];
+
+        for (let i = expr.length - 2; i >= 0; i--) {
+            result = [OP_IF, expr[i], result, false];
+        }
+
+        return { expanded: result, state: TransformState.Recurse };
+    });
+
+    evaluator.registerTransform(OP_OR, (evaluator, expr, orig) => {
+        if (expr.length === 0) {
+            return { expanded: false, state: TransformState.ReturnImm };
+        }
+        if (expr.length === 1) {
+            return { expanded: expr[0], state: TransformState.Recurse };
+        }
+
+        // Similar to cond, start with last expr and keep wrapping in OP_IF's
+        //
+        // Because or short circuits, we need to use a OP_LET
+        let result = expr[expr.length - 1];
+
+        for (let i = expr.length - 2; i >= 0; i--) {
+            const tmp = Symbol("or_tmp");
+            result = [
+                OP_LET,
+                [[tmp, expr[i]]],
+                [OP_IF, tmp, tmp, result]
+            ];
+        }
+
+        return { expanded: result, state: TransformState.Recurse };
     });
 }

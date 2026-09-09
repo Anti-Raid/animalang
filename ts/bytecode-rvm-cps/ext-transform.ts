@@ -1,4 +1,4 @@
-import { DottedPair, OP_AND, OP_BEGIN, OP_DEFINE, OP_IF, OP_LAMBDA, OP_OR, OP_QUOTE, OP_SET, symGen, wrapMulti } from "../common";
+import { DottedPair, OP_BEGIN, OP_DEFINE, OP_IF, OP_LAMBDA, OP_QUOTE, OP_SET, symGen, wrapMulti } from "../common";
 import { OP_CONT, OP_CONT_BASECONT } from "./vm";
 
 type SrcMap = Map<any, any>
@@ -165,41 +165,6 @@ const T = (e: any, k: (v: any) => any, env: Map<symbol, symbol>, srcMap: SrcMap)
             tag(srcMap, conv, e)
             return conv
         }, env, srcMap);
-    } else if (e[0] === OP_AND) {
-        const exprs = e.slice(1);
-        
-        if (exprs.length === 0) return k(true);      // (and) evaluates to #t
-        if (exprs.length === 1) return T(exprs[0], k, env, srcMap); // (and e) evaluates to e
-        
-        const first = exprs[0];
-        const rest = [OP_AND, ...exprs.slice(1)];
-        
-        const dynKAst = makeDynamicCont(srcMap, e, k);
-        const dynKFunc = makeContFunc(dynKAst);
-
-        return T(first, (val_sym) => {
-            // if true, evaluate the rest with k, otherwise short-circuit and pass the falsy value directly to k.
-            const conv = [OP_IF, val_sym, T(rest, dynKFunc, env, srcMap), dynKFunc(val_sym)]
-            tag(srcMap, conv, e)
-            return conv
-        }, env, srcMap)
-    } else if (e[0] === OP_OR) {
-        const exprs = e.slice(1);
-        
-        if (exprs.length === 0) return k(false);     // (or) evaluates to #f
-        if (exprs.length === 1) return T(exprs[0], k, env, srcMap); // (or e) evaluates to e
-        
-        const first = exprs[0];
-        const rest = [OP_OR, ...exprs.slice(1)];        
-        const dynKAst = makeDynamicCont(srcMap, e, k);
-        const dynKFunc = makeContFunc(dynKAst);
-
-        return T(first, (val_sym) => {
-            // if false, evaluate the rest with k, otherwise short-circuit and pass the turthy value directly to k.
-            const conv = [OP_IF, val_sym, dynKFunc(val_sym), T(rest, dynKFunc, env, srcMap)]
-            tag(srcMap, conv, e)
-            return conv
-        }, env, srcMap)
     }
 
     // func call expansion, puts k at the start of the cps list

@@ -1,4 +1,4 @@
-import { ASTStringifier, DottedPair, ensureCanBind, normalizeExpr, OP_AND, OP_BEGIN, OP_COND, OP_DEFINE, OP_IF, OP_LAMBDA, OP_LET, OP_LETREC, OP_LETSTAR, OP_OR, OP_QUOTE, OP_SET, unpackLambdaExprArgs, wrapMulti } from "../common"
+import { ASTStringifier, DottedPair, ensureCanBind, normalizeExpr, OP_BEGIN, OP_COND, OP_DEFINE, OP_IF, OP_LAMBDA, OP_LET, OP_LETREC, OP_LETSTAR, OP_QUOTE, OP_SET, unpackLambdaExprArgs, wrapMulti } from "../common"
 import { IBUILTINS_IDX_MAP } from "../std"
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir"
 import { CompilerScope } from "./scope"
@@ -68,12 +68,6 @@ export class Compiler {
                     return
                 case OP_LAMBDA:
                     this.#compileLambda(expr, opts)
-                    return
-                case OP_AND:
-                    this.#compileAnd(expr, opts)
-                    return
-                case OP_OR:
-                    this.#compileOr(expr, opts)
                     return
                 case OP_LET:
                 case OP_LETSTAR:
@@ -164,66 +158,6 @@ export class Compiler {
         if (opts.leaveOnStack) {
             opts.nodes.push({t: "PushValue", constant: undefined})
         }
-    }
-
-    #compileAnd(expr: any[], opts: CmpOpts) {
-        if (expr.length === 1) {
-            if (opts.leaveOnStack) opts.nodes.push({t: "PushValue", constant: true})
-            return;
-        }
-
-        const endLabel = new JumpLabel()
-
-        for (let i = 1; i < expr.length - 1; i++) {
-            this.#compile(expr[i], { ...opts, leaveOnStack: true, isTail: false })
-            if (opts.leaveOnStack) {
-                // If parent wants return value, we cannot just JIF as jump will pop ret val
-                //
-                // Instead, DUP top of stack, so JIF pops the duplicate leaving original value safely
-                // on top of stack (short-circuit). If the jump falls through, we pop out that value 
-                // and move on
-                opts.nodes.push({ t: "Dup" });
-                opts.nodes.push({ t: "CondJump", cond: "False", label: endLabel });
-                opts.nodes.push({ t: "Pop" });
-            } else {
-                opts.nodes.push({ t: "CondJump", label: endLabel, cond: "False" })
-            }
-        }
-
-        // tail expr is the last cond so it gets directly evaluated (if all the and condjumps get through)
-        // This inherits the parents isTail+leaveOnStack state so we get free tailcall
-        this.#compile(expr[expr.length - 1], opts)
-        opts.nodes.push({ t: "Label", label: endLabel });
-    }
-
-    #compileOr(expr: any[], opts: CmpOpts) {
-        if (expr.length === 1) {
-            if (opts.leaveOnStack) opts.nodes.push({t: "PushValue", constant: false})
-            return;
-        }
-
-        const endLabel = new JumpLabel()
-
-        for (let i = 1; i < expr.length - 1; i++) {
-            this.#compile(expr[i], { ...opts, leaveOnStack: true, isTail: false })
-            if (opts.leaveOnStack) {
-                // If parent wants return value, we cannot just JIT as jump will pop ret val
-                //
-                // Instead, DUP top of stack, so JIT pops the duplicate leaving original value safely
-                // on top of stack (short-circuit). If the jump falls through, we pop out that value 
-                // and move on
-                opts.nodes.push({ t: "Dup" });
-                opts.nodes.push({ t: "CondJump", cond: "True", label: endLabel });
-                opts.nodes.push({ t: "Pop" });
-            } else {
-                opts.nodes.push({ t: "CondJump", label: endLabel, cond: "True" })
-            }
-        }
-
-        // tail expr is the last cond so it gets directly evaluated (if all the and condjumps get through)
-        // This inherits the parents isTail+leaveOnStack state so we get free tailcall
-        this.#compile(expr[expr.length - 1], opts)
-        opts.nodes.push({ t: "Label", label: endLabel });
     }
 
     #compileLambda(expr: any[], opts: CmpOpts) {

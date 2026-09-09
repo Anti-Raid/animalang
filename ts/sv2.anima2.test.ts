@@ -18,6 +18,7 @@ describe('Anima', () => {
     const run = (expr: string) => {
         if (bcCache[expr]) return s.stringify(evaluator.evaluateRaw(bcCache[expr]))
         const bc = evaluator.compileRaw(expr)
+        console.log(expr)
         evaluator.deepPrint(bc)
         bcCache[expr] = bc
         return s.stringify(evaluator.evaluateRaw(bc));
@@ -738,6 +739,92 @@ expect(run(`
     (list (equal? (union '(a b d e f h j) '(f c e g a)) '(c g a b d e f h j)) (equal? (sum-of-squares (list 1 3 5 7)) 84))
         `)).toEqual("(#t #t)")
         });
+    });
+
+    it('or: evaluates base cases (0 and 1 argument)', () => {
+        expect(run(`(or)`)).toBe("#f");
+        expect(run(`(or #t)`)).toBe("#t");
+        expect(run(`(or #f)`)).toBe("#f");
+        expect(run(`(or 42)`)).toBe("42");
+    });
+
+    it('or: returns the first truthy value', () => {
+        expect(run(`(or #f 42)`)).toBe("42");
+        expect(run(`(or 42 #f)`)).toBe("42");
+        expect(run(`(or #f #f 'hello)`)).toBe('hello'); 
+        expect(run(`(or 1 2 3)`)).toBe("1");
+    });
+
+    it('or: short-circuits and does not evaluate subsequent expressions', () => {
+        const code = `
+            (define x 0)
+            (or #t (set! x 99) (set! x 100))
+            x
+        `;
+        // x should remain 0 because #t short-circuits the evaluation
+        expect(run(code)).toBe("0");
+    });
+
+    it('or: evaluates the truthy condition exactly once (IIFE/let validation)', () => {
+        // This specifically tests that `(let ((tmp expr)) (if tmp tmp ...))` 
+        // does not double-evaluate `expr` if it has side effects.
+        const code = `
+            (define counter 0)
+            (define (inc-and-return-true)
+                (set! counter (+ counter 1))
+                'success)
+            
+            (define result (or (inc-and-return-true) 'fallback))
+            
+            ;; Return a pair/list of the result and the counter
+            (list result counter)
+        `;
+        // If it evaluates twice, counter would be 2.
+        const res = run(code);
+        expect(res).toBe('(success 1)');
+    });
+
+    it('or:  evaluates falsy conditions exactly once', () => {
+        const code = `
+            (define counter 0)
+            (define (inc-and-return-false)
+                (set! counter (+ counter 1))
+                #f)
+            
+            (define result (or (inc-and-return-false) (inc-and-return-false) 42))
+            
+            (list result counter)
+        `;
+        // The function is called twice (once for each false condition), so counter should be 2.
+        // It should NOT be 4, which would happen if the desugaring was `(if expr expr ...)` without `let`.
+        const res = run(code);
+        expect(res).toBe("(42 2)");
+    });
+
+    it('or: treats everything except #f as truthy', () => {
+        // In Scheme, 0, empty string, and empty list are all truthy.
+        expect(run(`(or 0 #f)`)).toBe("0");
+        expect(run(`(or "" #f)`)).toBe('""');
+        expect(run(`(or '() #f)`)).toEqual("()"); // Adjust expected value based on your AST for '()
+    });
+
+    it('or: preserves tail-call optimization in the terminal position', () => {
+        // If the tail call state is lost during the desugaring of `or`,
+        // this recursive loop will crash with a Maximum Call Stack Size Exceeded error.
+        const code = `
+            (define (loop n)
+                (if (= n 0)
+                    'done
+                    ;; The recursive call is the fallback of the \`or\`, 
+                    ;; which MUST remain in tail position.
+                    (or #f (loop (- n 1)))))
+            
+            (loop 50000)
+        `;
+        
+        // Should complete successfully without blowing the JS stack
+        expect(() => run(code)).not.toThrow();
+        expect(run(code)).toBe('done');
     });
 })
 

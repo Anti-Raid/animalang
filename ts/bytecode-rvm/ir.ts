@@ -138,56 +138,6 @@ export class IR {
 
             switch (node.t) {
                 case "LoadValue": {
-                    // Check 1: if this is:
-                    //
-                    // LOAD* rY
-                    // MOVE dest=rX src=rY
-                    //
-                    // Then we can reduce it to
-                    // LOAD* rX
-                    const nextNode = nodes[i+1]
-                    if(nextNode && nextNode.t === "Move" && nextNode.srcReg === node.destReg) {
-                        //console.log(`Ignoring next node ${JSON.stringify(nextNode)} (${i+1}) by redirecting load of ${JSON.stringify(node)} (${i})`)
-                        nodes[i+1] = { t: "LoadValue", destReg: nextNode.destReg, constant: node.constant };
-                        nodes.splice(i, 1);
-                        i--;
-                        continue;                    
-                    }
-
-                    // Check 2: is it redundant
-                    let isRedundant = null; // start with the assumption that its needed
-                    for (let j = i+1; j < nodes.length; j++) {
-                        const nextNode = nodes[j]
-                        // Stop at Labels, Jumps and CondJumps
-                        if (nextNode.t === "Label" || nextNode.t === "Jump" || nextNode.t === "CondJump") break
-
-                        if (this.#nodeReadsReg(nextNode, node.destReg)) {
-                            break
-                        }
-
-                        // Check if its redundant due to dest reg overwrite
-                        const nno = this.#nodeOverwritesDestReg(nextNode)
-                        if(nno) {
-                            // if we have a LoadValue and then a overwriting op into the same register
-                            // and the overwriting op's source reg is also not the LoadValues dest, then
-                            // then LoadValue is redundant
-                            //
-                            // Call is special: if we see a call, then we cannot omit a LoadValue if we are loading
-                            // into procReg or startReg->startReg+nargs
-                            const usesSameDest = nno.destReg === node.destReg
-                            const isSelfRef = (nno.t === "Move" || nno.t === "Box" || nno.t === "Unbox") && nno.srcReg === node.destReg
-                            if (usesSameDest && !isSelfRef) {
-                                isRedundant = j
-                                break
-                            }
-                        }
-                    }
-
-                    if(isRedundant !== null) {
-                        //console.log(`Ignoring ${JSON.stringify(node)} (${i}) bc of ${JSON.stringify(this.nodes[isRedundant])} (${isRedundant})`)
-                        continue
-                    }
-
                     const v = node.constant
 
                     if (typeof v === "number") {   

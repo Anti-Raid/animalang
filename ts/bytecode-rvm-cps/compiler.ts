@@ -91,14 +91,6 @@ export class Compiler {
                 case OP_CONT:
                     this.#compileLambda(expr, opts)
                     return
-                case OP_LET:
-                case OP_LETSTAR:
-                case OP_LETREC:
-                case OP_COND:
-                    throw new Error("internal error: let/let*/letrec/cond should be transformed by AnimaTransform prior to reaching here")
-                case OP_AND:
-                case OP_OR:
-                    throw new Error("internal error: and/or should be transformed by AstCps prior to reaching here")
             }
         }
 
