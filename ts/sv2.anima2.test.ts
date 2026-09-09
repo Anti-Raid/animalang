@@ -826,6 +826,15 @@ expect(run(`
         expect(() => run(code)).not.toThrow();
         expect(run(code)).toBe('done');
     });
+
+    it('anima-macro', () => {
+        expect(run(`
+(anima-macro first-sym 
+    (list 'quote (car (car (cdr orig)))))
+
+(first-sym (listof 1 2 3))
+`)).toBe("listof");
+    });
 })
 
 describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {

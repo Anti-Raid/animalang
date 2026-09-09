@@ -2,7 +2,8 @@ import {
     OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, 
     OP_SET, OP_LETREC, OP_LETSTAR, DottedPair, ensureCanBind,
     OP_AND,
-    OP_OR
+    OP_OR,
+    AbstractClosure
 } from "../common";
 import { MacroEvaluator, TransformState } from "./macro"; // update with your path
 
@@ -247,5 +248,22 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         }
 
         return { expanded: result, state: TransformState.Recurse };
+    });
+
+    // (anima-macro onsym macrofn)
+    evaluator.registerTransform(Symbol.for("anima-macro"), (evaluator, expr, orig) => {
+        if (expr.length < 2) throw new Error(`anima-macro syntax error`);
+        let onsym = expr[0]
+        if (typeof onsym !== "symbol") throw new Error(`anima-macro onsym must be a constant symbol right now`);
+        let cmpexpr = [OP_LAMBDA, [Symbol.for("orig")], expr[1]]
+        let trCmpExpr = evaluator.transform(cmpexpr)
+        let cmpExprBc = evaluator.expandcmp.compile(trCmpExpr)
+        const res: AbstractClosure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope) // Use the VM to create the closure
+        evaluator.registerTransform(onsym, (evaluator, expr, orig) => {
+            const resp = evaluator.expandvm.evaluateClosure(res, evaluator.scope, [orig])
+            return { expanded: resp, state: TransformState.Recurse };
+        })
+
+        return { expanded: undefined, state: TransformState.ReturnImm };
     });
 }
