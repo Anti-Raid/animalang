@@ -1,31 +1,15 @@
-import { ASP, Globals, OP_LAMBDA, type DottedPair, type SerializableBytecode } from "./common"
-import { IBUILTINS, STD_PRELUDE, stdPreludeScope } from "./std"
-import { AnimaTransformer } from "./syntax-transformer"
-
-// eslint-disable-next-line
-export interface Closure extends SerializableBytecode {}
-// eslint-disable-next-line
-export interface ByteCode extends SerializableBytecode {}
-export interface AnimaVM {
-    evaluateRaw(code: ByteCode, scope: Globals): any,
-    evaluateClosure(code: Closure, scope: Globals, args: any[]): any
-}
-export interface Compiler {
-    compile(trExpr: any): ByteCode
-}
-export interface AnimaMeta {
-    id: string,
-    vm(maxSteps: number): AnimaVM
-    compiler(): Compiler
-    deepPrint(bc: ByteCode): void;
-}
+import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, Globals, OP_LAMBDA, type DottedPair } from "./common"
+import { Bootstrapper } from "./std"
+import { MacroEvaluator } from "./syntransformer-v1/macro"
+import { registerCoreSyntax } from "./syntransformer-v1/prelude"
 
 export class Anima {
-    #vm: AnimaVM
-    #comp: Compiler
+    #vm: AbstractVM
+    #comp: AbstractCompiler
     #scope: Globals
     #impl: AnimaMeta
-    #t = new AnimaTransformer()
+    #bootstrapper: Bootstrapper
+    #evaluator: MacroEvaluator
 
     get scope() {
         return this.#scope
@@ -43,15 +27,18 @@ export class Anima {
         this.#impl = impl
         this.#vm = impl.vm(maxSteps || 0)
         this.#comp = impl.compiler()
-        const publicScope = getBootstrapScopeFor(impl, this.#comp, this.#vm, this.#t)
+        this.#evaluator = new MacroEvaluator(impl, maxSteps || 0)
+        registerCoreSyntax(this.#evaluator)
+        this.#bootstrapper = new Bootstrapper()
+        const publicScope = this.#bootstrapper.setupPublicScope(impl, this.#comp, this.#vm, this.#evaluator)
         this.#scope = publicScope.nestWith({})
     }
 
-    public evaluateRaw(code: ByteCode): any {
+    public evaluateRaw(code: AbstractByteCode): any {
         return this.#vm.evaluateRaw(code, this.#scope)
     }
 
-    public evaluateClosure(code: Closure, args: any[]): any {
+    public evaluateClosure(code: AbstractClosure, args: any[]): any {
         return this.#vm.evaluateClosure(code, this.#scope, args)
     }
 
@@ -60,7 +47,7 @@ export class Anima {
         return this.compileAstToClosure(bast, args, globals)
     }
 
-    compileAstToClosure(bast: any, args: any[] | DottedPair, globals: Globals): Closure {
+    compileAstToClosure(bast: any, args: any[] | DottedPair, globals: Globals): AbstractClosure {
         const ast = [OP_LAMBDA, args, bast]
         const bc = this.compileRawAst(ast)
         const res = this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
@@ -73,46 +60,11 @@ export class Anima {
     }
 
     compileRawAst(ast: any) {
-        return _compileRawAst(ast, this.#comp, this.#t)
+        let trExpr = this.#evaluator.transform(ast)
+        return this.#comp.compile(trExpr)
     }
 
-    deepPrint(bc: ByteCode) {
+    deepPrint(bc: AbstractByteCode) {
         this.#impl.deepPrint(bc)
     }
-}
-
-const _compileRawAst = (ast: any, cmp: Compiler, t: AnimaTransformer) => {
-    let trExpr = t.transform(ast)
-    return cmp.compile(trExpr)
-}
-
-const bootstrappedPreludes: Map<string, Globals> = new Map()
-const getBootstrapScopeFor = (impl: AnimaMeta, cmp: Compiler, vm: AnimaVM, t: AnimaTransformer) => {
-    if (bootstrappedPreludes.has(impl.id)) {
-        return bootstrappedPreludes.get(impl.id)!
-    }
-    const preludeAst = new ASP(STD_PRELUDE, true).parse()
-    const PRELUDE_BC = _compileRawAst(preludeAst, cmp, t)
-    //impl.deepPrint(PRELUDE_BC)
-    const privScope = stdPreludeScope()
-    vm.evaluateRaw(PRELUDE_BC, privScope)
-
-    /* Base scope */
-    const publicScope = Globals.newWith({}, true); 
-    for (const [sym, value] of privScope.data.entries()) {
-        const symName = Symbol.keyFor(sym) || sym.description || "%Unknown";
-    
-        // If the func starts with a $, its public
-        if (symName.startsWith("$")) {
-            publicScope.data.set(Symbol.for(symName.replace('$', '')), value);
-        }
-    }
-
-    // finally, export the builtins
-    for(const builtin of IBUILTINS) {
-        publicScope.data.set(builtin.name, builtin)
-    }
-
-    bootstrappedPreludes.set(impl.id, publicScope)
-    return publicScope
 }

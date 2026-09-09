@@ -430,7 +430,7 @@ export const normalizeExpr = (expr: any): any =>{
     return expr;
 }
 
-export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxCtx: string, builtins: Map<symbol, number>) => {
+export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxCtx: string) => {
     if(typeof param !== "symbol") {
         throw new Error(`${syntaxCtx} parameter must be a symbol, but received ${typeof param}: ${String(param)}`);
     }
@@ -445,14 +445,10 @@ export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxC
     if (SPECIAL_FORMS.has(param)) {
         throw new Error(`${String(param)}: bad syntax`)
     }
-
-    if (builtins.has(param)) {
-        throw new Error(`${String(param)}: cannot shadow builtin procedure`)
-    }
 }
 
 export type UnpackedLambdaArgs = { params: symbol[], remParams: symbol | null }
-export const unpackLambdaExprArgs = (expr: any, builtins: Map<symbol, number>, ctx?: string): UnpackedLambdaArgs => {
+export const unpackLambdaExprArgs = (expr: any, ctx?: string): UnpackedLambdaArgs => {
     let params: symbol[] = []
     let remParams: symbol | null = null
     if (Array.isArray(expr[1])) {
@@ -471,10 +467,10 @@ export const unpackLambdaExprArgs = (expr: any, builtins: Map<symbol, number>, c
     // Validate params and remParams here
     const seen = new Set<symbol>();
     for(let i = 0; i < params.length; i++) {
-        ensureCanBind(params[i], seen, ctx || "lambda", builtins)
+        ensureCanBind(params[i], seen, ctx || "lambda")
     }
     if (remParams) {
-        ensureCanBind(remParams, seen, ctx || "lambda", builtins)
+        ensureCanBind(remParams, seen, ctx || "lambda")
     }
 
     return { params, remParams }
@@ -1021,4 +1017,22 @@ export class Globals {
 let n = 0
 export const symGen = (base: string) => {
     return Symbol(`${base}${n++}`)
+}
+
+// eslint-disable-next-line
+export interface AbstractClosure extends SerializableBytecode {}
+// eslint-disable-next-line
+export interface AbstractByteCode extends SerializableBytecode {}
+export interface AbstractVM {
+    evaluateRaw(code: AbstractByteCode, scope: Globals): any,
+    evaluateClosure(code: AbstractClosure, scope: Globals, args: any[]): any
+}
+export interface AbstractCompiler {
+    compile(trExpr: any): AbstractByteCode
+}
+export interface AnimaMeta {
+    id: string,
+    vm(maxSteps: number): AbstractVM
+    compiler(): AbstractCompiler
+    deepPrint(bc: AbstractByteCode): void;
 }

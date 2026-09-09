@@ -1,5 +1,6 @@
-import { ErrorObject, ExposedProps, Globals, IProcedure, isDeepEqual, isTruthy, symGen } from "./common";
+import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, ExposedProps, Globals, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen } from "./common";
 import { Cons } from "./list";
+import { MacroEvaluator } from "./syntransformer-v1/macro";
 
 /** 
  * A builtin function. 
@@ -546,12 +547,49 @@ export const STD_PRELUDE = `
             (result (%ArrayNew_)))
         
         (let loop ()
-        (let ((args (%MapObjNext_ iter)))      
-            (if (%MapObjDone_ iter)              
-                result                          
-                (begin
-                    (%ArrayPush_ result (apply f args)) 
-                    (loop)))))))))
+            (let ((args (%MapObjNext_ iter)))      
+                (if (%MapObjDone_ iter)              
+                    result                          
+                    (begin
+                        (%ArrayPush_ result (apply f args)) 
+                        (loop)))))))))
 
 (define $map (create-map))
 `
+
+export class Bootstrapper {
+    #bootstrappedPreludes: Map<string, Globals> = new Map()
+
+    /** Set up the public scope for the given vm and compiler instance */
+    setupPublicScope(impl: AnimaMeta, cmp: AbstractCompiler, vm: AbstractVM, evaluator: MacroEvaluator) {
+        if (this.#bootstrappedPreludes.has(impl.id)) {
+            return this.#bootstrappedPreludes.get(impl.id)!
+        }
+        const preludeAst = new ASP(STD_PRELUDE, true).parse()
+        console.log(preludeAst)
+        const transformExpr = evaluator.transform(preludeAst)
+        const PRELUDE_BC = cmp.compile(transformExpr)
+
+        const privScope = stdPreludeScope()
+        vm.evaluateRaw(PRELUDE_BC, privScope)
+
+        /* Base scope */
+        const publicScope = Globals.newWith({}, true); 
+        for (const [sym, value] of privScope.data.entries()) {
+            const symName = Symbol.keyFor(sym) || sym.description || "%Unknown";
+        
+            // If the func starts with a $, its public
+            if (symName.startsWith("$")) {
+                publicScope.data.set(Symbol.for(symName.replace('$', '')), value);
+            }
+        }
+
+        // finally, export the builtins
+        for(const builtin of IBUILTINS) {
+            publicScope.data.set(builtin.name, builtin)
+        }
+
+        this.#bootstrappedPreludes.set(impl.id, publicScope)
+        return publicScope
+    }
+}

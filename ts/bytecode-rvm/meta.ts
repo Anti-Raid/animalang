@@ -1,4 +1,4 @@
-import type { AnimaMeta } from "../anima";
+import type { AnimaMeta } from "../common";
 import { Compiler } from "./compiler";
 import { deepPrint } from "./utils";
 import { AnimaVM, ByteCode } from "./vm";

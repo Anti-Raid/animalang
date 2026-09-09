@@ -5,7 +5,6 @@ import {
   OP_SET,
   unpackLambdaExprArgs,
 } from "../common";
-import { IBUILTINS_IDX_MAP } from "../std";
 import { AnalysisScope } from "./scope";
 
 // Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
@@ -49,7 +48,7 @@ export class AstAnalysis {
                 
                 const lambdaScope = new AnalysisScope(scope);
                 
-                const extractedParams = unpackLambdaExprArgs(ast, IBUILTINS_IDX_MAP)
+                const extractedParams = unpackLambdaExprArgs(ast)
                 for (const p of extractedParams.params) {
                     lambdaScope.define(p); 
                 }

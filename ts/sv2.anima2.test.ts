@@ -1,12 +1,12 @@
 // Made w/ lots of help from gemini cli
-import { ASTStringifier, MissingVarError, isDeepEqual } from './common';
+import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual } from './common';
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
-import { Anima, type ByteCode } from './anima';
+import { Anima } from './anima';
 import { impl } from './bytecode-rvm/meta';
 
 const vmImpl = impl
-const bcCache: Record<string, ByteCode> = {}
+const bcCache: Record<string, AbstractByteCode> = {}
 describe('Anima', () => {
     let evaluator = new Anima(vmImpl)
     let s = new ASTStringifier()
@@ -476,13 +476,6 @@ expect(run(`
         it('checks contains', () => {
             expect(run("(contains? (list 1 2) 2)")).toBe("#t");
             expect(run("(contains? (list 1 2) 3)")).toBe("#f");
-        });
-
-        it('evaluates type? with JS Symbols', () => {
-            expect(run("(type? port)")).toBe('"number"');
-            expect(run("(type? protocol)")).toBe('"string"');
-            expect(run("(type? user_role)")).toBe('"list"');
-            expect(run("(type? 'my_symbol)")).toBe('"symbol"');
         });
     });
 

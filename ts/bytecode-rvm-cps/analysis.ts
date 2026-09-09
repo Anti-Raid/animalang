@@ -8,7 +8,6 @@ import {
   OP_DEFINE,
   unpackLambdaExprArgs,
 } from "../common";
-import { IBUILTINS_IDX_MAP } from "../std";
 import { AnalysisScope } from "./scope";
 import { OP_CONT } from "./vm";
 
@@ -54,7 +53,7 @@ export class AstAnalysis {
                 
                 const lambdaScope = new AnalysisScope(scope);
                 
-                const extractedParams = unpackLambdaExprArgs(ast, IBUILTINS_IDX_MAP)
+                const extractedParams = unpackLambdaExprArgs(ast)
                 for (const p of extractedParams.params) {
                     lambdaScope.define(p); 
                 }
@@ -104,7 +103,7 @@ export class ContifyAnalyzer {
     private registerCandidate(lambdaExpr: any) {
         if (this.candidates.has(lambdaExpr)) return;
 
-        const { params, remParams } = unpackLambdaExprArgs(lambdaExpr, IBUILTINS_IDX_MAP)
+        const { params, remParams } = unpackLambdaExprArgs(lambdaExpr)
 
         if (params && params.length > 0) {
             this.knownContinuationSymbols.add(params[0]);

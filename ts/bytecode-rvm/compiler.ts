@@ -190,7 +190,7 @@ export class Compiler {
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
         ascope.dbgPrint()
 
-        const { params, remParams } = unpackLambdaExprArgs(expr, IBUILTINS_IDX_MAP, "lambda")
+        const { params, remParams } = unpackLambdaExprArgs(expr, "lambda")
         const lambdaNodes: Node[] = []
 
         for(let i = 0; i < params.length; i++) {
@@ -335,7 +335,7 @@ export class Compiler {
             opts.scope.enterBlock()
             const seen = new Set<symbol>();
             for(let i = 0; i < params.length; i++) {
-                ensureCanBind(params[i], seen, "lambda", IBUILTINS_IDX_MAP)
+                ensureCanBind(params[i], seen, "lambda")
                 const inf = ascope.getVarinfo(params[i]);
                 if(!inf) throw new Error("Could not fetch varinfo")
                 

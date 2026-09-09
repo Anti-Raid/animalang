@@ -228,7 +228,7 @@ export class Compiler {
 
     #compileLambda(expr: any[], opts: CmpOpts) {
         // AnimaTransform ensures lambdas are of correct form
-        const { params, remParams } = unpackLambdaExprArgs(expr, IBUILTINS_IDX_MAP, "lambda")
+        const { params, remParams } = unpackLambdaExprArgs(expr, "lambda")
 
         // Once we've verified the syntax, we can then drop the entire lambda if its not actually needed
         if (!opts.leaveOnStack) return
@@ -290,7 +290,7 @@ export class Compiler {
             // Bind all arguments outside new block scope
             const seen = new Set<symbol>();
             for(let i = 0; i < args.length; i++) {
-                ensureCanBind(params[i], seen, "lambda", IBUILTINS_IDX_MAP)
+                ensureCanBind(params[i], seen, "lambda")
                 if (args[i] === undefined) continue // the vm guarantees that locals are initially undefined as a default value
                 this.#compile(args[i], { ...opts, leaveOnStack: true, isTail: false });
             }
