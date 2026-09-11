@@ -99,7 +99,8 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         }
 
         if (loopName) {
-            const namedLetExpr = [ [OP_LAMBDA, [], [OP_DEFINE, loopName, [OP_LAMBDA, params, ...body]], [loopName, ...exprs]] ];
+            const letrecExpr = [OP_LETREC, [ [loopName, [OP_LAMBDA, params, ...body]] ], loopName]
+            const namedLetExpr = [letrecExpr, ...exprs]
             return { expanded: namedLetExpr, state: TransformState.Recurse };
         }
         
@@ -188,8 +189,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         for (let stmt of rawBody) {
             if (Array.isArray(stmt) && stmt[0] === OP_DEFINE) {
                 const normalizedStmt = normalizeDefine(stmt);
-                defines.push([normalizedStmt[1], undefined]);
-                body.push([OP_SET, normalizedStmt[1], normalizedStmt[2]]);
+                defines.push([normalizedStmt[1], normalizedStmt[2]]);
             } else {
                 body.push(stmt);
             }
@@ -199,11 +199,14 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             return { expanded: [OP_LAMBDA, args, ...rawBody], state: TransformState.DoChildren };
         }
 
+        if (body.length === 0)
+            throw new Error("lambda body must contain at least one expression after internal/local defines etc.");
+
         // Keep the outer lambda and put the letrec inside its body!
-        const letrecExpr = [OP_LETREC, defines, ...body];
+        const letrecExpr = [OP_LETREC, defines, ...body]
         return { 
             expanded: [OP_LAMBDA, args, letrecExpr], 
-            state: TransformState.DoChildren 
+            state: TransformState.Recurse 
         };
     });
 

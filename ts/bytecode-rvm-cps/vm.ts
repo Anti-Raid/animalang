@@ -189,7 +189,8 @@ export class AnimaVM {
 
     public evaluateClosure(code: Closure, scope: Globals, args: any[]): any {
         // Initial frame
-        const cargs = this.#createClosureArg(code.tmpl, args.length, args, 0)
+        const cpsArgs = [CPS_BASE_CONT, ...args];
+        const cargs = this.#createClosureArg(code.tmpl, cpsArgs.length, cpsArgs, 0)
         let frame: CallFrame = new CallFrame(code.tmpl.code, cargs, code.upvars, 0, 0);
         try {
             return this.#execnext(frame, scope);

@@ -29,6 +29,7 @@ export class Anima {
         this.#comp = impl.compiler()
         this.#evaluator = new MacroEvaluator(impl, maxSteps || 0)
         registerCoreSyntax(this.#evaluator)
+        this.#evaluator.init()
         this.#bootstrapper = new Bootstrapper()
         const publicScope = this.#bootstrapper.setupPublicScope(impl, this.#comp, this.#vm, this.#evaluator)
         this.#scope = publicScope.nestWith({})

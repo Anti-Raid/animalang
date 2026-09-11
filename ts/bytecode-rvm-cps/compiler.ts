@@ -1,5 +1,5 @@
 import { ASTStringifier, DottedPair, ensureCanBind, normalizeExpr, OP_AND, OP_BEGIN, OP_COND, OP_DEFINE, OP_IF, OP_LAMBDA, OP_LET, OP_LETREC, OP_LETSTAR, OP_OR, OP_QUOTE, OP_SET, unpackLambdaExprArgs, wrapMulti } from "../common";
-import { AstAnalysis, ContifyAnalyzer } from "./analysis";
+import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { BUILTINS_START, OP_CONT, OP_CONT_BASECONT } from "./vm";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir"
@@ -23,14 +23,10 @@ export class Compiler {
 
     compile(trExpr_: any) {
         let trExpr = new AstCps().transform(trExpr_) // apply cps transform to trExpr
-        console.log(this.#s.stringify(trExpr))
+        console.log("CPS FORM: ", this.#s.stringify(trExpr))
         // Step 1 is to analyze our variables so we know what to box and what not to box
         let analyzer = new AstAnalysis()
         const ascope = analyzer.analyze(trExpr)
-        // Step 2: Contify analysis
-        const contifyAnalyzer = new ContifyAnalyzer(ascope)
-        const contifyTags = contifyAnalyzer.analyze(trExpr)
-        console.log(contifyTags)
 
         const scope = new CompilerScope(null)
         const nodes: Node[] = []

@@ -73,7 +73,7 @@ export class Compiler {
                 case OP_LETSTAR:
                 case OP_LETREC:
                 case OP_COND:
-                    throw new Error("internal error: let/let*/letrec/cond should be transformed by AnimaTransform prior to reaching here")
+                    throw new Error(`internal error: let/let*/letrec/cond should be transformed by AnimaTransform prior to reaching here: ${String(operator)}`)
             }
         }
 
