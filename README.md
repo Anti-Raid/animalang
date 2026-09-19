@@ -10,15 +10,16 @@ Anima uses a (simplified) Scheme-like grammar based on 's-expressions'
 
 ```
 <program>   ::= <expr>* 
-<expr>      ::= <primitive> | <list> | <quoted>
+<expr>      ::= <primitive> | <list> | <table-lit> | <quoted>
 <primitive> ::= <null> | <boolean> | <number> | <string> | <symbol>
 <null>    ::= null
 <boolean> ::= true | false
 <number>  ::= [0-9]+ ("." [0-9]+)? 
 <string>  ::= "[json/lisp escaped string]"
-<special> ::= ( | ) | [ | ] | ; | " | '
+<special> ::= ( | ) | [ | ] | { | } | ; | " | '
 <symbol>  ::= [character (excluding <special> and whitespace)]+
 <list>    ::= (<expr>*) | [<expr>*]
+<table-lit> ::= { (<expr> <expr>)* }
 <quoted>  ::= '<expr>
 ```
 
@@ -78,6 +79,42 @@ conditions match, returns `#<void>`. Throws an error if any clause is malformed.
 - last (list): Returns the final element of the list. Throws if the list is empty. Arity: 1.
 - length (list | string): Returns the integer length. Returns 0 if the argument is neither a list nor string. Arity: 1.
 - contains (list, item): Returns a boolean indicating strict inclusion of item within list. Arity: 2.
+
+#### Table Operations
+
+Tables provide first-class associative map data structures backed by a native JavaScript `Map` with immutability/freezing support for safe FFI boundaries.
+
+- `{key1 val1 key2 val2 ...}`: Literal syntax for tables. Desugars at read time to `(table key1 val1 key2 val2 ...)`. Empty table literal `{}` desugars to `(table)`. Keys and values evaluate dynamically at runtime.
+- `(table? val)`: Returns `#t` if `val` is an instance of `Table`, `#f` otherwise. Arity: 1.
+- `(table [k1 v1 k2 v2 ...])`: Constructs a new mutable `Table`. Accepts 0 or an even number of arguments (alternating keys and values). Arity: 0 or even.
+- `(table-ref tbl key [default])`: Looks up `key` in `tbl`. If `key` is not found, returns `default` if provided; otherwise throws an error. Arity: 2 or 3.
+- `(table-set! tbl key val)`: Associates `key` with `val` in `tbl`. Throws an error if `tbl` is frozen. Returns `#<void>`. Arity: 3.
+- `(table-has? tbl key)`: Returns `#t` if `key` exists in `tbl`, `#f` otherwise. Arity: 2.
+- `(table-delete! tbl key)`: Deletes `key` and its associated value from `tbl`. Throws an error if `tbl` is frozen. Returns `#t` if the key was present and removed, `#f` otherwise. Arity: 2.
+- `(table-clear! tbl)`: Removes all entries from `tbl`. Throws an error if `tbl` is frozen. Returns `#<void>`. Arity: 1.
+- `(table-size tbl)`: Returns the number of entries stored in `tbl`. Arity: 1.
+- `(table-empty? tbl)`: Returns `#t` if `tbl` is empty (`size === 0`), `#f` otherwise. Arity: 1.
+- `(empty? val)`: Generic empty predicate also returns `#t` for empty tables.
+- `(table-keys tbl)`: Returns a vector (native JavaScript array) containing all keys in `tbl`. Arity: 1.
+- `(table-values tbl)`: Returns a vector (native JavaScript array) containing all values in `tbl`. Arity: 1.
+- `(table-copy tbl)`: Creates a new unfrozen shallow copy of `tbl`. Arity: 1.
+- `(table-freeze! tbl)`: Freezes `tbl` in place to prevent any future mutations (`table-set!`, `table-delete!`, `table-clear!`), and returns `tbl`. Arity: 1.
+- `(table-frozen? tbl)`: Returns `#t` if `tbl` is frozen, `#f` otherwise. Arity: 1.
+- `(table-merge! target source)`: Copies all key-value pairs from `source` into `target`. Throws an error if `target` is frozen. Returns `target`. Arity: 2.
+- `(equal? a b)`: Performs deep recursive equality comparison across tables, vectors, lists, and primitives.
+
+##### JavaScript `Table` Class (FFI / Interop)
+
+The `Table` class exported from `animalang` provides clean integration with host TypeScript / JavaScript environments:
+
+- **Methods**: `.get(key)`, `.set(key, val)`, `.has(key)`, `.delete(key)`, `.clear()`, `.copy()`
+- **Properties**: `.size`, `.isFrozen` / `.frozen`
+- **Freezing**: `.freeze()`, `.freezeDeep()` (recursively freezes nested `Table` values)
+- **Iteration**: Implements `Iterable<[any, any]>` (`for (const [k, v] of tbl)`), `.entries()`, `.keys()`, `.values()`
+- **Conversion**:
+  - `tbl.toObject(deep = true)`: Converts string/symbol-keyed entries into a plain JavaScript `Record<string, any>` object (recursing on nested tables).
+  - `Table.fromObject(obj, deep = true)`: Constructs a `Table` from a plain JavaScript object.
+  - `tbl.toJSON()`: Enables direct use with `JSON.stringify(tbl)`.
 
 #### Logic & Type Checking
 - =: Checks if `n` number expressions are equal. Errors if any expression is not a number. Arity: >= 2.

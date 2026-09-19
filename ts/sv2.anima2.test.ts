@@ -1107,6 +1107,7 @@ describe('Tables (using Table class)', () => {
         expect(run('(table-ref {"a" 1} "missing" 42)')).toBe("42");
         expect(run('(table-ref {"a" 1} "missing" #f)')).toBe("#f");
         expect(() => run('(table-ref {"a" 1} "missing")')).toThrow();
+        expect(run(`(table-ref {'id 123} 'id)`)).toBe("123")
     });
 
     it('mutates tables with table-set!', () => {
