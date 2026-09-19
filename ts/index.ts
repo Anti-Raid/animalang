@@ -1,5 +1,6 @@
 export * from './anima';
 export { impl as implRvm } from './bytecode-rvm/meta'
+export { Table } from './table';
 
 export * as common from './common'
-export { ExposedProps, isTruthy, ErrorObject } from './common'
+export { isTruthy, ErrorObject } from './common'

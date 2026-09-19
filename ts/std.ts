@@ -1,4 +1,4 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, ExposedProps, Globals, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen } from "./common";
+import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, Globals, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
 
@@ -392,7 +392,7 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     new BuiltinFunction(Symbol.for("empty?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("empty? requires 1 argument");
         const val = regs[startReg];
-        return val === null || (Array.isArray(val) && val.length === 0) || (typeof val === "string" && val.length === 0);
+        return val === null || (Array.isArray(val) && val.length === 0) || (typeof val === "string" && val.length === 0) || (val instanceof Table && val.size === 0);
     }),
     new BuiltinFunction(Symbol.for("contains?"), (regs, startReg, nargs) => {
         if (nargs != 2) throw new Error("contains? requires 2 arguments");
@@ -416,19 +416,6 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     new BuiltinFunction(Symbol.for("error?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("error? requires 1 argument");
         return regs[startReg] instanceof ErrorObject
-    }),
-    new BuiltinFunction(Symbol.for("exposed-props?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("exposed-props? requires 1 argument");
-        return regs[startReg] instanceof ExposedProps
-    }),
-    // Exposed props
-    new BuiltinFunction(Symbol.for("pget"), (regs, startReg, nargs) => {
-        if (nargs != 2) throw new Error("pget requires 2 arguments (pget props key-str)");
-        const props = regs[startReg]
-        if (!(props instanceof ExposedProps)) throw new Error("pget requires the first argument to be an instance of ExposedProps")
-        const keyStr = regs[startReg+1]
-        if (typeof keyStr !== "string") throw new Error("pget requires the second argument to be a string")
-        return props.get(keyStr)
     }),
     new ApplyProc(),
     new TryProc(),
@@ -539,6 +526,112 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
         const vec = regs[startReg];
         if (!Array.isArray(vec)) throw new Error("vector-empty? requires a vector");
         return vec.length === 0;
+    }),
+    // Table operations
+    new BuiltinFunction(Symbol.for("table?"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table? requires 1 argument");
+        return regs[startReg] instanceof Table;
+    }),
+    new BuiltinFunction(Symbol.for("table"), (regs, startReg, nargs) => {
+        if (nargs % 2 !== 0) throw new Error("table requires an even number of arguments (key-value pairs)");
+        const tbl = new Table();
+        for (let i = 0; i < nargs; i += 2) {
+            tbl.set(regs[startReg + i], regs[startReg + i + 1]);
+        }
+        return tbl;
+    }),
+    new BuiltinFunction(Symbol.for("table-ref"), (regs, startReg, nargs) => {
+        if (nargs < 2 || nargs > 3) throw new Error("table-ref requires 2 or 3 arguments (table-ref tbl key [default])");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-ref requires a table");
+        const key = regs[startReg + 1];
+        if (tbl.has(key)) {
+            return tbl.get(key);
+        }
+        if (nargs === 3) {
+            return regs[startReg + 2];
+        }
+        throw new Error(`table-ref: key not found: ${String(key)}`);
+    }),
+    new BuiltinFunction(Symbol.for("table-set!"), (regs, startReg, nargs) => {
+        if (nargs !== 3) throw new Error("table-set! requires 3 arguments (table-set! tbl key val)");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-set! requires a table");
+        tbl.set(regs[startReg + 1], regs[startReg + 2]);
+        return undefined;
+    }),
+    new BuiltinFunction(Symbol.for("table-has?"), (regs, startReg, nargs) => {
+        if (nargs !== 2) throw new Error("table-has? requires 2 arguments (table-has? tbl key)");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-has? requires a table");
+        return tbl.has(regs[startReg + 1]);
+    }),
+    new BuiltinFunction(Symbol.for("table-delete!"), (regs, startReg, nargs) => {
+        if (nargs !== 2) throw new Error("table-delete! requires 2 arguments (table-delete! tbl key)");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-delete! requires a table");
+        return tbl.delete(regs[startReg + 1]);
+    }),
+    new BuiltinFunction(Symbol.for("table-clear!"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-clear! requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-clear! requires a table");
+        tbl.clear();
+        return undefined;
+    }),
+    new BuiltinFunction(Symbol.for("table-size"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-size requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-size requires a table");
+        return tbl.size;
+    }),
+    new BuiltinFunction(Symbol.for("table-empty?"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-empty? requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-empty? requires a table");
+        return tbl.size === 0;
+    }),
+    new BuiltinFunction(Symbol.for("table-keys"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-keys requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-keys requires a table");
+        return [...tbl.keys()];
+    }),
+    new BuiltinFunction(Symbol.for("table-values"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-values requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-values requires a table");
+        return [...tbl.values()];
+    }),
+    new BuiltinFunction(Symbol.for("table-copy"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-copy requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-copy requires a table");
+        return tbl.copy();
+    }),
+    new BuiltinFunction(Symbol.for("table-freeze!"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-freeze! requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-freeze! requires a table");
+        return tbl.freeze();
+    }),
+    new BuiltinFunction(Symbol.for("table-frozen?"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-frozen? requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-frozen? requires a table");
+        return tbl.isFrozen;
+    }),
+    new BuiltinFunction(Symbol.for("table-merge!"), (regs, startReg, nargs) => {
+        if (nargs !== 2) throw new Error("table-merge! requires 2 arguments (table-merge! target source)");
+        const target = regs[startReg];
+        const source = regs[startReg + 1];
+        if (!(target instanceof Table) || !(source instanceof Table)) {
+            throw new Error("table-merge! requires both arguments to be tables");
+        }
+        for (const [k, v] of source.entries()) {
+            target.set(k, v);
+        }
+        return target;
     }),
 ]
 

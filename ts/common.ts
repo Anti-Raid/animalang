@@ -1,6 +1,7 @@
 import { Cons } from "./list";
+import { Table } from "./table";
 
-export { Cons };
+export { Cons, Table };
 
 /** Returns if a value is truthy or not */
 export const isTruthy = (val: any): boolean => {
@@ -11,6 +12,16 @@ export const isTruthy = (val: any): boolean => {
 export const isDeepEqual = (a: any, b: any): boolean => {
     // If simple eqv? logic works, return true as no more work needed
     if (Object.is(a, b)) return true;
+
+    // Tables
+    if (a instanceof Table && b instanceof Table) {
+        if (a.size !== b.size) return false;
+        for (const [key, val] of a.entries()) {
+            if (!b.has(key)) return false;
+            if (!isDeepEqual(val, b.get(key))) return false;
+        }
+        return true;
+    }
 
     // Vectors
     if (Array.isArray(a) && Array.isArray(b)) {
@@ -53,22 +64,6 @@ export class MissingVarError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'MissingVarError';
-    }
-}
-
-/** Properties that are exposed to the anima engine */
-export class ExposedProps {
-    #props: Record<string, any>;
-
-    constructor(props: Record<string, any>) {
-        this.#props = props
-    }
-
-    get(key: string): any {
-        if (Object.hasOwn(this.#props, key)) {
-            return this.#props[key]
-        }
-        return undefined
     }
 }
 
@@ -129,7 +124,8 @@ export class ASPParseError extends Error {
     }
 }
 
-const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', ';', '"', "'"])
+const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', '{', '}', ';', '"', "'"])
+const ASP_CLOSING_TOKENS = new Set([')', ']', '}'])
 
 export class ASP {    
     #str: string;
@@ -192,8 +188,8 @@ export class ASP {
                 continue;
             }
 
-            // Lists
-            if (char === '(' || char === ')' || char === '[' || char === ']') {
+            // Lists & Tables
+            if (char === '(' || char === ')' || char === '[' || char === ']' || char === '{' || char === '}') {
                 tokens.push(this.advance());
                 continue;
             }
@@ -268,7 +264,7 @@ export class ASP {
                 current++;
                 const vec: any[] = [];
                 while (tokens[current] !== expectedClose) {
-                    if (current >= tokens.length || tokens[current] === ')' || tokens[current] === ']') {
+                    if (current >= tokens.length || ASP_CLOSING_TOKENS.has(tokens[current])) {
                         throw new ASPParseError(`Mismatched or missing closing bracket for '${token}'`, current);
                     }
                     vec.push(walk());
@@ -286,7 +282,7 @@ export class ASP {
                 let isDotted = false;
 
                 while (tokens[current] !== expectedClose) {
-                    if (current >= tokens.length || tokens[current] === ')' || tokens[current] === ']') {
+                    if (current >= tokens.length || ASP_CLOSING_TOKENS.has(tokens[current])) {
                         throw new ASPParseError(`Mismatched or missing closing bracket for '${token}'`, current);
                     }
 
@@ -322,8 +318,28 @@ export class ASP {
                 return tail;
             }
 
+            // Tables: { key1 val1 key2 val2 ... }
+            if (token === '{') {
+                current++;
+                const items: any[] = [];
+                while (tokens[current] !== '}') {
+                    if (current >= tokens.length || ASP_CLOSING_TOKENS.has(tokens[current])) {
+                        throw new ASPParseError(`Mismatched or missing closing bracket for '{'`, current);
+                    }
+                    if (tokens[current] === '.') {
+                        throw new ASPParseError(`Syntax error: '.' is not allowed in table literal`, current);
+                    }
+                    items.push(walk());
+                }
+                current++; // consume '}'
+                if (items.length % 2 !== 0) {
+                    throw new ASPParseError("table literal requires an even number of key-value expressions", current);
+                }
+                return Cons.list(Symbol.for("table"), ...items);
+            }
+
             // Stray closing brackets are not allowed
-            if (token === ')' || token === ']') {
+            if (token === ')' || token === ']' || token === '}') {
                 throw new ASPParseError("Unexpected closing bracket", current, token);
             }
 
@@ -417,6 +433,15 @@ export class ASTStringifier {
         if (Array.isArray(ast)) {
             const parts = ast.map(x => this.stringify(x));
             return `#(${parts.join(" ")})`;
+        }
+
+        // Tables
+        if (ast instanceof Table) {
+            const parts: string[] = [];
+            for (const [k, v] of ast.entries()) {
+                parts.push(`${this.stringify(k)} ${this.stringify(v)}`);
+            }
+            return `{${parts.join(" ")}}`;
         }
 
         // Procs
@@ -985,7 +1010,7 @@ export class ConstPool {
     }
 
     #freezeObj(obj: any) {
-        if (typeof obj !== "object" || obj === null || obj instanceof Cons) return obj;
+        if (typeof obj !== "object" || obj === null || obj instanceof Cons || obj instanceof Table) return obj;
         Object.keys(obj).forEach(prop => {
             if (typeof obj[prop] === 'object' && !Object.isFrozen(obj[prop])) {
                 this.#freezeObj(obj[prop]);

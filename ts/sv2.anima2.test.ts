@@ -1,5 +1,5 @@
 // Made w/ lots of help from gemini cli
-import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual } from './common';
+import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, ASPParseError } from './common';
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
 import { Anima } from './anima';
@@ -1052,6 +1052,214 @@ describe('Vectors (using JS Arrays)', () => {
         expect(run("(equal? #(1 2) #(1 2 3))")).toBe("#f");
         expect(run("(equal? #(1 2) '(1 2))")).toBe("#f");
         expect(run("(equal? #(1 #(2 3)) #(1 #(2 3)))")).toBe("#t");
+    });
+});
+
+describe('Tables (using Table class)', () => {
+    let evaluator = new Anima(vmImpl);
+    let s = new ASTStringifier();
+
+    const run = (expr: string) => {
+        const bc = evaluator.compileRaw(expr);
+        return s.stringify(evaluator.evaluateRaw(bc));
+    };
+
+    const runRaw = (expr: string) => {
+        const bc = evaluator.compileRaw(expr);
+        return evaluator.evaluateRaw(bc);
+    };
+
+    it('evaluates table literals {...}', () => {
+        expect(run("{}")).toBe("{}");
+        expect(run('{"a" 1 "b" 2}')).toBe('{"a" 1 "b" 2}');
+        expect(run('{"sum" (+ 10 20) "isTrue" #t}')).toBe('{"sum" 30 "isTrue" #t}');
+        expect(run('{"nested" {"x" 42}}')).toBe('{"nested" {"x" 42}}');
+    });
+
+    it('throws on malformed table literals', () => {
+        expect(() => evaluator.compileRaw('{"a"}')).toThrow(ASPParseError);
+        expect(() => evaluator.compileRaw('{"a" 1 "b"}')).toThrow(ASPParseError);
+        expect(() => evaluator.compileRaw('{"a" . 1}')).toThrow(ASPParseError);
+        expect(() => evaluator.compileRaw('{"a" 1 )')).toThrow(ASPParseError);
+        expect(() => evaluator.compileRaw('(list 1 2 }')).toThrow(ASPParseError);
+    });
+
+    it('tests table? predicate', () => {
+        expect(run("(table? {})")).toBe("#t");
+        expect(run('(table? (table "a" 1))')).toBe("#t");
+        expect(run("(table? #(1 2))")).toBe("#f");
+        expect(run("(table? '(1 2))")).toBe("#f");
+        expect(run('(table? "string")')).toBe("#f");
+        expect(run("(table? 123)")).toBe("#f");
+        expect(run("(table? #t)")).toBe("#f");
+    });
+
+    it('creates tables with table constructor', () => {
+        expect(run("(table)")).toBe("{}");
+        expect(run('(table "k" 99)')).toBe('{"k" 99}');
+        expect(run('(table "a" 1 "b" 2)')).toBe('{"a" 1 "b" 2}');
+        expect(() => run('(table "a")')).toThrow();
+    });
+
+    it('indexes with table-ref and defaults', () => {
+        expect(run('(table-ref {"a" 1 "b" 2} "a")')).toBe("1");
+        expect(run('(table-ref {"a" 1 "b" 2} "b")')).toBe("2");
+        expect(run('(table-ref {"a" 1} "missing" 42)')).toBe("42");
+        expect(run('(table-ref {"a" 1} "missing" #f)')).toBe("#f");
+        expect(() => run('(table-ref {"a" 1} "missing")')).toThrow();
+    });
+
+    it('mutates tables with table-set!', () => {
+        const script = `
+            (let ((tbl (table)))
+              (begin
+                (table-set! tbl "x" 10)
+                (table-set! tbl "y" 20)
+                (table-set! tbl "x" 30)
+                (list (table-ref tbl "x") (table-ref tbl "y"))))
+        `;
+        expect(run(script)).toBe("(30 20)");
+    });
+
+    it('checks membership with table-has?', () => {
+        expect(run('(table-has? {"a" 1} "a")')).toBe("#t");
+        expect(run('(table-has? {"a" 1} "b")')).toBe("#f");
+        expect(run('(table-has? {} "any")')).toBe("#f");
+    });
+
+    it('removes keys with table-delete!', () => {
+        const script = `
+            (let ((tbl {"a" 1 "b" 2}))
+              (let ((removed (table-delete! tbl "a")))
+                (list removed (table-has? tbl "a") (table-size tbl))))
+        `;
+        expect(run(script)).toBe("(#t #f 1)");
+    });
+
+    it('clears table with table-clear!', () => {
+        const script = `
+            (let ((tbl {"a" 1 "b" 2}))
+              (begin
+                (table-clear! tbl)
+                (table-size tbl)))
+        `;
+        expect(run(script)).toBe("0");
+    });
+
+    it('measures size with table-size and table-empty? / empty?', () => {
+        expect(run("(table-size {})")).toBe("0");
+        expect(run('(table-size {"a" 1 "b" 2})')).toBe("2");
+        expect(run("(table-empty? {})")).toBe("#t");
+        expect(run('(table-empty? {"a" 1})')).toBe("#f");
+        expect(run("(empty? {})")).toBe("#t");
+        expect(run('(empty? {"a" 1})')).toBe("#f");
+    });
+
+    it('extracts table-keys and table-values as vectors', () => {
+        expect(run("(vector? (table-keys {}))")).toBe("#t");
+        expect(run("(vector? (table-values {}))")).toBe("#t");
+        expect(run("(table-keys {})")).toBe("#()");
+        expect(run("(table-values {})")).toBe("#()");
+        expect(run('(table-keys {"a" 1})')).toBe('#("a")');
+        expect(run('(table-values {"a" 1})')).toBe("#(1)");
+    });
+
+    it('copies tables with table-copy', () => {
+        const script = `
+            (let ((t1 {"a" 1}))
+              (let ((t2 (table-copy t1)))
+                (begin
+                  (table-set! t2 "a" 99)
+                  (list (table-ref t1 "a") (table-ref t2 "a")))))
+        `;
+        expect(run(script)).toBe("(1 99)");
+    });
+
+    it('freezes tables with table-freeze! and enforces immutability', () => {
+        expect(run("(table-frozen? {})")).toBe("#f");
+        expect(run('(table-frozen? (table-freeze! {"a" 1}))')).toBe("#t");
+
+        // Mutating a frozen table throws
+        const failSet = `
+            (let ((tbl (table-freeze! {"a" 1})))
+              (table-set! tbl "a" 2))
+        `;
+        expect(() => run(failSet)).toThrow();
+
+        // Deleting from a frozen table throws
+        const failDel = `
+            (let ((tbl (table-freeze! {"a" 1})))
+              (table-delete! tbl "a"))
+        `;
+        expect(() => run(failDel)).toThrow();
+
+        // Clearing a frozen table throws
+        const failClear = `
+            (let ((tbl (table-freeze! {"a" 1})))
+              (table-clear! tbl))
+        `;
+        expect(() => run(failClear)).toThrow();
+
+        // table-copy creates an unfrozen mutable copy of a frozen table
+        const copyScript = `
+            (let ((frozen (table-freeze! {"a" 1})))
+              (let ((unfrozen (table-copy frozen)))
+                (begin
+                  (table-set! unfrozen "a" 42)
+                  (list (table-frozen? frozen) (table-frozen? unfrozen) (table-ref unfrozen "a")))))
+        `;
+        expect(run(copyScript)).toBe("(#t #f 42)");
+    });
+
+    it('merges tables with table-merge!', () => {
+        const script = `
+            (let ((t1 {"a" 1 "b" 2})
+                  (t2 {"b" 20 "c" 30}))
+              (begin
+                (table-merge! t1 t2)
+                (list (table-ref t1 "a") (table-ref t1 "b") (table-ref t1 "c"))))
+        `;
+        expect(run(script)).toBe("(1 20 30)");
+    });
+
+    it('compares tables with equal?', () => {
+        expect(run("(equal? {} {})")).toBe("#t");
+        expect(run('(equal? {"a" 1 "b" 2} {"b" 2 "a" 1})')).toBe("#t");
+        expect(run('(equal? {"a" 1} {"a" 2})')).toBe("#f");
+        expect(run('(equal? {"a" 1} {"a" 1 "b" 2})')).toBe("#f");
+        expect(run('(equal? {"nested" {"x" 1}} {"nested" {"x" 1}})')).toBe("#t");
+        expect(run('(equal? {"a" 1} \'("a" 1))')).toBe("#f");
+    });
+
+    it('supports JS Table class interop and FFI methods', () => {
+        const t = Table.fromObject({ name: "Willow", version: 2, meta: { active: true } });
+        expect(t instanceof Table).toBe(true);
+        expect(t.size).toBe(3);
+        expect(t.get("name")).toBe("Willow");
+        expect(t.get("meta") instanceof Table).toBe(true);
+        expect((t.get("meta") as Table).get("active")).toBe(true);
+
+        const obj = t.toObject();
+        expect(obj).toEqual({ name: "Willow", version: 2, meta: { active: true } });
+
+        expect(JSON.stringify(t)).toBe(JSON.stringify({ name: "Willow", version: 2, meta: { active: true } }));
+
+        // JS iteration
+        const entries = [...t.entries()];
+        expect(entries.length).toBe(3);
+
+        // JS freeze
+        t.freeze();
+        expect(t.isFrozen).toBe(true);
+        expect(() => t.set("name", "Other")).toThrow();
+        expect(() => t.delete("version")).toThrow();
+        expect(() => t.clear()).toThrow();
+
+        // Scheme evaluateRaw returns actual Table instance
+        const rawT = runRaw('{"id" "test-123" "count" 5}');
+        expect(rawT instanceof Table).toBe(true);
+        expect(rawT.get("id")).toBe("test-123");
+        expect(rawT.get("count")).toBe(5);
     });
 });
 
