@@ -55,6 +55,19 @@ describe('Anima', () => {
             expect(run("(+ (let [(x 1)] x) 1)")).toBe("2");
         });
 
+        it('comparisons', () => {
+            expect(run("(< 1 2 3)")).toBe("#t");
+            expect(run("(< 1 3 2)")).toBe("#f");
+            expect(run("(< 2 2)")).toBe("#f");
+            expect(run("(<= 1 2 2 3)")).toBe("#t");
+            expect(run("(<= 1 3 2)")).toBe("#f");
+            expect(run("(> 3 2 1)")).toBe("#t");
+            expect(run("(> 3 1 2)")).toBe("#f");
+            expect(run("(> 2 2)")).toBe("#f");
+            expect(run("(>= 3 2 2 1)")).toBe("#t");
+            expect(run("(>= 3 1 2)")).toBe("#f");
+        });
+
         it('Ensure valid TCO', () => {
             const script = `
                 (begin
@@ -834,6 +847,39 @@ expect(run(`
 
 (first-sym (listof 1 2 3))
 `)).toBe("listof");
+    });
+
+    it('call/cc', () => {
+        expect(run(`
+(+ 2 (call/cc (lambda (k) (+ 3 (k 5)))))
+`)).toBe("7");
+
+        expect(run(`
+(define (product lst)
+  (call/cc
+    (lambda (break)
+      (letrec ((loop (lambda (l)
+                      (cond
+                        ((null? l) 1)
+                        ((= (car l) 0) (break 0))
+                        (else (* (car l) (loop (cdr l))))))))
+        (loop lst)))))
+
+(list (product '(1 2 3 4 5)) (product '(1 2 0 4 5)))
+`)).toBe("(120 0)");
+
+        expect(run(`
+(let ((retry #f)
+      (val 0))
+  (begin
+    (set! val (call/cc (lambda (k) 
+                          (set! retry k) 
+                          1)))
+    (if (< val 5)
+        (begin
+          (set! val (+ val 1))
+          (retry val))
+        val)))`)).toBe("5");
     });
 })
 

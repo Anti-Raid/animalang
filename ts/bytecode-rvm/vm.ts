@@ -1,6 +1,6 @@
 import { BS, BSReader, ErrorObject, flattenDynamicArgs, Globals, IProcedure, type SerializableBytecode } from "../common";
 import { isTruthy } from "../common";
-import { ApplyProc, BuiltinFunction, IBUILTINS, TryProc } from "../std";
+import { ApplyProc, BuiltinFunction, CallCCProc, IBUILTINS, TryProc } from "../std";
 
 export const BUILTINS_START = 2**31
 
@@ -128,6 +128,18 @@ type RunningCont = { type: 'RUNNING'; frame: CallFrame; parent: Continuation | n
 type Continuation = RunningCont
 | { type: "TERMINAL", value: any }
 
+class VMContinuation {
+    constructor(public cont: Continuation | null) {}
+}
+
+/** Mark a continuation frame (and its parents) as shared to ensure they are copied on use */
+function markShared(cont: Continuation | null) {
+    while (cont !== null && cont.type === "RUNNING" && !cont.frame.shared) {
+        cont.frame.shared = true;
+        cont = cont.parent;
+    }
+}
+
 class CallFrame {
     constructor(
         public code: ByteCode,
@@ -135,6 +147,7 @@ class CallFrame {
         public upvars: any[],
         public ip: number,
         public id: number,
+        public shared: boolean = false
     ) {}
 
     readNext() {
@@ -146,6 +159,11 @@ class CallFrame {
 
     getConst(idx: number) {
         return this.code.constants[idx]
+    }
+
+    thaw(): CallFrame {
+        if (!this.shared) return this;
+        return new CallFrame(this.code, [...this.regs], this.upvars, this.ip, this.id, false);
     }
 }
 
@@ -183,7 +201,11 @@ export class AnimaVM {
                 throw new Error(`Script ran for more than ${this.maxSteps} instructions.`);
             }
 
-            const frame: CallFrame = cont.frame
+            let frame: CallFrame = cont.frame
+            if (frame.shared) {
+                frame = frame.thaw();
+                cont = { ...cont, frame };  
+            }
             const regs = frame.regs
             if (frame.ip >= frame.code.inst.length) {
                 throw new Error(`internal error: ${frame.ip} >= ${frame.code.inst.length}`)
@@ -428,6 +450,34 @@ export class AnimaVM {
                 
                 return trapCont;
             }
+        } else if (proc instanceof CallCCProc) {
+            markShared(cont);
+            const parentCont = (destReg === undefined) ? cont.parent : {
+                type: 'RUNNING',
+                frame: callerFrame,
+                parent: cont.parent,
+                destReg: destReg,
+                trySpot: cont.trySpot // Preserve outer try context
+            } as Continuation | null;
+            const vmCont = new VMContinuation(parentCont);  
+            const userProc = callerArgs[startReg];
+            return this.#invoke(userProc, cont, callerFrame, [vmCont], destReg, 0, 1);
+        } else if (proc instanceof VMContinuation) {
+            if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
+            const val = callerArgs[startReg];
+            let targetCont = proc.cont;
+
+            if (targetCont === null || targetCont.type === "TERMINAL") {
+                return { type: 'TERMINAL', value: val };
+            }
+
+            if (targetCont.destReg !== undefined) {
+                const frame = targetCont.frame.thaw();
+                frame.regs[targetCont.destReg] = val;
+                targetCont = frame === targetCont.frame ? targetCont : { ...targetCont, frame };
+            }
+
+            return targetCont;
         } else if (proc instanceof Closure) {
             const template = proc.tmpl;
             const pregs = this.#createClosureArg(proc.tmpl, nargs, callerArgs, startReg)

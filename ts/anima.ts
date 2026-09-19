@@ -1,4 +1,4 @@
-import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, Globals, OP_LAMBDA, type DottedPair } from "./common"
+import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, ASTStringifier, Globals, OP_LAMBDA, type DottedPair } from "./common"
 import { Bootstrapper } from "./std"
 import { MacroEvaluator } from "./syntransformer-v1/macro"
 import { registerCoreSyntax } from "./syntransformer-v1/prelude"
@@ -62,6 +62,7 @@ export class Anima {
 
     compileRawAst(ast: any) {
         let trExpr = this.#evaluator.transform(ast)
+        console.log("Transformed AST: ", new ASTStringifier().stringify(trExpr))
         return this.#comp.compile(trExpr)
     }
 

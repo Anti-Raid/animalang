@@ -27,9 +27,13 @@ export class ApplyProc extends IProcedure {
 export class TryProc extends IProcedure {
     public name = Symbol.for("try")
 }
+// Marker for `call/cc` intrinsic proc
+export class CallCCProc extends IProcedure {
+    public name = Symbol.for("call/cc")
+}
 
 // Stores all of our builtin funcs
-export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc)[] = [
+export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] = [
     new BuiltinFunction(Symbol.for("+"), (regs, startReg, nargs) => {
         let acc = 0; 
         for (let i = startReg; i < startReg+nargs; i++) {
@@ -172,66 +176,62 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc)[] = [
     new BuiltinFunction(Symbol.for("<"), (regs, startReg, nargs) => {
         if (nargs === 0) throw new Error("< requires at least 1 argument");
         
-        let start = regs[startReg];
-        if (typeof start !== "number") throw new Error(`< requires numbers, but received ${typeof start}`);
-        let res = true
+        let prev = regs[startReg];
+        if (typeof prev !== "number") throw new Error(`< requires numbers, but received ${typeof prev}`);
         for (let i = startReg+1; i < startReg+nargs; i++) {
             const val = regs[i]
             if (typeof val !== "number") throw new Error(`< requires numbers, but received ${typeof val}`);
-            if (val < start) {
-                res = false
-                break
+            if (!(prev < val)) {
+                return false
             }
+            prev = val
         }
-        return res
+        return true
     }),
     new BuiltinFunction(Symbol.for("<="), (regs, startReg, nargs) => {
         if (nargs === 0) throw new Error("<= requires at least 1 argument");
         
-        let start = regs[startReg];
-        if (typeof start !== "number") throw new Error(`<= requires numbers, but received ${typeof start}`);
-        let res = true
+        let prev = regs[startReg];
+        if (typeof prev !== "number") throw new Error(`<= requires numbers, but received ${typeof prev}`);
         for (let i = startReg+1; i < startReg+nargs; i++) {
             const val = regs[i]
             if (typeof val !== "number") throw new Error(`<= requires numbers, but received ${typeof val}`);
-            if (val <= start) {
-                res = false
-                break
+            if (!(prev <= val)) {
+                return false
             }
+            prev = val
         }
-        return res
+        return true
     }),
     new BuiltinFunction(Symbol.for(">"), (regs, startReg, nargs) => {
         if (nargs === 0) throw new Error("> requires at least 1 argument");
         
-        let start = regs[startReg];
-        if (typeof start !== "number") throw new Error(`> requires numbers, but received ${typeof start}`);
-        let res = true
+        let prev = regs[startReg];
+        if (typeof prev !== "number") throw new Error(`> requires numbers, but received ${typeof prev}`);
         for (let i = startReg+1; i < startReg+nargs; i++) {
             const val = regs[i]
             if (typeof val !== "number") throw new Error(`> requires numbers, but received ${typeof val}`);
-            if (val > start) {
-                res = false
-                break
+            if (!(prev > val)) {
+                return false
             }
+            prev = val
         }
-        return res
+        return true
     }),
     new BuiltinFunction(Symbol.for(">="), (regs, startReg, nargs) => {
         if (nargs === 0) throw new Error(">= requires at least 1 argument");
         
-        let start = regs[startReg];
-        if (typeof start !== "number") throw new Error(`>= requires numbers, but received ${typeof start}`);
-        let res = true
+        let prev = regs[startReg];
+        if (typeof prev !== "number") throw new Error(`>= requires numbers, but received ${typeof prev}`);
         for (let i = startReg+1; i < startReg+nargs; i++) {
             const val = regs[i]
             if (typeof val !== "number") throw new Error(`>= requires numbers, but received ${typeof val}`);
-            if (val > start) {
-                res = false
-                break
+            if (!(prev >= val)) {
+                return false
             }
+            prev = val
         }
-        return res
+        return true
     }),
     // list builtins
     new BuiltinFunction(Symbol.for("car"), (regs, startReg, nargs) => {
@@ -452,6 +452,7 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc)[] = [
     }),
     new ApplyProc(),
     new TryProc(),
+    new CallCCProc(),
     new BuiltinFunction(Symbol.for("gensym"), (regs, startReg, nargs) => {
         if (nargs > 1) throw new Error("gensym requires 0 or 1 arguments");
         switch (nargs) {

@@ -3,7 +3,7 @@ import type { UpVarLoc } from "./vm";
 export type Resolve = { type: "Global" } | { type: "Local", index: number } | { type: "Upvar", index: number }
 
 export class VariableMetadata {
-    get isBoxed() { return this.isCaptured && this.mutable }
+    get isBoxed() { return this.isCaptured || this.mutable }
 
     constructor(public mutable: boolean = false, public isCaptured: boolean = false, ) {}
 }
@@ -52,11 +52,20 @@ export class AnalysisScope {
         }
     }
 
+    findVarScope(sym: symbol): AnalysisScope | null {
+        if (this.#vals.has(sym)) return this;
+        return this.outer ? this.outer.findVarScope(sym) : null;
+    }
+
     markMutable(sym: symbol) {
-        if (this.#vals.has(sym)) {
-            this.#vals.get(sym)!.mutable = true;
-        } else if (this.outer) {
-            this.outer.markMutable(sym);
+        const ownerScope = this.findVarScope(sym);
+        if (ownerScope) {
+            const meta = ownerScope.#vals.get(sym)!;
+            meta.mutable = true;
+            // If the scope where it's defined is an ancestor of the current scope, it's captured!
+            if (ownerScope !== this) {
+                meta.isCaptured = true;
+            }
         }
     }
 }

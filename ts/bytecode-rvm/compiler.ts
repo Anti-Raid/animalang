@@ -177,7 +177,6 @@ export class Compiler {
         const lambdaScope = new CompilerScope(opts.scope)
         const ascope = opts.analyzer.scopeMap.get(expr)
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
-        ascope.dbgPrint()
 
         const { params, remParams } = unpackLambdaExprArgs(expr, "lambda")
         const lambdaNodes: Node[] = []
@@ -328,7 +327,6 @@ export class Compiler {
         if (resolved.type === 'Local') {
             const aresolved = opts.ascope.getVarinfo(varname)
             if (!aresolved) throw new Error(`internal error: ${String(varname)} has no analysis info present`)
-            
             if (aresolved.isBoxed) {
                 if (destReg !== undefined) {
                     // Unbox
@@ -366,7 +364,6 @@ export class Compiler {
         if (resolved.type === 'Local') {
             const aresolved = opts.ascope.getVarinfo(varname)
             if (!aresolved) throw new Error(`internal error: ${String(varname)} has no analysis info present`)
-
             if (aresolved.isBoxed) {
                 return [{ t: "SetBox", srcReg, destReg: resolved.index }]
             } else {

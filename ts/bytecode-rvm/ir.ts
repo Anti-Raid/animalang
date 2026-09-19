@@ -1,9 +1,10 @@
 import { ConstPool } from "../common";
 import { ByteCode, Closure, ClosureTemplate, OpCode, type UpVarLoc } from "./vm";
 
+let nextLabelId = 0;
+
 export class JumpLabel {
-    public id: number;
-    constructor() { this.id = Math.random(); } 
+    public id: number = ++nextLabelId;
 }
 
 export type JumpCond = "True" | "False"
@@ -99,33 +100,6 @@ export type Node = {
 
 export class IR {
     constructor() {}
-
-    #nodeOverwritesDestReg(node: Node) {
-        if(node.t === "Move" || node.t === "LoadValue" || node.t === "Box" || node.t === "Unbox" || node.t === "Call") {
-            return node
-        }
-        return null
-    }
-
-    #numInRange(min: number, max: number, num: number) {
-        return num >= min && num <= max
-    }
-
-    #nodeReadsReg(node: Node, reg: number) {
-        if (node.t === "Move") return node.srcReg === reg;
-        if (node.t === "Box") return node.srcReg === reg;
-        if (node.t === "Unbox") return node.srcReg === reg;
-        if (node.t === "SetBox") return node.srcReg === reg;
-        if (node.t === "SetUpvar") return node.srcReg === reg;
-        if (node.t === "SetGlobal") return node.srcReg === reg;
-        if (node.t === "Call") return (node.procReg === reg || this.#numInRange(node.startReg, node.startReg + node.nargs, reg));
-        if (node.t === "Return") return node.reg === reg;
-        if (node.t === "TailCall") return this.#numInRange(node.startReg, node.startReg + node.nargs, reg)
-        if (node.t === "Label") return false // its just a label
-        if (node.t === "IBuiltin") return this.#numInRange(node.startReg, node.startReg + node.nargs, reg)
-        if (node.t === "HasGlobal" || node.t === "LoadValue" || node.t === "LoadGlobal" || node.t === "LoadUpvar") return false // this reads from either const pool or upvars, not a register
-        return true; // if we dont know, just assume it reads
-    }
 
     lower(nodes: Node[], numRegs: number): ByteCode {
         const cpool = new ConstPool()
