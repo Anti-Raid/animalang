@@ -391,12 +391,14 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     }),
     new BuiltinFunction(Symbol.for("empty?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("empty? requires 1 argument");
-        return regs[startReg] === null || (typeof regs[startReg] === "string" && regs[startReg].length === 0);
+        const val = regs[startReg];
+        return val === null || (Array.isArray(val) && val.length === 0) || (typeof val === "string" && val.length === 0);
     }),
     new BuiltinFunction(Symbol.for("contains?"), (regs, startReg, nargs) => {
         if (nargs != 2) throw new Error("contains? requires 2 arguments");
         const list = regs[startReg];
         const item = regs[startReg+1];
+        if (Array.isArray(list)) return list.includes(item);
         return (list instanceof Cons) ? list.includes(item) : false;
     }),
     new BuiltinFunction(Symbol.for("symbol?"), (regs, startReg, nargs) => {
@@ -440,6 +442,103 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
             if (typeof regs[startReg] !== 'string') throw new Error("gensym requires the first argument to be a string")
             return symGen(regs[startReg])
         }
+    }),
+    // Vector operations
+    new BuiltinFunction(Symbol.for("vector?"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("vector? requires 1 argument");
+        return Array.isArray(regs[startReg]);
+    }),
+    new BuiltinFunction(Symbol.for("make-vector"), (regs, startReg, nargs) => {
+        if (nargs < 1 || nargs > 2) throw new Error("make-vector requires 1 or 2 arguments");
+        const len = regs[startReg];
+        if (typeof len !== "number" || !Number.isInteger(len) || len < 0) {
+            throw new Error("make-vector: length must be a non-negative integer");
+        }
+        const fill = nargs === 2 ? regs[startReg + 1] : 0;
+        const vec = new Array(len);
+        vec.fill(fill);
+        return vec;
+    }),
+    new BuiltinFunction(Symbol.for("vector"), (regs, startReg, nargs) => {
+        const vec = new Array(nargs);
+        for (let i = 0; i < nargs; i++) {
+            vec[i] = regs[startReg + i];
+        }
+        return vec;
+    }),
+    new BuiltinFunction(Symbol.for("vector-length"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("vector-length requires 1 argument");
+        const vec = regs[startReg];
+        if (!Array.isArray(vec)) throw new Error("vector-length requires a vector");
+        return vec.length;
+    }),
+    new BuiltinFunction(Symbol.for("vector-ref"), (regs, startReg, nargs) => {
+        if (nargs !== 2) throw new Error("vector-ref requires 2 arguments (vector-ref vec k)");
+        const vec = regs[startReg];
+        const k = regs[startReg + 1];
+        if (!Array.isArray(vec)) throw new Error("vector-ref requires a vector");
+        if (typeof k !== "number" || !Number.isInteger(k) || k < 0 || k >= vec.length) {
+            throw new Error(`vector-ref: index ${k} out of bounds for vector of length ${vec.length}`);
+        }
+        return vec[k];
+    }),
+    new BuiltinFunction(Symbol.for("vector-set!"), (regs, startReg, nargs) => {
+        if (nargs !== 3) throw new Error("vector-set! requires 3 arguments (vector-set! vec k val)");
+        const vec = regs[startReg];
+        const k = regs[startReg + 1];
+        const val = regs[startReg + 2];
+        if (!Array.isArray(vec)) throw new Error("vector-set! requires a vector");
+        if (typeof k !== "number" || !Number.isInteger(k) || k < 0 || k >= vec.length) {
+            throw new Error(`vector-set!: index ${k} out of bounds for vector of length ${vec.length}`);
+        }
+        vec[k] = val;
+        return undefined;
+    }),
+    new BuiltinFunction(Symbol.for("vector->list"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("vector->list requires 1 argument");
+        const vec = regs[startReg];
+        if (!Array.isArray(vec)) throw new Error("vector->list requires a vector");
+        return Cons.fromArray(vec);
+    }),
+    new BuiltinFunction(Symbol.for("list->vector"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("list->vector requires 1 argument");
+        const lst = regs[startReg];
+        if (lst === null) return [];
+        if (lst instanceof Cons && !lst.isImproper() && !lst.isCyclic()) {
+            return lst.toArray();
+        }
+        throw new Error("list->vector requires a proper list");
+    }),
+    new BuiltinFunction(Symbol.for("vector-fill!"), (regs, startReg, nargs) => {
+        if (nargs !== 2) throw new Error("vector-fill! requires 2 arguments (vector-fill! vec fill)");
+        const vec = regs[startReg];
+        const fill = regs[startReg + 1];
+        if (!Array.isArray(vec)) throw new Error("vector-fill! requires a vector");
+        vec.fill(fill);
+        return undefined;
+    }),
+    new BuiltinFunction(Symbol.for("vector-copy"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("vector-copy requires 1 argument");
+        const vec = regs[startReg];
+        if (!Array.isArray(vec)) throw new Error("vector-copy requires a vector");
+        return [...vec];
+    }),
+    new BuiltinFunction(Symbol.for("vector-append"), (regs, startReg, nargs) => {
+        const result: any[] = [];
+        for (let i = 0; i < nargs; i++) {
+            const vec = regs[startReg + i];
+            if (!Array.isArray(vec)) throw new Error("vector-append requires all arguments to be vectors");
+            for (let j = 0; j < vec.length; j++) {
+                result.push(vec[j]);
+            }
+        }
+        return result;
+    }),
+    new BuiltinFunction(Symbol.for("vector-empty?"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("vector-empty? requires 1 argument");
+        const vec = regs[startReg];
+        if (!Array.isArray(vec)) throw new Error("vector-empty? requires a vector");
+        return vec.length === 0;
     }),
 ]
 

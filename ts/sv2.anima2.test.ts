@@ -940,6 +940,121 @@ describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
     });
 });
 
+describe('Vectors (using JS Arrays)', () => {
+    let evaluator = new Anima(vmImpl);
+    let s = new ASTStringifier();
+
+    const run = (expr: string) => {
+        const bc = evaluator.compileRaw(expr);
+        return s.stringify(evaluator.evaluateRaw(bc));
+    };
+
+    it('evaluates vector literals #(...) and #[...]', () => {
+        expect(run("#()")).toBe("#()");
+        expect(run("#(1 2 3)")).toBe("#(1 2 3)");
+        expect(run("'#(10 20 30)")).toBe("#(10 20 30)");
+        expect(run("#[1 2 3]")).toBe("#(1 2 3)");
+        expect(run('#("hello" #t 42)')).toBe('#("hello" #t 42)');
+    });
+
+    it('tests vector? predicate', () => {
+        expect(run("(vector? #(1 2 3))")).toBe("#t");
+        expect(run("(vector? #())")).toBe("#t");
+        expect(run("(vector? '(1 2 3))")).toBe("#f");
+        expect(run("(vector? '())")).toBe("#f");
+        expect(run("(vector? 42)")).toBe("#f");
+        expect(run('(vector? "vec")')).toBe("#f");
+    });
+
+    it('creates vectors with make-vector and vector', () => {
+        expect(run("(make-vector 3)")).toBe("#(0 0 0)");
+        expect(run("(make-vector 4 #t)")).toBe("#(#t #t #t #t)");
+        expect(run("(make-vector 0)")).toBe("#()");
+        expect(run("(vector 1 2 3)")).toBe("#(1 2 3)");
+        expect(run("(vector)")).toBe("#()");
+        expect(run("(let ((x 10)) (vector x (+ x 5)))")).toBe("#(10 15)");
+    });
+
+    it('measures vector-length', () => {
+        expect(run("(vector-length #(1 2 3 4 5))")).toBe("5");
+        expect(run("(vector-length #())")).toBe("0");
+        expect(run("(vector-length (make-vector 10))")).toBe("10");
+        expect(() => run("(vector-length '(1 2 3))")).toThrow();
+    });
+
+    it('indexes with vector-ref and bounds checks', () => {
+        expect(run("(vector-ref #(10 20 30) 0)")).toBe("10");
+        expect(run("(vector-ref #(10 20 30) 1)")).toBe("20");
+        expect(run("(vector-ref #(10 20 30) 2)")).toBe("30");
+        expect(() => run("(vector-ref #(10 20 30) 3)")).toThrow();
+        expect(() => run("(vector-ref #(10 20 30) -1)")).toThrow();
+    });
+
+    it('mutates vectors with vector-set!', () => {
+        const script = `
+            (let ((v (vector 1 2 3)))
+              (begin
+                (vector-set! v 1 99)
+                v))
+        `;
+        expect(run(script)).toBe("#(1 99 3)");
+        expect(() => run("(let ((v (vector 1 2 3))) (vector-set! v 5 99))")).toThrow();
+    });
+
+    it('converts between vectors and lists', () => {
+        expect(run("(vector->list #(1 2 3))")).toBe("(1 2 3)");
+        expect(run("(vector->list #())")).toBe("()");
+        expect(run("(list->vector '(1 2 3))")).toBe("#(1 2 3)");
+        expect(run("(list->vector '())")).toBe("#()");
+        expect(run("(vector->list (list->vector '(a b c)))")).toBe("(a b c)");
+        expect(() => run("(list->vector 42)")).toThrow();
+    });
+
+    it('supports vector-fill!', () => {
+        const script = `
+            (let ((v (vector 1 2 3 4)))
+              (begin
+                (vector-fill! v 7)
+                v))
+        `;
+        expect(run(script)).toBe("#(7 7 7 7)");
+    });
+
+    it('copies vectors independently with vector-copy', () => {
+        const script = `
+            (let ((v1 (vector 1 2 3)))
+              (let ((v2 (vector-copy v1)))
+                (begin
+                  (vector-set! v2 0 99)
+                  (list v1 v2))))
+        `;
+        expect(run(script)).toBe("(#(1 2 3) #(99 2 3))");
+    });
+
+    it('concatenates vectors with vector-append', () => {
+        expect(run("(vector-append #(1 2) #(3 4) #(5))")).toBe("#(1 2 3 4 5)");
+        expect(run("(vector-append)")).toBe("#()");
+        expect(run("(vector-append #(1 2))")).toBe("#(1 2)");
+    });
+
+    it('checks vector-empty? and generic empty?', () => {
+        expect(run("(vector-empty? #())")).toBe("#t");
+        expect(run("(vector-empty? #(1))")).toBe("#f");
+        expect(run("(empty? #())")).toBe("#t");
+        expect(run("(empty? #(1))")).toBe("#f");
+        expect(run("(empty? '())")).toBe("#t");
+        expect(run('(empty? "")')).toBe("#t");
+    });
+
+    it('compares vectors with equal?', () => {
+        expect(run("(equal? #(1 2 3) #(1 2 3))")).toBe("#t");
+        expect(run("(equal? #(1 2) #(1 3))")).toBe("#f");
+        expect(run("(equal? #(1 2) #(1 2 3))")).toBe("#f");
+        expect(run("(equal? #(1 2) '(1 2))")).toBe("#f");
+        expect(run("(equal? #(1 #(2 3)) #(1 #(2 3)))")).toBe("#t");
+    });
+});
+
 /*
 const TEST_PROG = `
 (define union

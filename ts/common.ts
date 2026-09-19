@@ -12,6 +12,15 @@ export const isDeepEqual = (a: any, b: any): boolean => {
     // If simple eqv? logic works, return true as no more work needed
     if (Object.is(a, b)) return true;
 
+    // Vectors
+    if (Array.isArray(a) && Array.isArray(b)) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (!isDeepEqual(a[i], b[i])) return false;
+        }
+        return true;
+    }
+
     // Lists (Cons only)
     if (a instanceof Cons && b instanceof Cons) {
         const len = a.length;
@@ -176,6 +185,13 @@ export class ASP {
             if (this.isEOF()) break;
             const char = this.peek();
 
+            // Vectors: #( or #[
+            if (char === '#' && (this.#str[this.#currPos + 1] === '(' || this.#str[this.#currPos + 1] === '[')) {
+                this.advance(); // consume '#'
+                tokens.push('#' + this.advance()); // push '#(' or '#['
+                continue;
+            }
+
             // Lists
             if (char === '(' || char === ')' || char === '[' || char === ']') {
                 tokens.push(this.advance());
@@ -244,6 +260,21 @@ export class ASP {
                 }
                 const nextExpr = walk(); // Parse the next expr after the quote
                 return Cons.list(OP_QUOTE, nextExpr);  // Wrap in quote builtin proc
+            }
+
+            // Vectors
+            if (token === '#(' || token === '#[') {
+                const expectedClose = token === '#(' ? ')' : ']';
+                current++;
+                const vec: any[] = [];
+                while (tokens[current] !== expectedClose) {
+                    if (current >= tokens.length || tokens[current] === ')' || tokens[current] === ']') {
+                        throw new ASPParseError(`Mismatched or missing closing bracket for '${token}'`, current);
+                    }
+                    vec.push(walk());
+                }
+                current++;
+                return vec;
             }
 
             // Lists
@@ -382,6 +413,12 @@ export class ASTStringifier {
             return `(${parts.join(" ")})`;
         }
 
+        // Vectors
+        if (Array.isArray(ast)) {
+            const parts = ast.map(x => this.stringify(x));
+            return `#(${parts.join(" ")})`;
+        }
+
         // Procs
         if (ast instanceof IProcedure) {
             return `<procedure>`;
@@ -403,6 +440,9 @@ export class ASTStringifier {
 export const normalizeExpr = (expr: any): any =>{
     if (expr instanceof Cons) {
         return new Cons(normalizeExpr(expr.car), normalizeExpr(expr.cdr));
+    }
+    if (Array.isArray(expr)) {
+        return expr.map(normalizeExpr);
     }
     return expr;
 }
