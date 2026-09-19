@@ -1,138 +1,146 @@
 export class Cons {
-    public readonly isProper: boolean; // optimization for list?
-    private constructor(
-        private readonly _isView: boolean, // if our cons represents a view to an array or not
-        private readonly _head: any,
-        private readonly _tail: Cons | null,
-        private readonly _array: any[] | null,
-        private readonly _offset: number,
-        public readonly length: number
-    ) {
-        if (this._isView) {
-            this.isProper = true
-        } else {
-            // A Cons is proper if: 
-            // - its tail is null
-            // - if its tail is another proper Cons.
-            this.isProper = Cons.isNull(this._tail) || (this._tail instanceof Cons && this._tail.isProper);
+    public car: any;
+    public cdr: any;
+
+    private _cachedLength: number = -3;
+
+    private static globalEpoch: symbol = Symbol();
+    private _lastValidEpoch: symbol = Symbol();
+
+    constructor(car: any, cdr: any) {
+        this.car = car;
+        this.cdr = cdr;
+    }
+
+    public static pair(car: any, cdr: any): Cons {
+        return new Cons(car, cdr);
+    }
+
+    public setCar(newCar: any): void {
+        this.car = newCar;
+    }
+
+    public setCdr(newCdr: any): void {
+        this.cdr = newCdr;
+        // deoptimization note: we need to invalidate all of our lengths due to mutation
+        Cons.globalEpoch = Symbol(); 
+    }
+
+    // Returns length or -1 for improper list or -2 for cyclic list
+    public get length(): number {
+        // Fast path: if no set-cdr! has happened anywhere in the VM, return cached
+        if (this._lastValidEpoch === Cons.globalEpoch && this._cachedLength !== -3) {
+            return this._cachedLength;
         }
-    }
 
-    // construct a non-view cons representing a linked list pair
-    static pair(head: any, tail: any): Cons {
-        // ensure any array tail becomes a Cons
-        let rtail = tail;
-        if (Array.isArray(tail)) {
-            rtail = Cons.fromArray(tail);
-        }
+        // Slow path: recompute length (O(N)), then cache it
+        //
+        // We use tortoise-hare cycle detection here to handle cyclic lists caused by use of set-cdr!
+        let count = 0;
+        let slow: any = this;
+        let fast: any = this;
 
-        const len = 1 + (rtail instanceof Cons ? rtail.length : 0);
-        return new Cons(false, head, rtail, null, 0, len);
-    }
+        while (fast instanceof Cons) {
+            count++;
+            fast = fast.cdr;
 
-    // construct a cons with an array w/ a given offset into said array
-    static fromArray(arr: any[], offset: number = 0): Cons | null {
-        if (offset >= arr.length) return null;
-        
-        const len = arr.length - offset;
-        return new Cons(true, null, null, arr, offset, len);
-    }
+            // Move slow once every two iterations
+            if ((count & 1) === 0) {
+                slow = slow.cdr;
+            }
 
-    get head(): any {
-        return this._isView ? this._array![this._offset] : this._head;
-    }
-
-    get tail(): Cons | null {
-        if (this._isView) {
-            return Cons.fromArray(this._array!, this._offset + 1);
-        }
-        return this._tail;
-    }
-
-    *[Symbol.iterator]() {
-        // eslint-disable-next-line
-        let current: any = this;
-        
-        while (current !== null) {
-            if (current instanceof Cons) {
-                if (current._isView) {
-                    const arr = current._array!;
-                    if (current._offset === 0) {
-                        yield* arr;
-                        break
-                    } else {
-                        for(let i = current._offset; i < arr.length; i++) {
-                            yield arr[i]
-                        }
-                        break
-                    }
-                }
-                yield current.head;
-                current = current.tail;
-            } else {
-                // improper lists are annoying and need to know the final element is improper
-                return current
+            // Cycle detected
+            if (fast === slow) {
+                this._cachedLength = -2;
+                this._lastValidEpoch = Cons.globalEpoch;
+                return this._cachedLength;
             }
         }
+
+        // fast must end in null for a proper list; non-null means improper
+        this._cachedLength = (fast === null) ? count : -1;        
+        this._lastValidEpoch = Cons.globalEpoch;
+        return this._cachedLength;
     }
 
-    includes(elem: any): boolean {
-        for(const e of this) {
+    public isImproper(): boolean {
+        return this.length === -1;
+    }
+
+    public isCyclic(): boolean {
+        return this.length === -2;
+    }
+
+    public toDottedArray(): { elements: any[]; rest: any } {
+        if (this.isCyclic()) throw new Error("cannot convert circular list");
+        const elements: any[] = [];
+        let curr: any = this;
+        while (curr instanceof Cons) {
+            elements.push(curr.car);
+            curr = curr.cdr;
+        }
+        return { elements, rest: curr };
+    }
+
+    public toArray(): any[] {
+        if (this.isCyclic()) throw new Error("cannot convert circular list to array");
+        const elements: any[] = [];
+        let curr: any = this;
+        while (curr instanceof Cons) {
+            elements.push(curr.car);
+            curr = curr.cdr;
+        }
+        return elements;
+    }
+
+    public static list(...items: any[]): Cons | null {
+        let tail: any = null;
+        for (let i = items.length - 1; i >= 0; i--) {
+            tail = new Cons(items[i], tail);
+        }
+        return tail;
+    }
+
+    public static fromArray(arr: any[], offset: number = 0): Cons | null {
+        if (offset >= arr.length) return null;
+        let tail: any = null;
+        for (let i = arr.length - 1; i >= offset; i--) {
+            tail = new Cons(arr[i], tail);
+        }
+        return tail;
+    }
+
+    public includes(elem: any): boolean {
+        for (const e of this) {
             if (e === elem) {
-                return true
+                return true;
             }
         }
         return false;
     }
-    
-    get(idx: number): any {
-        if (idx < 0 || idx >= this.length) {
-            return undefined;
+
+    public get(idx: number): any {
+        if (idx < 0) return undefined;
+        let curr: any = this;
+        let i = 0;
+        while (curr instanceof Cons) {
+            if (i === idx) return curr.car;
+            curr = curr.cdr;
+            i++;
         }
-
-        // eslint-disable-next-line
-        let current: Cons | null = this;
-        let stepsRemaining = idx;
-
-        while (current !== null) {
-            if (current._isView) { // array view terminator
-                return current._array![current._offset + stepsRemaining];
-            }
-
-            if (stepsRemaining === 0) {
-                return current._head;
-            }
-
-            current = current._tail;
-            stepsRemaining--;
-        }
-
         return undefined;
     }
 
-    static isNull(val: any) {
-        return (val === null) || (Array.isArray(val) || val instanceof Cons) && (val.length == 0)
+    // Iterable support for for..of
+    public *[Symbol.iterator](): Generator<any, any, unknown> {
+        if (this.isCyclic()) {
+            throw new Error("cannot iterate circular list");
+        }
+        let curr: any = this;
+        while (curr instanceof Cons) {
+            yield curr.car;
+            curr = curr.cdr;
+        }
+        return curr; // done: true, value: tail (null if proper, atom if improper)
     }
 }
-
-/*
-const c = Cons.pair(-1, Cons.pair(0, Cons.fromArray([1,2,3])))
-console.log(c.length)
-for(const d of c) {
-    console.log(d)
-}
-console.log(c.includes(-1))
-console.log(c.includes(1))
-console.log(c.includes(6))
-console.log("cg",c.get(3))
-
-const c2 = Cons.pair(-1, Cons.pair(0, Cons.fromArray([1,2,3], 1)))
-console.log(c2.length)
-for(const d of c2) {
-    console.log(d)
-}
-console.log(c2.includes(-1))
-console.log(c2.includes(1))
-console.log(c2.includes(6))
-console.log("cg", c2.get(3))
-*/

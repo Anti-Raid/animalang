@@ -1,5 +1,6 @@
 import { BS, BSReader, ErrorObject, flattenDynamicArgs, Globals, IProcedure, type SerializableBytecode } from "../common";
 import { isTruthy } from "../common";
+import { Cons } from "../list";
 import { ApplyProc, BuiltinFunction, CallCCProc, IBUILTINS, TryProc } from "../std";
 
 export const BUILTINS_START = 2**31
@@ -517,11 +518,11 @@ export class AnimaVM {
 
         // variadic
         if (template.remParams !== null) {
-            const restArgs = new Array(nargs-arity);
-            for (let i = 0; i < restArgs.length; i++) {
-                restArgs[i] = args[startOffset + arity + i];
+            let tail: any = null;
+            for (let i = startOffset + nargs - 1; i >= startOffset + arity; i--) {
+                tail = new Cons(args[i], tail);
             }
-            closureRegs[arity] = restArgs
+            closureRegs[arity] = tail;
         }
 
         return closureRegs

@@ -107,11 +107,11 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
         return a % b
     }),
     new BuiltinFunction(Symbol.for("list"), (regs, startReg, nargs) => {
-        const lst = new Array(nargs)
-        for(let i = 0; i < nargs; i++) {
-            lst[i] = regs[startReg+i]
+        let tail: any = null;
+        for (let i = startReg + nargs - 1; i >= startReg; i--) {
+            tail = new Cons(regs[i], tail);
         }
-        return lst
+        return tail;
     }),
     new BuiltinFunction(Symbol.for("="), (regs, startReg, nargs) => {
         if (nargs === 0) throw new Error("= requires at least 1 argument");
@@ -236,12 +236,9 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     // list builtins
     new BuiltinFunction(Symbol.for("car"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("car requires 1 argument");
-        const val = regs[startReg]
-        if (Array.isArray(val)) {
-            if (val.length < 1) throw new Error("car requires a non-empty list");
-            return val[0];
-        } else if (val instanceof Cons) {
-            return val.head;
+        const val = regs[startReg];
+        if (val instanceof Cons) {
+            return val.car;
         } else if (val === null) {
             throw new Error("car requires a non-empty list");
         } else {
@@ -250,12 +247,9 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     }),
     new BuiltinFunction(Symbol.for("cdr"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("cdr requires 1 argument");
-        const val = regs[startReg]
-        if (Array.isArray(val)) {
-            if (val.length < 1) throw new Error("cdr requires a non-empty list");
-            return Cons.fromArray(val, 1)
-        } else if (val instanceof Cons) { 
-            return val.tail
+        const val = regs[startReg];
+        if (val instanceof Cons) { 
+            return val.cdr;
         } else if (val === null) {
             throw new Error("cdr requires a non-empty list");
         } else {
@@ -268,24 +262,13 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     }),
     new BuiltinFunction(Symbol.for("last"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("last requires 1 argument");
-        const val = regs[startReg]
-        if (Array.isArray(val)) {
-            if (val.length < 1) throw new Error("last requires a non-empty list");
-            return val[val.length - 1];
-        } else if (val instanceof Cons) {
-            const iterator = val[Symbol.iterator]();
-            let result = iterator.next();
-            let last = result.value;
-
-            while (!result.done) {
-                last = result.value;
-                result = iterator.next();
+        const val = regs[startReg];
+        if (val instanceof Cons) {
+            let curr: any = val;
+            while (curr.cdr instanceof Cons) {
+                curr = curr.cdr;
             }
-
-            if (result.value !== undefined) {
-                last = result.value;
-            }
-            return last;
+            return curr.cdr === null ? curr.car : curr.cdr;
         } else if (val === null) {
             throw new Error("last requires a non-empty list");
         } else {
@@ -294,39 +277,38 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     }),
     new BuiltinFunction(Symbol.for("length"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("length requires 1 argument");
-        const val = regs[startReg]
+        const val = regs[startReg];
         if (val === null) {
-            return 0 // empty list
+            return 0; // empty list
         }
-        // TODO: Add string-length? for strings specifically like scheme does
-        return (Array.isArray(val) || val instanceof Cons) ? val.length : (typeof val === "string" ? val.length : 0)
+        if (val instanceof Cons) {
+            if (val.isCyclic()) throw new Error("length: circular list has no length");
+            if (val.isImproper()) {
+                return val.toArray().length;
+            }
+            return val.length;
+        }
+        if (typeof val === "string") {
+            return val.length;
+        }
+        return 0;
     }),
     new BuiltinFunction(Symbol.for("member"), (regs, startReg, nargs) => {
         if (nargs != 2) throw new Error("member requires 2 arguments");
-        let list = regs[startReg] as (any[] | Cons | null)
-        const item = regs[startReg+1]
-        if (Array.isArray(list)) {
-            for (let i = 0; i < list.length; i++) {
-                if (isDeepEqual(list[i], item)) {
-                    // create a view of the array starting from i
-                    return Cons.fromArray(list, i)
-                }
-            }
+        const list = regs[startReg];
+        const item = regs[startReg+1];
+        if (list === null) {
             return false;
         }
-        else if (list === null) {
-            return false // not a member if empty list
-        }
-        else if (!(list instanceof Cons)) throw new Error("member? requires the first argument to be a list")
-        list = list as Cons // cast to Cons for type safety
-        let s: Cons | null = list
-        while(s !== null) {
-            if (isDeepEqual(s.head, item)) {
-                return s
+        if (!(list instanceof Cons)) throw new Error("member? requires the first argument to be a list");
+        let s: any = list;
+        while (s instanceof Cons) {
+            if (isDeepEqual(s.car, item)) {
+                return s;
             }
-            s = s.tail
+            s = s.cdr;
         }
-        return false
+        return false;
     }),
     new BuiltinFunction(Symbol.for("not"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("not requires 1 argument");
@@ -393,33 +375,29 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
     }),
     new BuiltinFunction(Symbol.for("list?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("list? requires 1 argument");
-        const val = regs[startReg]
-        
-        if (Cons.isNull(val)) return true;
-        if (Array.isArray(val)) return true; // js arrays are always proper lists
-        if (val instanceof Cons) return val.isProper;
+        const val = regs[startReg];
+        if (val === null) return true;
+        if (val instanceof Cons) return !val.isImproper() && !val.isCyclic();
         return false;
     }),
     new BuiltinFunction(Symbol.for("pair?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("pair? requires 1 argument");
         const val = regs[startReg];
-        // apparently, the empty list is not a pair
-        if (Cons.isNull(val)) return false; 
-        return val instanceof Cons || Array.isArray(val);
+        return val instanceof Cons;
     }),
     new BuiltinFunction(Symbol.for("null?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("null? requires 1 argument");
-        return Cons.isNull(regs[startReg])
+        return regs[startReg] === null;
     }),
     new BuiltinFunction(Symbol.for("empty?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("empty? requires 1 argument");
-        return Cons.isNull(regs[startReg])
+        return regs[startReg] === null || (typeof regs[startReg] === "string" && regs[startReg].length === 0);
     }),
     new BuiltinFunction(Symbol.for("contains?"), (regs, startReg, nargs) => {
         if (nargs != 2) throw new Error("contains? requires 2 arguments");
-        const list = regs[startReg]
-        const item = regs[startReg+1]
-        return (Array.isArray(list) || list instanceof Cons) ? list.includes(item) : false;
+        const list = regs[startReg];
+        const item = regs[startReg+1];
+        return (list instanceof Cons) ? list.includes(item) : false;
     }),
     new BuiltinFunction(Symbol.for("symbol?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("symbol? requires 1 argument");
@@ -470,92 +448,30 @@ for(let i = 0; i < IBUILTINS.length; i++) {
     IBUILTINS_IDX_MAP.set(IBUILTINS[i].name, i)
 }
 
-class MapObj {
-    #iters: (ArrayIterator<any> | Generator<any, void, unknown>)[]
-    #isdone: boolean
-    constructor(lists: any[]) {        
-        const iters = lists.map(list => {
-            if (list === null) return [][Symbol.iterator]();
-            if (Array.isArray(list) || list instanceof Cons) return list[Symbol.iterator]();
-            throw new Error("map arguments must be lists");
-        });
-        this.#iters = iters
-        this.#isdone = false
-    }
-
-    get done() { return this.#isdone }
-
-    next() {
-        if (this.#isdone) throw new Error("internal error: map iter done but %MapObjNext still called")
-        const nextVals = this.#iters.map(it => it.next());
-            
-        if (nextVals.some(res => res.done)) {
-            this.#isdone = true
-            return
-        }
-
-        // Unlike cons, this avoids the allocation of O(N) extra cons array views making it more performant
-        const args = [];
-        for (const res of nextVals) {
-            args.push(res.value);
-        }
-
-        return args
-    }
-}
-
-const MAPOBJ = Symbol.for("%MapObj")
-const MAPOBJDONE = Symbol.for("%MapObjDone")
-const MAPOBJNEXT = Symbol.for("%MapObjNext")
-const ARRAYNEW = Symbol.for("%ArrayNew")
-const ARRAYPUSH = Symbol.for("%ArrayPush")
-
-export const stdPreludeScope = () => Globals.newWith({
-    [MAPOBJ]: new BuiltinFunction(MAPOBJ, (regs, startReg, nargs) => {
-        if (nargs < 1) throw new Error("%MapObj requires at least 1 argument (1+ lists to map over)");
-        const lists = regs.slice(startReg, startReg+nargs)
-        return new MapObj(lists)
-    }),
-    [MAPOBJDONE]: new BuiltinFunction(MAPOBJDONE, (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("%MapObjDone requires 1 argument");
-        return regs[startReg].done
-    }),
-    [MAPOBJNEXT]: new BuiltinFunction(MAPOBJNEXT, (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("%MapObjNext requires 1 argument");
-        return regs[startReg].next()
-    }),
-    [ARRAYNEW]: new BuiltinFunction(ARRAYNEW, (_regs, _startReg, nargs) => {
-        if (nargs !== 0) throw new Error("%ArrayNew requires 0 arguments");
-        return []
-    }),
-    [ARRAYPUSH]: new BuiltinFunction(ARRAYPUSH, (regs, startReg, nargs) => {
-        if (nargs !== 2) throw new Error("%ArrayPush requires 2 arguments");
-        if(!Array.isArray(regs[startReg])) throw new Error(`internal error: %ArrayPush called on non-array ${regs[startReg]}`)
-        return regs[startReg].push(regs[startReg+1])
-    }),
-})
+export const stdPreludeScope = () => Globals.newWith({})
 
 export const STD_PRELUDE = `
-(define create-map (lambda ()
-    ; copy in prelude as locals to the lambda
-    (define %MapObj_ %MapObj)
-    (define %ArrayNew_ %ArrayNew)
-    (define %ArrayPush_ %ArrayPush)
-    (define %MapObjNext_ %MapObjNext)
-    (define %MapObjDone_ %MapObjDone)
-    (lambda (f . lists)
-        (let ((iter (apply %MapObj_ lists))
-            (result (%ArrayNew_)))
-        
-        (let loop ()
-            (let ((args (%MapObjNext_ iter)))      
-                (if (%MapObjDone_ iter)              
-                    result                          
-                    (begin
-                        (%ArrayPush_ result (apply f args)) 
-                        (loop)))))))))
-
-(define $map (create-map))
+(define $map
+    (lambda (f list1 . more)
+        (if (null? more)
+            (let loop ((lst list1))
+                (if (null? lst)
+                    '()
+                    (cons (f (car lst)) (loop (cdr lst)))))
+            (let loop ((lists (cons list1 more)))
+                (let check ((lsts lists))
+                    (if (null? lsts)
+                        (cons (apply f (let get-cars ((lsts lists))
+                                         (if (null? lsts)
+                                             '()
+                                             (cons (car (car lsts)) (get-cars (cdr lsts))))))
+                              (loop (let get-cdrs ((lsts lists))
+                                      (if (null? lsts)
+                                          '()
+                                          (cons (cdr (car lsts)) (get-cdrs (cdr lsts)))))))
+                        (if (null? (car lsts))
+                            '()
+                            (check (cdr lsts)))))))))
 `
 
 export class Bootstrapper {
@@ -567,7 +483,6 @@ export class Bootstrapper {
             return this.#bootstrappedPreludes.get(impl.id)!
         }
         const preludeAst = new ASP(STD_PRELUDE, true).parse()
-        console.log(preludeAst)
         const transformExpr = evaluator.transform(preludeAst)
         const PRELUDE_BC = cmp.compile(transformExpr)
 

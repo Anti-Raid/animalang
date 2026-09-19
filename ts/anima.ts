@@ -1,4 +1,4 @@
-import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, ASTStringifier, Globals, OP_LAMBDA, type DottedPair } from "./common"
+import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, ASTStringifier, Globals, OP_LAMBDA, Cons } from "./common"
 import { Bootstrapper } from "./std"
 import { MacroEvaluator } from "./syntransformer-v1/macro"
 import { registerCoreSyntax } from "./syntransformer-v1/prelude"
@@ -43,13 +43,13 @@ export class Anima {
         return this.#vm.evaluateClosure(code, this.#scope, args)
     }
 
-    compileToClosure(s: string, args: any[] | DottedPair, globals: Globals) {
+    compileToClosure(s: string, args: any, globals: Globals) {
         const bast = new ASP(s, true).parse()
         return this.compileAstToClosure(bast, args, globals)
     }
 
-    compileAstToClosure(bast: any, args: any[] | DottedPair, globals: Globals): AbstractClosure {
-        const ast = [OP_LAMBDA, args, bast]
+    compileAstToClosure(bast: any, args: any, globals: Globals): AbstractClosure {
+        const ast = Cons.list(OP_LAMBDA, args, bast)
         const bc = this.compileRawAst(ast)
         const res = this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
         return res
@@ -62,7 +62,6 @@ export class Anima {
 
     compileRawAst(ast: any) {
         let trExpr = this.#evaluator.transform(ast)
-        console.log("Transformed AST: ", new ASTStringifier().stringify(trExpr))
         return this.#comp.compile(trExpr)
     }
 

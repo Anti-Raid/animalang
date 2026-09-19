@@ -1,21 +1,21 @@
 import {
   OP_QUOTE,
-  DottedPair,
   OP_LAMBDA,
   OP_SET,
   unpackLambdaExprArgs,
+  Cons,
 } from "../common";
 import { AnalysisScope } from "./scope";
 
 // Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
 export class AstAnalysis {
-    scopeMap = new WeakMap<any[], AnalysisScope>();
+    scopeMap = new WeakMap<object, AnalysisScope>();
     
     analyze(ast: any) {
-        const baseScope = new AnalysisScope(null)
-        if (Array.isArray(ast)) this.scopeMap.set(ast, baseScope)
+        const baseScope = new AnalysisScope(null);
+        if (ast instanceof Cons) this.scopeMap.set(ast, baseScope);
         this.visit(ast, baseScope);
-        return baseScope
+        return baseScope;
     }
 
     private visit(ast: any, scope: AnalysisScope) {       
@@ -30,25 +30,18 @@ export class AstAnalysis {
             return;
         }
 
-        if (ast instanceof DottedPair) {
-            // analyze inner items of dotted pair
-            for (const child of ast.items) this.visit(child, scope);
-            this.visit(ast.rest, scope);
-            return;
-        }
+        if (!(ast instanceof Cons)) return;
 
-        if (!Array.isArray(ast)) return
-
-        const op = ast[0];
+        const op = ast.car;
         switch (op) {
             case OP_QUOTE:
-                return // don't touch quoted
-            case OP_LAMBDA:
-                const body = ast.slice(2);
+                return; // don't touch quoted
+            case OP_LAMBDA: {
+                const body = ast.cdr.cdr;
                 
                 const lambdaScope = new AnalysisScope(scope);
                 
-                const extractedParams = unpackLambdaExprArgs(ast)
+                const extractedParams = unpackLambdaExprArgs(ast);
                 for (const p of extractedParams.params) {
                     lambdaScope.define(p); 
                 }
@@ -59,19 +52,33 @@ export class AstAnalysis {
                 this.scopeMap.set(ast, lambdaScope);
 
                 // Visit children (yes scope change)
-                for (const child of body) this.visit(child, lambdaScope);
+                let curr: any = body;
+                while (curr instanceof Cons) {
+                    this.visit(curr.car, lambdaScope);
+                    curr = curr.cdr;
+                }
+                if (curr !== null) {
+                    this.visit(curr, lambdaScope);
+                }
                 return;
-            case OP_SET:
-                const sym = ast[1];
-                const value = ast[2];
+            }
+            case OP_SET: {
+                const sym = ast.cdr.car;
+                const value = ast.cdr.cdr.car;
                 
                 scope.markMutable(sym);
                 this.visit(value, scope);
                 return;
+            }
         }
         // Visit children (no scope change)
-        for (const child of ast) {
-            this.visit(child, scope);
+        let curr: any = ast;
+        while (curr instanceof Cons) {
+            this.visit(curr.car, scope);
+            curr = curr.cdr;
+        }
+        if (curr !== null) {
+            this.visit(curr, scope);
         }
     }
 }

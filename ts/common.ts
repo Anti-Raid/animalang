@@ -1,5 +1,7 @@
 import { Cons } from "./list";
 
+export { Cons };
+
 /** Returns if a value is truthy or not */
 export const isTruthy = (val: any): boolean => {
     return val !== false
@@ -10,11 +12,8 @@ export const isDeepEqual = (a: any, b: any): boolean => {
     // If simple eqv? logic works, return true as no more work needed
     if (Object.is(a, b)) return true;
 
-    // Lists
-    const aIsList = a instanceof Cons || Array.isArray(a);
-    const bIsList = b instanceof Cons || Array.isArray(b);
-
-    if (aIsList && bIsList) {
+    // Lists (Cons only)
+    if (a instanceof Cons && b instanceof Cons) {
         const len = a.length;
         if (len !== b.length) return false;
         if (len === 0) return true;
@@ -122,11 +121,6 @@ export class ASPParseError extends Error {
 }
 
 const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', ';', '"', "'"])
-
-// Represents a dotted pair, only supported in bytecode compiler
-export class DottedPair {
-    constructor(public items: any[], public rest: any) {}
-}
 
 export class ASP {    
     #str: string;
@@ -249,7 +243,7 @@ export class ASP {
                     throw new ASPParseError("Unexpected end of input: Missing expression after '", current);
                 }
                 const nextExpr = walk(); // Parse the next expr after the quote
-                return [OP_QUOTE, nextExpr];  // Wrap in quote builtin proc
+                return Cons.list(OP_QUOTE, nextExpr);  // Wrap in quote builtin proc
             }
 
             // Lists
@@ -257,6 +251,8 @@ export class ASP {
                 const expectedClose = token === '(' ? ')' : ']';
                 current++; 
                 const lst: any[] = [];
+                let rest: any = null;
+                let isDotted = false;
 
                 while (tokens[current] !== expectedClose) {
                     if (current >= tokens.length || tokens[current] === ')' || tokens[current] === ']') {
@@ -269,18 +265,30 @@ export class ASP {
                             throw new Error(`Syntax error: trailing '.' is not allowed`);
                         }
                         // Parse rest and make sure its the final guy
-                        const remParam = walk();
+                        rest = walk();
                         if (tokens[current] !== expectedClose) {
                             throw new Error(`Syntax error: multiple expressions after '.' is not allowed`);
                         }
                         current++;
-                        return new DottedPair(lst, remParam)
+                        isDotted = true;
+                        break;
                     }
-                    lst.push(walk())
+                    lst.push(walk());
                 }
                 
-                current++; 
-                return lst;
+                if (!isDotted) {
+                    current++; 
+                }
+
+                if (lst.length === 0 && !isDotted) {
+                    return null;
+                }
+
+                let tail: any = rest;
+                for (let i = lst.length - 1; i >= 0; i--) {
+                    tail = new Cons(lst[i], tail);
+                }
+                return tail;
             }
 
             // Stray closing brackets are not allowed
@@ -324,7 +332,7 @@ export class ASP {
         if (exprs.length == 1) return exprs[0]
 
         // Translate to begin
-        return [OP_BEGIN, ...exprs];
+        return Cons.list(OP_BEGIN, ...exprs);
     }
 }
 
@@ -354,13 +362,6 @@ export class ASTStringifier {
 
         // Lists
         if (ast === null) return "()";
-        if (Array.isArray(ast)) {
-            const lst = new Array(ast.length)
-            for(let i = 0; i < ast.length; i++) {
-                lst[i] = this.stringify(ast[i]);
-            }
-            return `(${lst.join(" ")})`;
-        }
 
         // Cons
         if (ast instanceof Cons) {
@@ -369,8 +370,8 @@ export class ASTStringifier {
 
             while (current !== null) {
                 if (current instanceof Cons) {
-                    parts.push(this.stringify(current.head));
-                    current = current.tail;
+                    parts.push(this.stringify(current.car));
+                    current = current.cdr;
                 } else {
                     // Improper list/pair
                     parts.push(".");
@@ -379,13 +380,6 @@ export class ASTStringifier {
                 }
             }
             return `(${parts.join(" ")})`;
-        } else if (ast instanceof DottedPair) {
-            const lst = new Array(ast.items.length)
-            for(let i = 0; i < ast.items.length; i++) {
-                lst[i] = this.stringify(ast.items[i]);
-            }
-            const rest = this.stringify(ast.rest);
-            return `(${lst.join(" ")} . ${rest})`
         }
 
         // Procs
@@ -406,27 +400,10 @@ export class ASTStringifier {
 }
 
 // Normalizes an expression
-//
-// In particular:
-// - Converts all DottedPair's into Cons
 export const normalizeExpr = (expr: any): any =>{
-    // Try preserving array-ness as far as possible for performance purposes
-    if (Array.isArray(expr)) {
-        if (expr.length === 0) return null; 
-        return expr.map(e => normalizeExpr(e))
+    if (expr instanceof Cons) {
+        return new Cons(normalizeExpr(expr.car), normalizeExpr(expr.cdr));
     }
-
-    if (expr instanceof DottedPair) {
-        const items = expr.items.map(e => normalizeExpr(e));
-        let tail = normalizeExpr(expr.rest);
-
-        // Build the cons backwards as (1 2 . 3) => (cons 1 (cons 2 3))
-        for (let i = items.length - 1; i >= 0; i--) {
-            tail = Cons.pair(items[i], tail);
-        }
-        return tail;
-    }
-
     return expr;
 }
 
@@ -451,15 +428,21 @@ export type UnpackedLambdaArgs = { params: symbol[], remParams: symbol | null }
 export const unpackLambdaExprArgs = (expr: any, ctx?: string): UnpackedLambdaArgs => {
     let params: symbol[] = []
     let remParams: symbol | null = null
-    if (Array.isArray(expr[1])) {
-        params = expr[1]
-    } else if (expr[1] instanceof DottedPair) {
-        // Bind params to items and remParam to remParams
-        params = expr[1].items
-        remParams = expr[1].rest
-    } else if (typeof expr[1] === "symbol") {
-        // Then all args must be bound to remparams
-        remParams = expr[1]
+    let args = (expr instanceof Cons) ? expr.cdr.car : expr;
+
+    if (args === null) {
+        // () -> 0 params
+    } else if (typeof args === "symbol") {
+        remParams = args;
+    } else if (args instanceof Cons) {
+        let curr: any = args;
+        while (curr instanceof Cons) {
+            params.push(curr.car);
+            curr = curr.cdr;
+        }
+        if (curr !== null) {
+            remParams = curr;
+        }
     } else {
         throw new Error(`${ctx || "lambda"} arguments must be a symbol (to bind all as a list to said symbol) or a list`);
     }
@@ -482,7 +465,7 @@ export const flattenDynamicArgs = (actualArgs: any[], callerArgs: any[], start: 
         actualArgs.push(callerArgs[start + i]);
     }
     const finalArg = callerArgs[start + nargs - 1]
-    if (Array.isArray(finalArg) || finalArg instanceof Cons) {
+    if (finalArg instanceof Cons) {
         actualArgs.push(...finalArg);
     } else if (finalArg === null) {
         // Empty list
@@ -492,10 +475,13 @@ export const flattenDynamicArgs = (actualArgs: any[], callerArgs: any[], start: 
     return actualArgs
 }
 
-export const wrapMulti = (exprs: any[]) => {
-    if (exprs.length === 0) return []; 
-    if (exprs.length === 1) return exprs[0];
-    return [OP_BEGIN, ...exprs];
+export const wrapMulti = (exprs: any): any => {
+    if (exprs === null) return null;
+    if (exprs instanceof Cons) {
+        if (exprs.cdr === null) return exprs.car;
+        return new Cons(OP_BEGIN, exprs);
+    }
+    return exprs;
 }
 
 /**
@@ -959,7 +945,7 @@ export class ConstPool {
     }
 
     #freezeObj(obj: any) {
-        if (typeof obj !== "object") return obj
+        if (typeof obj !== "object" || obj === null || obj instanceof Cons) return obj;
         Object.keys(obj).forEach(prop => {
             if (typeof obj[prop] === 'object' && !Object.isFrozen(obj[prop])) {
                 this.#freezeObj(obj[prop]);

@@ -1,5 +1,5 @@
 import { Anima } from "./anima";
-import { impl } from "./bytecode-svm/meta";
+import { impl } from "./bytecode-rvm/meta";
 
 const anima = new Anima(impl)
 

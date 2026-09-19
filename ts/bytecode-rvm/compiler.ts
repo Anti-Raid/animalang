@@ -1,7 +1,7 @@
-import { ASTStringifier, DottedPair, ensureCanBind, normalizeExpr, OP_AND, OP_BEGIN, OP_COND, OP_DEFINE, OP_IF, OP_LAMBDA, OP_LET, OP_LETREC, OP_LETSTAR, OP_QUOTE, OP_SET, unpackLambdaExprArgs, wrapMulti } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, OP_BEGIN, OP_IF, OP_LAMBDA, OP_QUOTE, OP_SET, OP_DEFINE, unpackLambdaExprArgs, wrapMulti, Cons } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
-import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir"
+import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { IBUILTINS_IDX_MAP } from "../std";
 import { BUILTINS_START } from "./vm";
 
@@ -43,22 +43,21 @@ export class Compiler {
             const res = this.#getVar(expr, opts, opts.destReg)
             if (res) opts.nodes.push(...res)
             return
-        } else if (expr instanceof DottedPair) {
-            throw new Error(`bad syntax: illegal use of dotted pair in execution context (consider quoting e.g. ${`'${this.#s.stringify(expr)}`})`);
-        } else if (!Array.isArray(expr)) { // non array (string etc.)
+        } else if (expr === null) {
+            if (opts.destReg === undefined) return 
+            opts.nodes.push({t: "LoadValue", constant: null, destReg: opts.destReg})
+            return
+        } else if (!(expr instanceof Cons)) { // non-cons (string, number, boolean, undefined, etc.)
             if (opts.destReg === undefined) return  
             opts.nodes.push({t: "LoadValue", constant: expr, destReg: opts.destReg})
             return
         }
 
-        if (expr.length === 0) {
-            // An empty array evaluates to null
-            if (opts.destReg === undefined) return 
-            opts.nodes.push({t: "LoadValue", constant: [], destReg: opts.destReg})
-            return
+        if (expr.isImproper()) {
+            throw new Error(`bad syntax: illegal use of dotted pair in execution context (consider quoting e.g. '${this.#s.stringify(expr)}')`);
         }
 
-        const operator = expr[0];
+        const operator = expr.car;
 
         if (typeof operator === "symbol") {
             switch (operator) {
@@ -93,78 +92,87 @@ export class Compiler {
         this.#compileNormalCall(expr, opts)
     }
 
-    #compileBegin(expr: any[], opts: CmpOpts) {
+    #compileBegin(expr: Cons, opts: CmpOpts) {
         // We need to load a void if we see an empty begin block
-        if (expr.length === 1) {
+        if (expr.cdr === null) {
             if (opts.destReg === undefined) return 
             opts.nodes.push({t: "LoadValue", constant: undefined, destReg: opts.destReg})
             return
         }
 
-        for (let i = 1; i < expr.length; i++) {
-            // the child is a tail call only if we are a tail call and its the last child
-            const isLastChild = (i === expr.length - 1);
-            const childIsTail = isLastChild && opts.isTail; 
-            this.#compile(expr[i], { ...opts, destReg: isLastChild ? opts.destReg : undefined, isTail: childIsTail });
+        let curr: any = expr.cdr;
+        while (curr instanceof Cons) {
+            const isLastChild = (curr.cdr === null);
+            const childIsTail = isLastChild && opts.isTail;
+            this.#compile(curr.car, { ...opts, destReg: isLastChild ? opts.destReg : undefined, isTail: childIsTail });
+            curr = curr.cdr;
         }
     }
 
     // compiles both if calls as well as code that is converted into if calls
-    #compileIfCall(expr: any[], opts: CmpOpts) {
-        if(expr.length != 4) {
+    #compileIfCall(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 4) {
             throw new Error(`if condition must be in format ["if", condition, true_expr, false_expr] but only have ${expr.length-1} arguments`)
         }
 
+        const cond = expr.cdr.car;
+        const thenExpr = expr.cdr.cdr.car;
+        const elseExpr = expr.cdr.cdr.cdr.car;
+
         // We need to compile the first arg first and leave it to a temp reg
         const condReg = opts.scope.allocTemp()
-        this.#compile(expr[1], { ...opts, destReg: condReg, isTail: false })
+        this.#compile(cond, { ...opts, destReg: condReg, isTail: false })
         // we place the bytecode as <jumpiffalse [false code]><true code><jump [|]><false code>|
         const falseLabel = new JumpLabel()
         const endLabel = new JumpLabel()
         opts.nodes.push({t: "CondJump", cond: "False", label: falseLabel, reg: condReg})
         opts.scope.freeTemp(condReg) // we can free the reg here
         // Place true code
-        this.#compile(expr[2], opts)
+        this.#compile(thenExpr, opts)
         // Place jump to end
         if (!this.#nodesEndsInRet(opts.nodes)) {
             opts.nodes.push({t: "Jump", label: endLabel})
         }
         // Place false code as well as jump to start of false code
         opts.nodes.push({t:"Label", label: falseLabel})
-        this.#compile(expr[3], opts)
+        this.#compile(elseExpr, opts)
         // Fix jump to end to now jump to after false code
         opts.nodes.push({t: "Label", label: endLabel})
     }
 
-    #compileQuote(expr: any[], opts: CmpOpts) {
-        if(expr.length != 2) {
+    #compileQuote(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 2) {
             throw new Error(`quote must be in format ["quote", expr] but have ${expr.length-1} arguments`)
         }
-        if(opts.destReg === undefined) return
-        opts.nodes.push({t: "LoadValue", constant: normalizeExpr(expr[1]), destReg: opts.destReg})
+        if (opts.destReg === undefined) return
+        opts.nodes.push({t: "LoadValue", constant: normalizeExpr(expr.cdr.car), destReg: opts.destReg})
     }
 
     // note that the syntax transformer alr handles defines inside a lambda so
-    #compileDefine(expr: any[], opts: CmpOpts) {
-        if(typeof expr[1] !== "symbol") throw new Error("internal error: complex defines should be transformed by AnimaTransform prior to reaching here")
+    #compileDefine(expr: Cons, opts: CmpOpts) {
+        const sym = expr.cdr.car;
+        const val = expr.cdr.cdr.car;
+        if (typeof sym !== "symbol") throw new Error("internal error: complex defines should be transformed by AnimaTransform prior to reaching here")
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
-        this.#compile(expr[2], { ...opts, destReg: valReg, isTail: false });
-        opts.nodes.push({t: "SetGlobal", srcReg: valReg, sym: expr[1]})
+        this.#compile(val, { ...opts, destReg: valReg, isTail: false });
+        opts.nodes.push({t: "SetGlobal", srcReg: valReg, sym})
         opts.scope.freeTemp(valReg)
         if (opts.destReg !== undefined) {
             opts.nodes.push({t: "LoadValue", destReg: opts.destReg, constant: undefined})
         }
     }
 
-    #compileSet(expr: any[], opts: CmpOpts) {
+    #compileSet(expr: Cons, opts: CmpOpts) {
         // AnimaTransform ensures sets are of correct form
+        const sym = expr.cdr.car;
+        const val = expr.cdr.cdr.car;
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
-        this.#compile(expr[2], { ...opts, destReg: valReg, isTail: false });
-        const res = this.#setVar(expr[1], opts, valReg)
+        this.#compile(val, { ...opts, destReg: valReg, isTail: false });
+        const res = this.#setVar(sym, opts, valReg)
         if(res) opts.nodes.push(...res)
         opts.scope.freeTemp(valReg)
         if (opts.destReg !== undefined) {
@@ -172,7 +180,7 @@ export class Compiler {
         }
     }
 
-    #compileLambda(expr: any[], opts: CmpOpts) {
+    #compileLambda(expr: Cons, opts: CmpOpts) {
         // AnimaTransform ensures lambdas are of correct form
         const lambdaScope = new CompilerScope(opts.scope)
         const ascope = opts.analyzer.scopeMap.get(expr)
@@ -201,7 +209,8 @@ export class Compiler {
 
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
-        this.#compile(wrapMulti(expr.slice(2)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope })
+        const body = expr.cdr.cdr;
+        this.#compile(wrapMulti(body), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope })
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
@@ -219,7 +228,7 @@ export class Compiler {
     }
 
     // a normal call
-    #compileNormalCall(expr: any[], opts: CmpOpts) {
+    #compileNormalCall(expr: Cons, opts: CmpOpts) {
         // Try IIFE optimizations
         if(this.#optIIFE(expr, opts)) {
             return
@@ -227,13 +236,17 @@ export class Compiler {
 
         // We need to compile the proc and place it on its own tempval
         const procReg = opts.scope.allocTemp();
-        this.#compile(expr[0], { ...opts, destReg: procReg, isTail: false })
+        this.#compile(expr.car, { ...opts, destReg: procReg, isTail: false })
 
         // Push all arguments to a contiguous reg block
-        const nargs = expr.length-1 // [func a b c] -> 5 - 2 = 3 args
+        const nargs = expr.cdr === null ? 0 : expr.cdr.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        for (let i = 1; i < expr.length; i++) {
-            this.#compile(expr[i], { ...opts, destReg: startReg+i-1, isTail: false })
+        let curr: any = expr.cdr;
+        let i = 0;
+        while (curr instanceof Cons) {
+            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false });
+            i++;
+            curr = curr.cdr;
         }
 
         if (opts.isTail) {
@@ -248,64 +261,70 @@ export class Compiler {
         opts.scope.freeTemp(procReg)
     }
 
-    #optIIFE(expr: any[], opts: CmpOpts): boolean {
+    #optIIFE(expr: Cons, opts: CmpOpts): boolean {
         // if we have a non-variadic IIFE ((lambda (params...) body) args...), then we can optimize it down
         // to BLOCK/ENDBLOCK instead of doing a whole function call
-        const first = expr[0]
-        if (Array.isArray(first) && (first[0] === OP_LAMBDA) && Array.isArray(first[1])) {
-            //console.log("Applying IIFE")
-            const ascope = opts.analyzer.scopeMap.get(first)
-            if (!ascope) throw new Error(`internal error: could not find ascope for expr ${first}`)
+        const first = expr.car;
+        if (first instanceof Cons && (first.car === OP_LAMBDA)) {
+            const rawParams = first.cdr.car;
+            // Non-variadic params: null (empty list) or proper Cons list
+            if (rawParams === null || (rawParams instanceof Cons && !rawParams.isImproper())) {
+                const ascope = opts.analyzer.scopeMap.get(first);
+                if (!ascope) throw new Error(`internal error: could not find ascope for expr ${first}`);
 
-            const params = first[1];
-            const body = first.slice(2);
-            const args = expr.slice(1)
-            if (params.length !== args.length) {
-                throw new Error(`expected exactly ${params.length} args, got ${args.length}`);
-            }
-            
-            // Bind all arguments outside new block scope
-            const argRegs: number[] = [];
-            for(let i = 0; i < args.length; i++) {
-                const tempReg = opts.scope.allocTemp();
-                this.#compile(args[i], { ...opts, destReg: tempReg, isTail: false });
-                argRegs.push(tempReg);
-            }
-
-            // Now enter block
-            opts.scope.enterBlock()
-            const seen = new Set<symbol>();
-            for(let i = 0; i < params.length; i++) {
-                ensureCanBind(params[i], seen, "lambda")
-                const inf = ascope.getVarinfo(params[i]);
-                if(!inf) throw new Error("Could not fetch varinfo")
-                
-                const destReg = opts.scope.addLocal(params[i])            
-                if(inf.isBoxed) {
-                    opts.nodes.push({ t: "Box", srcReg: argRegs[i], destReg });
-                } else {
-                    opts.nodes.push({ t: "Move", srcReg: argRegs[i], destReg });
+                const params = rawParams === null ? [] : rawParams.toArray();
+                const body = first.cdr.cdr;
+                const args = expr.cdr === null ? [] : expr.cdr.toArray();
+                if (params.length !== args.length) {
+                    throw new Error(`expected exactly ${params.length} args, got ${args.length}`);
                 }
-            }
+                
+                // Bind all arguments outside new block scope
+                const argRegs: number[] = [];
+                for(let i = 0; i < args.length; i++) {
+                    const tempReg = opts.scope.allocTemp();
+                    this.#compile(args[i], { ...opts, destReg: tempReg, isTail: false });
+                    argRegs.push(tempReg);
+                }
 
-            this.#compile(wrapMulti(body), {...opts, ascope})
-            opts.scope.exitBlock()
-            for (const reg of argRegs) {
-                opts.scope.freeTemp(reg);
+                // Now enter block
+                opts.scope.enterBlock()
+                const seen = new Set<symbol>();
+                for(let i = 0; i < params.length; i++) {
+                    ensureCanBind(params[i], seen, "lambda")
+                    const inf = ascope.getVarinfo(params[i]);
+                    if(!inf) throw new Error("Could not fetch varinfo")
+                    
+                    const destReg = opts.scope.addLocal(params[i])            
+                    if(inf.isBoxed) {
+                        opts.nodes.push({ t: "Box", srcReg: argRegs[i], destReg });
+                    } else {
+                        opts.nodes.push({ t: "Move", srcReg: argRegs[i], destReg });
+                    }
+                }
+
+                this.#compile(wrapMulti(body), {...opts, ascope})
+                opts.scope.exitBlock()
+                for (const reg of argRegs) {
+                    opts.scope.freeTemp(reg);
+                }
+                return true;
             }
-            return true
-        } else {
-            return false
         }
+        return false;
     }
 
     /** Optimizes intrinsic/builtin ops */ 
-    #optIntrinsicNormal(expr: any[], builtinIdx: number, opts: CmpOpts) {
+    #optIntrinsicNormal(expr: Cons, builtinIdx: number, opts: CmpOpts) {
         // Push args
-        const nargs = expr.length - 1; // expr - Symbol(op)
+        const nargs = expr.cdr === null ? 0 : expr.cdr.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        for(let i = 1; i < expr.length; i++) {
-            this.#compile(expr[i], { ...opts, destReg: startReg + (i - 1), isTail: false });
+        let curr: any = expr.cdr;
+        let i = 0;
+        while (curr instanceof Cons) {
+            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false });
+            i++;
+            curr = curr.cdr;
         }
 
         if (opts.isTail) {

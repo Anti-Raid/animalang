@@ -909,7 +909,7 @@ describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
         // (1 2 . 3) 
         const improper = Cons.pair(1, Cons.pair(2, 3));
         
-        expect(isDeepEqual(arr, arrCons)).toBe(true);
+        expect(isDeepEqual(arr, arrCons)).toBe(false);
         expect(isDeepEqual(arr, improper)).toBe(false);
     });
 
