@@ -365,6 +365,21 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
         if (typeof val !== "number" || !Number.isInteger(val)) throw new Error("odd? requires an integer");
         return Math.abs(val % 2) === 1; 
     }),
+    new BuiltinFunction(Symbol.for("infinite?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("infinite? requires 1 argument");
+        const val = regs[startReg];
+        return typeof val === "number" && (val === Infinity || val === -Infinity);
+    }),
+    new BuiltinFunction(Symbol.for("finite?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("finite? requires 1 argument");
+        const val = regs[startReg];
+        return typeof val === "number" && Number.isFinite(val);
+    }),
+    new BuiltinFunction(Symbol.for("nan?"), (regs, startReg, nargs) => {
+        if (nargs != 1) throw new Error("nan? requires 1 argument");
+        const val = regs[startReg];
+        return typeof val === "number" && Number.isNaN(val);
+    }),
     new BuiltinFunction(Symbol.for("boolean?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("boolean? requires 1 argument");
         return typeof regs[startReg] == "boolean"

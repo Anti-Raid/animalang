@@ -115,7 +115,7 @@ export class IR {
                     const v = node.constant
 
                     if (typeof v === "number") {   
-                        if (Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF) {
+                        if (Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) {
                             // We can use u32 specialization here
                             inst.push(OpCode.LOADU32, node.destReg, v);
                         } else if (Number.isInteger(v) && v >= -1 * 0xFFFFFFFF && v < 0) {

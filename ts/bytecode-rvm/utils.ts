@@ -10,6 +10,9 @@ const constToString = (s: any): string => {
     } else if (typeof s === "string") {
         return `"${s.toString()}"`
     } else if (typeof s === "number") {
+        if (s === Infinity) return "+inf.0";
+        if (s === -Infinity) return "-inf.0";
+        if (Number.isNaN(s)) return "+nan.0";
         return `${s}`
     } else if (typeof s === "boolean") {
         return `<${s}>`

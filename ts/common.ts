@@ -352,9 +352,17 @@ export class ASP {
             if (token === 'null') return null;
             if (token === '<#void>') return undefined;
 
+            // Infinities & NaN (Scheme R6RS/R7RS: +inf.0, -inf.0, inf.0, +nan.0, -nan.0, nan.0)
+            const lowerToken = token.toLowerCase();
+            if (lowerToken === '+inf.0' || lowerToken === 'inf.0' || lowerToken === '+infinity' || lowerToken === 'infinity') return Infinity;
+            if (lowerToken === '-inf.0' || lowerToken === '-infinity') return -Infinity;
+            if (lowerToken === '+nan.0' || lowerToken === '-nan.0' || lowerToken === 'nan.0' || lowerToken === '+nan' || lowerToken === '-nan' || lowerToken === 'nan') return NaN;
+
             // Numbers
-            const num = Number(token);
-            if (!Number.isNaN(num)) return num;
+            if (token.trim() !== "") {
+                const num = Number(token);
+                if (!Number.isNaN(num)) return num;
+            }
 
             // Strings must be (un?)escaped
             if (token.startsWith('"') && token.endsWith('"')) {
@@ -392,6 +400,9 @@ export class ASTStringifier {
     public stringify(ast: any): string {
         // Booleans+number
         if (typeof ast === "number") {
+            if (ast === Infinity) return "+inf.0";
+            if (ast === -Infinity) return "-inf.0";
+            if (Number.isNaN(ast)) return "+nan.0";
             return String(ast);
         } else if (typeof ast === "boolean") {
             return ast ? "#t" : "#f"
@@ -562,6 +573,9 @@ export class BS {
     #lastUniqueSym: number = 1;
     #uniqueSymMap: Map<symbol, number> = new Map();
 
+    #f64 = new Float64Array(1);
+    #u32 = new Uint32Array(this.#f64.buffer);
+
     static readonly U32 = 0x01
     static readonly U32ARR = 0x02
     static readonly STR = 0x03
@@ -573,6 +587,7 @@ export class BS {
     static readonly BOOL = 0x09
     static readonly CLASS = 0x0A
     static readonly UNIQUESYMBOL = 0x0B
+    static readonly F64 = 0x0C
     static readonly UNDEFINED = 0xFF
 
     constructor(initialCapacity: number = 1024) {
@@ -597,6 +612,18 @@ export class BS {
         this.#ensureCapacity(2);
         this.#buffer[this.#length++] = BS.U32
         this.#buffer[this.#length++] = val
+    }
+
+    /** Write a 64-bit IEEE-754 floating point number
+     * 
+     * Format: <F64><word0><word1>
+     */
+    writeF64(val: number): void {
+        this.#ensureCapacity(3);
+        this.#buffer[this.#length++] = BS.F64;
+        this.#f64[0] = val;
+        this.#buffer[this.#length++] = this.#u32[0];
+        this.#buffer[this.#length++] = this.#u32[1];
     }
 
     /** Write an array of 32-bit words
@@ -729,7 +756,11 @@ export class BS {
         } else if (val === undefined) {
             this.writeUndefined()
         } else if (typeof val === 'number') {
-            this.writeU32(val);
+            if (Number.isInteger(val) && val >= 0 && val <= 0xFFFFFFFF && !Object.is(val, -0)) {
+                this.writeU32(val);
+            } else {
+                this.writeF64(val);
+            }
         } else if (typeof val === 'string') {
             this.writeString(val);
         } else if (typeof val === 'symbol') {
@@ -763,6 +794,9 @@ export class BSReader {
     #textDecoder = new TextDecoder();
     #factories = new Map<string, (r: BSReader) => any>();
     #uniqueSymbolIds = new Map<number, symbol>()
+
+    #f64 = new Float64Array(1);
+    #u32 = new Uint32Array(this.#f64.buffer);
 
     constructor(buffer: Uint32Array) {
         this.#buffer = buffer;
@@ -808,6 +842,12 @@ export class BSReader {
         switch (tag) {
             case BS.U32:
                 return this.#buffer[this.#cursor++];
+
+            case BS.F64: {
+                this.#u32[0] = this.#buffer[this.#cursor++];
+                this.#u32[1] = this.#buffer[this.#cursor++];
+                return this.#f64[0];
+            }
             
             case BS.U32ARR: {
                 const len = this.#buffer[this.#cursor++];
@@ -901,6 +941,12 @@ export class BSReader {
         if (this.peekTag() !== BS.U32) throw new Error("Expected U32");
         const val = this.read();
         return val as number;
+    }
+
+    /** Helper to explicitly expect an F64 */
+    readF64(): number {
+        if (this.peekTag() !== BS.F64) throw new Error("Expected F64");
+        return this.read() as number;
     }
 
     /** Helper to explicitly expect a Uint32Array */

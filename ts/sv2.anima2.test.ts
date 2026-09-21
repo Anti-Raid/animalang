@@ -1,7 +1,8 @@
 // Made w/ lots of help from gemini cli
-import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, ASPParseError } from './common';
+import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, ASPParseError, BS, BSReader } from './common';
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
+import { ByteCode } from './bytecode-rvm/vm';
 import { Anima } from './anima';
 import { impl } from './bytecode-rvm/meta';
 
@@ -1261,6 +1262,205 @@ describe('Tables (using Table class)', () => {
         expect(rawT instanceof Table).toBe(true);
         expect(rawT.get("id")).toBe("test-123");
         expect(rawT.get("count")).toBe(5);
+    });
+});
+
+describe('Floats, Infinities & NaNs', () => {
+    let evaluator = new Anima(vmImpl);
+    let s = new ASTStringifier();
+
+    const run = (expr: string) => {
+        const bc = evaluator.compileRaw(expr);
+        return s.stringify(evaluator.evaluateRaw(bc));
+    };
+
+    const runRaw = (expr: string) => {
+        const bc = evaluator.compileRaw(expr);
+        return evaluator.evaluateRaw(bc);
+    };
+
+    it('evaluates floating-point number literals', () => {
+        expect(run("3.14")).toBe("3.14");
+        expect(runRaw("3.14")).toBe(3.14);
+        expect(run("-0.5")).toBe("-0.5");
+        expect(runRaw("-0.5")).toBe(-0.5);
+        expect(run("0.0")).toBe("0");
+        expect(run(".25")).toBe("0.25");
+        expect(run("-.75")).toBe("-0.75");
+        expect(run("1.5e3")).toBe("1500");
+        expect(run("1.5e-3")).toBe("0.0015");
+    });
+
+    it('evaluates infinities (+inf.0, -inf.0, inf.0) and NaNs (+nan.0, -nan.0, nan.0)', () => {
+        expect(run("+inf.0")).toBe("+inf.0");
+        expect(runRaw("+inf.0")).toBe(Infinity);
+        expect(run("-inf.0")).toBe("-inf.0");
+        expect(runRaw("-inf.0")).toBe(-Infinity);
+        expect(run("inf.0")).toBe("+inf.0");
+        expect(runRaw("inf.0")).toBe(Infinity);
+        expect(run("+Infinity")).toBe("+inf.0");
+        expect(run("-Infinity")).toBe("-inf.0");
+        expect(run("Infinity")).toBe("+inf.0");
+
+        expect(run("+nan.0")).toBe("+nan.0");
+        expect(Number.isNaN(runRaw("+nan.0"))).toBe(true);
+        expect(run("-nan.0")).toBe("+nan.0");
+        expect(Number.isNaN(runRaw("-nan.0"))).toBe(true);
+        expect(run("nan.0")).toBe("+nan.0");
+        expect(Number.isNaN(runRaw("nan.0"))).toBe(true);
+    });
+
+    it('tests numeric predicates with floats, infinities and NaNs', () => {
+        // number?
+        expect(run("(number? 3.14)")).toBe("#t");
+        expect(run("(number? +inf.0)")).toBe("#t");
+        expect(run("(number? -inf.0)")).toBe("#t");
+        expect(run("(number? +nan.0)")).toBe("#t");
+
+        // integer?
+        expect(run("(integer? 42)")).toBe("#t");
+        expect(run("(integer? 3.14)")).toBe("#f");
+        expect(run("(integer? +inf.0)")).toBe("#f");
+        expect(run("(integer? -inf.0)")).toBe("#f");
+        expect(run("(integer? +nan.0)")).toBe("#f");
+
+        // positive?
+        expect(run("(positive? 3.14)")).toBe("#t");
+        expect(run("(positive? +inf.0)")).toBe("#t");
+        expect(run("(positive? -inf.0)")).toBe("#f");
+        expect(run("(positive? +nan.0)")).toBe("#f");
+
+        // negative?
+        expect(run("(negative? -3.14)")).toBe("#t");
+        expect(run("(negative? -inf.0)")).toBe("#t");
+        expect(run("(negative? +inf.0)")).toBe("#f");
+        expect(run("(negative? +nan.0)")).toBe("#f");
+
+        // zero?
+        expect(run("(zero? 0.0)")).toBe("#t");
+        expect(run("(zero? +inf.0)")).toBe("#f");
+        expect(run("(zero? -inf.0)")).toBe("#f");
+        expect(run("(zero? +nan.0)")).toBe("#f");
+
+        // infinite?
+        expect(run("(infinite? +inf.0)")).toBe("#t");
+        expect(run("(infinite? -inf.0)")).toBe("#t");
+        expect(run("(infinite? 3.14)")).toBe("#f");
+        expect(run("(infinite? 42)")).toBe("#f");
+        expect(run("(infinite? +nan.0)")).toBe("#f");
+
+        // finite?
+        expect(run("(finite? 3.14)")).toBe("#t");
+        expect(run("(finite? 42)")).toBe("#t");
+        expect(run("(finite? +inf.0)")).toBe("#f");
+        expect(run("(finite? -inf.0)")).toBe("#f");
+        expect(run("(finite? +nan.0)")).toBe("#f");
+
+        // nan?
+        expect(run("(nan? +nan.0)")).toBe("#t");
+        expect(run("(nan? -nan.0)")).toBe("#t");
+        expect(run("(nan? nan.0)")).toBe("#t");
+        expect(run("(nan? 3.14)")).toBe("#f");
+        expect(run("(nan? +inf.0)")).toBe("#f");
+    });
+
+    it('performs arithmetic with floating-point numbers', () => {
+        expect(run("(+ 1.5 2.5)")).toBe("4");
+        expect(run("(+ 1.25 0.5)")).toBe("1.75");
+        expect(run("(- 10.5 3.25)")).toBe("7.25");
+        expect(run("(- 5.5)")).toBe("-5.5");
+        expect(run("(* 2.5 4.0)")).toBe("10");
+        expect(run("(* -1.5 2.0)")).toBe("-3");
+        expect(run("(/ 7.5 2.5)")).toBe("3");
+        expect(run("(/ 1.0 4.0)")).toBe("0.25");
+        expect(run("(remainder 5.5 2.0)")).toBe("1.5");
+    });
+
+    it('performs arithmetic with infinities', () => {
+        expect(run("(- +inf.0)")).toBe("-inf.0");
+        expect(run("(- -inf.0)")).toBe("+inf.0");
+        expect(run("(+ +inf.0 100)")).toBe("+inf.0");
+        expect(run("(+ -inf.0 100)")).toBe("-inf.0");
+        expect(run("(* 2.0 +inf.0)")).toBe("+inf.0");
+        expect(run("(* -2.0 +inf.0)")).toBe("-inf.0");
+        expect(run("(/ 1.0 +inf.0)")).toBe("0");
+        expect(run("(/ +inf.0 2.0)")).toBe("+inf.0");
+        expect(run("(/ +inf.0 +inf.0)")).toBe("+nan.0");
+        expect(run("(- +inf.0 +inf.0)")).toBe("+nan.0");
+    });
+
+    it('compares floats and infinities correctly', () => {
+        expect(run("(< -inf.0 -100 0 100 +inf.0)")).toBe("#t");
+        expect(run("(<= -inf.0 -inf.0 0 3.14 +inf.0 +inf.0)")).toBe("#t");
+        expect(run("(> +inf.0 100 0 -100 -inf.0)")).toBe("#t");
+        expect(run("(>= +inf.0 +inf.0 3.14 0 -inf.0 -inf.0)")).toBe("#t");
+        expect(run("(= +inf.0 +inf.0)")).toBe("#t");
+        expect(run("(= -inf.0 -inf.0)")).toBe("#t");
+        expect(run("(= +inf.0 -inf.0)")).toBe("#f");
+        expect(run("(= 3.14 3.14)")).toBe("#t");
+        expect(run("(= 3.14 3.15)")).toBe("#f");
+        expect(run("(= +nan.0 +nan.0)")).toBe("#f");
+
+        expect(run("(eqv? +inf.0 +inf.0)")).toBe("#t");
+        expect(run("(eqv? -inf.0 -inf.0)")).toBe("#t");
+        expect(run("(eqv? +inf.0 -inf.0)")).toBe("#f");
+        expect(run("(eqv? 3.14 3.14)")).toBe("#t");
+
+        expect(run("(equal? +inf.0 +inf.0)")).toBe("#t");
+        expect(run("(equal? -inf.0 -inf.0)")).toBe("#t");
+        expect(run("(equal? '(1.5 +inf.0) '(1.5 +inf.0))")).toBe("#t");
+        expect(run("(equal? #(1.5 +inf.0) #(1.5 +inf.0))")).toBe("#t");
+        expect(run('(equal? {"x" +inf.0} {"x" +inf.0})')).toBe("#t");
+    });
+
+    it('serializes and deserializes floats and infinities in ByteCode (BS / BSReader)', () => {
+        // Direct BS / BSReader F64 serde
+        const bs = new BS();
+        bs.writeF64(3.141592653589793);
+        bs.writeF64(Infinity);
+        bs.writeF64(-Infinity);
+        bs.writeF64(NaN);
+        bs.writeValue(2.71828);
+        bs.writeValue(Infinity);
+        bs.writeValue(-Infinity);
+        bs.writeValue(100);
+
+        const buf = bs.finalize();
+        const reader = new BSReader(buf);
+
+        expect(reader.readF64()).toBe(3.141592653589793);
+        expect(reader.readF64()).toBe(Infinity);
+        expect(reader.readF64()).toBe(-Infinity);
+        expect(Number.isNaN(reader.readF64())).toBe(true);
+
+        expect(reader.read()).toBe(2.71828);
+        expect(reader.read()).toBe(Infinity);
+        expect(reader.read()).toBe(-Infinity);
+        expect(reader.read()).toBe(100);
+
+        // ByteCode serialization containing floats and infinities
+        const bc = evaluator.compileRaw('(+ 3.14 2.71 +inf.0)');
+        const bcBs = new BS();
+        ByteCode.register(new BSReader(new Uint32Array(0)));
+        bcBs.writeSerializable(bc as ByteCode);
+
+        const dumped = bcBs.finalize();
+        const bcReader = new BSReader(dumped);
+        ByteCode.register(bcReader);
+        const deserializedBc = bcReader.read() as ByteCode;
+
+        expect(deserializedBc instanceof ByteCode).toBe(true);
+        expect(s.stringify(evaluator.evaluateRaw(deserializedBc))).toBe("+inf.0");
+
+        // ByteCode serialization with float result
+        const bcFloat = evaluator.compileRaw('(* 2.5 1.5)');
+        const bcFloatBs = new BS();
+        bcFloatBs.writeSerializable(bcFloat as ByteCode);
+        const floatDumped = bcFloatBs.finalize();
+        const floatReader = new BSReader(floatDumped);
+        ByteCode.register(floatReader);
+        const deserializedFloatBc = floatReader.read() as ByteCode;
+        expect(s.stringify(evaluator.evaluateRaw(deserializedFloatBc))).toBe("3.75");
     });
 });
 
