@@ -1111,6 +1111,21 @@ describe('Tables (using Table class)', () => {
         expect(run(`(table-ref {'id 123} 'id)`)).toBe("123")
     });
 
+    it('checks equality with table-is?', () => {
+        expect(run('(table-is? {"a" 1 "b" 2} "a" 1)')).toBe("#t");
+        expect(run('(table-is? {"a" 1 "b" 2} "a" 2)')).toBe("#f");
+        expect(run('(table-is? {"a" 1 "b" 2} "b" 2)')).toBe("#t");
+        expect(run('(table-is? {"a" "food"} "a" "food")')).toBe("#t");
+        expect(run('(table-is? {"a" "food"} "a" "toys")')).toBe("#f");
+        expect(run('(table-is? {"a" 1} "missing" 1)')).toBe("#f");
+        expect(run('(table-is? {"a" 1} "missing" "default" "default")')).toBe("#t");
+        expect(run('(table-is? {"a" 1} "missing" "other" "default")')).toBe("#f");
+        expect(run('(table-is? {\'id "123"} \'id "123")')).toBe("#t");
+        expect(run('(table-is? {\'id "123"} \'id "456")')).toBe("#f");
+        expect(() => run('(table-is? "not-a-table" "a" 1)')).toThrow();
+        expect(() => run('(table-is? {"a" 1} "a")')).toThrow();
+    });
+
     it('mutates tables with table-set!', () => {
         const script = `
             (let ((tbl (table)))

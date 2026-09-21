@@ -568,6 +568,22 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
         }
         throw new Error(`table-ref: key not found: ${String(key)}`);
     }),
+    new BuiltinFunction(Symbol.for("table-is?"), (regs, startReg, nargs) => {
+        if (nargs < 3 || nargs > 4) throw new Error("table-is? requires 3 or 4 arguments (table-is? tbl key expected [default])");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-is? requires a table");
+        const key = regs[startReg + 1];
+        const expected = regs[startReg + 2];
+        let val: any;
+        if (tbl.has(key)) {
+            val = tbl.get(key);
+        } else if (nargs === 4) {
+            val = regs[startReg + 3];
+        } else {
+            return false;
+        }
+        return isDeepEqual(val, expected);
+    }),
     new BuiltinFunction(Symbol.for("table-set!"), (regs, startReg, nargs) => {
         if (nargs !== 3) throw new Error("table-set! requires 3 arguments (table-set! tbl key val)");
         const tbl = regs[startReg];
