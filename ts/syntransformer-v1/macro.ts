@@ -1,4 +1,4 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Globals, OP_QUOTE } from "../common"
+import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Table, OP_QUOTE } from "../common"
 import { Bootstrapper } from "../std";
 
 export enum TransformState {
@@ -20,7 +20,7 @@ export class MacroEvaluator {
     readonly #transformers: Map<symbol, Transform>
     readonly #bootstrapper: Bootstrapper
 
-    scope: Globals
+    scope: Table
     readonly expandcmp: AbstractCompiler
     readonly expandvm: AbstractVM;
 
@@ -30,12 +30,12 @@ export class MacroEvaluator {
         this.expandvm = meta.vm(maxSteps)
         this.#transformers = new Map<symbol, Transform>()
         this.#bootstrapper = new Bootstrapper()
-        this.scope = Globals.newWith({})
+        this.scope = new Table()
     }
 
     init() {
         const publicScope = this.#bootstrapper.setupPublicScope(this.meta, this.expandcmp, this.expandvm, this)
-        this.scope = publicScope.nestWith({})
+        this.scope = publicScope.chained()
     }
 
     registerTransform(onsym: symbol, transform: Transform) {

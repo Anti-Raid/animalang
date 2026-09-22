@@ -1249,34 +1249,111 @@ describe('Tables (using Table class)', () => {
     });
 
     it('supports JS Table class interop and FFI methods', () => {
-        const t = Table.fromObject({ name: "Willow", version: 2, meta: { active: true } });
+        const meta = new Table();
+        meta.set("active", true);
+
+        const t = new Table();
+        t.set("name", "Willow");
+        t.set("version", 2);
+        t.set("meta", meta);
+
         expect(t instanceof Table).toBe(true);
         expect(t.size).toBe(3);
         expect(t.get("name")).toBe("Willow");
         expect(t.get("meta") instanceof Table).toBe(true);
         expect((t.get("meta") as Table).get("active")).toBe(true);
 
-        const obj = t.toObject();
-        expect(obj).toEqual({ name: "Willow", version: 2, meta: { active: true } });
-
-        expect(JSON.stringify(t)).toBe(JSON.stringify({ name: "Willow", version: 2, meta: { active: true } }));
-
         // JS iteration
         const entries = [...t.entries()];
         expect(entries.length).toBe(3);
 
+        // Chaining
+        const child = t.chained();
+        expect(child.parent).toBe(t);
+        expect(child.get("name")).toBe("Willow");
+        child.set("name", "Luna");
+        expect(child.get("name")).toBe("Luna");
+        expect(t.get("name")).toBe("Willow");
+        expect(child.size).toBe(4);
+
         // JS freeze
-        t.freeze();
-        expect(t.isFrozen).toBe(true);
+        t.frozen = true;
+        expect(t.frozen).toBe(true);
         expect(() => t.set("name", "Other")).toThrow();
         expect(() => t.delete("version")).toThrow();
         expect(() => t.clear()).toThrow();
+
+        // JS host can unfreeze
+        t.frozen = false;
+        expect(t.frozen).toBe(false);
+        t.set("name", "Other");
+        expect(t.get("name")).toBe("Other");
+        t.frozen = true;
 
         // Scheme evaluateRaw returns actual Table instance
         const rawT = runRaw('{"id" "test-123" "count" 5}');
         expect(rawT instanceof Table).toBe(true);
         expect(rawT.get("id")).toBe("test-123");
         expect(rawT.get("count")).toBe(5);
+    });
+
+    it('supports table-chain, table-entries and table-current-entries in Scheme', () => {
+        const script = `
+            (let ((parent {"a" 1 "b" 2}))
+              (let ((child (table-chain parent)))
+                (begin
+                  (table-set! child "b" 20)
+                  (table-set! child "c" 30)
+                  (list
+                    (table-ref child "a")
+                    (table-ref child "b")
+                    (table-ref parent "b")
+                    (table-size child)
+                    (vector-length (table-current-entries child))
+                    (vector-length (table-current-entries parent))
+                    (vector-length (table-entries child))))))
+        `;
+        expect(run(script)).toBe("(1 20 2 4 2 2 4)");
+
+        // table-chain with frozen = #t
+        const frozenChildScript = `
+            (let ((parent {"a" 1}))
+              (let ((child (table-chain parent #t)))
+                (table-frozen? child)))
+        `;
+        expect(run(frozenChildScript)).toBe("#t");
+    });
+
+    it('supports chained tables', () => {
+        const root = new Table();
+        root.set("a", 1);
+        root.set("b", 2);
+
+        const child = root.chained();
+        child.set("b", 20);
+        child.set("c", 30);
+
+        expect(child.parent).toBe(root);
+        expect(child.size).toBe(4);
+        expect(child.has("a")).toBe(true);
+        expect(child.get("a")).toBe(1);
+        expect(child.get("b")).toBe(20);
+        expect(root.get("b")).toBe(2);
+        expect(child.get("missing")).toBeUndefined();
+        expect(child.has("missing")).toBe(false);
+
+        // grandchild chaining
+        const grand = child.chained();
+        expect(grand.parent).toBe(child);
+        expect(grand.has("a")).toBe(true);
+        expect(grand.get("a")).toBe(1);
+        expect(grand.get("b")).toBe(20);
+        expect(grand.get("c")).toBe(30);
+        expect(grand.has("missing")).toBe(false);
+        // currentEntries only returns own entries
+        expect([...root.currentEntries()]).toEqual([["a", 1], ["b", 2]]);
+        expect([...child.currentEntries()]).toEqual([["b", 20], ["c", 30]]);
+        expect([...grand.currentEntries()]).toEqual([]);
     });
 });
 

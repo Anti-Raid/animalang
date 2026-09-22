@@ -1,4 +1,4 @@
-import { BS, BSReader, ErrorObject, flattenDynamicArgs, Globals, IProcedure, type SerializableBytecode } from "../common";
+import { BS, BSReader, ErrorObject, flattenDynamicArgs, Table, MissingVarError, IProcedure, type SerializableBytecode } from "../common";
 import { isTruthy } from "../common";
 import { Cons } from "../list";
 import { ApplyProc, BuiltinFunction, CallCCProc, IBUILTINS, TryProc } from "../std";
@@ -171,7 +171,7 @@ class CallFrame {
 export class AnimaVM {
     constructor(public steps: number = 0, public maxSteps: number = 0) {}
 
-    public evaluateRaw(code: ByteCode, scope: Globals): any {
+    public evaluateRaw(code: ByteCode, scope: Table): any {
         // Initial frame
         let frame: CallFrame = new CallFrame(code, createRegs(code.numReg), [], 0, 0);
         try {
@@ -182,7 +182,7 @@ export class AnimaVM {
         }
     }
 
-    public evaluateClosure(code: Closure, scope: Globals, args: any[]): any {
+    public evaluateClosure(code: Closure, scope: Table, args: any[]): any {
         // Initial frame
         const cargs = this.#createClosureArg(code.tmpl, args.length, args, 0)
         let frame: CallFrame = new CallFrame(code.tmpl.code, cargs, code.upvars, 0, 0);
@@ -194,7 +194,7 @@ export class AnimaVM {
         }
     }
 
-    #execnext(initialFrame: CallFrame, execScope: Globals) {
+    #execnext(initialFrame: CallFrame, execScope: Table) {
         let cont: Continuation = { type: 'RUNNING', frame: initialFrame, parent: null, trySpot: undefined }
         while(cont.type === 'RUNNING') {
             this.steps++;
@@ -252,6 +252,9 @@ export class AnimaVM {
                     case OpCode.LOADGLOBAL: {
                         const destReg = frame.readNext()
                         const varname = frame.getConst(frame.readNext()) as symbol // compiler ensures its a symbol
+                        if (!execScope.has(varname)) {
+                            throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`);
+                        }
                         regs[destReg] = execScope.get(varname)
                         break
                     }
@@ -263,7 +266,9 @@ export class AnimaVM {
                     }
                     case OpCode.HASGLOBAL: {
                         const varname = frame.getConst(frame.readNext()) as symbol // compiler ensures its a symbol
-                        execScope.assert(varname)
+                        if (!execScope.has(varname)) {
+                            throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`);
+                        }
                         break
                     }
                     case OpCode.JIF: {

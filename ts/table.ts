@@ -1,45 +1,54 @@
 export class Table implements Iterable<[any, any]> {
     #map: Map<any, any>;
+    #parent: Table | null;
     #frozen: boolean;
 
-    constructor(entries?: Iterable<[any, any]> | null, frozen: boolean = false) {
-        this.#map = new Map(entries ?? undefined);
+    constructor(parent: Table | null = null, frozen: boolean = false) {
+        this.#map = new Map();
+        this.#parent = parent;
         this.#frozen = frozen;
     }
 
-    get size(): number {
-        return this.#map.size;
+    get parent(): Table | null {
+        return this.#parent;
     }
 
-    get isFrozen(): boolean {
-        return this.#frozen;
+    chained(frozen: boolean = false): Table {
+        return new Table(this, frozen);
+    }
+
+    get size(): number {
+        return this.#map.size + (this.#parent ? this.#parent.size : 0);
     }
 
     get frozen(): boolean {
         return this.#frozen;
     }
 
-    freeze(): this {
-        this.#frozen = true;
-        return this;
-    }
-
-    freezeDeep(): this {
-        this.#frozen = true;
-        for (const val of this.#map.values()) {
-            if (val instanceof Table && !val.isFrozen) {
-                val.freezeDeep();
-            }
-        }
-        return this;
+    set frozen(val: boolean) {
+        this.#frozen = Boolean(val);
     }
 
     get(key: any): any {
-        return this.#map.get(key);
+        let curr: Table | null = this;
+        while (curr !== null) {
+            if (curr.#map.has(key)) {
+                return curr.#map.get(key);
+            }
+            curr = curr.#parent;
+        }
+        return undefined;
     }
 
     has(key: any): boolean {
-        return this.#map.has(key);
+        let curr: Table | null = this;
+        while (curr !== null) {
+            if (curr.#map.has(key)) {
+                return true;
+            }
+            curr = curr.#parent;
+        }
+        return false;
     }
 
     set(key: any, val: any): this {
@@ -58,47 +67,40 @@ export class Table implements Iterable<[any, any]> {
         this.#map.clear();
     }
 
-    keys(): IterableIterator<any> {
-        return this.#map.keys();
+    *keys(): IterableIterator<any> {
+        yield* this.#map.keys();
+        if (this.#parent) {
+            yield* this.#parent.keys();
+        }
     }
 
-    values(): IterableIterator<any> {
-        return this.#map.values();
+    *values(): IterableIterator<any> {
+        yield* this.#map.values();
+        if (this.#parent) {
+            yield* this.#parent.values();
+        }
     }
 
-    entries(): IterableIterator<[any, any]> {
+    *entries(): IterableIterator<[any, any]> {
+        yield* this.#map.entries();
+        if (this.#parent) {
+            yield* this.#parent.entries();
+        }
+    }
+
+    currentEntries(): IterableIterator<[any, any]> {
         return this.#map.entries();
     }
 
     [Symbol.iterator](): IterableIterator<[any, any]> {
-        return this.#map[Symbol.iterator]();
+        return this.entries();
     }
 
     copy(): Table {
-        return new Table(this.#map.entries(), false);
-    }
-
-    toObject(deep: boolean = true): Record<string, any> {
-        const obj: Record<string, any> = {};
-        for (const [k, v] of this.#map.entries()) {
-            const keyStr = typeof k === "symbol" ? (k.description || Symbol.keyFor(k) || String(k)) : String(k);
-            obj[keyStr] = (deep && v instanceof Table) ? v.toObject(true) : v;
+        const copyTbl = new Table(null, false);
+        for (const [k, v] of this.entries()) {
+            copyTbl.set(k, v);
         }
-        return obj;
-    }
-
-    static fromObject(obj: Record<string, any>, deep: boolean = true): Table {
-        const tbl = new Table();
-        for (const [k, v] of Object.entries(obj)) {
-            const val = (deep && typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof Table))
-                ? Table.fromObject(v, true)
-                : v;
-            tbl.set(k, val);
-        }
-        return tbl;
-    }
-
-    toJSON(): Record<string, any> {
-        return this.toObject(true);
+        return copyTbl;
     }
 }

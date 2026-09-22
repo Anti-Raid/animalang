@@ -107,14 +107,11 @@ Tables provide first-class associative map data structures backed by a native Ja
 
 The `Table` class exported from `animalang` provides clean integration with host TypeScript / JavaScript environments:
 
+- **Constructor**: `new Table(parent = null, frozen = false)`
+- **Chaining**: `tbl.chained(frozen = false)` creates a child table linked to `tbl` as its `.parent`
 - **Methods**: `.get(key)`, `.set(key, val)`, `.has(key)`, `.delete(key)`, `.clear()`, `.copy()`
-- **Properties**: `.size`, `.isFrozen` / `.frozen`
-- **Freezing**: `.freeze()`, `.freezeDeep()` (recursively freezes nested `Table` values)
-- **Iteration**: Implements `Iterable<[any, any]>` (`for (const [k, v] of tbl)`), `.entries()`, `.keys()`, `.values()`
-- **Conversion**:
-  - `tbl.toObject(deep = true)`: Converts string/symbol-keyed entries into a plain JavaScript `Record<string, any>` object (recursing on nested tables).
-  - `Table.fromObject(obj, deep = true)`: Constructs a `Table` from a plain JavaScript object.
-  - `tbl.toJSON()`: Enables direct use with `JSON.stringify(tbl)`.
+- **Properties**: `.parent`, `.size`, `.frozen` (getter & setter: `tbl.frozen = true`)
+- **Iteration**: Implements `Iterable<[any, any]>` (`for (const [k, v] of tbl)`), `.entries()`, `.currentEntries()` (own entries only), `.keys()`, `.values()`
 
 #### Logic & Type Checking
 - =: Checks if `n` number expressions are equal. Errors if any expression is not a number. Arity: >= 2.

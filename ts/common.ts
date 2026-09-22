@@ -1066,51 +1066,6 @@ export class ConstPool {
     }
 }
 
-export class Globals {
-    private constructor(public data: Map<symbol, any>, public frozen: boolean = false, public outer: Globals | null) {}
-
-    static newWith(fields: Record<symbol, any>, frozen: boolean = false) {
-        const map = new Map()
-        Object.getOwnPropertySymbols(fields).forEach((sym) => {
-            map.set(sym, fields[sym])
-        });
-        return new Globals(map, frozen, null);
-    }
-
-    nestWith(fields: Record<symbol, any>, frozen: boolean = false) {
-        const map = new Map()
-        Object.getOwnPropertySymbols(fields).forEach((sym) => {
-            map.set(sym, fields[sym])
-        });
-        return new Globals(map, frozen, this);
-    }
-
-    get(varname: symbol): any {
-        if (this.data.has(varname)) {
-            return this.data.get(varname)
-        }
-        if (this.outer) {
-            return this.outer.get(varname)
-        }
-        throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`)
-    }
-
-    assert(varname: symbol): void {
-        if (this.data.has(varname)) {
-            return
-        }
-        if (this.outer) {
-            return this.outer.assert(varname)
-        }
-        throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`)
-    }
-
-    set(varname: symbol, data: any) {
-        if (this.frozen) throw new Error(`Variable '${String(varname)}' cannot be set in a frozen scope.`);
-        this.data.set(varname, data)
-    }
-}
-
 let n = 0
 export const symGen = (base: string) => {
     return Symbol(`${base}${n++}`)
@@ -1121,8 +1076,8 @@ export interface AbstractClosure extends SerializableBytecode {}
 // eslint-disable-next-line
 export interface AbstractByteCode extends SerializableBytecode {}
 export interface AbstractVM {
-    evaluateRaw(code: AbstractByteCode, scope: Globals): any,
-    evaluateClosure(code: AbstractClosure, scope: Globals, args: any[]): any
+    evaluateRaw(code: AbstractByteCode, scope: Table): any,
+    evaluateClosure(code: AbstractClosure, scope: Table, args: any[]): any
 }
 export interface AbstractCompiler {
     compile(trExpr: any): AbstractByteCode
