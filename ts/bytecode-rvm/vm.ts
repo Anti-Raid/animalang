@@ -125,29 +125,36 @@ class Box {
     constructor(public val: any) {}
 }
 
-type RunningCont = { type: 'RUNNING'; frame: CallFrame; parent: Continuation | null, trySpot: Continuation | null | undefined, destReg?: number }
-type Continuation = RunningCont
-| { type: "TERMINAL", value: any }
+export class ExecutionContext {
+    public acc: any = null;
 
-class VMContinuation {
-    constructor(public cont: Continuation | null) {}
+    constructor(
+        public vm: AnimaVM,
+        public scope: Table
+    ) {}
 }
 
-/** Mark a continuation frame (and its parents) as shared to ensure they are copied on use */
-function markShared(cont: Continuation | null) {
-    while (cont !== null && cont.type === "RUNNING" && !cont.frame.shared) {
-        cont.frame.shared = true;
-        cont = cont.parent;
+class VMContinuation {
+    constructor(public frame: Frame | null) {}
+}
+
+/** Mark an active frame (and its parents) as shared for copy-on-write */
+function markShared(frame: Frame | null) {
+    while (frame !== null && !frame.shared) {
+        frame.shared = true;
+        frame = frame.parent;
     }
 }
 
-class CallFrame {
+export class Frame {
     constructor(
         public code: ByteCode,
         public regs: any[],
         public upvars: any[],
         public ip: number,
-        public id: number,
+        public parent: Frame | null,
+        public retDestReg: number = -1,
+        public trySpot: Frame | null | undefined = undefined,
         public shared: boolean = false
     ) {}
 
@@ -162,9 +169,9 @@ class CallFrame {
         return this.code.constants[idx]
     }
 
-    thaw(): CallFrame {
+    thaw(): Frame {
         if (!this.shared) return this;
-        return new CallFrame(this.code, [...this.regs], this.upvars, this.ip, this.id, false);
+        return new Frame(this.code, [...this.regs], this.upvars, this.ip, this.parent, this.retDestReg, this.trySpot, false);
     }
 }
 
@@ -172,10 +179,10 @@ export class AnimaVM {
     constructor(public steps: number = 0, public maxSteps: number = 0) {}
 
     public evaluateRaw(code: ByteCode, scope: Table): any {
-        // Initial frame
-        let frame: CallFrame = new CallFrame(code, createRegs(code.numReg), [], 0, 0);
+        const ctx = new ExecutionContext(this, scope);
+        let frame: Frame = new Frame(code, createRegs(code.numReg), [], 0, null, -1, undefined, false);
         try {
-            return this.#execnext(frame, scope);
+            return this.#execnext(ctx, frame);
         } catch (err: any) {
             console.log(`${err.stack}\n\nCurrent Frame IP: ${frame.ip}`)
             throw err
@@ -183,29 +190,32 @@ export class AnimaVM {
     }
 
     public evaluateClosure(code: Closure, scope: Table, args: any[]): any {
-        // Initial frame
+        const ctx = new ExecutionContext(this, scope);
         const cargs = this.#createClosureArg(code.tmpl, args.length, args, 0)
-        let frame: CallFrame = new CallFrame(code.tmpl.code, cargs, code.upvars, 0, 0);
+        let frame: Frame = new Frame(code.tmpl.code, cargs, code.upvars, 0, null, -1, undefined, false);
         try {
-            return this.#execnext(frame, scope);
+            return this.#execnext(ctx, frame);
         } catch (err: any) {
             console.log(`${err.stack}\n\nCurrent Frame IP: ${frame.ip}`)
             throw err
         }
     }
 
-    #execnext(initialFrame: CallFrame, execScope: Table) {
-        let cont: Continuation = { type: 'RUNNING', frame: initialFrame, parent: null, trySpot: undefined }
-        while(cont.type === 'RUNNING') {
+    #execnext(ctx: ExecutionContext, initialFrame: Frame) {
+        let frame: Frame | null = initialFrame;
+
+        while(frame !== null) {
             this.steps++;
             if (this.maxSteps && this.steps > this.maxSteps) {
                 throw new Error(`Script ran for more than ${this.maxSteps} instructions.`);
             }
 
-            let frame: CallFrame = cont.frame
             if (frame.shared) {
                 frame = frame.thaw();
-                cont = { ...cont, frame };  
+            }
+            if (frame.retDestReg !== -1) {
+                frame.regs[frame.retDestReg] = ctx.acc;
+                frame.retDestReg = -1;
             }
             const regs = frame.regs
             if (frame.ip >= frame.code.inst.length) {
@@ -252,21 +262,21 @@ export class AnimaVM {
                     case OpCode.LOADGLOBAL: {
                         const destReg = frame.readNext()
                         const varname = frame.getConst(frame.readNext()) as symbol // compiler ensures its a symbol
-                        if (!execScope.has(varname)) {
+                        if (!ctx.scope.has(varname)) {
                             throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`);
                         }
-                        regs[destReg] = execScope.get(varname)
+                        regs[destReg] = ctx.scope.get(varname)
                         break
                     }
                     case OpCode.SETGLOBAL: {
                         const srcReg = frame.readNext()
                         const varname = frame.getConst(frame.readNext()) as symbol // compiler ensures its a symbol
-                        execScope.set(varname, regs[srcReg])
+                        ctx.scope.set(varname, regs[srcReg])
                         break
                     }
                     case OpCode.HASGLOBAL: {
                         const varname = frame.getConst(frame.readNext()) as symbol // compiler ensures its a symbol
-                        if (!execScope.has(varname)) {
+                        if (!ctx.scope.has(varname)) {
                             throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`);
                         }
                         break
@@ -335,167 +345,100 @@ export class AnimaVM {
                         break
                     }
                     case OpCode.RETURN: {
-                        const reg = frame.readNext()
-                        const retVal = frame.regs[reg];
-                        if (cont.parent === null) {
-                            cont = { type: 'TERMINAL', value: retVal };
-                        } else {
-                            const parent: Continuation = cont.parent;
-                            if (parent.type === "RUNNING" && parent.destReg !== undefined) {
-                                parent.frame.regs[parent.destReg] = retVal;
-                            }
-                            cont = parent; // Jump back to the parent continuation
-                        }
-                        break;               
+                        const reg = frame.readNext();
+                        ctx.acc = regs[reg];
+                        frame = frame.parent;
+                        break;
                     }
                     case OpCode.CALL: {
-                        const procIdx = frame.readNext()
+                        const procIdx = frame.readNext();
                         const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
                         const destReg = frame.readNext();
                         const startReg = frame.readNext();
                         const nargs = frame.readNext();
-                        cont = this.#invoke(proc, cont, frame, regs, destReg, startReg, nargs)
+
+                        frame.retDestReg = destReg;
+                        frame = this.#invoke(ctx, proc, frame, regs, startReg, nargs, false);
                         break;
                     }
                     case OpCode.TAILCALL: {
-                        const procIdx = frame.readNext()
+                        const procIdx = frame.readNext();
                         const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
                         const startReg = frame.readNext();
                         const nargs = frame.readNext();
-                        cont = this.#invoke(proc, cont, frame, regs, undefined, startReg, nargs);
+
+                        frame = this.#invoke(ctx, proc, frame, regs, startReg, nargs, true);
                         break;
                     }
                     default:
                         let _: never = opcode;
                 }
             } catch (err) {
-                // We either resolve the try-call or rethrow
-                if (cont.type === "RUNNING" && cont.trySpot !== undefined) {
-                    const retVal = new ErrorObject(err)
-                    if (cont.trySpot === null || cont.trySpot.type !== "RUNNING") {
-                        return retVal
-                    }
-                    const target: RunningCont = cont.trySpot
-
-                    if (target.destReg !== undefined) {
-                        target.frame.regs[target.destReg] = retVal;
-                    }
-
-                    cont = target
-                    continue
+                if (frame !== null && frame.trySpot !== undefined) {
+                    ctx.acc = new ErrorObject(err);
+                    frame = frame.trySpot;
+                    continue;
                 }
-                throw err
+                throw err;
             }
         }
 
-        return cont.value
+        return ctx.acc;
     }
 
-    // Note: if destReg is not set, we treat it as a tailcall
     #invoke(
-        proc: any, 
-        cont: RunningCont,
-        callerFrame: CallFrame, 
-        callerArgs: any[], 
-        destReg: number | undefined, 
-        startReg: number, 
-        nargs: number
-    ): Continuation {
+        ctx: ExecutionContext,
+        proc: any,
+        callerFrame: Frame,
+        callerArgs: any[],
+        startReg: number,
+        nargs: number,
+        isTail: boolean,
+        overrideTrySpot?: Frame | null
+    ): Frame | null {
+        const trySpot = (overrideTrySpot !== undefined) ? overrideTrySpot : callerFrame.trySpot;
+
         if (proc instanceof BuiltinFunction) {
-            const retVal = proc.cb(callerArgs, startReg, nargs)
-            if (destReg !== undefined) {
-                callerFrame.regs[destReg] = retVal
-            } else {
-                if (cont.parent === null) return { type: 'TERMINAL', value: retVal };
-                
-                const parent = cont.parent;
-                if (parent.type === "RUNNING" && parent.destReg !== undefined) {
-                    parent.frame.regs[parent.destReg] = retVal;
-                }
-                return parent;
-            }
-            return cont // no change to continuation needed
+            ctx.acc = proc.cb(callerArgs, startReg, nargs);
+            return isTail ? callerFrame.parent : callerFrame;
+        } else if (proc instanceof Closure) {
+            const pregs = this.#createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
+            const parent = isTail ? callerFrame.parent : callerFrame;
+            return new Frame(
+                proc.tmpl.code,
+                pregs,
+                proc.upvars,
+                0,
+                parent,
+                -1,
+                trySpot,
+                false
+            );
         } else if (proc instanceof ApplyProc) {
             const actualProc = callerArgs[startReg];
-            const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "apply")
-            return this.#invoke(actualProc, cont, callerFrame, actualArgs, destReg, 0, actualArgs.length)
+            const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "apply");
+            return this.#invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, overrideTrySpot);
         } else if (proc instanceof TryProc) {
             const actualProc = callerArgs[startReg];
-            const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "try")
-
-            const trapCont: Continuation | null = (destReg === undefined) ? cont.parent : {
-                type: 'RUNNING',
-                frame: callerFrame,
-                parent: cont.parent,
-                destReg: destReg,
-                trySpot: cont.trySpot
-            };
+            const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "try");
+            const trapFrame = isTail ? callerFrame.parent : callerFrame;
 
             try {
-                const resultingCont = this.#invoke(actualProc, cont, callerFrame, actualArgs, destReg, 0, actualArgs.length);
-                
-                if (resultingCont.type === "RUNNING" && resultingCont !== cont && resultingCont !== cont.parent) {
-                    return {
-                        ...resultingCont,
-                        trySpot: trapCont
-                    };
-                }                
-                return resultingCont;
-
+                return this.#invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, trapFrame);
             } catch (err) {
-                // Builtins error etc.
-                const errObj = new ErrorObject(err);
-                
-                if (trapCont === null || trapCont.type !== "RUNNING") {
-                    return { type: 'TERMINAL', value: errObj };
-                }
-                
-                if (trapCont.destReg !== undefined) {
-                    trapCont.frame.regs[trapCont.destReg] = errObj;
-                }
-                
-                return trapCont;
+                ctx.acc = new ErrorObject(err);
+                return trapFrame;
             }
         } else if (proc instanceof CallCCProc) {
-            markShared(cont);
-            const parentCont = (destReg === undefined) ? cont.parent : {
-                type: 'RUNNING',
-                frame: callerFrame,
-                parent: cont.parent,
-                destReg: destReg,
-                trySpot: cont.trySpot // Preserve outer try context
-            } as Continuation | null;
-            const vmCont = new VMContinuation(parentCont);  
+            markShared(callerFrame);
+            const targetFrame = isTail ? callerFrame.parent : callerFrame;
+            const vmCont = new VMContinuation(targetFrame);
             const userProc = callerArgs[startReg];
-            return this.#invoke(userProc, cont, callerFrame, [vmCont], destReg, 0, 1);
+            return this.#invoke(ctx, userProc, callerFrame, [vmCont], 0, 1, isTail);
         } else if (proc instanceof VMContinuation) {
             if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
-            const val = callerArgs[startReg];
-            let targetCont = proc.cont;
-
-            if (targetCont === null || targetCont.type === "TERMINAL") {
-                return { type: 'TERMINAL', value: val };
-            }
-
-            if (targetCont.destReg !== undefined) {
-                const frame = targetCont.frame.thaw();
-                frame.regs[targetCont.destReg] = val;
-                targetCont = frame === targetCont.frame ? targetCont : { ...targetCont, frame };
-            }
-
-            return targetCont;
-        } else if (proc instanceof Closure) {
-            const template = proc.tmpl;
-            const pregs = this.#createClosureArg(proc.tmpl, nargs, callerArgs, startReg)
-            const parentCont = (destReg === undefined) ? cont.parent : {
-                type: 'RUNNING',
-                frame: callerFrame,
-                parent: cont.parent,
-                destReg: destReg,
-                trySpot: cont.trySpot // Preserve outer try context
-            } as Continuation | null;
-            const nextFrame = new CallFrame(template.code, pregs, proc.upvars, 0, callerFrame.id+1);
-            return { type: 'RUNNING', frame: nextFrame, parent: parentCont, trySpot: cont.trySpot };
+            ctx.acc = callerArgs[startReg];
+            return proc.frame;
         } else {
             throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
         }
