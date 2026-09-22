@@ -180,7 +180,7 @@ export class AnimaVM {
 
     public evaluateRaw(code: ByteCode, scope: Table): any {
         const ctx = new ExecutionContext(this, scope);
-        let frame: Frame = new Frame(code, createRegs(code.numReg), [], 0, null, -1, undefined, false);
+        let frame: Frame = this.#newFrame(code, createRegs(code.numReg), [], null, undefined);
         try {
             return this.#execnext(ctx, frame);
         } catch (err: any) {
@@ -192,7 +192,7 @@ export class AnimaVM {
     public evaluateClosure(code: Closure, scope: Table, args: any[]): any {
         const ctx = new ExecutionContext(this, scope);
         const cargs = this.#createClosureArg(code.tmpl, args.length, args, 0)
-        let frame: Frame = new Frame(code.tmpl.code, cargs, code.upvars, 0, null, -1, undefined, false);
+        let frame: Frame = this.#newFrame(code.tmpl.code, cargs, code.upvars, null, undefined);
         try {
             return this.#execnext(ctx, frame);
         } catch (err: any) {
@@ -403,17 +403,11 @@ export class AnimaVM {
             return isTail ? callerFrame.parent : callerFrame;
         } else if (proc instanceof Closure) {
             const pregs = this.#createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
+            if (isTail && !callerFrame.shared) {
+                return this.#reuseFrame(callerFrame, proc.tmpl.code, pregs, proc.upvars, trySpot);
+            }
             const parent = isTail ? callerFrame.parent : callerFrame;
-            return new Frame(
-                proc.tmpl.code,
-                pregs,
-                proc.upvars,
-                0,
-                parent,
-                -1,
-                trySpot,
-                false
-            );
+            return this.#newFrame(proc.tmpl.code, pregs, proc.upvars, parent, trySpot);
         } else if (proc instanceof ApplyProc) {
             const actualProc = callerArgs[startReg];
             const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "apply");
@@ -442,6 +436,32 @@ export class AnimaVM {
         } else {
             throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
         }
+    }
+
+    #newFrame(
+        code: ByteCode,
+        regs: any[],
+        upvars: any[],
+        parent: Frame | null,
+        trySpot: Frame | null | undefined
+    ): Frame {
+        return new Frame(code, regs, upvars, 0, parent, -1, trySpot, false);
+    }
+
+    #reuseFrame(
+        frame: Frame,
+        code: ByteCode,
+        regs: any[],
+        upvars: any[],
+        trySpot: Frame | null | undefined
+    ): Frame {
+        frame.code = code;
+        frame.regs = regs;
+        frame.upvars = upvars;
+        frame.ip = 0;
+        frame.retDestReg = -1;
+        frame.trySpot = trySpot;
+        return frame;
     }
 
     #createClosureArg(template: ClosureTemplate, nargs: number, args: any[], startOffset: number) {
