@@ -213,10 +213,6 @@ export class AnimaVM {
             if (frame.shared) {
                 frame = frame.thaw();
             }
-            if (frame.retDestReg !== -1) {
-                frame.regs[frame.retDestReg] = ctx.acc;
-                frame.retDestReg = -1;
-            }
             const regs = frame.regs
             if (frame.ip >= frame.code.inst.length) {
                 throw new Error(`internal error: ${frame.ip} >= ${frame.code.inst.length}`)
@@ -347,7 +343,7 @@ export class AnimaVM {
                     case OpCode.RETURN: {
                         const reg = frame.readNext();
                         ctx.acc = regs[reg];
-                        frame = frame.parent;
+                        frame = this.#setRetVal(frame.parent, ctx.acc);
                         break;
                     }
                     case OpCode.CALL: {
@@ -376,7 +372,7 @@ export class AnimaVM {
             } catch (err) {
                 if (frame !== null && frame.trySpot !== undefined) {
                     ctx.acc = new ErrorObject(err);
-                    frame = frame.trySpot;
+                    frame = this.#setRetVal(frame.trySpot, ctx.acc);
                     continue;
                 }
                 throw err;
@@ -400,7 +396,8 @@ export class AnimaVM {
 
         if (proc instanceof BuiltinFunction) {
             ctx.acc = proc.cb(callerArgs, startReg, nargs);
-            return isTail ? callerFrame.parent : callerFrame;
+            const target = isTail ? callerFrame.parent : callerFrame;
+            return this.#setRetVal(target, ctx.acc);
         } else if (proc instanceof Closure) {
             const pregs = this.#createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
             if (isTail && !callerFrame.shared) {
@@ -421,7 +418,7 @@ export class AnimaVM {
                 return this.#invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, trapFrame);
             } catch (err) {
                 ctx.acc = new ErrorObject(err);
-                return trapFrame;
+                return this.#setRetVal(trapFrame, ctx.acc);
             }
         } else if (proc instanceof CallCCProc) {
             markShared(callerFrame);
@@ -432,10 +429,21 @@ export class AnimaVM {
         } else if (proc instanceof VMContinuation) {
             if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
             ctx.acc = callerArgs[startReg];
-            return proc.frame;
+            return this.#setRetVal(proc.frame, ctx.acc);
         } else {
             throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
         }
+    }
+
+    #setRetVal(frame: Frame | null, val: any): Frame | null {
+        if (frame !== null && frame.retDestReg !== -1) {
+            if (frame.shared) {
+                frame = frame.thaw();
+            }
+            frame.regs[frame.retDestReg] = val;
+            frame.retDestReg = -1;
+        }
+        return frame;
     }
 
     #newFrame(
