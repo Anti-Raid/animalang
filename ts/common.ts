@@ -352,7 +352,7 @@ export class ASP {
             if (token === 'null') return null;
             if (token === '<#void>') return undefined;
 
-            // Infinities & NaN (Scheme R6RS/R7RS: +inf.0, -inf.0, inf.0, +nan.0, -nan.0, nan.0)
+            // Infinities + NaN
             const lowerToken = token.toLowerCase();
             if (lowerToken === '+inf.0' || lowerToken === 'inf.0' || lowerToken === '+infinity' || lowerToken === 'infinity') return Infinity;
             if (lowerToken === '-inf.0' || lowerToken === '-infinity') return -Infinity;
@@ -392,7 +392,9 @@ export class ASP {
 }
 
 // Marker class that all procs should extend from
-export class IProcedure {}
+export class IProcedure {
+    constructor(public debugName?: string) {}
+}
 
 export class ASTStringifier {
     constructor() {}

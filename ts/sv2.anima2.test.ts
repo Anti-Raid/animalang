@@ -2,7 +2,7 @@
 import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, ASPParseError, BS, BSReader } from './common';
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
-import { ByteCode } from './bytecode-rvm/vm';
+import { ByteCode, AnimaVM } from './bytecode-rvm/vm';
 import { Anima } from './anima';
 import { impl } from './bytecode-rvm/meta';
 
@@ -881,6 +881,61 @@ expect(run(`
           (set! val (+ val 1))
           (retry val))
         val)))`)).toBe("5");
+
+        // Verify continuation is an IProcedure and procedure? recognizes it
+        expect(run(`(procedure? (call/cc (lambda (k) k)))`)).toBe("#t");
+
+        // Multi-shot continuation test within same evaluation context
+        expect(run(`
+(let ((k #f)
+      (count 0))
+  (set! count (+ count 1))
+  (call/cc (lambda (cont) (set! k cont)))
+  (if (< count 3)
+      (begin
+        (set! count (+ count 1))
+        (k #t))
+      count))
+`)).toBe("3");
+
+        // Disallow invoking continuations across separate execution / FFI boundaries
+        run(`(define saved-k #f)`);
+        run(`(+ 10 (call/cc (lambda (k) (set! saved-k k) 5)))`);
+        expect(() => run(`(saved-k 42)`)).toThrow("Cannot invoke a continuation across execution/FFI boundary");
+
+        // Verify debugName on procedures
+        const plusProc = evaluator.scope.get(Symbol.for("+"));
+        expect(plusProc.debugName).toBe("+");
+        const applyProc = evaluator.scope.get(Symbol.for("apply"));
+        expect(applyProc.debugName).toBe("apply");
+        const tryProc = evaluator.scope.get(Symbol.for("try"));
+        expect(tryProc.debugName).toBe("try");
+        const callccProc = evaluator.scope.get(Symbol.for("call/cc"));
+        expect(callccProc.debugName).toBe("call/cc");
+
+        const closure = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (x y) (+ x y))`));
+        expect(closure.debugName).toBe("lambda");
+        const restClosure = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (x . rest) x)`));
+        expect(restClosure.debugName).toBe("lambda");
+
+        const cont = evaluator.evaluateRaw(evaluator.compileRaw(`(call/cc (lambda (k) k))`));
+        expect(cont.debugName).toBe("continuation");
+    });
+
+    it('steps and maxSteps isolation per ExecutionContext', () => {
+        const vm = new AnimaVM(0, 100);
+        const code1 = evaluator.compileRaw(`(+ 1 2 3)`);
+        // Run sequentially multiple times on the same vm instance; each run has its own step budget
+        for (let i = 0; i < 20; i++) {
+            expect(vm.evaluateRaw(code1 as ByteCode, evaluator.scope)).toBe(6);
+        }
+
+        // Verify that execution exceeding maxSteps throws
+        const loopBc = evaluator.compileRaw(`(letrec ((loop (lambda () (loop)))) (loop))`);
+        expect(() => vm.evaluateRaw(loopBc as ByteCode, evaluator.scope)).toThrow(/Script ran for more than 100 instructions/);
+
+        // Verify that passing an explicit maxSteps override works
+        expect(() => vm.evaluateRaw(loopBc as ByteCode, evaluator.scope, 50)).toThrow(/Script ran for more than 50 instructions/);
     });
 })
 

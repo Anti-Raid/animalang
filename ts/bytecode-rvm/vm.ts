@@ -83,14 +83,14 @@ export class ClosureTemplate implements SerializableBytecode {
 /** An actual anima closure bound to a scope */
 export class Closure extends IProcedure implements SerializableBytecode {
     public bsid = "Closure"
-    constructor(public tmpl: ClosureTemplate, public upvars: any[]) {
-        super()
+    constructor(public tmpl: ClosureTemplate, public upvars: any[], debugName: string = "lambda") {
+        super(debugName);
     }
 
-    static fromTemplate(tmpl: ClosureTemplate) {
+    static fromTemplate(tmpl: ClosureTemplate, debugName: string = "lambda") {
         // Allocate enough space for the upvars from outer scopes
         const upvars = new Array(tmpl.upvarLocs.length)
-        return new Closure(tmpl, upvars)
+        return new Closure(tmpl, upvars, debugName)
     }
 
     dump(bs: BS) {
@@ -126,23 +126,30 @@ class Box {
 }
 
 export class ExecutionContext {
+    public static nextId: number = 0;
+    public id: number;
     public acc: any = null;
+    public epoch: number = 0;
+    public steps: number = 0;
+    public maxSteps: number = 0;
+    public currentFrame: Frame | null = null;
 
     constructor(
         public vm: AnimaVM,
-        public scope: Table
-    ) {}
+        public scope: Table,
+        maxSteps?: number
+    ) {
+        this.id = ++ExecutionContext.nextId;
+        this.maxSteps = maxSteps ?? vm.maxSteps;
+    }
 }
 
-class VMContinuation {
-    constructor(public frame: Frame | null) {}
-}
-
-/** Mark an active frame (and its parents) as shared for copy-on-write */
-function markShared(frame: Frame | null) {
-    while (frame !== null && !frame.shared) {
-        frame.shared = true;
-        frame = frame.parent;
+class VMContinuation extends IProcedure {
+    constructor(
+        public frame: Frame | null,
+        public ctxId: number
+    ) {
+        super("continuation");
     }
 }
 
@@ -155,7 +162,8 @@ export class Frame {
         public parent: Frame | null,
         public retDestReg: number = -1,
         public trySpot: Frame | null | undefined = undefined,
-        public shared: boolean = false
+        public epoch: number = 0,
+        public debugName: string = "anonymous"
     ) {}
 
     readNext() {
@@ -169,34 +177,45 @@ export class Frame {
         return this.code.constants[idx]
     }
 
-    thaw(): Frame {
-        if (!this.shared) return this;
-        return new Frame(this.code, [...this.regs], this.upvars, this.ip, this.parent, this.retDestReg, this.trySpot, false);
+    thaw(ctx: ExecutionContext): Frame {
+        return new Frame(this.code, [...this.regs], this.upvars, this.ip, this.parent, this.retDestReg, this.trySpot, ctx.epoch, this.debugName);
+    }
+
+    share(ctx: ExecutionContext): this {
+        ctx.epoch++;
+        return this;
+    }
+
+    isShared(ctx: ExecutionContext): boolean {
+        return this.epoch < ctx.epoch;
     }
 }
 
 export class AnimaVM {
     constructor(public steps: number = 0, public maxSteps: number = 0) {}
 
-    public evaluateRaw(code: ByteCode, scope: Table): any {
-        const ctx = new ExecutionContext(this, scope);
-        let frame: Frame = this.#newFrame(code, createRegs(code.numReg), [], null, undefined);
+    public evaluateRaw(code: ByteCode, scope: Table, maxSteps?: number): any {
+        const ctx = new ExecutionContext(this, scope, maxSteps);
+        let frame: Frame = this.#newFrame(ctx, code, createRegs(code.numReg), [], null, undefined, "top-level");
         try {
             return this.#execnext(ctx, frame);
         } catch (err: any) {
-            console.log(`${err.stack}\n\nCurrent Frame IP: ${frame.ip}`)
+            const active = ctx.currentFrame ?? frame;
+            console.log(`${err.stack}\n\nCurrent Frame [${active.debugName}] IP: ${active.ip}`)
             throw err
         }
     }
 
-    public evaluateClosure(code: Closure, scope: Table, args: any[]): any {
-        const ctx = new ExecutionContext(this, scope);
-        const cargs = this.#createClosureArg(code.tmpl, args.length, args, 0)
-        let frame: Frame = this.#newFrame(code.tmpl.code, cargs, code.upvars, null, undefined);
+    public evaluateClosure(code: Closure, scope: Table, args: any[], maxSteps?: number): any {
+        const ctx = new ExecutionContext(this, scope, maxSteps);
+        const cargs = this.#createClosureArg(code.tmpl, args.length, args, 0);
+        const debugName = code.debugName ?? "lambda";
+        let frame: Frame = this.#newFrame(ctx, code.tmpl.code, cargs, code.upvars, null, undefined, debugName);
         try {
             return this.#execnext(ctx, frame);
         } catch (err: any) {
-            console.log(`${err.stack}\n\nCurrent Frame IP: ${frame.ip}`)
+            const active = ctx.currentFrame ?? frame;
+            console.log(`${err.stack}\n\nCurrent Frame [${active.debugName}] IP: ${active.ip}`)
             throw err
         }
     }
@@ -205,13 +224,16 @@ export class AnimaVM {
         let frame: Frame | null = initialFrame;
 
         while(frame !== null) {
+            ctx.currentFrame = frame;
+            ctx.steps++;
             this.steps++;
-            if (this.maxSteps && this.steps > this.maxSteps) {
-                throw new Error(`Script ran for more than ${this.maxSteps} instructions.`);
+            if (ctx.maxSteps && ctx.steps > ctx.maxSteps) {
+                throw new Error(`Script ran for more than ${ctx.maxSteps} instructions.`);
             }
 
-            if (frame.shared) {
-                frame = frame.thaw();
+            if (frame.isShared(ctx)) {
+                frame = frame.thaw(ctx);
+                ctx.currentFrame = frame;
             }
             const regs = frame.regs
             if (frame.ip >= frame.code.inst.length) {
@@ -343,7 +365,7 @@ export class AnimaVM {
                     case OpCode.RETURN: {
                         const reg = frame.readNext();
                         ctx.acc = regs[reg];
-                        frame = this.#setRetVal(frame.parent, ctx.acc);
+                        frame = this.#setRetVal(ctx, frame.parent, ctx.acc);
                         break;
                     }
                     case OpCode.CALL: {
@@ -372,7 +394,7 @@ export class AnimaVM {
             } catch (err) {
                 if (frame !== null && frame.trySpot !== undefined) {
                     ctx.acc = new ErrorObject(err);
-                    frame = this.#setRetVal(frame.trySpot, ctx.acc);
+                    frame = this.#setRetVal(ctx, frame.trySpot, ctx.acc);
                     continue;
                 }
                 throw err;
@@ -397,14 +419,15 @@ export class AnimaVM {
         if (proc instanceof BuiltinFunction) {
             ctx.acc = proc.cb(callerArgs, startReg, nargs);
             const target = isTail ? callerFrame.parent : callerFrame;
-            return this.#setRetVal(target, ctx.acc);
+            return this.#setRetVal(ctx, target, ctx.acc);
         } else if (proc instanceof Closure) {
             const pregs = this.#createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
-            if (isTail && !callerFrame.shared) {
-                return this.#reuseFrame(callerFrame, proc.tmpl.code, pregs, proc.upvars, trySpot);
+            const debugName = proc.debugName ?? "lambda";
+            if (isTail && !callerFrame.isShared(ctx)) {
+                return this.#reuseFrame(callerFrame, proc.tmpl.code, pregs, proc.upvars, trySpot, debugName);
             }
             const parent = isTail ? callerFrame.parent : callerFrame;
-            return this.#newFrame(proc.tmpl.code, pregs, proc.upvars, parent, trySpot);
+            return this.#newFrame(ctx, proc.tmpl.code, pregs, proc.upvars, parent, trySpot, debugName);
         } else if (proc instanceof ApplyProc) {
             const actualProc = callerArgs[startReg];
             const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "apply");
@@ -418,27 +441,30 @@ export class AnimaVM {
                 return this.#invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, trapFrame);
             } catch (err) {
                 ctx.acc = new ErrorObject(err);
-                return this.#setRetVal(trapFrame, ctx.acc);
+                return this.#setRetVal(ctx, trapFrame, ctx.acc);
             }
         } else if (proc instanceof CallCCProc) {
-            markShared(callerFrame);
+            callerFrame.share(ctx);
             const targetFrame = isTail ? callerFrame.parent : callerFrame;
-            const vmCont = new VMContinuation(targetFrame);
+            const vmCont = new VMContinuation(targetFrame, ctx.id);
             const userProc = callerArgs[startReg];
             return this.#invoke(ctx, userProc, callerFrame, [vmCont], 0, 1, isTail);
         } else if (proc instanceof VMContinuation) {
+            if (proc.ctxId !== ctx.id) {
+                throw new Error("Cannot invoke a continuation across execution/FFI boundary");
+            }
             if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
             ctx.acc = callerArgs[startReg];
-            return this.#setRetVal(proc.frame, ctx.acc);
+            return this.#setRetVal(ctx, proc.frame, ctx.acc);
         } else {
             throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
         }
     }
 
-    #setRetVal(frame: Frame | null, val: any): Frame | null {
+    #setRetVal(ctx: ExecutionContext, frame: Frame | null, val: any): Frame | null {
         if (frame !== null && frame.retDestReg !== -1) {
-            if (frame.shared) {
-                frame = frame.thaw();
+            if (frame.isShared(ctx)) {
+                frame = frame.thaw(ctx);
             }
             frame.regs[frame.retDestReg] = val;
             frame.retDestReg = -1;
@@ -447,13 +473,15 @@ export class AnimaVM {
     }
 
     #newFrame(
+        ctx: ExecutionContext,
         code: ByteCode,
         regs: any[],
         upvars: any[],
         parent: Frame | null,
-        trySpot: Frame | null | undefined
+        trySpot: Frame | null | undefined,
+        debugName: string = "anonymous"
     ): Frame {
-        return new Frame(code, regs, upvars, 0, parent, -1, trySpot, false);
+        return new Frame(code, regs, upvars, 0, parent, -1, trySpot, ctx.epoch, debugName);
     }
 
     #reuseFrame(
@@ -461,7 +489,8 @@ export class AnimaVM {
         code: ByteCode,
         regs: any[],
         upvars: any[],
-        trySpot: Frame | null | undefined
+        trySpot: Frame | null | undefined,
+        debugName: string = "anonymous"
     ): Frame {
         frame.code = code;
         frame.regs = regs;
@@ -469,6 +498,7 @@ export class AnimaVM {
         frame.ip = 0;
         frame.retDestReg = -1;
         frame.trySpot = trySpot;
+        frame.debugName = debugName;
         return frame;
     }
 

@@ -15,21 +15,30 @@ export class BuiltinFunction extends IProcedure {
         public name: symbol,
         public cb: (regs: readonly any[], startReg: number, nargs: number) => any,
     ) {
-        super()
+        super(name.description || Symbol.keyFor(name));
     }
 }
 
 // Marker for `apply` intrinsic proc
 export class ApplyProc extends IProcedure {
     public name = Symbol.for("apply")
+    constructor() {
+        super("apply");
+    }
 }
 // Marker for `try` intrinsic proc
 export class TryProc extends IProcedure {
     public name = Symbol.for("try")
+    constructor() {
+        super("try");
+    }
 }
 // Marker for `call/cc` intrinsic proc
 export class CallCCProc extends IProcedure {
     public name = Symbol.for("call/cc")
+    constructor() {
+        super("call/cc");
+    }
 }
 
 // Stores all of our builtin funcs
