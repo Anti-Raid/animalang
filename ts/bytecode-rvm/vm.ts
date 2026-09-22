@@ -1,7 +1,22 @@
-import { BS, BSReader, ErrorObject, flattenDynamicArgs, Table, MissingVarError, IProcedure, type SerializableBytecode } from "../common";
-import { isTruthy } from "../common";
+import {
+    BS,
+    BSReader,
+    ErrorObject,
+    flattenDynamicArgs,
+    Table,
+    MissingVarError,
+    IProcedure,
+    isTruthy,
+    type SerializableBytecode,
+    type AbstractByteCode,
+    type AbstractClosure,
+    type AbstractVM
+} from "../common";
 import { Cons } from "../list";
-import { ApplyProc, BuiltinFunction, CallCCProc, IBUILTINS, TryProc } from "../std";
+import { ApplyProc, BuiltinFunction, CallCCProc, IBUILTINS, TryProc, type BuiltinCodeGenFn } from "../std";
+import { CodeEmitter } from "./code-emitter";
+
+export { CodeEmitter };
 
 export const BUILTINS_START = 2**31
 
@@ -14,9 +29,9 @@ export enum OpCode {
     LOADGLOBAL,
     SETGLOBAL,
     HASGLOBAL,
-    JIF, // jump if false
-    JIT, // jump if true
-    JUMP, // unconditional jump
+    IF,
+    ELSE,
+    ENDIF,
     CALL,
     TAILCALL,
     RETURN,
@@ -27,8 +42,10 @@ export enum OpCode {
     MOVE,
 }
 
-export class ByteCode implements SerializableBytecode {
+export class ByteCode implements AbstractByteCode {
     public bsid = "ByteCode"
+    public nativeFn: NativeFn | null = null;
+    public execCount: number = 0;
     constructor(public constants: any[], public inst: Uint32Array, public numReg: number) {}
     dump(bs: BS) {
         bs.writeU32Arr(this.inst)
@@ -81,7 +98,7 @@ export class ClosureTemplate implements SerializableBytecode {
 }
 
 /** An actual anima closure bound to a scope */
-export class Closure extends IProcedure implements SerializableBytecode {
+export class Closure extends IProcedure implements AbstractClosure {
     public bsid = "Closure"
     constructor(public tmpl: ClosureTemplate, public upvars: any[], debugName: string = "lambda") {
         super(debugName);
@@ -144,7 +161,7 @@ export class ExecutionContext {
     }
 }
 
-class VMContinuation extends IProcedure {
+export class VMContinuation extends IProcedure {
     constructor(
         public frame: Frame | null,
         public ctxId: number
@@ -154,6 +171,8 @@ class VMContinuation extends IProcedure {
 }
 
 export class Frame {
+    public deopted: boolean = false;
+
     constructor(
         public code: ByteCode,
         public regs: any[],
@@ -165,6 +184,12 @@ export class Frame {
         public epoch: number = 0,
         public debugName: string = "anonymous"
     ) {}
+
+    public deopt(ip: number): this {
+        this.deopted = true;
+        this.ip = ip;
+        return this;
+    }
 
     readNext() {
         if (this.ip >= this.code.inst.length) {
@@ -178,7 +203,9 @@ export class Frame {
     }
 
     thaw(ctx: ExecutionContext): Frame {
-        return new Frame(this.code, [...this.regs], this.upvars, this.ip, this.parent, this.retDestReg, this.trySpot, ctx.epoch, this.debugName);
+        const f = new Frame(this.code, [...this.regs], this.upvars, this.ip, this.parent, this.retDestReg, this.trySpot, ctx.epoch, this.debugName);
+        f.deopted = this.deopted;
+        return f;
     }
 
     share(ctx: ExecutionContext): this {
@@ -191,14 +218,18 @@ export class Frame {
     }
 }
 
-export class AnimaVM {
-    constructor(public steps: number = 0, public maxSteps: number = 0) {}
+export class AnimaVM implements AbstractVM {
+    readonly executor: VMExecutor;
+
+    constructor(public steps: number = 0, public maxSteps: number = 0) {
+        this.executor = new VMExecutor(this);
+    }
 
     public evaluateRaw(code: ByteCode, scope: Table, maxSteps?: number): any {
         const ctx = new ExecutionContext(this, scope, maxSteps);
-        let frame: Frame = this.#newFrame(ctx, code, createRegs(code.numReg), [], null, undefined, "top-level");
+        let frame: Frame = this.executor.newFrame(ctx, code, createRegs(code.numReg), [], null, undefined, "top-level");
         try {
-            return this.#execnext(ctx, frame);
+            return this.executor.execnext(ctx, frame);
         } catch (err: any) {
             const active = ctx.currentFrame ?? frame;
             console.log(`${err.stack}\n\nCurrent Frame [${active.debugName}] IP: ${active.ip}`)
@@ -208,25 +239,30 @@ export class AnimaVM {
 
     public evaluateClosure(code: Closure, scope: Table, args: any[], maxSteps?: number): any {
         const ctx = new ExecutionContext(this, scope, maxSteps);
-        const cargs = this.#createClosureArg(code.tmpl, args.length, args, 0);
+        const cargs = this.executor.createClosureArg(code.tmpl, args.length, args, 0);
         const debugName = code.debugName ?? "lambda";
-        let frame: Frame = this.#newFrame(ctx, code.tmpl.code, cargs, code.upvars, null, undefined, debugName);
+        let frame: Frame = this.executor.newFrame(ctx, code.tmpl.code, cargs, code.upvars, null, undefined, debugName);
         try {
-            return this.#execnext(ctx, frame);
+            return this.executor.execnext(ctx, frame);
         } catch (err: any) {
             const active = ctx.currentFrame ?? frame;
             console.log(`${err.stack}\n\nCurrent Frame [${active.debugName}] IP: ${active.ip}`)
             throw err
         }
     }
+}
 
-    #execnext(ctx: ExecutionContext, initialFrame: Frame) {
+/** Highly internal, actually evaluates JS code, all APIs here are private */
+class VMExecutor {
+    constructor(public vm: AnimaVM) {}
+
+    public execnext(ctx: ExecutionContext, initialFrame: Frame) {
         let frame: Frame | null = initialFrame;
 
         while(frame !== null) {
             ctx.currentFrame = frame;
             ctx.steps++;
-            this.steps++;
+            this.vm.steps++;
             if (ctx.maxSteps && ctx.steps > ctx.maxSteps) {
                 throw new Error(`Script ran for more than ${ctx.maxSteps} instructions.`);
             }
@@ -235,10 +271,19 @@ export class AnimaVM {
                 frame = frame.thaw(ctx);
                 ctx.currentFrame = frame;
             }
-            const regs = frame.regs
-            if (frame.ip >= frame.code.inst.length) {
-                throw new Error(`internal error: ${frame.ip} >= ${frame.code.inst.length}`)
+
+            if (!frame.deopted && frame.ip === 0) {
+                frame.code.execCount++;
+                if (frame.code.execCount > 1 && frame.code.nativeFn === null) {
+                    JITCompiler.compile(frame.code);
+                }
+                if (frame.code.nativeFn !== null) {
+                    frame = frame.code.nativeFn(ctx, frame, this.vm, this);
+                    continue;
+                }
             }
+
+            const regs = frame.regs
 
             try {
                 const opcode: OpCode = frame.readNext()
@@ -260,7 +305,7 @@ export class AnimaVM {
                     case OpCode.NEGATE: {
                         const reg = frame.readNext()
                         if (typeof regs[reg] !== "number") throw new Error("cannot negate non-number")
-                        regs[reg] = -1*regs[reg] 
+                        regs[reg] = -regs[reg] 
                         break
                     }
                     case OpCode.LOADUPVAR: {
@@ -299,25 +344,20 @@ export class AnimaVM {
                         }
                         break
                     }
-                    case OpCode.JIF: {
+                    case OpCode.IF: {
                         const condReg = frame.readNext()
-                        const jumpIdx = frame.readNext()
+                        const elseOffset = frame.readNext()
                         if (!isTruthy(regs[condReg])) {
-                            frame.ip = jumpIdx
+                            frame.ip = elseOffset
                         }
                         break
                     }
-                    case OpCode.JIT: {
-                        const condReg = frame.readNext()
-                        const jumpIdx = frame.readNext()
-                        if (isTruthy(regs[condReg])) {
-                            frame.ip = jumpIdx
-                        }
+                    case OpCode.ELSE: {
+                        const endOffset = frame.readNext()
+                        frame.ip = endOffset
                         break
                     }
-                    case OpCode.JUMP: {
-                        const jumpIdx = frame.readNext()
-                        frame.ip = jumpIdx
+                    case OpCode.ENDIF: {
                         break
                     }
                     case OpCode.NEWCLOSURE: {
@@ -365,7 +405,7 @@ export class AnimaVM {
                     case OpCode.RETURN: {
                         const reg = frame.readNext();
                         ctx.acc = regs[reg];
-                        frame = this.#setRetVal(ctx, frame.parent, ctx.acc);
+                        frame = this.setRetVal(ctx, frame.parent, ctx.acc);
                         break;
                     }
                     case OpCode.CALL: {
@@ -376,7 +416,7 @@ export class AnimaVM {
                         const nargs = frame.readNext();
 
                         frame.retDestReg = destReg;
-                        frame = this.#invoke(ctx, proc, frame, regs, startReg, nargs, false);
+                        frame = this.invoke(ctx, proc, frame, regs, startReg, nargs, false);
                         break;
                     }
                     case OpCode.TAILCALL: {
@@ -385,7 +425,7 @@ export class AnimaVM {
                         const startReg = frame.readNext();
                         const nargs = frame.readNext();
 
-                        frame = this.#invoke(ctx, proc, frame, regs, startReg, nargs, true);
+                        frame = this.invoke(ctx, proc, frame, regs, startReg, nargs, true);
                         break;
                     }
                     default:
@@ -394,7 +434,7 @@ export class AnimaVM {
             } catch (err) {
                 if (frame !== null && frame.trySpot !== undefined) {
                     ctx.acc = new ErrorObject(err);
-                    frame = this.#setRetVal(ctx, frame.trySpot, ctx.acc);
+                    frame = this.setRetVal(ctx, frame.trySpot, ctx.acc);
                     continue;
                 }
                 throw err;
@@ -404,7 +444,7 @@ export class AnimaVM {
         return ctx.acc;
     }
 
-    #invoke(
+    public invoke(
         ctx: ExecutionContext,
         proc: any,
         callerFrame: Frame,
@@ -419,49 +459,49 @@ export class AnimaVM {
         if (proc instanceof BuiltinFunction) {
             ctx.acc = proc.cb(callerArgs, startReg, nargs);
             const target = isTail ? callerFrame.parent : callerFrame;
-            return this.#setRetVal(ctx, target, ctx.acc);
+            return this.setRetVal(ctx, target, ctx.acc);
         } else if (proc instanceof Closure) {
-            const pregs = this.#createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
+            const pregs = this.createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
             const debugName = proc.debugName ?? "lambda";
             if (isTail && !callerFrame.isShared(ctx)) {
-                return this.#reuseFrame(callerFrame, proc.tmpl.code, pregs, proc.upvars, trySpot, debugName);
+                return this.reset(callerFrame, proc.tmpl.code, pregs, proc.upvars, trySpot, debugName);
             }
             const parent = isTail ? callerFrame.parent : callerFrame;
-            return this.#newFrame(ctx, proc.tmpl.code, pregs, proc.upvars, parent, trySpot, debugName);
+            return this.newFrame(ctx, proc.tmpl.code, pregs, proc.upvars, parent, trySpot, debugName);
         } else if (proc instanceof ApplyProc) {
             const actualProc = callerArgs[startReg];
             const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "apply");
-            return this.#invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, overrideTrySpot);
+            return this.invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, overrideTrySpot);
         } else if (proc instanceof TryProc) {
             const actualProc = callerArgs[startReg];
             const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "try");
             const trapFrame = isTail ? callerFrame.parent : callerFrame;
 
             try {
-                return this.#invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, trapFrame);
+                return this.invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, trapFrame);
             } catch (err) {
                 ctx.acc = new ErrorObject(err);
-                return this.#setRetVal(ctx, trapFrame, ctx.acc);
+                return this.setRetVal(ctx, trapFrame, ctx.acc);
             }
         } else if (proc instanceof CallCCProc) {
             callerFrame.share(ctx);
             const targetFrame = isTail ? callerFrame.parent : callerFrame;
             const vmCont = new VMContinuation(targetFrame, ctx.id);
             const userProc = callerArgs[startReg];
-            return this.#invoke(ctx, userProc, callerFrame, [vmCont], 0, 1, isTail);
+            return this.invoke(ctx, userProc, callerFrame, [vmCont], 0, 1, isTail, overrideTrySpot);
         } else if (proc instanceof VMContinuation) {
             if (proc.ctxId !== ctx.id) {
                 throw new Error("Cannot invoke a continuation across execution/FFI boundary");
             }
             if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
             ctx.acc = callerArgs[startReg];
-            return this.#setRetVal(ctx, proc.frame, ctx.acc);
+            return this.setRetVal(ctx, proc.frame, ctx.acc);
         } else {
             throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
         }
     }
 
-    #setRetVal(ctx: ExecutionContext, frame: Frame | null, val: any): Frame | null {
+    public setRetVal(ctx: ExecutionContext, frame: Frame | null, val: any): Frame | null {
         if (frame !== null && frame.retDestReg !== -1) {
             if (frame.isShared(ctx)) {
                 frame = frame.thaw(ctx);
@@ -472,7 +512,7 @@ export class AnimaVM {
         return frame;
     }
 
-    #newFrame(
+    public newFrame(
         ctx: ExecutionContext,
         code: ByteCode,
         regs: any[],
@@ -484,7 +524,7 @@ export class AnimaVM {
         return new Frame(code, regs, upvars, 0, parent, -1, trySpot, ctx.epoch, debugName);
     }
 
-    #reuseFrame(
+    public reset(
         frame: Frame,
         code: ByteCode,
         regs: any[],
@@ -499,10 +539,11 @@ export class AnimaVM {
         frame.retDestReg = -1;
         frame.trySpot = trySpot;
         frame.debugName = debugName;
+        frame.deopted = false;
         return frame;
     }
 
-    #createClosureArg(template: ClosureTemplate, nargs: number, args: any[], startOffset: number) {
+    public createClosureArg(template: ClosureTemplate, nargs: number, args: any[], startOffset: number) {
         const arity = template.params.length; // number of required args
         if (template.remParams !== null) {
             // variadic
@@ -532,5 +573,354 @@ export class AnimaVM {
         }
 
         return closureRegs
+    }
+
+    public callJit(
+        ctx: ExecutionContext,
+        proc: any,
+        callerFrame: Frame,
+        callerArgs: any[],
+        startReg: number,
+        nargs: number,
+        destReg: number
+    ): boolean {
+        if (proc instanceof BuiltinFunction) {
+            callerFrame.regs[destReg] = proc.cb(callerArgs, startReg, nargs);
+            ctx.acc = callerFrame.regs[destReg];
+            return true;
+        }
+
+        if (proc instanceof Closure) {
+            callerFrame.retDestReg = destReg;
+            const calleeFrame = this.invoke(ctx, proc, callerFrame, callerArgs, startReg, nargs, false);
+            if (calleeFrame === null) return false;
+
+            if (proc.tmpl.code.nativeFn === null) {
+                proc.tmpl.code.execCount++;
+                if (proc.tmpl.code.execCount > 1) {
+                    JITCompiler.compile(proc.tmpl.code);
+                }
+            }
+
+            if (proc.tmpl.code.nativeFn !== null) {
+                const resFrame = proc.tmpl.code.nativeFn(ctx, calleeFrame, this.vm, this);
+                if (resFrame === callerFrame) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+}
+
+type NativeFn = (
+    ctx: ExecutionContext,
+    frame: Frame,
+    vm: AnimaVM,
+    executor: VMExecutor
+) => Frame | null;
+
+const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
+    [OpCode.ENDIF]: 1,
+    [OpCode.NEGATE]: 2,
+    [OpCode.HASGLOBAL]: 2,
+    [OpCode.ELSE]: 2,
+    [OpCode.RETURN]: 2,
+    [OpCode.LOADCONST]: 3,
+    [OpCode.LOADU32]: 3,
+    [OpCode.LOADGLOBAL]: 3,
+    [OpCode.SETGLOBAL]: 3,
+    [OpCode.IF]: 3,
+    [OpCode.NEWCLOSURE]: 3,
+    [OpCode.BOX]: 3,
+    [OpCode.UNBOX]: 3,
+    [OpCode.SETBOX]: 3,
+    [OpCode.MOVE]: 3,
+    [OpCode.LOADUPVAR]: 4,
+    [OpCode.SETUPVAR]: 4,
+    [OpCode.TAILCALL]: 4,
+    [OpCode.CALL]: 5,
+};
+
+export class JITCompiler {
+    public static getBuiltinFunctionCodeGen(procIdx: number): BuiltinCodeGenFn | null {
+        if (procIdx >= BUILTINS_START) {
+            const builtin = IBUILTINS[procIdx - BUILTINS_START];
+            if (builtin instanceof BuiltinFunction && builtin.codeGenFn) {
+                return builtin.codeGenFn;
+            }
+        }
+        return null;
+    }
+
+    public static compile(code: ByteCode): NativeFn {
+        const fn = this.generateFunction(code);
+        code.nativeFn = fn;
+        return fn;
+    }
+
+    public static generateFunction(code: ByteCode): NativeFn {
+        const source = this.generateSource(code);
+        console.log(`[JIT Compiled Function]:\n${source}\n`);
+        const factory = new Function(
+            "IBUILTINS",
+            "BUILTINS_START",
+            "isTruthy",
+            "Box",
+            "ErrorObject",
+            "MissingVarError",
+            "Closure",
+            source
+        );
+        return factory(
+            IBUILTINS,
+            BUILTINS_START,
+            isTruthy,
+            Box,
+            ErrorObject,
+            MissingVarError,
+            Closure
+        );
+    }
+
+    public static generateSource(code: ByteCode): string {
+        const inst = code.inst;
+        const out = new CodeEmitter();
+        let ip = 0;
+
+        out.emit(`
+            return function(ctx, frame, vm, executor) {
+                const regs = frame.regs;
+                const upvars = frame.upvars;
+                const constants = frame.code.constants;
+                try {
+        `);
+
+        while (ip < inst.length) {
+            const opIp = ip;
+            const opcode: OpCode = inst[ip++];
+            switch (opcode) {
+                case OpCode.LOADCONST: {
+                    const destReg = inst[ip++];
+                    const constIdx = inst[ip++];
+                    out.emit(`regs[${destReg}] = constants[${constIdx}];`);
+                    break;
+                }
+                case OpCode.LOADU32: {
+                    const destReg = inst[ip++];
+                    const u32Val = inst[ip++];
+                    out.emit(`regs[${destReg}] = ${u32Val};`);
+                    break;
+                }
+                case OpCode.NEGATE: {
+                    const reg = inst[ip++];
+                    out.emit(`
+                        if (typeof regs[${reg}] !== "number") {
+                            frame.ip = ${opIp};
+                            throw new Error("cannot negate non-number");
+                        }
+                        regs[${reg}] = -regs[${reg}];
+                    `);
+                    break;
+                }
+                case OpCode.LOADUPVAR: {
+                    const destReg = inst[ip++];
+                    const upvarIdx = inst[ip++];
+                    const andUnbox = inst[ip++];
+                    if (andUnbox) {
+                        out.emit(`regs[${destReg}] = (upvars[${upvarIdx}]).val;`);
+                    } else {
+                        out.emit(`regs[${destReg}] = upvars[${upvarIdx}];`);
+                    }
+                    break;
+                }
+                case OpCode.SETUPVAR: {
+                    const srcReg = inst[ip++];
+                    const upvarIdx = inst[ip++];
+                    const andBox = inst[ip++];
+                    if (andBox) {
+                        out.emit(`upvars[${upvarIdx}] = new Box(regs[${srcReg}]);`);
+                    } else {
+                        out.emit(`upvars[${upvarIdx}] = regs[${srcReg}];`);
+                    }
+                    break;
+                }
+                case OpCode.LOADGLOBAL: {
+                    const destReg = inst[ip++];
+                    const symConstIdx = inst[ip++];
+                    out.emit(`
+                        {
+                            const varname = constants[${symConstIdx}];
+                            if (!ctx.scope.has(varname)) {
+                                frame.ip = ${opIp};
+                                throw new MissingVarError("Variable '" + String(varname) + "' is not defined in the current scope.");
+                            }
+                            regs[${destReg}] = ctx.scope.get(varname);
+                        }
+                    `);
+                    break;
+                }
+                case OpCode.SETGLOBAL: {
+                    const srcReg = inst[ip++];
+                    const symConstIdx = inst[ip++];
+                    out.emit(`ctx.scope.set(constants[${symConstIdx}], regs[${srcReg}]);`);
+                    break;
+                }
+                case OpCode.HASGLOBAL: {
+                    const symConstIdx = inst[ip++];
+                    out.emit(`
+                        {
+                            const varname = constants[${symConstIdx}];
+                            if (!ctx.scope.has(varname)) {
+                                frame.ip = ${opIp};
+                                throw new MissingVarError("Variable '" + String(varname) + "' is not defined in the current scope.");
+                            }
+                        }
+                    `);
+                    break;
+                }
+                case OpCode.IF: {
+                    const condReg = inst[ip++];
+                    const elseOffset = inst[ip++];
+                    out.emit(`if (isTruthy(regs[${condReg}])) {`);
+                    break;
+                }
+                case OpCode.ELSE: {
+                    const endOffset = inst[ip++];
+                    out.emit(`} else {`);
+                    break;
+                }
+                case OpCode.ENDIF: {
+                    out.emit(`}`);
+                    break;
+                }
+                case OpCode.BOX: {
+                    const destReg = inst[ip++];
+                    const srcReg = inst[ip++];
+                    out.emit(`regs[${destReg}] = new Box(regs[${srcReg}]);`);
+                    break;
+                }
+                case OpCode.UNBOX: {
+                    const destReg = inst[ip++];
+                    const srcReg = inst[ip++];
+                    out.emit(`regs[${destReg}] = (regs[${srcReg}]).val;`);
+                    break;
+                }
+                case OpCode.SETBOX: {
+                    const destReg = inst[ip++];
+                    const srcReg = inst[ip++];
+                    out.emit(`(regs[${destReg}]).val = regs[${srcReg}];`);
+                    break;
+                }
+                case OpCode.MOVE: {
+                    const destReg = inst[ip++];
+                    const srcReg = inst[ip++];
+                    out.emit(`regs[${destReg}] = regs[${srcReg}];`);
+                    break;
+                }
+                case OpCode.NEWCLOSURE: {
+                    const destReg = inst[ip++];
+                    const tidx = inst[ip++];
+                    out.emit(`
+                        {
+                            const template = constants[${tidx}];
+                            const closure = Closure.fromTemplate(template);
+                            for (let i = 0; i < template.upvarLocs.length; i++) {
+                                const loc = template.upvarLocs[i];
+                                closure.upvars[i] = loc.local ? regs[loc.index] : upvars[loc.index];
+                            }
+                            regs[${destReg}] = closure;
+                        }
+                    `);
+                    break;
+                }
+                case OpCode.CALL: {
+                    const procIdx = inst[ip++];
+                    const destReg = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    const codeGenFn = this.getBuiltinFunctionCodeGen(procIdx);
+                    if (codeGenFn) {
+                        out.emit(`frame.ip = ${opIp};`);
+                        const res = codeGenFn(out, startReg, nargs, destReg);
+                        if (typeof res === "string") {
+                            out.emit(`regs[${destReg}] = ${res};`);
+                            out.emit(`ctx.acc = regs[${destReg}];`);
+                            break;
+                        } else if (res === undefined) {
+                            out.emit(`ctx.acc = regs[${destReg}];`);
+                            break;
+                        }
+                    }
+                    out.emit(`
+                        {
+                            const proc = (${procIdx} < BUILTINS_START) ? regs[${procIdx}] : IBUILTINS[${procIdx} - BUILTINS_START];
+                            frame.ip = ${opIp};
+                            if (!executor.callJit(ctx, proc, frame, regs, ${startReg}, ${nargs}, ${destReg})) {
+                                return frame.deopt(${opIp});
+                            }
+                        }
+                    `);
+                    break;
+                }
+                case OpCode.TAILCALL: {
+                    const procIdx = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    const codeGenFn = this.getBuiltinFunctionCodeGen(procIdx);
+                    if (codeGenFn) {
+                        out.emit(`frame.ip = ${opIp};`);
+                        const res = codeGenFn(out, startReg, nargs);
+                        if (typeof res === "string") {
+                            out.emit(`ctx.acc = ${res};`);
+                            out.emit(`return executor.setRetVal(ctx, frame.parent, ctx.acc);`);
+                            break;
+                        } else if (res === undefined) {
+                            out.emit(`return executor.setRetVal(ctx, frame.parent, ctx.acc);`);
+                            break;
+                        }
+                    }
+                    out.emit(`
+                        {
+                            const proc = (${procIdx} < BUILTINS_START) ? regs[${procIdx}] : IBUILTINS[${procIdx} - BUILTINS_START];
+                            frame.ip = ${opIp};
+                            return executor.invoke(ctx, proc, frame, regs, ${startReg}, ${nargs}, true);
+                        }
+                    `);
+                    break;
+                }
+                case OpCode.RETURN: {
+                    const reg = inst[ip++];
+                    out.emit(`
+                        ctx.acc = regs[${reg}];
+                        return executor.setRetVal(ctx, frame.parent, ctx.acc);
+                    `);
+                    break;
+                }
+                default: {
+                    out.emit(`return frame.deopt(${opIp});`);
+                    const len = INSTRUCTION_LENGTHS[opcode] ?? 1;
+                    ip = opIp + len;
+                    break;
+                }
+            }
+        }
+
+        out.emit(`
+                    return null;
+                } catch (err) {
+                    if (frame !== null && frame.trySpot !== undefined) {
+                        ctx.acc = new ErrorObject(err);
+                        return executor.setRetVal(ctx, frame.trySpot, ctx.acc);
+                    }
+                    throw err;
+                }
+            };
+        `);
+
+        return out.toString();
     }
 }

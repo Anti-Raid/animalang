@@ -2,7 +2,7 @@
 import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, ASPParseError, BS, BSReader } from './common';
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
-import { ByteCode, AnimaVM } from './bytecode-rvm/vm';
+import { ByteCode, AnimaVM, JITCompiler, OpCode } from './bytecode-rvm/vm';
 import { Anima } from './anima';
 import { impl } from './bytecode-rvm/meta';
 
@@ -1610,6 +1610,282 @@ describe('Floats, Infinities & NaNs', () => {
         expect(s.stringify(evaluator.evaluateRaw(deserializedFloatBc))).toBe("3.75");
     });
 });
+
+describe("JIT Compiler Runtime Compilation & Execution", () => {
+    const animaScope = () => {
+        const anima = new Anima(impl);
+        return anima.scope;
+    };
+
+    it("compiles functions executed more than once (warm-up trigger)", () => {
+        const anima = new Anima(impl);
+        const code = anima.compileRaw(`
+            (define (double x) (+ x x))
+            double
+        `);
+        const doubleClosure = anima.evaluateRaw(code);
+        const fnCode = doubleClosure.tmpl.code as ByteCode;
+
+        expect(fnCode.execCount).toBe(0);
+        expect(fnCode.nativeFn).toBeNull();
+
+        // Execution 1: runs in interpreter, warm-up count increases
+        const res1 = anima.evaluateClosure(doubleClosure, [21]);
+        expect(res1).toBe(42);
+        expect(fnCode.execCount).toBe(1);
+        expect(fnCode.nativeFn).toBeNull();
+
+        // Execution 2: triggers JIT compilation at runtime!
+        const res2 = anima.evaluateClosure(doubleClosure, [50]);
+        expect(res2).toBe(100);
+        expect(fnCode.execCount).toBe(2);
+        expect(fnCode.nativeFn).not.toBeNull();
+        expect(typeof fnCode.nativeFn).toBe("function");
+
+        // Execution 3: executes with nativeFn already compiled
+        const res3 = anima.evaluateClosure(doubleClosure, [100]);
+        expect(res3).toBe(200);
+        expect(fnCode.execCount).toBe(3);
+        expect(fnCode.nativeFn).not.toBeNull();
+    });
+
+    it("executes straight-line native opcodes (LOADU32, MOVE, RETURN) completely natively", () => {
+        const anima = new Anima(impl);
+        // A pure straight-line function: (lambda (x) x)
+        const code = anima.compileRaw(`(lambda (x) x)`);
+        const idClosure = anima.evaluateRaw(code);
+        const fnCode = idClosure.tmpl.code as ByteCode;
+
+        // Compile it directly or warm it up
+        expect(fnCode.nativeFn).toBeNull();
+        anima.evaluateClosure(idClosure, [42]);
+        expect(fnCode.execCount).toBe(1);
+
+        // 2nd run compiles and executes natively
+        const res = anima.evaluateClosure(idClosure, [999]);
+        expect(res).toBe(999);
+        expect(fnCode.nativeFn).not.toBeNull();
+
+        // 3rd run natively
+        expect(anima.evaluateClosure(idClosure, ["hello"])).toBe("hello");
+    });
+
+    it("executes LOADCONST and NEGATE natively with type error handling", () => {
+        // Construct custom bytecode:
+        // 0: LOADCONST r1, 42
+        // 3: NEGATE r1
+        // 5: RETURN r1
+        const inst = new Uint32Array([
+            OpCode.LOADCONST, 1, 0,
+            OpCode.NEGATE, 1,
+            OpCode.RETURN, 1
+        ]);
+        const bc = new ByteCode([42], inst, 3);
+        const nativeFn = JITCompiler.compile(bc);
+        expect(nativeFn).toBeDefined();
+
+        const vm = new AnimaVM();
+        const res = vm.evaluateRaw(bc, animaScope());
+        expect(res).toBe(-42);
+
+        // Non-number negate throws error
+        const badInst = new Uint32Array([
+            OpCode.LOADCONST, 1, 0,
+            OpCode.NEGATE, 1,
+            OpCode.RETURN, 1
+        ]);
+        const badBc = new ByteCode(["not a number"], badInst, 3);
+        JITCompiler.compile(badBc);
+        expect(() => vm.evaluateRaw(badBc, animaScope())).toThrow(/cannot negate non-number/);
+    });
+
+    it("executes BOX, UNBOX, and SETBOX natively", () => {
+        // 0: LOADU32 r1, 100
+        // 3: BOX r2, r1
+        // 6: LOADU32 r3, 200
+        // 9: SETBOX r2, r3
+        // 12: UNBOX r4, r2
+        // 15: RETURN r4
+        const inst = new Uint32Array([
+            OpCode.LOADU32, 1, 100,
+            OpCode.BOX, 2, 1,
+            OpCode.LOADU32, 3, 200,
+            OpCode.SETBOX, 2, 3,
+            OpCode.UNBOX, 4, 2,
+            OpCode.RETURN, 4
+        ]);
+        const bc = new ByteCode([], inst, 5);
+        JITCompiler.compile(bc);
+
+        const vm = new AnimaVM();
+        expect(vm.evaluateRaw(bc, animaScope())).toBe(200);
+    });
+
+    it("executes LOADGLOBAL and SETGLOBAL natively", () => {
+        const mySym = Symbol.for("jit-global-var");
+        // 0: LOADU32 r1, 777
+        // 3: SETGLOBAL r1, const(mySym)
+        // 6: LOADGLOBAL r2, const(mySym)
+        // 9: RETURN r2
+        const inst = new Uint32Array([
+            OpCode.LOADU32, 1, 777,
+            OpCode.SETGLOBAL, 1, 0,
+            OpCode.LOADGLOBAL, 2, 0,
+            OpCode.RETURN, 2
+        ]);
+        const bc = new ByteCode([mySym], inst, 3);
+        JITCompiler.compile(bc);
+
+        const vm = new AnimaVM();
+        const scope = animaScope();
+        expect(vm.evaluateRaw(bc, scope)).toBe(777);
+        expect(scope.get(mySym)).toBe(777);
+    });
+
+    it("deoptimizes cleanly to interpreter on unhandled opcodes", () => {
+        // Function with straight-line ops followed by an unhandled opcode:
+        // 0: LOADU32 r1, 50
+        // 3: LOADU32 r2, 60
+        // 6: CALL IBUILTIN(+) dest=r0, start=r1, nargs=2 (CALL is unhandled in JIT Phase 1)
+        // 11: RETURN r0
+        const plusSym = Symbol.for("+");
+        const inst = new Uint32Array([
+            OpCode.LOADU32, 1, 50,
+            OpCode.LOADU32, 2, 60,
+            OpCode.CALL, (2**31), 0, 1, 2,
+            OpCode.RETURN, 0
+        ]);
+        const bc = new ByteCode([], inst, 4);
+
+        // Compile it with JIT
+        JITCompiler.compile(bc);
+        expect(bc.nativeFn).not.toBeNull();
+
+        const vm = new AnimaVM();
+        // Evaluating this will run native code for LOADU32 r1, 50 and LOADU32 r2, 60,
+        // then hit deopt(6) at CALL, drop to interpreter, and execute CALL and RETURN!
+        const res = vm.evaluateRaw(bc, animaScope());
+        expect(res).toBe(110);
+    });
+
+    it("executes IF, ELSE, ENDIF control flow completely natively without deoptimizing", () => {
+        const anima = new Anima(impl);
+        const code = anima.compileRaw(`
+            (define (my-branch c a b)
+                (if c a b))
+            my-branch
+        `);
+        const branchClosure = anima.evaluateRaw(code);
+        const fnCode = branchClosure.tmpl.code as ByteCode;
+
+        // Run 1 in interpreter
+        expect(anima.evaluateClosure(branchClosure, [true, 10, 20])).toBe(10);
+        expect(fnCode.execCount).toBe(1);
+        expect(fnCode.nativeFn).toBeNull();
+
+        // Run 2 triggers JIT compilation!
+        expect(anima.evaluateClosure(branchClosure, [false, 10, 20])).toBe(20);
+        expect(fnCode.execCount).toBe(2);
+        expect(fnCode.nativeFn).not.toBeNull();
+
+        // Run 3 executes natively through true branch
+        expect(anima.evaluateClosure(branchClosure, [true, 99, 100])).toBe(99);
+
+        // Run 4 executes natively through false branch
+        expect(anima.evaluateClosure(branchClosure, [false, 99, 100])).toBe(100);
+    });
+
+    it("executes nested IF, ELSE, ENDIF completely natively", () => {
+        const anima = new Anima(impl);
+        const code = anima.compileRaw(`
+            (define (classify a b)
+                (if a
+                    (if b "both" "only-a")
+                    (if b "only-b" "neither")))
+            classify
+        `);
+        const fnClosure = anima.evaluateRaw(code);
+        const fnCode = fnClosure.tmpl.code as ByteCode;
+
+        // Run 1
+        expect(anima.evaluateClosure(fnClosure, [true, true])).toBe("both");
+
+        // Run 2: compiles!
+        expect(anima.evaluateClosure(fnClosure, [true, false])).toBe("only-a");
+        expect(fnCode.nativeFn).not.toBeNull();
+
+        // Further runs execute natively
+        expect(anima.evaluateClosure(fnClosure, [false, true])).toBe("only-b");
+        expect(anima.evaluateClosure(fnClosure, [false, false])).toBe("neither");
+    });
+
+    it("executes TAILCALL recursively in JIT without stack overflow", () => {
+        const anima = new Anima(impl);
+        const code = anima.compileRaw(`
+            (define (sum-loop n acc)
+                (if (= n 0)
+                    acc
+                    (sum-loop (- n 1) (+ acc n))))
+            sum-loop
+        `);
+        const loopClosure = anima.evaluateRaw(code);
+        const fnCode = loopClosure.tmpl.code as ByteCode;
+
+        // Run 1 in interpreter
+        expect(anima.evaluateClosure(loopClosure, [5, 0])).toBe(15);
+
+        // Run 2: compiles and executes natively!
+        expect(anima.evaluateClosure(loopClosure, [1000, 0])).toBe(500500);
+        expect(fnCode.nativeFn).not.toBeNull();
+
+        // Run 3: large iteration count to verify TCO in JIT
+        expect(anima.evaluateClosure(loopClosure, [5000, 0])).toBe(12502500);
+    });
+
+    it("executes non-tail CALL to user closures natively via callJit", () => {
+        const anima = new Anima(impl);
+        const code = anima.compileRaw(`
+            (define (square x) (* x x))
+            (define (sum-of-squares a b)
+                (+ (square a) (square b)))
+            sum-of-squares
+        `);
+        const sumSqClosure = anima.evaluateRaw(code);
+        const fnCode = sumSqClosure.tmpl.code as ByteCode;
+
+        // Run 1
+        expect(anima.evaluateClosure(sumSqClosure, [3, 4])).toBe(25);
+
+        // Run 2: compiles!
+        expect(anima.evaluateClosure(sumSqClosure, [5, 12])).toBe(169);
+        expect(fnCode.nativeFn).not.toBeNull();
+
+        // Run 3: executes natively
+        expect(anima.evaluateClosure(sumSqClosure, [6, 8])).toBe(100);
+    });
+
+    it("deoptimizes cleanly on CALL with call/cc", () => {
+        const anima = new Anima(impl);
+        const code = anima.compileRaw(`
+            (define (test-callcc x)
+                (+ x (call/cc (lambda (k) (+ 10 (k 5))))))
+            test-callcc
+        `);
+        const fnClosure = anima.evaluateRaw(code);
+        const fnCode = fnClosure.tmpl.code as ByteCode;
+
+        // Run 1
+        expect(anima.evaluateClosure(fnClosure, [100])).toBe(105);
+
+        // Run 2: compiles JIT, encounters call/cc, deoptimizes cleanly and completes!
+        expect(anima.evaluateClosure(fnClosure, [200])).toBe(205);
+        expect(fnCode.nativeFn).not.toBeNull();
+
+        // Run 3
+        expect(anima.evaluateClosure(fnClosure, [300])).toBe(305);
+    });
+});
+
 
 /*
 const TEST_PROG = `

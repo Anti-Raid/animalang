@@ -125,18 +125,17 @@ export class Compiler {
         // we place the bytecode as <jumpiffalse [false code]><true code><jump [|]><false code>|
         const falseLabel = new JumpLabel()
         const endLabel = new JumpLabel()
-        opts.nodes.push({t: "CondJump", cond: "False", label: falseLabel, reg: condReg})
+        opts.nodes.push({t: "If", reg: condReg, elseLabel: falseLabel})
         opts.scope.freeTemp(condReg) // we can free the reg here
         // Place true code
         this.#compile(thenExpr, opts)
-        // Place jump to end
-        if (!this.#nodesEndsInRet(opts.nodes)) {
-            opts.nodes.push({t: "Jump", label: endLabel})
-        }
+        // Place else separator
+        opts.nodes.push({t: "Else", endLabel})
         // Place false code as well as jump to start of false code
         opts.nodes.push({t:"Label", label: falseLabel})
         this.#compile(elseExpr, opts)
-        // Fix jump to end to now jump to after false code
+        // Place EndIf and end label
+        opts.nodes.push({t: "EndIf"})
         opts.nodes.push({t: "Label", label: endLabel})
     }
 

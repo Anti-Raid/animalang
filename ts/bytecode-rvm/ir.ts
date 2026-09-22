@@ -42,13 +42,14 @@ export type Node = {
     t: "Label",
     label: JumpLabel
 } | {
-    t: "CondJump", // internally specializes into JUMPIFTRUE or JUMPIFFALSE instructions later on during emission
+    t: "If",
     reg: number,
-    label: JumpLabel,
-    cond: JumpCond
+    elseLabel: JumpLabel,
 } | {
-    t: "Jump",
-    label: JumpLabel
+    t: "Else",
+    endLabel: JumpLabel,
+} | {
+    t: "EndIf",
 } | {
     t: "Call",
     procReg: number,
@@ -155,14 +156,18 @@ export class IR {
                     resolvedLabels.set(node.label, inst.length)
                     break
                 }
-                case "CondJump": {
-                    const jidx = inst.push(node.cond === "False" ? OpCode.JIF : OpCode.JIT, node.reg, -1) - 1
-                    jumpIdxs.set(jidx, node.label)
+                case "If": {
+                    const jidx = inst.push(OpCode.IF, node.reg, -1) - 1
+                    jumpIdxs.set(jidx, node.elseLabel)
                     break
                 }
-                case "Jump": {
-                    const jidx = inst.push(OpCode.JUMP, -1) - 1
-                    jumpIdxs.set(jidx, node.label)
+                case "Else": {
+                    const jidx = inst.push(OpCode.ELSE, -1) - 1
+                    jumpIdxs.set(jidx, node.endLabel)
+                    break
+                }
+                case "EndIf": {
+                    inst.push(OpCode.ENDIF)
                     break
                 }
                 case "Call": {

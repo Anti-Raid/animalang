@@ -28,7 +28,7 @@ const constToString = (s: any): string => {
         return `fn(${s.params.map(x => constToString(x)).join(', ')}${s.remParams ? ` . ${constToString(s.remParams)}` : ""})`
     } else if (s instanceof Closure) {
         return `c.fn(${s.tmpl.params.map(x => constToString(x)).join(', ')}${s.tmpl.remParams ? ` . ${constToString(s.tmpl.remParams)}` : ""})`
-    } {
+    } else {
         return `<unknown:${s}>`
     }
 }
@@ -47,11 +47,6 @@ const stringifyInst = (inst: ByteCode): string[] => {
         switch (opcode) {
             case OpCode.RETURN:
                 line += `${padOp("RETURN")} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-                
-            case OpCode.JUMP:
-                line += `${padOp("JUMP")} #${inst.inst[idx + 1]}`; 
                 idx += 2;
                 break;
 
@@ -111,10 +106,19 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 3;
                 continue
 
-            case OpCode.JIF:
-            case OpCode.JIT:
-                line += `${padOp(OpCode[opcode])} r${inst.inst[idx + 1]}, #${inst.inst[idx + 2]}`;
+            case OpCode.IF:
+                line += `${padOp("IF")} r${inst.inst[idx + 1]}, else=#${inst.inst[idx + 2]}`;
                 idx += 3;
+                break;
+
+            case OpCode.ELSE:
+                line += `${padOp("ELSE")} end=#${inst.inst[idx + 1]}`;
+                idx += 2;
+                break;
+
+            case OpCode.ENDIF:
+                line += `${padOp("ENDIF")}`;
+                idx += 1;
                 break;
 
             case OpCode.TAILCALL: {
