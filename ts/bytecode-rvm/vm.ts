@@ -1,9 +1,5 @@
 import { Table, type AbstractVM } from "../common";
-import { ByteCode, Closure, ClosureTemplate, createRegs } from "./bytecodedef";
-import { CodeEmitter } from "./code-emitter";
-import { JITCompiler } from "./jit";
-import { ExecutionContext, Frame, VMContinuation, VMExecutor } from "./core";
-import { BytecodeInterpreter } from "./interp";
+import { OpCode, CodeEmitter, JITCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, createRegs } from "./exec";
 
 export {
     CodeEmitter,
@@ -13,9 +9,9 @@ export {
     VMContinuation,
     VMExecutor,
     BytecodeInterpreter,
+    ByteCode,
+    OpCode
 };
-
-export * from "./bytecodedef";
 
 export type ExecutionMode = "interp" | "aot";
 
@@ -47,7 +43,8 @@ export class AnimaVM implements AbstractVM {
             compileAot(code);
         }
         const ctx = new ExecutionContext(this, scope);
-        const frame: Frame = this.executor.newFrame(ctx, code, createRegs(code.numReg), [], null, "top-level");
+        const topClosure = new Closure(new ClosureTemplate([], null, code, []), [], "top-level");
+        const frame: Frame = this.executor.newFrame(ctx, topClosure, createRegs(code.numReg), null);
         try {
             if (this.mode === "aot") {
                 return this.executor.execAot(ctx, frame);
@@ -67,8 +64,7 @@ export class AnimaVM implements AbstractVM {
         }
         const ctx = new ExecutionContext(this, scope);
         const cargs = this.executor.createClosureArg(code.tmpl, args.length, args, 0);
-        const debugName = code.debugName ?? "lambda";
-        const frame: Frame = this.executor.newFrame(ctx, code.tmpl.code, cargs, code.upvars, null, debugName);
+        const frame: Frame = this.executor.newFrame(ctx, code, cargs, null);
         try {
             if (this.mode === "aot") {
                 return this.executor.execAot(ctx, frame);

@@ -1,7 +1,10 @@
 import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
-import { CodeEmitter } from "./bytecode-rvm/code-emitter";
+
+export type CodeEmitter = {
+    emit: (str: string) => void
+}
 
 export type BuiltinCodeGenFn = (
     emitter: CodeEmitter,

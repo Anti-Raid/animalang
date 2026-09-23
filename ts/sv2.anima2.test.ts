@@ -9,7 +9,7 @@ import { impl, implAot } from './bytecode-rvm/meta';
 const vmImpl = impl
 const bcCache: Record<string, AbstractByteCode> = {}
 describe('Anima', () => {
-    let evaluator = new Anima(vmImpl)
+    let evaluator = new Anima(implAot)
     let s = new ASTStringifier()
     evaluator.scope.set(Symbol.for("port"), 8080)
     evaluator.scope.set(Symbol.for("protocol"), "tcp")

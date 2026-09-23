@@ -1,4 +1,4 @@
-import type { UpVarLoc } from "./vm";
+import type { UpVarLoc } from "./exec";
 
 export type Resolve = { type: "Global" } | { type: "Local", index: number } | { type: "Upvar", index: number }
 

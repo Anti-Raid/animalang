@@ -1,6 +1,6 @@
 import { BS, BSReader, type SerializableBytecode } from "../common"
 import { IBUILTINS } from "../std"
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode } from "./vm"
+import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode } from "./exec"
 
 const constToString = (s: any): string => {
     if (s === null) {

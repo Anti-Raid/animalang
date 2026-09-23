@@ -1,5 +1,5 @@
 import { ConstPool } from "../common";
-import { ByteCode, Closure, ClosureTemplate, OpCode, type UpVarLoc } from "./vm";
+import { ByteCode, Closure, ClosureTemplate, OpCode, type UpVarLoc } from "./exec";
 
 let nextLabelId = 0;
 
