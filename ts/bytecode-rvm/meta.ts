@@ -5,7 +5,14 @@ import { AnimaVM, ByteCode } from "./vm";
 
 export const impl: AnimaMeta = {
     id: "rvm",
-    vm: (maxSteps: number) => new AnimaVM(0, maxSteps),
+    vm: () => new AnimaVM("interp"),
     compiler: () => new Compiler(),
     deepPrint: (bc) => deepPrint(bc as ByteCode)
-}
+};
+
+export const implAot: AnimaMeta = {
+    id: "rvm-aot",
+    vm: () => new AnimaVM("aot"),
+    compiler: () => new Compiler(),
+    deepPrint: (bc) => deepPrint(bc as ByteCode)
+};
