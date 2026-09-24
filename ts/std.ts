@@ -1,4 +1,4 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
+import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, packValues, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
 import { ARITHMETIC, opCons, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "./ops";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
@@ -22,6 +22,7 @@ export class BuiltinFunction extends IProcedure {
 
 export const IBUILTINS: BuiltinFunction[] = [
     ...ARITHMETIC.map(([name, fn]) => new BuiltinFunction(Symbol.for(name), fn)),
+    new BuiltinFunction(Symbol.for("values"), (regs, startReg, nargs) => packValues(regs.slice(startReg, startReg + nargs))),
     new BuiltinFunction(Symbol.for("eqv?"), (regs, startReg, nargs) => {
         // DEVIATION: normal scheme requires arity 2, anima extends this to arity >=1
         if (nargs === 0) throw new Error("eqv? requires at least 1 argument");
@@ -379,6 +380,11 @@ export const stdPreludeScope = () => new Table()
 
 export const STD_PRELUDE = `
 (define $list (lambda args args))
+(define $coroutine-create (lambda (proc) (%coroutine-create proc)))
+(define $coroutine-resume (lambda (co . vals) (%coroutine-resume-list co vals)))
+(define $coroutine-yield (lambda vals (%coroutine-yield-list vals)))
+(define $call-with-values (lambda (producer consumer) (apply consumer (%values->list (producer)))))
+(define $coroutine-status (lambda (co) (%coroutine-status co)))
 
 
 (let ((apply-proc #f)
@@ -422,40 +428,40 @@ export const STD_PRELUDE = `
     (lambda (before thunk after)
         (%dynamic-wind before thunk after)))
 
-(let ((current-handlers '())
-      (raise-proc #f)
+(let ((raise-proc #f)
       (with-ex-handler-proc #f)
       (raise-cont-proc #f)
       (try-proc #f))
     (set! raise-proc
         (lambda (obj)
-            (if (null? current-handlers)
-                (unhandled-error obj)
-                (let ((h (car current-handlers)))
-                    (set! current-handlers (cdr current-handlers))
-                    (h obj)
-                    (raise-proc (make-error-object "handler returned on non-continuable exception"))))))
+            (let ((hs (%handlers)))
+                (if (null? hs)
+                    (unhandled-error obj)
+                    (begin
+                        (%set-handlers! (cdr hs))
+                        ((car hs) obj)
+                        (raise-proc (make-error-object "handler returned on non-continuable exception")))))))
 
     (set! with-ex-handler-proc
         (lambda (handler thunk)
-            (let ((prev current-handlers))
+            (let ((saved '()))
                 (%dynamic-wind
                     (lambda ()
-                        (set! current-handlers (cons handler current-handlers)))
+                        (set! saved (%handlers))
+                        (%set-handlers! (cons handler saved)))
                     thunk
                     (lambda ()
-                        (set! current-handlers prev))))))
+                        (%set-handlers! saved))))))
 
     (set! raise-cont-proc
         (lambda (obj)
-            (if (null? current-handlers)
-                (unhandled-error obj)
-                (let ((h (car current-handlers))
-                      (prev current-handlers))
+            (let ((hs (%handlers)))
+                (if (null? hs)
+                    (unhandled-error obj)
                     (%dynamic-wind
-                        (lambda () (set! current-handlers (cdr prev)))
-                        (lambda () (h obj))
-                        (lambda () (set! current-handlers prev)))))))
+                        (lambda () (%set-handlers! (cdr hs)))
+                        (lambda () ((car hs) obj))
+                        (lambda () (%set-handlers! hs)))))))
 
     (set! try-proc
         (lambda (thunk catch-proc)

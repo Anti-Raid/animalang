@@ -43,6 +43,10 @@ export class Anima {
         return this.#vm.evaluateClosure(code, this.#scope, args)
     }
 
+    public coroutineResume(co: any, ...args: any[]): { done: boolean, value: any, values: any[] } {
+        return this.#vm.resumeCoroutine(co, args)
+    }
+
     compileToClosure(s: string, args: any, globals: Table) {
         const bast = new ASP(s, true).parse()
         return this.compileAstToClosure(bast, args, globals)

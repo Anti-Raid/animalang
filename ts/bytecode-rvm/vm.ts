@@ -1,5 +1,5 @@
-import { Table, type AbstractVM } from "../common";
-import { OpCode, CodeEmitter, JITCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, createRegs } from "./exec";
+import { ASTStringifier, ErrorObject, Table, unpackValues, type AbstractVM } from "../common";
+import { OpCode, CodeEmitter, JITCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs } from "./exec";
 
 export {
     CodeEmitter,
@@ -10,7 +10,8 @@ export {
     VMExecutor,
     BytecodeInterpreter,
     ByteCode,
-    OpCode
+    OpCode,
+    Coroutine
 };
 
 export type ExecutionMode = "interp" | "aot";
@@ -34,6 +35,17 @@ export class AnimaVM implements AbstractVM {
         const ctx = new ExecutionContext(this, scope);
         const cargs = this.executor.createClosureArg(code.tmpl, args.length, args, 0);
         return this.#run(ctx, this.executor.newFrame(ctx, code, cargs, null));
+    }
+
+    public resumeCoroutine(co: Coroutine, args: any[]): { done: boolean, value: any, values: any[] } {
+        try {
+            const values = unpackValues(this.executor.coResume(null, co, args));
+            return { done: co.status === "dead", value: values[0], values };
+        } catch (err) {
+            if (!(err instanceof ReRaise)) throw err;
+            const val = err.value instanceof ErrorObject ? err.value.error : err.value;
+            throw val instanceof Error ? val : new Error(new ASTStringifier().stringify(val));
+        }
     }
 
     #run(ctx: ExecutionContext, frame: Frame): any {

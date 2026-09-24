@@ -197,6 +197,7 @@ const stringifyInst = (inst: ByteCode): string[] => {
 
             case OpCode.LIST:
             case OpCode.CONS:
+            case OpCode.VALUESLIST:
                 line += `${padOp(OpCode[opcode])} dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
                 idx += 4;
                 break;
@@ -209,6 +210,46 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 5;
                 break;
             }
+
+            case OpCode.GETHANDLERS:
+                line += `${padOp("GETHANDLERS")} r${inst.inst[idx + 1]}`;
+                idx += 2;
+                break;
+
+            case OpCode.SETHANDLERS:
+                line += `${padOp("SETHANDLERS")} r${inst.inst[idx + 1]}`;
+                idx += 2;
+                break;
+
+            case OpCode.COCREATE:
+                line += `${padOp("COCREATE")} dest=r${inst.inst[idx + 1]}, proc=r${inst.inst[idx + 2]}`;
+                idx += 3;
+                break;
+
+            case OpCode.CORESUME:
+                line += `${padOp("CORESUME")} dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
+                idx += 4;
+                break;
+
+            case OpCode.COYIELD:
+                line += `${padOp("COYIELD")} start=r${inst.inst[idx + 1]}, nargs=${inst.inst[idx + 2]}`;
+                idx += 3;
+                break;
+
+            case OpCode.CORESUMELIST:
+                line += `${padOp("CORESUMELIST")} dest=r${inst.inst[idx + 1]}, co=r${inst.inst[idx + 2]}, list=r${inst.inst[idx + 3]}`;
+                idx += 4;
+                break;
+
+            case OpCode.COYIELDLIST:
+                line += `${padOp("COYIELDLIST")} list=r${inst.inst[idx + 1]}`;
+                idx += 2;
+                break;
+
+            case OpCode.COSTATUS:
+                line += `${padOp("COSTATUS")} dest=r${inst.inst[idx + 1]}, co=r${inst.inst[idx + 2]}`;
+                idx += 3;
+                break;
 
             case OpCode.APPLYLIST: {
                 const proc = inst.inst[idx + 1];

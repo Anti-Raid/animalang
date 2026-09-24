@@ -138,6 +138,39 @@ export type Node = {
     startReg: number,
     nargs: number
 } | {
+    t: "GetHandlers",
+    destReg: number
+} | {
+    t: "SetHandlers",
+    srcReg: number
+} | {
+    t: "CoCreate",
+    destReg: number,
+    procReg: number
+} | {
+    t: "CoResume",
+    destReg: number,
+    startReg: number,
+    nargs: number
+} | {
+    t: "CoYield",
+    startReg: number,
+    nargs: number,
+    destReg?: number
+} | {
+    t: "CoResumeList",
+    destReg: number,
+    coReg: number,
+    listReg: number
+} | {
+    t: "CoYieldList",
+    listReg: number,
+    destReg?: number
+} | {
+    t: "CoStatus",
+    destReg: number,
+    coReg: number
+} | {
     t: "ApplyList",
     procReg: number,
     destReg?: number,
@@ -296,6 +329,40 @@ export class IR {
                 }
                 case "IndexedOp": {
                     inst.push(node.op, node.destReg, node.startReg, node.nargs, node.idx);
+                    break;
+                }
+                case "GetHandlers": {
+                    inst.push(OpCode.GETHANDLERS, node.destReg);
+                    break;
+                }
+                case "SetHandlers": {
+                    inst.push(OpCode.SETHANDLERS, node.srcReg);
+                    break;
+                }
+                case "CoCreate": {
+                    inst.push(OpCode.COCREATE, node.destReg, node.procReg);
+                    break;
+                }
+                case "CoResume": {
+                    inst.push(OpCode.CORESUME, node.destReg, node.startReg, node.nargs);
+                    break;
+                }
+                case "CoYield": {
+                    inst.push(OpCode.COYIELD, node.startReg, node.nargs);
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    break;
+                }
+                case "CoResumeList": {
+                    inst.push(OpCode.CORESUMELIST, node.destReg, node.coReg, node.listReg);
+                    break;
+                }
+                case "CoYieldList": {
+                    inst.push(OpCode.COYIELDLIST, node.listReg);
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    break;
+                }
+                case "CoStatus": {
+                    inst.push(OpCode.COSTATUS, node.destReg, node.coReg);
                     break;
                 }
                 case "ApplyList": {

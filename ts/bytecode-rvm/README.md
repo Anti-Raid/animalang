@@ -97,6 +97,20 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 - **Forms**: `(%list <arg> ...)`, `(%cons a d)`
 - **Semantics**: Each compiles to one opcode (`LIST`, `CONS`) over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
 
+### `%handlers` / `%set-handlers!`
+- **Forms**: `(%handlers)`, `(%set-handlers! <lst>)`
+- **Semantics**: Read and replace the current execution context's exception handler stack (`GETHANDLERS` / `SETHANDLERS`). Each context, and so each coroutine, has its own stack. Used by the prelude's `raise`, `raise-continuable` and `with-exception-handler`.
+
+### Coroutine intrinsics
+- **Forms**: `(%coroutine-create <proc>)`, `(%coroutine-resume <co> <val> ...)`, `(%coroutine-yield <val> ...)`, `(%coroutine-status <co>)`, plus `(%coroutine-resume-list <co> <lst>)` / `(%coroutine-yield-list <lst>)` which take the values as a runtime list (used by the prelude wrappers)
+- **Semantics**:
+  - Asymmetric, one-shot coroutines. Each coroutine owns its own execution context (frames, wind stack, handler stack), so it can be resumed from any later evaluation, including by the host via `Anima.coroutineResume(co, ...vals)`, which returns `{ done, value, values }` (`value` is the first of `values`).
+  - The first resume passes its values as the procedure's arguments. Later resumes make the pending `%coroutine-yield` return their values, and `%coroutine-resume` returns the yielded values, both as multiple values (see `values`).
+  - Status is one of `suspended`, `running`, `normal` (it resumed another coroutine) or `dead`. Resuming a non-suspended coroutine is an error.
+  - An error the coroutine does not handle marks it `dead` and is raised again in the resumer as-is.
+  - `dynamic-wind` thunks do not run on yield/resume.
+  - Yielding from inside a Scheme callback invoked by a host builtin is an error (the callback runs in a separate execution context).
+
 ## Standard Library & Prelude Mappings
 
 The standard library builds the public Scheme procedures on top of these `%` intrinsics:
@@ -116,6 +130,8 @@ The standard library builds the public Scheme procedures on top of these `%` int
 - `cons`: Direct calls are rewritten to the matching `%` form. Uses as a value get the builtin of the same name, whose callback is the same function the opcode runs (`ts/ops.ts`).
 - Single-argument predicates (`null? pair? list? number? integer? ... table-frozen?`, the `PREDICATES` table in `ts/ops.ts`): Direct calls are rewritten to `%` forms (e.g. `(null? x)` becomes `(%null? x)`), which all compile to one `PREDICATE` opcode indexing the table. Uses as a value get a builtin generated from the same table.
 - `car`, `cdr`, `caar` ... `cddddr` (all compositions up to 4 levels) and `first second third`: Direct calls are rewritten to `%` forms (e.g. `(third x)` becomes `(%third x)`), which all compile to one `CXR` opcode indexing `CXR_PATHS` in `ts/ops.ts`. Uses as a value get the builtin of the same name, which runs the same function, so errors name the procedure either way (e.g. `third: list is too short`).
+- `coroutine-create coroutine-resume coroutine-yield coroutine-status`: Direct calls are rewritten to the matching `%` form. Uses as a value resolve to prelude wrappers around the intrinsics.
+- `values call-with-values`: `(values a b)` is a `MultipleValues` object (`common.ts`), `(values x)` is just `x` and `(values)` is zero values. `values` is a builtin, `call-with-values` is a prelude procedure (built on the `%values->list` intrinsic, which compiles to `VALUESLIST` and turns zero, one or multiple values into a list), and `receive`, `let-values` (parallel binding) and `let*-values` are syntax transformer macros built on `call-with-values`. Multiple values reaching a single-value context stay a `MultipleValues` object and print as `(values a b)`.
 - `list`:
   - Direct calls `(list a b ...)` are rewritten to `(%list a b ...)`.
   - Uses as a value resolve to the prelude procedure `(define $list (lambda args args))`, since a rest parameter is already a fresh list.

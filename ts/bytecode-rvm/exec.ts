@@ -10,10 +10,12 @@ import {
     BS,
     BSReader,
     SerializableBytecode,
-    AbstractClosure
+    AbstractClosure,
+    OpaqueValue,
+    packValues
 } from "../common";
 import { Cons } from "../list";
-import { ARITHMETIC, ARITHMETIC_FNS, makeList, opCons, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "../ops";
+import { ARITHMETIC, ARITHMETIC_FNS, makeList, opCons, valuesToList, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "../ops";
 import { BuiltinFunction, IBUILTINS } from "../std";
 
 export const BUILTINS_START = 2**31;
@@ -53,6 +55,15 @@ export enum OpCode {
     ARITHMETIC,
     CALLBUILTIN,
     MOVEACC,
+    GETHANDLERS,
+    SETHANDLERS,
+    COCREATE,
+    CORESUME,
+    COYIELD,
+    COSTATUS,
+    CORESUMELIST,
+    COYIELDLIST,
+    VALUESLIST,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -84,9 +95,18 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.APPLYLIST]: 3,
     [OpCode.CALLBUILTIN]: 5,
     [OpCode.MOVEACC]: 2,
+    [OpCode.GETHANDLERS]: 2,
+    [OpCode.SETHANDLERS]: 2,
+    [OpCode.COCREATE]: 3,
+    [OpCode.CORESUME]: 4,
+    [OpCode.COYIELD]: 3,
+    [OpCode.CORESUMELIST]: 4,
+    [OpCode.COYIELDLIST]: 2,
+    [OpCode.COSTATUS]: 3,
     [OpCode.TAILAPPLYLIST]: 3,
     [OpCode.LIST]: 4,
     [OpCode.CONS]: 4,
+    [OpCode.VALUESLIST]: 4,
     [OpCode.CXR]: 5,
     [OpCode.PREDICATE]: 5,
     [OpCode.ARITHMETIC]: 5,
@@ -200,11 +220,12 @@ export class Closure extends IProcedure implements AbstractClosure {
     }
 }
 
-const WINDOW_OPS = { makeList, opCons };
+const WINDOW_OPS = { makeList, opCons, valuesToList };
 
 const WINDOW_FN_NAMES: Partial<Record<OpCode, keyof typeof WINDOW_OPS>> = {
     [OpCode.LIST]: "makeList",
     [OpCode.CONS]: "opCons",
+    [OpCode.VALUESLIST]: "valuesToList",
 };
 
 
@@ -213,6 +234,8 @@ export const createRegs = (numRegs: number) => {
     for (let i = 0; i < numRegs; i++) regs.push(undefined);
     return regs;
 };
+
+export const listToArray = (lst: Cons | null): any[] => lst === null ? [] : [...lst];
 
 export const resolveProc = (regs: readonly any[], procIdx: number): any => {
     return procIdx < BUILTINS_START ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
@@ -316,6 +339,9 @@ export class ExecutionContext {
     public wind: WindPoint | null = null;
     public pendingWind: PendingWindTransition | null = null;
     public jsDepth: number = 0;
+    public handlers: Cons | null = null;
+    public coroutine: Coroutine | null = null;
+    public yielded: boolean = false;
 
     constructor(
         public vm: AbstractVM,
@@ -323,6 +349,30 @@ export class ExecutionContext {
     ) {
         this.id = ++ExecutionContext.nextId;
     }
+}
+
+export type CoroutineStatus = "suspended" | "running" | "normal" | "dead";
+
+export class Coroutine extends OpaqueValue {
+    public status: CoroutineStatus = "suspended";
+    public started: boolean = false;
+    public frame: Frame | null = null;
+    public readonly ctx: ExecutionContext;
+
+    constructor(public readonly proc: any, vm: AbstractVM, scope: Table) {
+        super();
+        this.ctx = new ExecutionContext(vm, scope);
+        this.ctx.coroutine = this;
+    }
+
+    get typeName() {
+        return "coroutine";
+    }
+}
+
+// an error that escaped a coroutine, raised again in the resumer as-is
+export class ReRaise {
+    constructor(public readonly value: any) {}
 }
 
 export class VMContinuation extends IProcedure {
@@ -405,10 +455,17 @@ export class Suspend {
     static error(err: any) {
         return new Suspend(null, err);
     }
+
+    static yield(val: any) {
+        return new Suspend((ctx, executor, caller) => executor.coYield(ctx, caller, val));
+    }
 }
+
+const MAX_RESUME_DEPTH = 200;
 
 export class VMExecutor {
     public raiseProc: any | null = null;
+    public resumeDepth: number = 0;
 
     constructor(public vm: AbstractVM) {}
 
@@ -423,8 +480,17 @@ export class VMExecutor {
     public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any): Frame | null {
         if (err instanceof EscapedError) throw err;
         if (err instanceof UnhandledSchemeError) {
+            if (ctx.coroutine !== null) throw err;
             if (err.error instanceof Error) throw err.error;
             throw new Error(String(err.error));
+        }
+        if (err instanceof ReRaise) {
+            if (this.raiseProc !== null && this.raiseProc !== false) {
+                const val = err.value instanceof Error ? new ErrorObject(err.value) : err.value;
+                return this.invoke(ctx, this.raiseProc, frame, [val], 0, 1, false);
+            }
+            const val = err.value instanceof ErrorObject ? err.value.error : err.value;
+            throw val instanceof Error ? val : new Error(String(val));
         }
         if (this.raiseProc !== null && this.raiseProc !== false) {
             const errObj = (err instanceof ErrorObject)
@@ -537,6 +603,68 @@ export class VMExecutor {
         args.length = numPos;
         args.push(rest);
         return code.directFn!(ctx, proc, this, ...args);
+    }
+
+    public coCreate(ctx: ExecutionContext, proc: any): Coroutine {
+        if (!(proc instanceof Closure || proc instanceof BuiltinFunction)) {
+            throw new Error(`coroutine-create: expected a procedure but got ${String(proc)}`);
+        }
+        return new Coroutine(proc, ctx.vm, ctx.scope);
+    }
+
+    public coStatus(co: any): symbol {
+        if (!(co instanceof Coroutine)) throw new Error(`coroutine-status: expected a coroutine but got ${String(co)}`);
+        return Symbol.for(co.status);
+    }
+
+    public coYield(ctx: ExecutionContext, frame: Frame, val: any): Frame | null {
+        const co = ctx.coroutine;
+        if (co === null) throw new Error("coroutine-yield: not inside a coroutine (or across a host call boundary)");
+        co.frame = frame;
+        ctx.yielded = true;
+        ctx.acc = val;
+        return null;
+    }
+
+    public coResume(ctx: ExecutionContext | null, co: any, args: any[]): any {
+        if (!(co instanceof Coroutine)) throw new Error(`coroutine-resume: expected a coroutine but got ${String(co)}`);
+        if (co.status !== "suspended") throw new Error(`coroutine-resume: cannot resume a ${co.status} coroutine`);
+        if (this.resumeDepth >= MAX_RESUME_DEPTH) throw new Error("coroutine-resume: too many nested resumes");
+
+        const cctx = co.ctx;
+        const outer = ctx?.coroutine ?? null;
+        if (outer !== null) outer.status = "normal";
+        co.status = "running";
+        cctx.yielded = false;
+        this.resumeDepth++;
+        try {
+            let frame: Frame | null;
+            if (!co.started) {
+                co.started = true;
+                frame = this.invoke(cctx, co.proc, null, args, 0, args.length, false);
+            } else {
+                frame = co.frame;
+                co.frame = null;
+                cctx.acc = packValues(args);
+            }
+            if (frame !== null) {
+                if ((this.vm as any).mode === "aot") {
+                    JITCompiler.compileAll(frame.code, frame.closure.tmpl);
+                    JITCompiler.run(cctx, frame, this);
+                } else {
+                    BytecodeInterpreter.run(cctx, frame, this);
+                }
+            }
+        } catch (err) {
+            co.status = "dead";
+            throw new ReRaise(err instanceof UnhandledSchemeError ? err.error : err);
+        } finally {
+            this.resumeDepth--;
+            if (outer !== null) outer.status = "running";
+        }
+
+        co.status = cctx.yielded ? "suspended" : "dead";
+        return cctx.acc;
     }
 
     public resumeSuspend(ctx: ExecutionContext, sig: Suspend): Frame | null {
@@ -759,6 +887,48 @@ export class BytecodeInterpreter {
                         regs[inst[ip++]] = ctx.acc;
                         break;
                     }
+                    case OpCode.GETHANDLERS: {
+                        regs[inst[ip++]] = ctx.handlers;
+                        break;
+                    }
+                    case OpCode.SETHANDLERS: {
+                        ctx.handlers = regs[inst[ip++]];
+                        break;
+                    }
+                    case OpCode.COCREATE: {
+                        const destReg = inst[ip++];
+                        regs[destReg] = executor.coCreate(ctx, regs[inst[ip++]]);
+                        break;
+                    }
+                    case OpCode.CORESUME: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        regs[destReg] = executor.coResume(ctx, regs[startReg], regs.slice(startReg + 1, startReg + nargs));
+                        break;
+                    }
+                    case OpCode.CORESUMELIST: {
+                        const destReg = inst[ip++];
+                        const coReg = inst[ip++];
+                        regs[destReg] = executor.coResume(ctx, regs[coReg], listToArray(regs[inst[ip++]]));
+                        break;
+                    }
+                    case OpCode.COYIELD: {
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        frame.ip = ip;
+                        return executor.coYield(ctx, frame, packValues(regs.slice(startReg, startReg + nargs)));
+                    }
+                    case OpCode.COYIELDLIST: {
+                        const listReg = inst[ip++];
+                        frame.ip = ip;
+                        return executor.coYield(ctx, frame, packValues(listToArray(regs[listReg])));
+                    }
+                    case OpCode.COSTATUS: {
+                        const destReg = inst[ip++];
+                        regs[destReg] = executor.coStatus(regs[inst[ip++]]);
+                        break;
+                    }
                     case OpCode.TAILCALL: {
                         const proc = resolveProc(regs, inst[ip++]);
                         const startReg = inst[ip++];
@@ -852,6 +1022,12 @@ export class BytecodeInterpreter {
                         regs[destReg] = opCons(regs, startReg, inst[ip++]);
                         break;
                     }
+                    case OpCode.VALUESLIST: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = valuesToList(regs, startReg, inst[ip++]);
+                        break;
+                    }
                     case OpCode.CXR: {
                         const destReg = inst[ip++];
                         const startReg = inst[ip++];
@@ -905,6 +1081,8 @@ const JIT_DEPS = {
     MAX_JS_DEPTH,
     Frame,
     Suspend,
+    packValues,
+    listToArray,
 };
 
 type ProcRef = { reg: number } | { builtin: number };
@@ -922,6 +1100,12 @@ type AotInst =
     | { k: "EndWind" }
     | { k: "SetRaiseProc"; src: number }
     | { k: "MoveAcc"; dst: number }
+    | { k: "GetHandlers"; dst: number }
+    | { k: "SetHandlers"; src: number }
+    | { k: "CoCreate"; dst: number; proc: number }
+    | { k: "CoResume"; dst: number; start: number; nargs: number }
+    | { k: "CoResumeList"; dst: number; co: number; list: number }
+    | { k: "CoStatus"; dst: number; co: number }
     | { k: "CallBuiltin"; builtin: number; dst: number; start: number; nargs: number; resume: number }
     | { k: "WindowOp"; fn: keyof typeof WINDOW_OPS; dst: number; start: number; nargs: number }
     | { k: "TableOp"; table: "CXR_FNS" | "PREDICATE_FNS" | "ARITHMETIC_FNS"; idx: number; dst: number; start: number; nargs: number };
@@ -935,6 +1119,7 @@ type AotTerm =
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean }
     | { k: "Apply"; proc: ProcRef; isTail: boolean; args: { start: number; nargs: number } | { list: number }; resume: number }
     | { k: "CallCC"; proc: number; isTail: boolean; resume: number }
+    | { k: "Yield"; args: { start: number; nargs: number } | { list: number }; resume: number }
     | { k: "Return"; reg: number };
 
 type AotBlock = { start: number; insts: AotInst[]; term: AotTerm };
@@ -1033,6 +1218,8 @@ export class JITCompiler {
                 case OpCode.APPLY:
                 case OpCode.APPLYLIST:
                 case OpCode.CALLCC:
+                case OpCode.COYIELD:
+                case OpCode.COYIELDLIST:
                     blocks.add(nextIp);
                     break;
             }
@@ -1107,6 +1294,7 @@ export class JITCompiler {
                         break;
                     case OpCode.LIST:
                     case OpCode.CONS:
+                    case OpCode.VALUESLIST:
                         insts.push({ k: "WindowOp", fn: WINDOW_FN_NAMES[opcode]!, dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.CXR:
@@ -1143,6 +1331,33 @@ export class JITCompiler {
                     }
                     case OpCode.MOVEACC:
                         insts.push({ k: "MoveAcc", dst: inst[ip++] });
+                        break;
+                    case OpCode.GETHANDLERS:
+                        insts.push({ k: "GetHandlers", dst: inst[ip++] });
+                        break;
+                    case OpCode.SETHANDLERS:
+                        insts.push({ k: "SetHandlers", src: inst[ip++] });
+                        break;
+                    case OpCode.COCREATE:
+                        insts.push({ k: "CoCreate", dst: inst[ip++], proc: inst[ip++] });
+                        break;
+                    case OpCode.CORESUME:
+                        insts.push({ k: "CoResume", dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                        break;
+                    case OpCode.COSTATUS:
+                        insts.push({ k: "CoStatus", dst: inst[ip++], co: inst[ip++] });
+                        break;
+                    case OpCode.COYIELD: {
+                        const start = inst[ip++];
+                        const nargs = inst[ip++];
+                        term = { k: "Yield", args: { start, nargs }, resume: ip };
+                        break;
+                    }
+                    case OpCode.COYIELDLIST:
+                        term = { k: "Yield", args: { list: inst[ip++] }, resume: ip };
+                        break;
+                    case OpCode.CORESUMELIST:
+                        insts.push({ k: "CoResumeList", dst: inst[ip++], co: inst[ip++], list: inst[ip++] });
                         break;
                     case OpCode.TAILCALL: {
                         const procIdx = inst[ip++];
@@ -1247,7 +1462,7 @@ export class CodeEmitter {
             const entryLive = new Set(this.#liveIn.get(0));
             for (const block of blocks) {
                 const t = block.term;
-                if (t.k === "Call" || t.k === "Apply" || t.k === "CallCC") {
+                if (t.k === "Call" || t.k === "Apply" || t.k === "CallCC" || t.k === "Yield") {
                     for (const r of this.#liveIn.get(t.resume) ?? []) entryLive.add(r);
                 }
             }
@@ -1325,7 +1540,11 @@ export class CodeEmitter {
         switch (inst.k) {
             case "Move": case "Box": case "Unbox": return [inst.src];
             case "SetBox": return [inst.dst, inst.src];
-            case "SetUpvar": case "SetGlobal": case "SetRaiseProc": return [inst.src];
+            case "SetUpvar": case "SetGlobal": case "SetRaiseProc": case "SetHandlers": return [inst.src];
+            case "CoCreate": return [inst.proc];
+            case "CoStatus": return [inst.co];
+            case "CoResume": return CodeEmitter.#window(inst.start, inst.nargs);
+            case "CoResumeList": return [inst.co, inst.list];
             case "Wind": return [inst.before, inst.after];
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
             case "CallBuiltin": case "WindowOp": case "TableOp": return CodeEmitter.#window(inst.start, inst.nargs);
@@ -1340,6 +1559,7 @@ export class CodeEmitter {
             case "TailCallBuiltin": return CodeEmitter.#window(term.start, term.nargs);
             case "Apply": return [...("reg" in term.proc ? [term.proc.reg] : []), ...("list" in term.args ? [term.args.list] : CodeEmitter.#window(term.args.start, term.args.nargs))];
             case "CallCC": return [term.proc];
+            case "Yield": return "list" in term.args ? [term.args.list] : CodeEmitter.#window(term.args.start, term.args.nargs);
             case "Return": return [term.reg];
             default: return [];
         }
@@ -1405,6 +1625,12 @@ export class CodeEmitter {
         return `(${[...spills, `${fn}(regs, ${start}, ${nargs})`].join(", ")})`;
     }
 
+    #yieldValue(term: Extract<AotTerm, { k: "Yield" }>): string {
+        return "list" in term.args
+            ? `packValues(listToArray(r${term.args.list}))`
+            : `packValues([${this.#argList(term.args.start, term.args.nargs)}])`;
+    }
+
     #acc(): string {
         return this.mode === "direct" ? "acc" : "ctx.acc";
     }
@@ -1453,6 +1679,18 @@ export class CodeEmitter {
                 return this.emit(`executor.raiseProc = r${inst.src};`);
             case "MoveAcc":
                 return this.emit(`r${inst.dst} = ${this.#acc()};`);
+            case "GetHandlers":
+                return this.emit(`r${inst.dst} = ctx.handlers;`);
+            case "SetHandlers":
+                return this.emit(`ctx.handlers = r${inst.src};`);
+            case "CoCreate":
+                return this.emit(`r${inst.dst} = executor.coCreate(ctx, r${inst.proc});`);
+            case "CoResume":
+                return this.emit(`r${inst.dst} = executor.coResume(ctx, r${inst.start}, [${this.#argList(inst.start + 1, inst.nargs - 1)}]);`);
+            case "CoResumeList":
+                return this.emit(`r${inst.dst} = executor.coResume(ctx, r${inst.co}, listToArray(r${inst.list}));`);
+            case "CoStatus":
+                return this.emit(`r${inst.dst} = executor.coStatus(r${inst.co});`);
             case "CallBuiltin":
                 return this.emit(`
                     ${direct ? "" : `frame.ip = ${inst.resume};`}
@@ -1609,6 +1847,12 @@ export class CodeEmitter {
                     ${term.isTail ? "" : this.#spillLive(term.resume)}
                     return executor.callCC(ctx, r${term.proc}, frame, ${term.isTail});
                 `);
+            case "Yield":
+                return this.emit(`
+                    frame.ip = ${term.resume};
+                    ${this.#spillLive(term.resume)}
+                    return executor.coYield(ctx, frame, ${this.#yieldValue(term)});
+                `);
             case "Return":
                 return this.emit(`
                     ctx.acc = r${term.reg};
@@ -1736,6 +1980,11 @@ export class CodeEmitter {
                 return this.emit(`
                     rip = ${term.isTail ? -1 : term.resume};
                     throw Suspend.callCC(r${term.proc});
+                `);
+            case "Yield":
+                return this.emit(`
+                    rip = ${term.resume};
+                    throw Suspend.yield(${this.#yieldValue(term)});
                 `);
             case "Return":
                 return this.emit(`return r${term.reg};`);

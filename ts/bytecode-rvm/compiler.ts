@@ -9,12 +9,21 @@ import { BUILTINS_START, OpCode } from "./exec";
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
 const OP_SET_RAISE_PROC = Symbol.for("%set-raise-proc");
+const OP_HANDLERS = Symbol.for("%handlers");
+const OP_SET_HANDLERS = Symbol.for("%set-handlers!");
+const OP_CO_CREATE = Symbol.for("%coroutine-create");
+const OP_CO_RESUME = Symbol.for("%coroutine-resume");
+const OP_CO_YIELD = Symbol.for("%coroutine-yield");
+const OP_CO_STATUS = Symbol.for("%coroutine-status");
+const OP_CO_RESUME_LIST = Symbol.for("%coroutine-resume-list");
+const OP_CO_YIELD_LIST = Symbol.for("%coroutine-yield-list");
 const OP_APPLY = Symbol.for("%apply");
 const OP_APPLY_MARGS = Symbol.for("%apply-multi")
 
 const WINDOW_INTRINSICS = new Map<symbol, OpCode>([
     [Symbol.for("%list"), OpCode.LIST],
     [Symbol.for("%cons"), OpCode.CONS],
+    [Symbol.for("%values->list"), OpCode.VALUESLIST],
 ])
 
 const INDEXED_INTRINSICS = new Map<symbol, { op: OpCode, idx: number }>([
@@ -108,6 +117,47 @@ export class Compiler {
                     return
                 case OP_SET_RAISE_PROC:
                     this.#compileSetRaiseProc(expr, opts)
+                    return
+                case OP_HANDLERS:
+                    this.#compileRuntimeOp(expr, opts, 0, 0, (start, nargs, dest) => {
+                        if (dest !== undefined) opts.nodes.push({ t: "GetHandlers", destReg: dest })
+                    })
+                    return
+                case OP_SET_HANDLERS:
+                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
+                        opts.nodes.push({ t: "SetHandlers", srcReg: start })
+                        if (dest !== undefined) opts.nodes.push({ t: "LoadValue", destReg: dest, constant: undefined })
+                    })
+                    return
+                case OP_CO_CREATE:
+                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
+                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoCreate", destReg, procReg: start }))
+                    })
+                    return
+                case OP_CO_RESUME:
+                    this.#compileRuntimeOp(expr, opts, 1, Infinity, (start, nargs, dest) => {
+                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoResume", destReg, startReg: start, nargs }))
+                    })
+                    return
+                case OP_CO_YIELD:
+                    this.#compileRuntimeOp(expr, opts, 0, Infinity, (start, nargs, dest) => {
+                        opts.nodes.push({ t: "CoYield", startReg: start, nargs, destReg: dest })
+                    })
+                    return
+                case OP_CO_RESUME_LIST:
+                    this.#compileRuntimeOp(expr, opts, 2, 2, (start, nargs, dest) => {
+                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoResumeList", destReg, coReg: start, listReg: start + 1 }))
+                    })
+                    return
+                case OP_CO_YIELD_LIST:
+                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
+                        opts.nodes.push({ t: "CoYieldList", listReg: start, destReg: dest })
+                    })
+                    return
+                case OP_CO_STATUS:
+                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
+                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoStatus", destReg, coReg: start }))
+                    })
                     return
                 case OP_APPLY:
                     this.#compileApply(expr, opts)
@@ -325,6 +375,30 @@ export class Compiler {
             opts.nodes.push({ t: "CallCC", destReg: opts.destReg, procReg });
         }
         opts.scope.freeTemp(procReg);
+    }
+
+    #compileRuntimeOp(expr: Cons, opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {
+        const nargs = expr.cdr === null ? 0 : expr.cdr.length
+        if (nargs < minArgs || nargs > maxArgs) {
+            const expected = minArgs === maxArgs ? `${minArgs}` : maxArgs === Infinity ? `at least ${minArgs}` : `${minArgs} to ${maxArgs}`
+            throw new Error(`${String(expr.car.description)} requires ${expected} arguments, got ${nargs}`)
+        }
+        const startReg = opts.scope.regAlloc.allocBlock(nargs)
+        let curr: any = expr.cdr
+        let i = 0
+        while (curr instanceof Cons) {
+            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false })
+            i++
+            curr = curr.cdr
+        }
+        emit(startReg, nargs, opts.destReg)
+        opts.scope.regAlloc.freeBlock(startReg, nargs)
+    }
+
+    #withDest(opts: CmpOpts, dest: number | undefined, push: (destReg: number) => void) {
+        const destReg = dest ?? opts.scope.allocTemp()
+        push(destReg)
+        if (dest === undefined) opts.scope.freeTemp(destReg)
     }
 
     #compileSetRaiseProc(expr: Cons, opts: CmpOpts) {

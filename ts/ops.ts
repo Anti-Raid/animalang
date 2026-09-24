@@ -1,5 +1,5 @@
 import { Cons } from "./list";
-import { ErrorObject, IProcedure } from "./common";
+import { ErrorObject, IProcedure, unpackValues } from "./common";
 import { Table } from "./table";
 
 const numAt = (name: string, regs: readonly any[], i: number): number => {
@@ -146,6 +146,11 @@ export const makeList = (regs: readonly any[], start: number, nargs: number) => 
     let tail: Cons | null = null;
     for (let i = start + nargs - 1; i >= start; i--) tail = new Cons(regs[i], tail);
     return tail;
+};
+
+export const valuesToList = (regs: readonly any[], start: number, nargs: number) => {
+    if (nargs !== 1) throw new Error("%values->list requires 1 argument");
+    return Cons.fromArray(unpackValues(regs[start]));
 };
 
 export const opCons = (regs: readonly any[], start: number, nargs: number) => {

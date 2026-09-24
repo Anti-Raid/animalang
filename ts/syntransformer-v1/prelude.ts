@@ -422,11 +422,57 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
     });
 
-    for (const name of ["list", "cons"]) {
+    for (const name of ["list", "cons", "coroutine-create", "coroutine-resume", "coroutine-yield", "coroutine-status"]) {
         evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
             return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
         });
     }
+
+    const callWithValues = (producerExpr: any, formals: any, body: any) =>
+        list(Symbol.for("call-with-values"), list(OP_LAMBDA, null, producerExpr), cons(OP_LAMBDA, cons(formals, body)));
+
+    const valuesClause = (clause: any, form: string): [any, any] => {
+        if (!(clause instanceof Cons) || !(clause.cdr instanceof Cons) || clause.cdr.cdr !== null) {
+            throw new Error(`${form} clause must be of form (formals expr)`);
+        }
+        return [clause.car, clause.cdr.car];
+    };
+
+    evaluator.registerTransform(Symbol.for("receive"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 4) throw new Error("receive must be of form (receive formals expr body...)");
+        return { expanded: callWithValues(cadr(expr), expr.car, cddr(expr)), state: TransformState.Recurse };
+    });
+
+    evaluator.registerTransform(Symbol.for("let*-values"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error("let*-values must be of form (let*-values (clause...) body...)");
+        const clauses = toArray(expr.car);
+        const body = expr.cdr;
+        if (clauses.length === 0) return { expanded: cons(OP_LET, cons(null, body)), state: TransformState.Recurse };
+        const [formals, init] = valuesClause(clauses[0], "let*-values");
+        const rest = cons(Symbol.for("let*-values"), cons(fromArray(clauses.slice(1)), body));
+        return { expanded: callWithValues(init, formals, list(rest)), state: TransformState.Recurse };
+    });
+
+    evaluator.registerTransform(Symbol.for("let-values"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error("let-values must be of form (let-values (clause...) body...)");
+        const renames: any[] = [];
+        const rename = (formals: any): any => {
+            if (formals === null) return null;
+            if (typeof formals === "symbol") {
+                const tmp = Symbol(`lv_${formals.description}`);
+                renames.push(list(formals, tmp));
+                return tmp;
+            }
+            if (formals instanceof Cons) return cons(rename(formals.car), rename(formals.cdr));
+            throw new Error("let-values formals must be symbols");
+        };
+        const clauses = toArray(expr.car).map(c => valuesClause(c, "let-values")).map(([formals, init]) => [rename(formals), init]);
+        let inner: any = cons(OP_LET, cons(fromArray(renames), expr.cdr));
+        for (let i = clauses.length - 1; i >= 0; i--) {
+            inner = callWithValues(clauses[i][1], clauses[i][0], list(inner));
+        }
+        return { expanded: inner, state: TransformState.Recurse };
+    });
 
     for (const [name] of [...CXR_PATHS, ...PREDICATES, ...ARITHMETIC]) {
         evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {

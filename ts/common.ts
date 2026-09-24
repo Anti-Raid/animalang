@@ -106,7 +106,10 @@ export const SPECIAL_FORMS = new Set([
     OP_ELSE,
     OP_QUOTE,
     OP_AND,
-    OP_OR
+    OP_OR,
+    Symbol.for("receive"),
+    Symbol.for("let-values"),
+    Symbol.for("let*-values"),
 ])
 
 export const RESERVED_BUILTINS = new Set([
@@ -404,6 +407,18 @@ export class ASP {
 }
 
 // Marker class that all procs should extend from
+export class MultipleValues {
+    constructor(public readonly values: any[]) {}
+}
+
+export const packValues = (vals: any[]): any => vals.length === 1 ? vals[0] : new MultipleValues(vals);
+
+export const unpackValues = (val: any): any[] => val instanceof MultipleValues ? val.values : [val];
+
+export abstract class OpaqueValue {
+    abstract get typeName(): string;
+}
+
 export class IProcedure {
     constructor(public debugName?: string) {}
 }
@@ -472,6 +487,14 @@ export class ASTStringifier {
         // Procs
         if (ast instanceof IProcedure) {
             return `<procedure>`;
+        }
+
+        if (ast instanceof MultipleValues) {
+            return `(values${ast.values.map(v => " " + this.stringify(v)).join("")})`;
+        }
+
+        if (ast instanceof OpaqueValue) {
+            return `<${ast.typeName}>`;
         }
 
         // Errors
@@ -1107,7 +1130,8 @@ export interface AbstractClosure extends SerializableBytecode {}
 export interface AbstractByteCode extends SerializableBytecode {}
 export interface AbstractVM {
     evaluateRaw(code: AbstractByteCode, scope: Table): any,
-    evaluateClosure(code: AbstractClosure, scope: Table, args: any[]): any
+    evaluateClosure(code: AbstractClosure, scope: Table, args: any[]): any,
+    resumeCoroutine(co: any, args: any[]): { done: boolean, value: any, values: any[] }
 }
 export interface AbstractCompiler {
     compile(trExpr: any): AbstractByteCode

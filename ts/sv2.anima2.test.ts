@@ -2,6 +2,7 @@
 import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, ASPParseError, BS, BSReader } from './common';
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
+import { BuiltinFunction } from './std';
 import { ByteCode, AnimaVM, JITCompiler, OpCode } from './bytecode-rvm/vm';
 import { Anima } from './anima';
 import { implAot } from './bytecode-rvm/meta';
@@ -177,6 +178,79 @@ describe('Anima', () => {
             run(`(define (bad n) (if (= n 0) (car '()) (+ 1 (bad (- n 1)))))`);
             expect(() => run("(bad 10)")).toThrow("car: list is too short");
             expect(run("(try (lambda () (bad 5)) (lambda (e) 'caught))")).toBe("caught");
+        });
+
+        it('coroutines', () => {
+            expect(run(`(define gen (coroutine-create (lambda () (coroutine-yield 1) (coroutine-yield 2) 3)))
+                        (list (coroutine-resume gen) (coroutine-status gen) (coroutine-resume gen) (coroutine-resume gen) (coroutine-status gen))`)).toBe("(1 suspended 2 3 dead)");
+            expect(run(`(define acc-co (coroutine-create (lambda (start) (let loop ((total start)) (loop (+ total (coroutine-yield total)))))))
+                        (list (coroutine-resume acc-co 1) (coroutine-resume acc-co 10) (coroutine-resume acc-co 100))`)).toBe("(1 11 111)");
+            expect(run(`(define inner-co (coroutine-create (lambda () (coroutine-yield (coroutine-status outer-co)) 'inner-done)))
+                        (define outer-co (coroutine-create (lambda () (list (coroutine-resume inner-co) (coroutine-resume inner-co) (coroutine-status outer-co)))))
+                        (coroutine-resume outer-co)`)).toBe("(normal inner-done running)");
+            expect(run(`(define (walk n) (if (= n 0) (coroutine-yield 'bottom) (+ 1 (walk (- n 1)))))
+                        (define deep-co (coroutine-create (lambda (n) (walk n))))
+                        (list (coroutine-resume deep-co 3000) (coroutine-resume deep-co 0))`)).toBe("(bottom 3000)");
+            expect(run(`(define hco (coroutine-create (lambda ()
+                          (with-exception-handler (lambda (e) (list 'inner-caught e))
+                            (lambda () (coroutine-yield 'paused) (raise-continuable 'oops))))))
+                        (list (coroutine-resume hco)
+                              (try (lambda () (raise 'outside)) (lambda (e) (list 'outer-caught e)))
+                              (coroutine-resume hco))`)).toBe("(paused (outer-caught outside) (inner-caught oops))");
+            expect(run(`(define bad-co (coroutine-create (lambda () (coroutine-yield 1) (raise 'broken))))
+                        (coroutine-resume bad-co)
+                        (list (try (lambda () (coroutine-resume bad-co)) (lambda (e) (list 'caught e))) (coroutine-status bad-co))`)).toBe("((caught broken) dead)");
+            expect(run(`(try (lambda () (coroutine-resume (coroutine-create (lambda () (car '()))))) (lambda (e) (error-message e)))`)).toBe('"car: list is too short"');
+            expect(run(`(try (lambda () (coroutine-resume gen)) (lambda (e) (error-message e)))`)).toBe('"coroutine-resume: cannot resume a dead coroutine"');
+            expect(run(`(try (lambda () (coroutine-yield 1)) (lambda (e) (error-message e)))`)).toBe('"coroutine-yield: not inside a coroutine (or across a host call boundary)"');
+            expect(run(`(map (lambda (co) (coroutine-resume co)) (list (coroutine-create (lambda () 'a)) (coroutine-create (lambda () 'b))))`)).toBe("(a b)");
+
+            evaluator.scope.set(Symbol.for("host-call"), new BuiltinFunction(Symbol.for("host-call"), (regs, start) => evaluator.evaluateClosure(regs[start], [])));
+            expect(run(`(try (lambda () (coroutine-resume (coroutine-create (lambda () (host-call (lambda () (coroutine-yield 1)))))))
+                             (lambda (e) (error-message e)))`)).toBe('"coroutine-yield: not inside a coroutine (or across a host call boundary)"');
+        });
+
+        it('host can resume coroutines across evaluations', () => {
+            const co = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda (x) (+ (coroutine-yield (* x 2)) 1)))`));
+            expect(evaluator.coroutineResume(co, 5)).toEqual({ done: false, value: 10, values: [10] });
+            expect(evaluator.coroutineResume(co, 7)).toEqual({ done: true, value: 8, values: [8] });
+            expect(() => evaluator.coroutineResume(co)).toThrow("cannot resume a dead coroutine");
+
+            const fetcher = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (+ (coroutine-yield '(fetch a)) (coroutine-yield '(fetch b)))))`));
+            const answers: Record<string, number> = { a: 1, b: 2 };
+            let step = evaluator.coroutineResume(fetcher);
+            while (!step.done) {
+                const key = Symbol.keyFor(step.value.cdr.car)!;
+                step = evaluator.coroutineResume(fetcher, answers[key]);
+            }
+            expect(step.value).toBe(3);
+
+            const failing = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (raise 'nope)))`));
+            expect(() => evaluator.coroutineResume(failing)).toThrow("nope");
+        });
+
+        it('multiple values', () => {
+            expect(run("(call-with-values (lambda () (values 1 2)) +)")).toBe("3");
+            expect(run("(call-with-values (lambda () 5) list)")).toBe("(5)");
+            expect(run("(call-with-values (lambda () (values)) list)")).toBe("()");
+            expect(run("(values 7)")).toBe("7");
+            expect(run("(values 1 'a)")).toBe("(values 1 a)");
+            expect(run("(receive (a b . rest) (values 1 2 3 4) (list a b rest))")).toBe("(1 2 (3 4))");
+            expect(run("(receive all (values 1 2) all)")).toBe("(1 2)");
+            expect(run("(let-values (((a b) (values 1 2)) ((c) (values 3))) (list a b c))")).toBe("(1 2 3)");
+            expect(run("(let ((a 10)) (let-values (((a) (values 1)) ((b) (values a))) (list a b)))")).toBe("(1 10)");
+            expect(run("(let*-values (((a) (values 1)) ((b) (values (+ a 1)))) (list a b))")).toBe("(1 2)");
+            expect(run(`(define mv-co (coroutine-create (lambda (a b) (receive (x y) (coroutine-yield (+ a b) (* a b)) (list x y)))))
+                        (list (call-with-values (lambda () (coroutine-resume mv-co 2 3)) list) (coroutine-resume mv-co 'p 'q))`)).toBe("((5 6) (p q))");
+            expect(run(`(define mv-co2 (coroutine-create (lambda () (let ((y coroutine-yield)) (y 1 2)))))
+                        (call-with-values (lambda () (let ((r coroutine-resume)) (r mv-co2))) list)`)).toBe("(1 2)");
+
+            expect(run(`(define mv-co3 (coroutine-create (lambda () (let ((y coroutine-yield)) (+ 100 (y 1))))))
+                        (list (coroutine-resume mv-co3) (coroutine-resume mv-co3 5) (coroutine-status mv-co3))`)).toBe("(1 105 dead)");
+
+            const hostCo = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda (a b) (receive (x y) (coroutine-yield b a) (+ x y))))`));
+            expect(evaluator.coroutineResume(hostCo, 1, 2)).toEqual({ done: false, value: 2, values: [2, 1] });
+            expect(evaluator.coroutineResume(hostCo, 10, 20)).toEqual({ done: true, value: 30, values: [30] });
         });
 
         it('rejects binding reserved builtins', () => {
