@@ -40,6 +40,16 @@ export class Table implements Iterable<[any, any]> {
         return undefined;
     }
 
+    lookup(key: any, missing: any): any {
+        let curr: Table | null = this;
+        while (curr !== null) {
+            const val = curr.#map.get(key);
+            if (val !== undefined || curr.#map.has(key)) return val;
+            curr = curr.#parent;
+        }
+        return missing;
+    }
+
     has(key: any): boolean {
         let curr: Table | null = this;
         while (curr !== null) {

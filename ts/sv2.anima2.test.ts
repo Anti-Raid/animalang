@@ -127,6 +127,29 @@ describe('Anima', () => {
             expect(run("(sum-to 100000 0)")).toBe("5000050000");
         });
 
+        it('non-tail calls keep call/cc, errors and deep recursion working', () => {
+            expect(run(`(define (deep n k) (if (= n 0) (k 'escaped) (+ 1 (deep (- n 1) k))))
+                        (call/cc (lambda (k) (deep 50 k)))`)).toBe("escaped");
+            expect(run(`(define saved #f)
+                        (define hits 0)
+                        (define (f) (+ 100 (call/cc (lambda (k) (set! saved k) 1))))
+                        (define (g) (let ((r (f))) (set! hits (+ hits 1)) (if (< hits 3) (saved hits) (list r hits))))
+                        (g)`)).toBe("(102 3)");
+            expect(run(`(define (mk n acc) (if (= n 0) acc (mk (- n 1) (cons n acc))))
+                        (define (len l) (if (null? l) 0 (+ 1 (len (cdr l)))))
+                        (len (mk 100000 '()))`)).toBe("100000");
+            expect(run(`(define (thrower n) (if (= n 0) (raise 'boom) (+ 1 (thrower (- n 1)))))
+                        (try (lambda () (thrower 20)) (lambda (e) (list 'caught e)))`)).toBe("(caught boom)");
+            expect(run(`(define (resumer n) (if (= n 0) (raise-continuable 'x) (+ 1 (resumer (- n 1)))))
+                        (with-exception-handler (lambda (e) 10) (lambda () (resumer 5)))`)).toBe("15");
+            expect(run(`(define trail '())
+                        (define (inner k) (dynamic-wind (lambda () (set! trail (cons 'in trail))) (lambda () (+ 1 (k 'out))) (lambda () (set! trail (cons 'after trail)))))
+                        (list (call/cc (lambda (k) (+ 1 (inner k)))) trail)`)).toBe("(out (after in))");
+            run(`(define (bad n) (if (= n 0) (car '()) (+ 1 (bad (- n 1)))))`);
+            expect(() => run("(bad 10)")).toThrow("car: list is too short");
+            expect(run("(try (lambda () (bad 5)) (lambda (e) 'caught))")).toBe("caught");
+        });
+
         it('rejects binding reserved builtins', () => {
             expect(() => run("(lambda (+) 1)")).toThrow("cannot bind builtin +");
             expect(() => run("(let ((< 1)) <)")).toThrow("cannot bind builtin <");

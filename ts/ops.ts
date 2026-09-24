@@ -17,8 +17,9 @@ const divisorArgs = (name: string, regs: readonly any[], start: number, nargs: n
 };
 
 export const opAdd = (regs: readonly any[], start: number, nargs: number) => {
-    let acc = 0;
-    for (let i = start; i < start + nargs; i++) acc += numAt("+", regs, i);
+    if (nargs === 0) return 0;
+    let acc = numAt("+", regs, start);
+    for (let i = start + 1; i < start + nargs; i++) acc += numAt("+", regs, i);
     return acc;
 };
 
