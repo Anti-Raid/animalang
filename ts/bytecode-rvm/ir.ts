@@ -188,30 +188,29 @@ export class IR {
                     break
                 }
                 case "Call": {
-                    if (node.procReg >= BUILTINS_START) throw new Error("internal error: builtin calls must use IBuiltin")
-                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs)
+                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs, 0)
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailCall": {
-                    inst.push(OpCode.TAILCALL, node.procReg, node.startReg, node.nargs)
+                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs, 1)
                     break
                 }
                 case "Apply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs)
+                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, 0)
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailApply": {
-                    inst.push(OpCode.TAILAPPLY, node.procReg, node.startReg, node.nargs)
+                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, 1)
                     break
                 }
                 case "IBuiltin": {
-                    inst.push(OpCode.CALLBUILTIN, node.builtinIdx - BUILTINS_START, node.destReg, node.startReg, node.nargs)
+                    inst.push(OpCode.CALL, node.builtinIdx, node.startReg, node.nargs, 0, OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "IBuiltinTail": {
-                    inst.push(OpCode.TAILCALL, node.builtinIdx, node.startReg, node.nargs)
+                    inst.push(OpCode.CALL, node.builtinIdx, node.startReg, node.nargs, 1)
                     break
                 }   
                 case "Return": {
@@ -248,12 +247,12 @@ export class IR {
                     break
                 }
                 case "CallCC": {
-                    inst.push(OpCode.CALLCC, node.procReg);
+                    inst.push(OpCode.CALLCC, node.procReg, 0);
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "TailCallCC": {
-                    inst.push(OpCode.TAILCALLCC, node.procReg);
+                    inst.push(OpCode.CALLCC, node.procReg, 1);
                     break;
                 }
                 case "CoYield": {
@@ -262,7 +261,7 @@ export class IR {
                     break;
                 }
                 case "CoResume": {
-                    inst.push(node.isTail ? OpCode.TAILCORESUME : OpCode.CORESUME, node.coReg, node.listReg);
+                    inst.push(OpCode.CORESUME, node.coReg, node.listReg, node.isTail ? 1 : 0);
                     if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
                     break;
                 }

@@ -79,7 +79,7 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 - **Semantics**:
   - Unpacks the trailing `<lst>` argument and splices its elements after any preceding `<arg> ...` expressions before calling `<proc>`.
   - Resolves `<proc>` with compile-time builtin optimization (`#resolveProcReg`): if `<proc>` is an unshadowed reference to a standard library builtin, references the builtin directly via its intrinsic index (`BUILTINS_START + idx`), avoiding temporary register allocation and `LoadGlobal`.
-  - Emits `OpCode.APPLY` (in non-tail position) or `OpCode.TAILAPPLY` (in tail position) with `nargs >= 1` indicating the width of the register window `[startReg, startReg + nargs)`.
+  - Emits `OpCode.APPLY` (with its tail flag set in tail position) with `nargs >= 1` indicating the width of the register window `[startReg, startReg + nargs)`.
 
 ### `%apply-multi`
 - **Form**: `(%apply-multi <proc> <lst>)`
@@ -90,12 +90,12 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 ### Arithmetic intrinsics
 - **Forms**: `(%+ <arg> ...)`, `%-`, `%*`, `%/`, `%modulo`, `%remainder`, `%=`, `%eq?`, `%<`, `%<=`, `%>`, `%>=`
 - **Semantics**:
-  - All compile to `CALLBUILTIN` of the builtin with the same name (the `ARITHMETIC` table in `ts/ops.ts`) over the register window `[startReg, startReg + nargs)`, with the usual Scheme variadic behaviour (`(%- x)` negates, `(%/ x)` is `1/x`, comparisons chain).
+  - All compile to a `CALL` of the builtin with the same name (the `ARITHMETIC` table in `ts/ops.ts`) over the register window `[startReg, startReg + nargs)`, with the usual Scheme variadic behaviour (`(%- x)` negates, `(%/ x)` is `1/x`, comparisons chain).
   - Intrinsics are not values, so they cannot be passed to `%apply` / `%apply-multi`.
 
 ### List intrinsics
 - **Forms**: `(%list <arg> ...)`, `(%cons a d)`
-- **Semantics**: Each compiles to `CALLBUILTIN` of the `list` / `cons` builtin over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
+- **Semantics**: Each compiles to a `CALL` of the `list` / `cons` builtin over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
 
 ### `%handlers` / `%set-handlers!`
 - **Forms**: `(%handlers)`, `(%set-handlers! <lst>)`
@@ -105,7 +105,7 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 - **Forms**: `(%coroutine-create <proc>)`, `(%coroutine-resume <co> <val> ...)`, `(%coroutine-yield <val> ...)`, `(%coroutine-status <co>)`, `(%coroutine-close <co>)`, plus `(%coroutine-resume-list <co> <lst>)` / `(%coroutine-yield-list <lst>)` which take the values as a runtime list (used by the prelude wrappers)
 - **Semantics**:
   - Asymmetric, one-shot coroutines. Each coroutine owns its own execution context (frames, wind stack, handler stack), so it can be resumed from any later evaluation, including by the host via `Anima.coroutineResume(co, ...vals)`, which returns `{ done, value, values }` (`value` is the first of `values`).
-  - Resume and yield switch coroutines inside the driver loop (every frame records its execution context), so nothing nests on the JS stack. `%coroutine-resume` in tail position is a proper tail call: the coroutine's yields and final value go straight to the caller's caller, so chains of tail resumes (schedulers, symmetric hand-offs) run in constant space. It compiles to `CORESUME`/`TAILCORESUME` with the values as a list register.
+  - Resume and yield switch coroutines inside the driver loop (every frame records its execution context), so nothing nests on the JS stack. `%coroutine-resume` in tail position is a proper tail call: the coroutine's yields and final value go straight to the caller's caller, so chains of tail resumes (schedulers, symmetric hand-offs) run in constant space. It compiles to `CORESUME` (tail flag set in tail position) with the values as a list register.
   - The first resume passes its values as the procedure's arguments. Later resumes make the pending `%coroutine-yield` return their values, and `%coroutine-resume` returns the yielded values, both as multiple values (see `values`).
   - Status is one of `suspended`, `running`, `normal` (it resumed another coroutine) or `dead`. Resuming a non-suspended coroutine is an error.
   - An error the coroutine does not handle marks it `dead` and is raised again in the resumer as-is.
@@ -114,9 +114,9 @@ The compiler directly recognizes the following low-level `%` intrinsics:
   - Yielding from inside a Scheme callback invoked by a host builtin is an error (the callback runs in a separate execution context).
 
 ### How intrinsics are compiled
-- **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALLBUILTIN idx dst start nargs`, where `idx` indexes `IBUILTINS`. The AOT emitter inlines the common ones by name.
+- **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines the common ones by name.
 - **Runtime operations that only need the execution context** (`%coroutine-create`, `%coroutine-status`, `%coroutine-close`, `%handlers`, `%set-handlers!`, `%set-raise-proc`, the wind/unwind steps of `%dynamic-wind`, and internal helpers with no public builtin: `%values->list` and the list/apply conversions behind `%coroutine-yield-list` and `%apply-multi`) compile to `CALLRT idx dst start nargs`, where `idx` indexes the `RUNTIME` table in `exec.ts`.
-- **Control flow that suspends or leaves the frame** keeps dedicated opcodes: calls, tail calls, `APPLY`/`TAILAPPLY`, `CALLCC`/`TAILCALLCC`, `CORESUME`/`TAILCORESUME`, `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
+- **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `isTail` operand; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
 
 ## Standard Library & Prelude Mappings
 
@@ -135,8 +135,8 @@ The standard library builds the public Scheme procedures on top of these `%` int
   - The syntax transformer rewrites direct calls into the matching intrinsic, e.g. `(+ a b c)` becomes `(%+ a b c)`.
   - Uses as a value (e.g. `(map + xs ys)`) get the builtin of the same name, whose callback is the same operation function the opcode runs (`ts/ops.ts`), so there is no duplicated logic.
 - `cons`: Direct calls are rewritten to the matching `%` form. Uses as a value get the builtin of the same name, whose callback is the same function the opcode runs (`ts/ops.ts`).
-- Single-argument predicates (`null? pair? list? number? integer? ... table-frozen?`, the `PREDICATES` table in `ts/ops.ts`): Direct calls are rewritten to `%` forms (e.g. `(null? x)` becomes `(%null? x)`), which compile to `CALLBUILTIN` of the builtin with that name. Uses as a value get a builtin generated from the same table.
-- `car`, `cdr`, `caar` ... `cddddr` (all compositions up to 4 levels) and `first second third`: Direct calls are rewritten to `%` forms (e.g. `(third x)` becomes `(%third x)`), which compile to `CALLBUILTIN` of the builtin with that name (generated from `CXR_PATHS` in `ts/ops.ts`). Uses as a value get the builtin of the same name, which runs the same function, so errors name the procedure either way (e.g. `third: list is too short`).
+- Single-argument predicates (`null? pair? list? number? integer? ... table-frozen?`, the `PREDICATES` table in `ts/ops.ts`): Direct calls are rewritten to `%` forms (e.g. `(null? x)` becomes `(%null? x)`), which compile to a `CALL` of the builtin with that name. Uses as a value get a builtin generated from the same table.
+- `car`, `cdr`, `caar` ... `cddddr` (all compositions up to 4 levels) and `first second third`: Direct calls are rewritten to `%` forms (e.g. `(third x)` becomes `(%third x)`), which compile to a `CALL` of the builtin with that name (generated from `CXR_PATHS` in `ts/ops.ts`). Uses as a value get the builtin of the same name, which runs the same function, so errors name the procedure either way (e.g. `third: list is too short`).
 - `coroutine-create coroutine-resume coroutine-yield coroutine-status coroutine-close`: Direct calls are rewritten to the matching `%` form. Uses as a value resolve to prelude wrappers around the intrinsics.
 - `values call-with-values`: `(values a b)` is a `MultipleValues` object (`common.ts`), `(values x)` is just `x` and `(values)` is zero values. `values` is a builtin, `call-with-values` is a prelude procedure (built on the `%values->list` intrinsic, which compiles to `CALLRT` and turns zero, one or multiple values into a list), and `receive`, `let-values` (parallel binding) and `let*-values` are syntax transformer macros built on `call-with-values`. Multiple values reaching a single-value context stay a `MultipleValues` object and print as `(values a b)`.
 - `list`:

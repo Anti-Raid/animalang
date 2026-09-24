@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
 import { BuiltinFunction } from './std';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
+import { BUILTINS_START } from './bytecode-rvm/exec';
 import { Anima } from './anima';
 import { impl, implAot } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
@@ -2142,13 +2143,13 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Function with straight-line ops followed by an unhandled opcode:
         // 0: LOADU32 r1, 50
         // 3: LOADU32 r2, 60
-        // 6: CALLBUILTIN(+) dest=r0, start=r1, nargs=2
-        // 11: RETURN r0
+        // 6: CALL builtin(+), start=r1, nargs=2; MOVEACC r0
+        // 13: RETURN r0
         const plusSym = Symbol.for("+");
         const inst = new Uint32Array([
             OpCode.LOADU32, 1, 50,
             OpCode.LOADU32, 2, 60,
-            OpCode.CALLBUILTIN, 0, 0, 1, 2,
+            OpCode.CALL, BUILTINS_START, 1, 2, 0, OpCode.MOVEACC, 0,
             OpCode.RETURN, 0
         ]);
         const bc = new ByteCode([], inst, 4);
@@ -2200,7 +2201,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         expect(anima.evaluateClosure(fnClosure, [false, false])).toBe("neither");
     });
 
-    it("executes TAILCALL recursively in JIT without stack overflow", () => {
+    it("executes tail CALL recursively in JIT without stack overflow", () => {
         const anima = new Anima(implAot);
         const code = anima.compileRaw(`
             (define (sum-loop n acc)

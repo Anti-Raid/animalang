@@ -111,62 +111,24 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 1;
                 break;
 
-            case OpCode.TAILCALL: {
-                const proc = inst.inst[idx + 1];
-                const startReg = inst.inst[idx + 2];
-                const nargs = inst.inst[idx + 3];
-                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`
-                line += `${padOp("TAILCALL")} ${procStr}, start=r${startReg}, nargs=${nargs}`;
-                idx += 4;
-                break;
-            }
-
             case OpCode.CALL:
-                line += `${padOp("CALL")} r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
-                idx += 4;
-                break;
-
-            case OpCode.CALLBUILTIN:
-                line += `${padOp("CALLBUILTIN")} builtin(${String(IBUILTINS[inst.inst[idx + 1]].name)}), dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
+            case OpCode.APPLY: {
+                const proc = inst.inst[idx + 1];
+                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
+                line += `${padOp(OpCode[opcode])} ${procStr}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${inst.inst[idx + 4] ? ", tail" : ""}`;
                 idx += 5;
                 break;
+            }
 
             case OpCode.MOVEACC:
                 line += `${padOp("MOVEACC")} r${inst.inst[idx + 1]}`;
                 idx += 2;
                 break;
 
-            case OpCode.TAILAPPLY: {
-                const proc = inst.inst[idx + 1];
-                const startReg = inst.inst[idx + 2];
-                const nargs = inst.inst[idx + 3];
-                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
-                line += `${padOp("TAILAPPLY")} ${procStr}, start=r${startReg}, nargs=${nargs}`;
-                idx += 4;
+            case OpCode.CALLCC:
+                line += `${padOp("CALLCC")} proc=r${inst.inst[idx + 1]}${inst.inst[idx + 2] ? ", tail" : ""}`;
+                idx += 3;
                 break;
-            }
-
-            case OpCode.APPLY: {
-                const proc = inst.inst[idx + 1];
-                const startReg = inst.inst[idx + 2];
-                const nargs = inst.inst[idx + 3];
-                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
-                line += `${padOp("APPLY")} ${procStr}, start=r${startReg}, nargs=${nargs}`;
-                idx += 4;
-                break;
-            }
-            case OpCode.CALLCC: {
-                line += `${padOp("CALLCC")} proc=r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-            }
-
-            case OpCode.TAILCALLCC: {
-                const procReg = inst.inst[idx + 1];
-                line += `${padOp("TAILCALLCC")} proc=r${procReg}`;
-                idx += 2;
-                break;
-            }
 
             case OpCode.COYIELD:
                 line += `${padOp("COYIELD")} r${inst.inst[idx + 1]}`;
@@ -174,9 +136,8 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 break;
 
             case OpCode.CORESUME:
-            case OpCode.TAILCORESUME:
-                line += `${padOp(OpCode[opcode])} co=r${inst.inst[idx + 1]}, args=r${inst.inst[idx + 2]}`;
-                idx += 3;
+                line += `${padOp("CORESUME")} co=r${inst.inst[idx + 1]}, args=r${inst.inst[idx + 2]}${inst.inst[idx + 3] ? ", tail" : ""}`;
+                idx += 4;
                 break;
 
             case OpCode.CALLRT:
@@ -209,7 +170,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 3
+export const BYTECODE_VERSION = 5
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

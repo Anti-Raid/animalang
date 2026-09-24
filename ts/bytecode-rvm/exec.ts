@@ -31,7 +31,6 @@ export enum OpCode {
     ELSE,
     ENDIF,
     CALL,
-    TAILCALL,
     RETURN,
     NEWCLOSURE,
     BOX,
@@ -39,45 +38,36 @@ export enum OpCode {
     SETBOX,
     MOVE,
     CALLCC,
-    TAILCALLCC,
     APPLY,
-    TAILAPPLY,
-    CALLBUILTIN,
     MOVEACC,
     COYIELD,
     CALLRT,
     CORESUME,
-    TAILCORESUME,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.ENDIF]: 1,
     [OpCode.ELSE]: 2,
     [OpCode.RETURN]: 2,
-    [OpCode.TAILCALLCC]: 2,
     [OpCode.LOADCONST]: 3,
     [OpCode.LOADU32]: 3,
     [OpCode.LOADGLOBAL]: 3,
     [OpCode.SETGLOBAL]: 3,
     [OpCode.IF]: 3,
-    [OpCode.CALLCC]: 2,
+    [OpCode.CALLCC]: 3,
     [OpCode.NEWCLOSURE]: 3,
     [OpCode.BOX]: 3,
     [OpCode.UNBOX]: 3,
     [OpCode.SETBOX]: 3,
     [OpCode.MOVE]: 3,
-    [OpCode.TAILCALL]: 4,
-    [OpCode.TAILAPPLY]: 4,
     [OpCode.SETUPVAR]: 4,
     [OpCode.LOADUPVAR]: 4,
-    [OpCode.CALL]: 4,
-    [OpCode.APPLY]: 4,
-    [OpCode.CALLBUILTIN]: 5,
+    [OpCode.CALL]: 5,
+    [OpCode.APPLY]: 5,
     [OpCode.MOVEACC]: 2,
     [OpCode.COYIELD]: 2,
     [OpCode.CALLRT]: 5,
-    [OpCode.CORESUME]: 3,
-    [OpCode.TAILCORESUME]: 3,
+    [OpCode.CORESUME]: 4,
 };
 
 export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecutor) => Frame | null;
@@ -897,57 +887,18 @@ export class BytecodeInterpreter {
                         return executor.setRetVal(ctx, frame.parent, ctx.acc);
                     }
                     case OpCode.CALL: {
-                        const proc = regs[inst[ip++]];
-                        const startReg = inst[ip++];
-                        const nargs = inst[ip++];
-                        if (proc instanceof BuiltinFunction) {
-                            ctx.acc = proc.cb(regs, startReg, nargs);
-                            break;
-                        }
-                        frame.ip = ip;
-                        return executor.invoke(ctx, proc, frame, regs, startReg, nargs, false);
-                    }
-                    case OpCode.CALLBUILTIN: {
-                        const builtin = IBUILTINS[inst[ip++]];
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = builtin.cb(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.MOVEACC: {
-                        regs[inst[ip++]] = ctx.acc;
-                        break;
-                    }
-                    case OpCode.COYIELD: {
-                        const valReg = inst[ip++];
-                        frame.ip = ip;
-                        return executor.coYield(ctx, frame, regs[valReg]);
-                    }
-                    case OpCode.CORESUME: {
-                        const coReg = inst[ip++];
-                        const listReg = inst[ip++];
-                        frame.ip = ip;
-                        return executor.coResume(ctx, frame, regs[coReg], listToArray(regs[listReg]));
-                    }
-                    case OpCode.TAILCORESUME: {
-                        const coReg = inst[ip++];
-                        const listReg = inst[ip++];
-                        frame.ip = ip;
-                        return executor.coResume(ctx, frame.parent, regs[coReg], listToArray(regs[listReg]));
-                    }
-                    case OpCode.CALLRT: {
-                        const fn = RUNTIME_FNS[inst[ip++]];
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = fn(ctx, executor, regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.TAILCALL: {
                         const proc = resolveProc(regs, inst[ip++]);
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
+                        const isTail = inst[ip++] !== 0;
 
-                        if (proc === frame.closure && !frame.isShared(ctx)) {
+                        if (!isTail && proc instanceof BuiltinFunction) {
+                            ctx.acc = proc.cb(regs, startReg, nargs);
+                            break;
+                        }
+
+                        // self tail call: rebind the params in place and jump back to the start
+                        if (isTail && proc === frame.closure && !frame.isShared(ctx)) {
                             const tmpl = proc.tmpl;
                             const numPos = tmpl.params.length;
                             if (tmpl.remParams !== null ? nargs >= numPos : nargs === numPos) {
@@ -969,31 +920,44 @@ export class BytecodeInterpreter {
                         }
 
                         frame.ip = ip;
-                        return executor.invoke(ctx, proc, frame, regs, startReg, nargs, true);
+                        return executor.invoke(ctx, proc, frame, regs, startReg, nargs, isTail);
+                    }
+                    case OpCode.MOVEACC: {
+                        regs[inst[ip++]] = ctx.acc;
+                        break;
+                    }
+                    case OpCode.COYIELD: {
+                        const valReg = inst[ip++];
+                        frame.ip = ip;
+                        return executor.coYield(ctx, frame, regs[valReg]);
+                    }
+                    case OpCode.CORESUME: {
+                        const coReg = inst[ip++];
+                        const listReg = inst[ip++];
+                        const isTail = inst[ip++] !== 0;
+                        frame.ip = ip;
+                        return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]));
+                    }
+                    case OpCode.CALLRT: {
+                        const fn = RUNTIME_FNS[inst[ip++]];
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = fn(ctx, executor, regs, startReg, inst[ip++]);
+                        break;
                     }
                     case OpCode.APPLY: {
                         const proc = resolveProc(regs, inst[ip++]);
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
+                        const isTail = inst[ip++] !== 0;
                         frame.ip = ip;
-                        return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), false);
-                    }
-                    case OpCode.TAILAPPLY: {
-                        const proc = resolveProc(regs, inst[ip++]);
-                        const startReg = inst[ip++];
-                        const nargs = inst[ip++];
-                        frame.ip = ip;
-                        return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), true);
+                        return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), isTail);
                     }
                     case OpCode.CALLCC: {
                         const procReg = inst[ip++];
+                        const isTail = inst[ip++] !== 0;
                         frame.ip = ip;
-                        return executor.callCC(ctx, regs[procReg], frame, false);
-                    }
-                    case OpCode.TAILCALLCC: {
-                        const procReg = inst[ip++];
-                        frame.ip = ip;
-                        return executor.callCC(ctx, regs[procReg], frame, true);
+                        return executor.callCC(ctx, regs[procReg], frame, isTail);
                     }
                     default: {
                         const _: never = opcode;
@@ -1148,12 +1112,16 @@ export class AotCompiler {
                 case OpCode.ELSE:
                     blocks.add(inst[ip + 1]);
                     break;
+                case OpCode.COYIELD:
+                    blocks.add(nextIp);
+                    break;
                 case OpCode.CALL:
+                    if (inst[nextIp - 1] === 0 && inst[ip + 1] < BUILTINS_START) blocks.add(nextIp);
+                    break;
                 case OpCode.APPLY:
                 case OpCode.CALLCC:
-                case OpCode.COYIELD:
                 case OpCode.CORESUME:
-                    blocks.add(nextIp);
+                    if (inst[nextIp - 1] === 0) blocks.add(nextIp);
                     break;
             }
 
@@ -1226,37 +1194,21 @@ export class AotCompiler {
                         term = { k: "Jump", target: ip };
                         break;
                     case OpCode.CALL: {
-                        const proc = inst[ip++];
-                        const start = inst[ip++];
-                        const nargs = inst[ip++];
-                        term = { k: "Call", proc, start, nargs, resume: ip };
-                        break;
-                    }
-                    case OpCode.CALLBUILTIN: {
-                        const builtin = inst[ip++];
-                        const dst = inst[ip++];
-                        const start = inst[ip++];
-                        const nargs = inst[ip++];
-                        insts.push({ k: "CallBuiltin", builtin, dst, start, nargs, resume: ip });
-                        break;
-                    }
-                    case OpCode.MOVEACC:
-                        insts.push({ k: "MoveAcc", dst: inst[ip++] });
-                        break;
-                    case OpCode.COYIELD:
-                        term = { k: "Yield", val: inst[ip++], resume: ip };
-                        break;
-                    case OpCode.CORESUME:
-                    case OpCode.TAILCORESUME:
-                        term = { k: "CoResume", co: inst[ip++], list: inst[ip++], isTail: opcode === OpCode.TAILCORESUME, resume: ip };
-                        break;
-                    case OpCode.CALLRT:
-                        insts.push({ k: "RtCall", rt: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
-                        break;
-                    case OpCode.TAILCALL: {
                         const procIdx = inst[ip++];
                         const start = inst[ip++];
                         const nargs = inst[ip++];
+                        const isTail = inst[ip++] !== 0;
+                        if (!isTail && procIdx >= BUILTINS_START) {
+                            if (inst[ip] !== OpCode.MOVEACC) throw new Error("internal error: builtin CALL must be followed by MOVEACC");
+                            const dst = inst[ip + 1];
+                            ip += 2;
+                            insts.push({ k: "CallBuiltin", builtin: procIdx - BUILTINS_START, dst, start, nargs, resume: ip });
+                            break;
+                        }
+                        if (!isTail) {
+                            term = { k: "Call", proc: procIdx, start, nargs, resume: ip };
+                            break;
+                        }
                         if (procIdx >= BUILTINS_START) {
                             term = { k: "TailCallBuiltin", builtin: procIdx - BUILTINS_START, start, nargs, ip };
                             break;
@@ -1269,18 +1221,33 @@ export class AotCompiler {
                             : { k: "TailCall", proc: procIdx, start, nargs, ip };
                         break;
                     }
-                    case OpCode.APPLY:
-                    case OpCode.TAILAPPLY: {
+                    case OpCode.MOVEACC:
+                        insts.push({ k: "MoveAcc", dst: inst[ip++] });
+                        break;
+                    case OpCode.COYIELD:
+                        term = { k: "Yield", val: inst[ip++], resume: ip };
+                        break;
+                    case OpCode.CORESUME: {
+                        const co = inst[ip++];
+                        const list = inst[ip++];
+                        term = { k: "CoResume", co, list, isTail: inst[ip++] !== 0, resume: ip };
+                        break;
+                    }
+                    case OpCode.CALLRT:
+                        insts.push({ k: "RtCall", rt: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                        break;
+                    case OpCode.APPLY: {
                         const procIdx = inst[ip++];
                         const start = inst[ip++];
                         const nargs = inst[ip++];
-                        term = { k: "Apply", proc: this.procRef(procIdx), isTail: opcode === OpCode.TAILAPPLY, start, nargs, resume: ip };
+                        term = { k: "Apply", proc: this.procRef(procIdx), isTail: inst[ip++] !== 0, start, nargs, resume: ip };
                         break;
                     }
-                    case OpCode.CALLCC:
-                    case OpCode.TAILCALLCC:
-                        term = { k: "CallCC", proc: inst[ip++], isTail: opcode === OpCode.TAILCALLCC, resume: ip };
+                    case OpCode.CALLCC: {
+                        const proc = inst[ip++];
+                        term = { k: "CallCC", proc, isTail: inst[ip++] !== 0, resume: ip };
                         break;
+                    }
                     case OpCode.RETURN:
                         term = { k: "Return", reg: inst[ip++] };
                         break;
