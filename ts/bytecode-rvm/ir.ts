@@ -131,7 +131,8 @@ export type Node = {
     startReg: number,
     nargs: number
 } | {
-    t: "Cxr",
+    t: "IndexedOp",
+    op: OpCode,
     idx: number,
     destReg: number,
     startReg: number,
@@ -289,8 +290,8 @@ export class IR {
                     inst.push(node.op, node.destReg, node.startReg, node.nargs);
                     break;
                 }
-                case "Cxr": {
-                    inst.push(OpCode.CXR, node.destReg, node.startReg, node.nargs, node.idx);
+                case "IndexedOp": {
+                    inst.push(node.op, node.destReg, node.startReg, node.nargs, node.idx);
                     break;
                 }
                 case "ApplyList": {

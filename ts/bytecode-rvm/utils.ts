@@ -1,6 +1,6 @@
 import { BS, BSReader, type SerializableBytecode } from "../common"
 import { IBUILTINS } from "../std"
-import { CXR_PATHS } from "../ops"
+import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops"
 import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode } from "./exec"
 
 const constToString = (s: any): string => {
@@ -194,30 +194,20 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 break;
             }
 
-            case OpCode.ADD:
-            case OpCode.SUB:
-            case OpCode.MUL:
-            case OpCode.DIV:
-            case OpCode.MOD:
-            case OpCode.REM:
-            case OpCode.NUMEQ:
-            case OpCode.EQ:
-            case OpCode.LT:
-            case OpCode.LE:
-            case OpCode.GT:
-            case OpCode.GE:
             case OpCode.LIST:
             case OpCode.CONS:
-            case OpCode.ISNULL:
-            case OpCode.ISPAIR:
                 line += `${padOp(OpCode[opcode])} dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
                 idx += 4;
                 break;
 
             case OpCode.CXR:
-                line += `${padOp("CXR")} ${CXR_PATHS[inst.inst[idx + 4]][0]}, dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
+            case OpCode.PREDICATE:
+            case OpCode.ARITHMETIC: {
+                const table = opcode === OpCode.CXR ? CXR_PATHS : opcode === OpCode.PREDICATE ? PREDICATES : ARITHMETIC;
+                line += `${padOp(OpCode[opcode])} ${table[inst.inst[idx + 4]][0]}, dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
                 idx += 5;
                 break;
+            }
 
             case OpCode.APPLYLIST: {
                 const proc = inst.inst[idx + 1];

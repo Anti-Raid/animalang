@@ -3,7 +3,7 @@ import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { IBUILTINS_IDX_MAP } from "../std";
-import { CXR_PATHS } from "../ops";
+import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops";
 import { BUILTINS_START, OpCode } from "./exec";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
@@ -13,25 +13,15 @@ const OP_APPLY = Symbol.for("%apply");
 const OP_APPLY_MARGS = Symbol.for("%apply-multi")
 
 const WINDOW_INTRINSICS = new Map<symbol, OpCode>([
-    [Symbol.for("%+"), OpCode.ADD],
-    [Symbol.for("%-"), OpCode.SUB],
-    [Symbol.for("%*"), OpCode.MUL],
-    [Symbol.for("%/"), OpCode.DIV],
-    [Symbol.for("%modulo"), OpCode.MOD],
-    [Symbol.for("%remainder"), OpCode.REM],
-    [Symbol.for("%="), OpCode.NUMEQ],
-    [Symbol.for("%eq?"), OpCode.EQ],
-    [Symbol.for("%<"), OpCode.LT],
-    [Symbol.for("%<="), OpCode.LE],
-    [Symbol.for("%>"), OpCode.GT],
-    [Symbol.for("%>="), OpCode.GE],
     [Symbol.for("%list"), OpCode.LIST],
     [Symbol.for("%cons"), OpCode.CONS],
-    [Symbol.for("%null?"), OpCode.ISNULL],
-    [Symbol.for("%pair?"), OpCode.ISPAIR],
 ])
 
-const CXR_INTRINSICS = new Map<symbol, number>(CXR_PATHS.map(([name], i) => [Symbol.for(`%${name}`), i]))
+const INDEXED_INTRINSICS = new Map<symbol, { op: OpCode, idx: number }>([
+    ...CXR_PATHS.map(([name], idx): [symbol, { op: OpCode, idx: number }] => [Symbol.for(`%${name}`), { op: OpCode.CXR, idx }]),
+    ...PREDICATES.map(([name], idx): [symbol, { op: OpCode, idx: number }] => [Symbol.for(`%${name}`), { op: OpCode.PREDICATE, idx }]),
+    ...ARITHMETIC.map(([name], idx): [symbol, { op: OpCode, idx: number }] => [Symbol.for(`%${name}`), { op: OpCode.ARITHMETIC, idx }]),
+])
 
 interface CmpOpts {
     destReg?: number // where to store dest reg
@@ -127,9 +117,9 @@ export class Compiler {
                     return
             }
 
-            const cxrIdx = CXR_INTRINSICS.get(operator)
-            if (cxrIdx !== undefined) {
-                this.#compileWindowIntrinsic(expr, OpCode.CXR, opts, cxrIdx)
+            const indexed = INDEXED_INTRINSICS.get(operator)
+            if (indexed !== undefined) {
+                this.#compileWindowIntrinsic(expr, indexed.op, opts, indexed.idx)
                 return
             }
 
@@ -360,7 +350,7 @@ export class Compiler {
         }
     }
 
-    #compileWindowIntrinsic(expr: Cons, op: OpCode, opts: CmpOpts, cxrIdx?: number) {
+    #compileWindowIntrinsic(expr: Cons, op: OpCode, opts: CmpOpts, tableIdx?: number) {
         const nargs = expr.cdr === null ? 0 : expr.cdr.length
         const startReg = opts.scope.regAlloc.allocBlock(nargs)
         let curr: any = expr.cdr
@@ -372,15 +362,15 @@ export class Compiler {
         }
 
         const destReg = opts.destReg ?? opts.scope.allocTemp()
-        opts.nodes.push(cxrIdx === undefined
+        opts.nodes.push(tableIdx === undefined
             ? { t: "WindowOp", op, destReg, startReg, nargs }
-            : { t: "Cxr", idx: cxrIdx, destReg, startReg, nargs })
+            : { t: "IndexedOp", op, idx: tableIdx, destReg, startReg, nargs })
         if (opts.destReg === undefined) opts.scope.freeTemp(destReg)
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
 
     #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
-        if (WINDOW_INTRINSICS.has(procExpr) || CXR_INTRINSICS.has(procExpr)) {
+        if (WINDOW_INTRINSICS.has(procExpr) || INDEXED_INTRINSICS.has(procExpr)) {
             throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
         }
         if (typeof procExpr === "symbol") {

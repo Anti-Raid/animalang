@@ -101,6 +101,14 @@ describe('Anima', () => {
             expect(run("(third '(1 2 3))")).toBe("3");
             expect(run("(map second '((1 2) (3 4)))")).toBe("(2 4)");
             expect(() => run("(third '(1 2))")).toThrow("third: list is too short");
+            expect(run("(number? 1)")).toBe("#t");
+            expect(run("(list? '(1 . 2))")).toBe("#f");
+            expect(run("(even? 4)")).toBe("#t");
+            expect(run("(map null? '(() 1))")).toBe("(#t #f)");
+            expect(() => run("(even? 1.5)")).toThrow("even? requires an integer");
+            expect(() => run("(table-empty? 1)")).toThrow("table-empty? requires a table");
+            expect(() => run("(zero? 1 2)")).toThrow("zero? requires 1 argument");
+            expect(() => run("(let ((f pair?)) (f))")).toThrow("pair? requires 1 argument");
             expect(() => run("(let ((f third)) (f '(1 2)))")).toThrow("third: list is too short");
             expect(run("(let ((f <)) (f 1 2))")).toBe("#t");
             expect(() => run("(+ 1 \"a\")")).toThrow("+ requires numbers, but received string");
@@ -1923,13 +1931,13 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Function with straight-line ops followed by an unhandled opcode:
         // 0: LOADU32 r1, 50
         // 3: LOADU32 r2, 60
-        // 6: ADD r0, r1, r2
-        // 10: RETURN r0
+        // 6: ARITHMETIC(+) r0, r1, r2
+        // 11: RETURN r0
         const plusSym = Symbol.for("+");
         const inst = new Uint32Array([
             OpCode.LOADU32, 1, 50,
             OpCode.LOADU32, 2, 60,
-            OpCode.ADD, 0, 1, 2,
+            OpCode.ARITHMETIC, 0, 1, 2, 0,
             OpCode.RETURN, 0
         ]);
         const bc = new ByteCode([], inst, 4);

@@ -90,12 +90,12 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 ### Arithmetic intrinsics
 - **Forms**: `(%+ <arg> ...)`, `%-`, `%*`, `%/`, `%modulo`, `%remainder`, `%=`, `%eq?`, `%<`, `%<=`, `%>`, `%>=`
 - **Semantics**:
-  - Compiles to a single opcode (`ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `REM`, `NUMEQ`, `EQ`, `LT`, `LE`, `GT`, `GE`) over the register window `[startReg, startReg + nargs)`, with the usual Scheme variadic behaviour (`(%- x)` negates, `(%/ x)` is `1/x`, comparisons chain).
+  - All compile to one `ARITHMETIC` opcode over the register window `[startReg, startReg + nargs)`, indexing the `ARITHMETIC` table in `ts/ops.ts`, with the usual Scheme variadic behaviour (`(%- x)` negates, `(%/ x)` is `1/x`, comparisons chain).
   - Intrinsics are not values, so they cannot be passed to `%apply` / `%apply-multi`.
 
 ### List intrinsics
-- **Forms**: `(%list <arg> ...)`, `(%cons a d)`, `(%null? x)`, `(%pair? x)`
-- **Semantics**: Each compiles to one opcode (`LIST`, `CONS`, `ISNULL`, `ISPAIR`) over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
+- **Forms**: `(%list <arg> ...)`, `(%cons a d)`
+- **Semantics**: Each compiles to one opcode (`LIST`, `CONS`) over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
 
 ## Standard Library & Prelude Mappings
 
@@ -113,7 +113,8 @@ The standard library builds the public Scheme procedures on top of these `%` int
 - `+ - * / modulo remainder = eq? < <= > >=`:
   - The syntax transformer rewrites direct calls into the matching intrinsic, e.g. `(+ a b c)` becomes `(%+ a b c)`.
   - Uses as a value (e.g. `(map + xs ys)`) get the builtin of the same name, whose callback is the same operation function the opcode runs (`ts/ops.ts`), so there is no duplicated logic.
-- `cons null? pair?`: Direct calls are rewritten to the matching `%` form. Uses as a value get the builtin of the same name, whose callback is the same function the opcode runs (`ts/ops.ts`).
+- `cons`: Direct calls are rewritten to the matching `%` form. Uses as a value get the builtin of the same name, whose callback is the same function the opcode runs (`ts/ops.ts`).
+- Single-argument predicates (`null? pair? list? number? integer? ... table-frozen?`, the `PREDICATES` table in `ts/ops.ts`): Direct calls are rewritten to `%` forms (e.g. `(null? x)` becomes `(%null? x)`), which all compile to one `PREDICATE` opcode indexing the table. Uses as a value get a builtin generated from the same table.
 - `car`, `cdr`, `caar` ... `cddddr` (all compositions up to 4 levels) and `first second third`: Direct calls are rewritten to `%` forms (e.g. `(third x)` becomes `(%third x)`), which all compile to one `CXR` opcode indexing `CXR_PATHS` in `ts/ops.ts`. Uses as a value get the builtin of the same name, which runs the same function, so errors name the procedure either way (e.g. `third: list is too short`).
 - `list`:
   - Direct calls `(list a b ...)` are rewritten to `(%list a b ...)`.

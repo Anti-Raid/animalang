@@ -1,6 +1,6 @@
 import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
-import { opAdd, opSub, opMul, opDiv, opMod, opRem, opNumEq, opEq, opLt, opLe, opGt, opGe, opCons, opIsNull, opIsPair, CXR_PATHS, CXR_FNS } from "./ops";
+import { ARITHMETIC, opCons, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "./ops";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
 
 /** 
@@ -21,18 +21,7 @@ export class BuiltinFunction extends IProcedure {
 }
 
 export const IBUILTINS: BuiltinFunction[] = [
-    new BuiltinFunction(Symbol.for("+"), opAdd),
-    new BuiltinFunction(Symbol.for("-"), opSub),
-    new BuiltinFunction(Symbol.for("*"), opMul),
-    new BuiltinFunction(Symbol.for("/"), opDiv),
-    new BuiltinFunction(Symbol.for("modulo"), opMod),
-    new BuiltinFunction(Symbol.for("remainder"), opRem),
-    new BuiltinFunction(Symbol.for("="), opNumEq),
-    new BuiltinFunction(Symbol.for("eq?"), opEq),
-    new BuiltinFunction(Symbol.for("<"), opLt),
-    new BuiltinFunction(Symbol.for("<="), opLe),
-    new BuiltinFunction(Symbol.for(">"), opGt),
-    new BuiltinFunction(Symbol.for(">="), opGe),
+    ...ARITHMETIC.map(([name, fn]) => new BuiltinFunction(Symbol.for(name), fn)),
     new BuiltinFunction(Symbol.for("eqv?"), (regs, startReg, nargs) => {
         // DEVIATION: normal scheme requires arity 2, anima extends this to arity >=1
         if (nargs === 0) throw new Error("eqv? requires at least 1 argument");
@@ -65,6 +54,7 @@ export const IBUILTINS: BuiltinFunction[] = [
     // list builtins
     new BuiltinFunction(Symbol.for("cons"), opCons),
     ...CXR_PATHS.map(([name], i) => new BuiltinFunction(Symbol.for(name), CXR_FNS[i])),
+    ...PREDICATES.map(([name], i) => new BuiltinFunction(Symbol.for(name), PREDICATE_FNS[i])),
     new BuiltinFunction(Symbol.for("last"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("last requires 1 argument");
         const val = regs[startReg];
@@ -128,10 +118,6 @@ export const IBUILTINS: BuiltinFunction[] = [
         if (nargs != 1) throw new Error("");
         throw new Error(regs[startReg])
     }),
-    new BuiltinFunction(Symbol.for("error?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("error? requires 1 argument");
-        return regs[startReg] instanceof ErrorObject
-    }),
     new BuiltinFunction(Symbol.for("make-error-object"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("make-error-object requires 1 argument");
         return new ErrorObject(regs[startReg]);
@@ -151,97 +137,12 @@ export const IBUILTINS: BuiltinFunction[] = [
         return err?.message?.toString() || String(err);
     }),
     // Builtin predicates
-    new BuiltinFunction(Symbol.for("number?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("number? requires 1 argument");
-        return typeof regs[startReg] == "number"
-    }),
-    new BuiltinFunction(Symbol.for("integer?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("integer? requires 1 argument");
-        return typeof regs[startReg] == "number" && Number.isInteger(regs[startReg])
-    }),
-    new BuiltinFunction(Symbol.for("positive?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("positive? requires 1 argument");
-        return typeof regs[startReg] == "number" && regs[startReg] > 0
-    }),
-    new BuiltinFunction(Symbol.for("negative?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("negative? requires 1 argument");
-        return typeof regs[startReg] == "number" && regs[startReg] < 0
-    }),
-    new BuiltinFunction(Symbol.for("zero?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("zero? requires 1 argument");
-        return typeof regs[startReg] == "number" && regs[startReg] == 0
-    }),
-    new BuiltinFunction(Symbol.for("even?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("even? requires 1 argument");
-        const val = regs[startReg];
-        if (typeof val !== "number" || !Number.isInteger(val)) throw new Error("even? requires an integer");
-        return val % 2 === 0;
-    }),
-    new BuiltinFunction(Symbol.for("odd?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("odd? requires 1 argument");
-        const val = regs[startReg];
-        if (typeof val !== "number" || !Number.isInteger(val)) throw new Error("odd? requires an integer");
-        return Math.abs(val % 2) === 1; 
-    }),
-    new BuiltinFunction(Symbol.for("infinite?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("infinite? requires 1 argument");
-        const val = regs[startReg];
-        return typeof val === "number" && (val === Infinity || val === -Infinity);
-    }),
-    new BuiltinFunction(Symbol.for("finite?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("finite? requires 1 argument");
-        const val = regs[startReg];
-        return typeof val === "number" && Number.isFinite(val);
-    }),
-    new BuiltinFunction(Symbol.for("nan?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("nan? requires 1 argument");
-        const val = regs[startReg];
-        return typeof val === "number" && Number.isNaN(val);
-    }),
-    new BuiltinFunction(Symbol.for("boolean?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("boolean? requires 1 argument");
-        return typeof regs[startReg] == "boolean"
-    }),
-    new BuiltinFunction(Symbol.for("void?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("void? requires 1 argument");
-        return typeof regs[startReg] == "undefined"
-    }),
-    new BuiltinFunction(Symbol.for("list?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("list? requires 1 argument");
-        const val = regs[startReg];
-        if (val === null) return true;
-        if (val instanceof Cons) return !val.isImproper() && !val.isCyclic();
-        return false;
-    }),
-    new BuiltinFunction(Symbol.for("pair?"), opIsPair),
-    new BuiltinFunction(Symbol.for("null?"), opIsNull),
-    new BuiltinFunction(Symbol.for("empty?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("empty? requires 1 argument");
-        const val = regs[startReg];
-        return val === null || (Array.isArray(val) && val.length === 0) || (typeof val === "string" && val.length === 0) || (val instanceof Table && val.size === 0);
-    }),
     new BuiltinFunction(Symbol.for("contains?"), (regs, startReg, nargs) => {
         if (nargs != 2) throw new Error("contains? requires 2 arguments");
         const list = regs[startReg];
         const item = regs[startReg+1];
         if (Array.isArray(list)) return list.includes(item);
         return (list instanceof Cons) ? list.includes(item) : false;
-    }),
-    new BuiltinFunction(Symbol.for("symbol?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("symbol? requires 1 argument");
-        return typeof regs[startReg] == "symbol"
-    }),
-    new BuiltinFunction(Symbol.for("string?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("string? requires 1 argument");
-        return typeof regs[startReg] == "string"
-    }),
-    new BuiltinFunction(Symbol.for("procedure?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("procedure? requires 1 argument");
-        return regs[startReg] instanceof IProcedure
-    }),
-    new BuiltinFunction(Symbol.for("error?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("error? requires 1 argument");
-        return regs[startReg] instanceof ErrorObject
     }),
     new BuiltinFunction(Symbol.for("gensym"), (regs, startReg, nargs) => {
         if (nargs > 1) throw new Error("gensym requires 0 or 1 arguments");
@@ -254,10 +155,6 @@ export const IBUILTINS: BuiltinFunction[] = [
         }
     }),
     // Vector operations
-    new BuiltinFunction(Symbol.for("vector?"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("vector? requires 1 argument");
-        return Array.isArray(regs[startReg]);
-    }),
     new BuiltinFunction(Symbol.for("make-vector"), (regs, startReg, nargs) => {
         if (nargs < 1 || nargs > 2) throw new Error("make-vector requires 1 or 2 arguments");
         const len = regs[startReg];
@@ -344,17 +241,7 @@ export const IBUILTINS: BuiltinFunction[] = [
         }
         return result;
     }),
-    new BuiltinFunction(Symbol.for("vector-empty?"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("vector-empty? requires 1 argument");
-        const vec = regs[startReg];
-        if (!Array.isArray(vec)) throw new Error("vector-empty? requires a vector");
-        return vec.length === 0;
-    }),
     // Table operations
-    new BuiltinFunction(Symbol.for("table?"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("table? requires 1 argument");
-        return regs[startReg] instanceof Table;
-    }),
     new BuiltinFunction(Symbol.for("table"), (regs, startReg, nargs) => {
         if (nargs % 2 !== 0) throw new Error("table requires an even number of arguments (key-value pairs)");
         const tbl = new Table();
@@ -424,12 +311,6 @@ export const IBUILTINS: BuiltinFunction[] = [
         if (!(tbl instanceof Table)) throw new Error("table-size requires a table");
         return tbl.size;
     }),
-    new BuiltinFunction(Symbol.for("table-empty?"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("table-empty? requires 1 argument");
-        const tbl = regs[startReg];
-        if (!(tbl instanceof Table)) throw new Error("table-empty? requires a table");
-        return tbl.size === 0;
-    }),
     new BuiltinFunction(Symbol.for("table-keys"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("table-keys requires 1 argument");
         const tbl = regs[startReg];
@@ -473,12 +354,6 @@ export const IBUILTINS: BuiltinFunction[] = [
         if (!(tbl instanceof Table)) throw new Error("table-freeze! requires a table");
         tbl.frozen = true;
         return tbl;
-    }),
-    new BuiltinFunction(Symbol.for("table-frozen?"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("table-frozen? requires 1 argument");
-        const tbl = regs[startReg];
-        if (!(tbl instanceof Table)) throw new Error("table-frozen? requires a table");
-        return tbl.frozen;
     }),
     new BuiltinFunction(Symbol.for("table-merge!"), (regs, startReg, nargs) => {
         if (nargs !== 2) throw new Error("table-merge! requires 2 arguments (table-merge! target source)");

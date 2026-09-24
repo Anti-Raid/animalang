@@ -8,7 +8,7 @@ import {
     Cons
 } from "../common";
 import { MacroEvaluator, TransformState } from "./macro";
-import { CXR_PATHS } from "../ops";
+import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops";
 
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
@@ -422,13 +422,13 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
     });
 
-    for (const name of ["+", "-", "*", "/", "modulo", "remainder", "=", "eq?", "<", "<=", ">", ">=", "list", "cons", "null?", "pair?"]) {
+    for (const name of ["list", "cons"]) {
         evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
             return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
         });
     }
 
-    for (const [name] of CXR_PATHS) {
+    for (const [name] of [...CXR_PATHS, ...PREDICATES, ...ARITHMETIC]) {
         evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
             return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
         });

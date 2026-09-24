@@ -1,4 +1,6 @@
 import { Cons } from "./list";
+import { ErrorObject, IProcedure } from "./common";
+import { Table } from "./table";
 
 const numAt = (name: string, regs: readonly any[], i: number): number => {
     const val = regs[i];
@@ -122,6 +124,23 @@ export const opGe = (regs: readonly any[], start: number, nargs: number) => {
     return true;
 };
 
+export const ARITHMETIC: [name: string, fn: (regs: readonly any[], start: number, nargs: number) => any][] = [
+    ["+", opAdd],
+    ["-", opSub],
+    ["*", opMul],
+    ["/", opDiv],
+    ["modulo", opMod],
+    ["remainder", opRem],
+    ["=", opNumEq],
+    ["eq?", opEq],
+    ["<", opLt],
+    ["<=", opLe],
+    [">", opGt],
+    [">=", opGe],
+];
+
+export const ARITHMETIC_FNS = ARITHMETIC.map(([, fn]) => fn);
+
 export const makeList = (regs: readonly any[], start: number, nargs: number) => {
     let tail: Cons | null = null;
     for (let i = start + nargs - 1; i >= start; i--) tail = new Cons(regs[i], tail);
@@ -160,12 +179,48 @@ export const makeCxr = (name: string, path: string) => {
 
 export const CXR_FNS = CXR_PATHS.map(([name, path]) => makeCxr(name, path));
 
-export const opIsNull = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 1) throw new Error("null? requires 1 argument");
-    return regs[start] === null;
+const requireInteger = (name: string, val: any): number => {
+    if (typeof val !== "number" || !Number.isInteger(val)) throw new Error(`${name} requires an integer`);
+    return val;
 };
 
-export const opIsPair = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 1) throw new Error("pair? requires 1 argument");
-    return regs[start] instanceof Cons;
+const requireTable = (name: string, val: any): Table => {
+    if (!(val instanceof Table)) throw new Error(`${name} requires a table`);
+    return val;
 };
+
+export const PREDICATES: [name: string, test: (val: any) => boolean][] = [
+    ["null?", val => val === null],
+    ["pair?", val => val instanceof Cons],
+    ["list?", val => val === null || (val instanceof Cons && !val.isImproper() && !val.isCyclic())],
+    ["number?", val => typeof val === "number"],
+    ["integer?", val => typeof val === "number" && Number.isInteger(val)],
+    ["positive?", val => typeof val === "number" && val > 0],
+    ["negative?", val => typeof val === "number" && val < 0],
+    ["zero?", val => typeof val === "number" && val === 0],
+    ["even?", val => requireInteger("even?", val) % 2 === 0],
+    ["odd?", val => Math.abs(requireInteger("odd?", val) % 2) === 1],
+    ["infinite?", val => typeof val === "number" && (val === Infinity || val === -Infinity)],
+    ["finite?", val => typeof val === "number" && Number.isFinite(val)],
+    ["nan?", val => typeof val === "number" && Number.isNaN(val)],
+    ["boolean?", val => typeof val === "boolean"],
+    ["void?", val => typeof val === "undefined"],
+    ["symbol?", val => typeof val === "symbol"],
+    ["string?", val => typeof val === "string"],
+    ["procedure?", val => val instanceof IProcedure],
+    ["error?", val => val instanceof ErrorObject],
+    ["vector?", val => Array.isArray(val)],
+    ["table?", val => val instanceof Table],
+    ["empty?", val => val === null || (Array.isArray(val) && val.length === 0) || (typeof val === "string" && val.length === 0) || (val instanceof Table && val.size === 0)],
+    ["vector-empty?", val => {
+        if (!Array.isArray(val)) throw new Error("vector-empty? requires a vector");
+        return val.length === 0;
+    }],
+    ["table-empty?", val => requireTable("table-empty?", val).size === 0],
+    ["table-frozen?", val => requireTable("table-frozen?", val).frozen],
+];
+
+export const PREDICATE_FNS = PREDICATES.map(([name, test]) => (regs: readonly any[], start: number, nargs: number) => {
+    if (nargs !== 1) throw new Error(`${name} requires 1 argument`);
+    return test(regs[start]);
+});

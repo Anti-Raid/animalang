@@ -13,7 +13,7 @@ import {
     AbstractClosure
 } from "../common";
 import { Cons } from "../list";
-import { opAdd, opSub, opMul, opDiv, opMod, opRem, opNumEq, opEq, opLt, opLe, opGt, opGe, makeList, opCons, opIsNull, opIsPair, CXR_FNS } from "../ops";
+import { ARITHMETIC_FNS, makeList, opCons, CXR_FNS, PREDICATE_FNS } from "../ops";
 import { BuiltinFunction, IBUILTINS } from "../std";
 
 export const BUILTINS_START = 2**31;
@@ -44,25 +44,13 @@ export enum OpCode {
     SETRAISEPROC,
     APPLY,
     TAILAPPLY,
-    ADD,
-    SUB,
-    MUL,
-    DIV,
-    MOD,
-    REM,
-    NUMEQ,
-    EQ,
-    LT,
-    LE,
-    GT,
-    GE,
     APPLYLIST,
     TAILAPPLYLIST,
     LIST,
     CONS,
-    ISNULL,
-    ISPAIR,
     CXR,
+    PREDICATE,
+    ARITHMETIC,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -95,21 +83,9 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.TAILAPPLYLIST]: 3,
     [OpCode.LIST]: 4,
     [OpCode.CONS]: 4,
-    [OpCode.ISNULL]: 4,
-    [OpCode.ISPAIR]: 4,
     [OpCode.CXR]: 5,
-    [OpCode.ADD]: 4,
-    [OpCode.SUB]: 4,
-    [OpCode.MUL]: 4,
-    [OpCode.DIV]: 4,
-    [OpCode.MOD]: 4,
-    [OpCode.REM]: 4,
-    [OpCode.NUMEQ]: 4,
-    [OpCode.EQ]: 4,
-    [OpCode.LT]: 4,
-    [OpCode.LE]: 4,
-    [OpCode.GT]: 4,
-    [OpCode.GE]: 4,
+    [OpCode.PREDICATE]: 5,
+    [OpCode.ARITHMETIC]: 5,
 };
 
 export type NativeFn = (
@@ -215,25 +191,11 @@ export class Closure extends IProcedure implements AbstractClosure {
     }
 }
 
-const WINDOW_OPS = { opAdd, opSub, opMul, opDiv, opMod, opRem, opNumEq, opEq, opLt, opLe, opGt, opGe, makeList, opCons, opIsNull, opIsPair };
+const WINDOW_OPS = { makeList, opCons };
 
 const WINDOW_FN_NAMES: Partial<Record<OpCode, keyof typeof WINDOW_OPS>> = {
-    [OpCode.ADD]: "opAdd",
-    [OpCode.SUB]: "opSub",
-    [OpCode.MUL]: "opMul",
-    [OpCode.DIV]: "opDiv",
-    [OpCode.MOD]: "opMod",
-    [OpCode.REM]: "opRem",
-    [OpCode.NUMEQ]: "opNumEq",
-    [OpCode.EQ]: "opEq",
-    [OpCode.LT]: "opLt",
-    [OpCode.LE]: "opLe",
-    [OpCode.GT]: "opGt",
-    [OpCode.GE]: "opGe",
     [OpCode.LIST]: "makeList",
     [OpCode.CONS]: "opCons",
-    [OpCode.ISNULL]: "opIsNull",
-    [OpCode.ISPAIR]: "opIsPair",
 };
 
 
@@ -815,78 +777,6 @@ export class BytecodeInterpreter {
                         executor.raiseProc = regs[inst[ip++]];
                         break;
                     }
-                    case OpCode.ADD: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opAdd(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.SUB: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opSub(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.MUL: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opMul(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.DIV: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opDiv(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.MOD: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opMod(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.REM: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opRem(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.NUMEQ: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opNumEq(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.EQ: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opEq(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.LT: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opLt(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.LE: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opLe(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.GT: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opGt(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.GE: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opGe(regs, startReg, inst[ip++]);
-                        break;
-                    }
                     case OpCode.LIST: {
                         const destReg = inst[ip++];
                         const startReg = inst[ip++];
@@ -899,23 +789,25 @@ export class BytecodeInterpreter {
                         regs[destReg] = opCons(regs, startReg, inst[ip++]);
                         break;
                     }
-                    case OpCode.ISNULL: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opIsNull(regs, startReg, inst[ip++]);
-                        break;
-                    }
-                    case OpCode.ISPAIR: {
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = opIsPair(regs, startReg, inst[ip++]);
-                        break;
-                    }
                     case OpCode.CXR: {
                         const destReg = inst[ip++];
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         regs[destReg] = CXR_FNS[inst[ip++]](regs, startReg, nargs);
+                        break;
+                    }
+                    case OpCode.PREDICATE: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        regs[destReg] = PREDICATE_FNS[inst[ip++]](regs, startReg, nargs);
+                        break;
+                    }
+                    case OpCode.ARITHMETIC: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        regs[destReg] = ARITHMETIC_FNS[inst[ip++]](regs, startReg, nargs);
                         break;
                     }
                     default: {
@@ -941,6 +833,8 @@ const JIT_DEPS = {
     WindPoint,
     ...WINDOW_OPS,
     CXR_FNS,
+    PREDICATE_FNS,
+    ARITHMETIC_FNS,
     windowApplyArgs,
     listApplyArgs,
 };
@@ -1326,22 +1220,8 @@ export class JITCompiler {
                     out.emit(`executor.raiseProc = regs[${srcReg}];`);
                     break;
                 }
-                case OpCode.ADD:
-                case OpCode.SUB:
-                case OpCode.MUL:
-                case OpCode.DIV:
-                case OpCode.MOD:
-                case OpCode.REM:
-                case OpCode.NUMEQ:
-                case OpCode.EQ:
-                case OpCode.LT:
-                case OpCode.LE:
-                case OpCode.GT:
-                case OpCode.GE:
                 case OpCode.LIST:
                 case OpCode.CONS:
-                case OpCode.ISNULL:
-                case OpCode.ISPAIR:
                 {
                     const destReg = inst[ip++];
                     const startReg = inst[ip++];
@@ -1355,6 +1235,22 @@ export class JITCompiler {
                     const nargs = inst[ip++];
                     const idx = inst[ip++];
                     out.emit(`regs[${destReg}] = CXR_FNS[${idx}](regs, ${startReg}, ${nargs});`);
+                    break;
+                }
+                case OpCode.PREDICATE: {
+                    const destReg = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    const idx = inst[ip++];
+                    out.emit(`regs[${destReg}] = PREDICATE_FNS[${idx}](regs, ${startReg}, ${nargs});`);
+                    break;
+                }
+                case OpCode.ARITHMETIC: {
+                    const destReg = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    const idx = inst[ip++];
+                    out.emit(`regs[${destReg}] = ARITHMETIC_FNS[${idx}](regs, ${startReg}, ${nargs});`);
                     break;
                 }
                 default: {
