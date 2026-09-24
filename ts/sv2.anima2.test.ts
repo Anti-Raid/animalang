@@ -118,6 +118,15 @@ describe('Anima', () => {
             expect(() => run("(/ 1 0)")).toThrow("division by zero");
         });
 
+        it('self tail calls respect redefinition and rest params', () => {
+            run(`(define (count-down n) (if (= n 0) 'done (begin (if (= n 5) (set! count-down (lambda (m) 'swapped)) #f) (count-down (- n 1)))))`);
+            expect(run("(count-down 10)")).toBe("swapped");
+            run(`(define (rest-loop n . xs) (if (= n 0) xs (rest-loop (- n 1) n (* n 10))))`);
+            expect(run("(rest-loop 3)")).toBe("(1 10)");
+            run(`(define (sum-to n acc) (if (= n 0) acc (sum-to (- n 1) (+ acc n))))`);
+            expect(run("(sum-to 100000 0)")).toBe("5000050000");
+        });
+
         it('rejects binding reserved builtins', () => {
             expect(() => run("(lambda (+) 1)")).toThrow("cannot bind builtin +");
             expect(() => run("(let ((< 1)) <)")).toThrow("cannot bind builtin <");

@@ -39,7 +39,7 @@ export class AnimaVM implements AbstractVM {
     #run(ctx: ExecutionContext, frame: Frame): any {
         try {
             if (this.mode === "aot") {
-                JITCompiler.compileAll(frame.code);
+                JITCompiler.compileAll(frame.code, frame.closure.tmpl);
                 return JITCompiler.run(ctx, frame, this.executor);
             }
             return BytecodeInterpreter.run(ctx, frame, this.executor);
