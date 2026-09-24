@@ -294,28 +294,20 @@ export class Compiler {
         this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: afterProcReg, isTail: false });
 
         // Call before()
-        const discardBefore = opts.scope.allocTemp();
-        opts.nodes.push({ t: "Call", procReg: beforeProcReg, destReg: discardBefore, startReg: 0, nargs: 0 });
-        opts.scope.freeTemp(discardBefore);
+        opts.nodes.push({ t: "Call", procReg: beforeProcReg, startReg: 0, nargs: 0 });
 
         // Wind
         opts.nodes.push({ t: "Wind", beforeReg: beforeProcReg, afterReg: afterProcReg });
 
         // Call thunk()
-        const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg;
-        opts.nodes.push({ t: "Call", procReg: thunkProcReg, destReg: targetReg, startReg: 0, nargs: 0 });
+        opts.nodes.push({ t: "Call", procReg: thunkProcReg, destReg: opts.destReg, startReg: 0, nargs: 0 });
 
         // EndWind
         opts.nodes.push({ t: "EndWind" });
 
         // Call after()
-        const discardAfter = opts.scope.allocTemp();
-        opts.nodes.push({ t: "Call", procReg: afterProcReg, destReg: discardAfter, startReg: 0, nargs: 0 });
-        opts.scope.freeTemp(discardAfter);
+        opts.nodes.push({ t: "Call", procReg: afterProcReg, startReg: 0, nargs: 0 });
 
-        if (opts.destReg === undefined) {
-            opts.scope.freeTemp(targetReg);
-        }
         opts.scope.freeTemp(beforeProcReg);
         opts.scope.freeTemp(thunkProcReg);
         opts.scope.freeTemp(afterProcReg);
@@ -330,9 +322,7 @@ export class Compiler {
         if (opts.isTail) {
             opts.nodes.push({ t: "TailCallCC", procReg });
         } else {
-            const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg;
-            opts.nodes.push({ t: "CallCC", destReg: targetReg, procReg });
-            if (opts.destReg === undefined) opts.scope.freeTemp(targetReg);
+            opts.nodes.push({ t: "CallCC", destReg: opts.destReg, procReg });
         }
         opts.scope.freeTemp(procReg);
     }
@@ -426,9 +416,7 @@ export class Compiler {
         if (opts.isTail) {
             opts.nodes.push({ t: "TailApplyList", procReg, listReg });
         } else {
-            const destReg = opts.destReg ?? opts.scope.allocTemp();
-            opts.nodes.push({ t: "ApplyList", procReg, destReg, listReg });
-            if (opts.destReg === undefined) opts.scope.freeTemp(destReg);
+            opts.nodes.push({ t: "ApplyList", procReg, destReg: opts.destReg, listReg });
         }
 
         opts.scope.freeTemp(listReg);
@@ -439,9 +427,7 @@ export class Compiler {
         if (opts.isTail) {
             opts.nodes.push({ t: "TailApply", procReg, startReg, nargs });
         } else {
-            const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg;
-            opts.nodes.push({ t: "Apply", destReg: targetReg, procReg, startReg, nargs });
-            if (opts.destReg === undefined) opts.scope.freeTemp(targetReg);
+            opts.nodes.push({ t: "Apply", destReg: opts.destReg, procReg, startReg, nargs });
         }
     }
     // a normal call
@@ -468,9 +454,7 @@ export class Compiler {
         if (opts.isTail) {
             opts.nodes.push({t: "TailCall", nargs, procReg, startReg})
         } else {
-            const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg!;
-            opts.nodes.push({t: "Call", destReg: targetReg, nargs, procReg, startReg})
-            if (opts.destReg === undefined) opts.scope.freeTemp(targetReg);
+            opts.nodes.push({t: "Call", destReg: opts.destReg, nargs, procReg, startReg})
         }
 
         opts.scope.regAlloc.freeBlock(startReg, nargs)

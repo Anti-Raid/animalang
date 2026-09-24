@@ -127,16 +127,20 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 break;
             }
 
-            case OpCode.CALL: {
-                const proc = inst.inst[idx + 1];
-                const destReg = inst.inst[idx + 2];
-                const startReg = inst.inst[idx + 3];
-                const nargs = inst.inst[idx + 4];
-                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`
-                line += `${padOp(OpCode[opcode])} ${procStr}, dest=r${destReg}, start=r${startReg}, nargs=${nargs}`;
+            case OpCode.CALL:
+                line += `${padOp("CALL")} r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
+                idx += 4;
+                break;
+
+            case OpCode.CALLBUILTIN:
+                line += `${padOp("CALLBUILTIN")} builtin(${String(IBUILTINS[inst.inst[idx + 1]].name)}), dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
                 idx += 5;
                 break;
-            }
+
+            case OpCode.MOVEACC:
+                line += `${padOp("MOVEACC")} r${inst.inst[idx + 1]}`;
+                idx += 2;
+                break;
 
             case OpCode.TAILAPPLY: {
                 const proc = inst.inst[idx + 1];
@@ -150,12 +154,11 @@ const stringifyInst = (inst: ByteCode): string[] => {
 
             case OpCode.APPLY: {
                 const proc = inst.inst[idx + 1];
-                const destReg = inst.inst[idx + 2];
-                const startReg = inst.inst[idx + 3];
-                const nargs = inst.inst[idx + 4];
+                const startReg = inst.inst[idx + 2];
+                const nargs = inst.inst[idx + 3];
                 const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
-                line += `${padOp("APPLY")} ${procStr}, dest=r${destReg}, start=r${startReg}, nargs=${nargs}`;
-                idx += 5;
+                line += `${padOp("APPLY")} ${procStr}, start=r${startReg}, nargs=${nargs}`;
+                idx += 4;
                 break;
             }
             case OpCode.WIND: {
@@ -173,10 +176,8 @@ const stringifyInst = (inst: ByteCode): string[] => {
             }
 
             case OpCode.CALLCC: {
-                const destReg = inst.inst[idx + 1];
-                const procReg = inst.inst[idx + 2];
-                line += `${padOp("CALLCC")} proc=r${procReg}, dest=r${destReg}`;
-                idx += 3;
+                line += `${padOp("CALLCC")} proc=r${inst.inst[idx + 1]}`;
+                idx += 2;
                 break;
             }
 
@@ -212,8 +213,8 @@ const stringifyInst = (inst: ByteCode): string[] => {
             case OpCode.APPLYLIST: {
                 const proc = inst.inst[idx + 1];
                 const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
-                line += `${padOp("APPLYLIST")} ${procStr}, dest=r${inst.inst[idx + 2]}, list=r${inst.inst[idx + 3]}`;
-                idx += 4;
+                line += `${padOp("APPLYLIST")} ${procStr}, list=r${inst.inst[idx + 2]}`;
+                idx += 3;
                 break;
             }
 
@@ -250,7 +251,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 1
+export const BYTECODE_VERSION = 2
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

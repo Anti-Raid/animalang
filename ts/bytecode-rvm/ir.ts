@@ -1,5 +1,5 @@
 import { ConstPool } from "../common";
-import { ByteCode, Closure, ClosureTemplate, OpCode, type UpVarLoc } from "./exec";
+import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, type UpVarLoc } from "./exec";
 
 let nextLabelId = 0;
 
@@ -53,7 +53,7 @@ export type Node = {
 } | {
     t: "Call",
     procReg: number,
-    destReg: number, // ret value is stored in destReg
+    destReg?: number,
     startReg: number,
     nargs: number,
 } | {
@@ -65,7 +65,7 @@ export type Node = {
 } | {
     t: "Apply",
     procReg: number,
-    destReg: number,
+    destReg?: number,
     startReg: number,
     nargs: number,
 } | {
@@ -116,7 +116,7 @@ export type Node = {
     t: "EndWind"
 } | {
     t: "CallCC",
-    destReg: number,
+    destReg?: number,
     procReg: number
 } | {
     t: "TailCallCC",
@@ -140,7 +140,7 @@ export type Node = {
 } | {
     t: "ApplyList",
     procReg: number,
-    destReg: number,
+    destReg?: number,
     listReg: number
 } | {
     t: "TailApplyList",
@@ -210,7 +210,9 @@ export class IR {
                     break
                 }
                 case "Call": {
-                    inst.push(OpCode.CALL, node.procReg, node.destReg, node.startReg, node.nargs)
+                    if (node.procReg >= BUILTINS_START) throw new Error("internal error: builtin calls must use IBuiltin")
+                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs)
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailCall": {
@@ -218,7 +220,8 @@ export class IR {
                     break
                 }
                 case "Apply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.destReg, node.startReg, node.nargs)
+                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs)
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailApply": {
@@ -226,7 +229,7 @@ export class IR {
                     break
                 }
                 case "IBuiltin": {
-                    inst.push(OpCode.CALL, node.builtinIdx, node.destReg, node.startReg, node.nargs)
+                    inst.push(OpCode.CALLBUILTIN, node.builtinIdx - BUILTINS_START, node.destReg, node.startReg, node.nargs)
                     break
                 }
                 case "IBuiltinTail": {
@@ -275,7 +278,8 @@ export class IR {
                     break;
                 }
                 case "CallCC": {
-                    inst.push(OpCode.CALLCC, node.destReg, node.procReg);
+                    inst.push(OpCode.CALLCC, node.procReg);
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "TailCallCC": {
@@ -295,7 +299,8 @@ export class IR {
                     break;
                 }
                 case "ApplyList": {
-                    inst.push(OpCode.APPLYLIST, node.procReg, node.destReg, node.listReg);
+                    inst.push(OpCode.APPLYLIST, node.procReg, node.listReg);
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "TailApplyList": {

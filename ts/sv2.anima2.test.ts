@@ -145,6 +145,35 @@ describe('Anima', () => {
             expect(run(`(define trail '())
                         (define (inner k) (dynamic-wind (lambda () (set! trail (cons 'in trail))) (lambda () (+ 1 (k 'out))) (lambda () (set! trail (cons 'after trail)))))
                         (list (call/cc (lambda (k) (+ 1 (inner k)))) trail)`)).toBe("(out (after in))");
+            expect(run(`(define (wound) (dynamic-wind (lambda () 'before-val) (lambda () 42) (lambda () 'after-val)))
+                        (+ 1 (wound))`)).toBe("43");
+            expect(run(`(+ 1 (call/cc (lambda (k) (dynamic-wind (lambda () 'b) (lambda () (k 10)) (lambda () 'a)))))`)).toBe("11");
+            expect(run(`(define (vsum . xs) (if (null? xs) 0 (+ (car xs) (apply vsum (cdr xs)))))
+                        (define (outer n) (+ n (vsum 1 2 3)))
+                        (outer 10)`)).toBe("16");
+            expect(run(`(define (ev? n) (if (= n 0) #t (od? (- n 1))))
+                        (define (od? n) (if (= n 0) #f (ev? (- n 1))))
+                        (list (ev? 100000) (od? 100001))`)).toBe("(#t #t)");
+            expect(run(`(define (ap f . xs) (apply f xs))
+                        (define (use) (list (ap + 1 2) (ap (lambda (a b) (* a b)) 3 4) (ap vsum 5 6)))
+                        (use)`)).toBe("(3 12 11)");
+            expect(run(`(define (gen-list)
+                          (let ((acc '()) (k-saved #f) (n 0))
+                            (call/cc (lambda (done)
+                              (let ((v (call/cc (lambda (k) (set! k-saved k) 0))))
+                                (set! acc (cons v acc))
+                                (set! n (+ n 1))
+                                (if (< n 4) (k-saved n) (done #f)))))
+                            acc))
+                        (define (wrap) (list 'result (gen-list)))
+                        (wrap)`)).toBe("(result (3 2 1 0))");
+            expect(run(`(define calls 0)
+                        (define (ev2 n) (set! calls (+ calls 1)) (if (= n 0) #t (od2 (- n 1))))
+                        (define (od2 n) (set! calls (+ calls 1)) (if (= n 0) #f (ev2 (- n 1))))
+                        (list (ev2 5000) calls)`)).toBe("(#t 5001)");
+            expect(run(`(define lcalls 0)
+                        (define (len2 l) (set! lcalls (+ lcalls 1)) (if (null? l) 0 (+ 1 (len2 (cdr l)))))
+                        (list (len2 (mk 5000 '())) lcalls)`)).toBe("(5000 5001)");
             run(`(define (bad n) (if (= n 0) (car '()) (+ 1 (bad (- n 1)))))`);
             expect(() => run("(bad 10)")).toThrow("car: list is too short");
             expect(run("(try (lambda () (bad 5)) (lambda (e) 'caught))")).toBe("caught");
