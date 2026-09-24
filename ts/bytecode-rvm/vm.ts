@@ -1,9 +1,9 @@
 import { ASTStringifier, ErrorObject, Table, unpackValues, type AbstractVM } from "../common";
-import { OpCode, CodeEmitter, JITCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs } from "./exec";
+import { OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs } from "./exec";
 
 export {
     CodeEmitter,
-    JITCompiler,
+    AotCompiler,
     ExecutionContext,
     Frame,
     VMContinuation,
@@ -39,8 +39,18 @@ export class AnimaVM implements AbstractVM {
 
     public resumeCoroutine(co: Coroutine, args: any[]): { done: boolean, value: any, values: any[] } {
         try {
-            const values = unpackValues(this.executor.coResume(null, co, args));
+            const values = unpackValues(this.executor.coResumeNested(null, co, args));
             return { done: co.status === "dead", value: values[0], values };
+        } catch (err) {
+            if (!(err instanceof ReRaise)) throw err;
+            const val = err.value instanceof ErrorObject ? err.value.error : err.value;
+            throw val instanceof Error ? val : new Error(new ASTStringifier().stringify(val));
+        }
+    }
+
+    public closeCoroutine(co: Coroutine): void {
+        try {
+            this.executor.coClose(null, co);
         } catch (err) {
             if (!(err instanceof ReRaise)) throw err;
             const val = err.value instanceof ErrorObject ? err.value.error : err.value;
@@ -51,8 +61,8 @@ export class AnimaVM implements AbstractVM {
     #run(ctx: ExecutionContext, frame: Frame): any {
         try {
             if (this.mode === "aot") {
-                JITCompiler.compileAll(frame.code, frame.closure.tmpl);
-                return JITCompiler.run(ctx, frame, this.executor);
+                AotCompiler.compileAll(frame.code, frame.closure.tmpl);
+                return AotCompiler.run(ctx, frame, this.executor);
             }
             return BytecodeInterpreter.run(ctx, frame, this.executor);
         } catch (err: any) {

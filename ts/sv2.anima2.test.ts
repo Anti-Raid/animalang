@@ -3,12 +3,12 @@ import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, 
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
 import { BuiltinFunction } from './std';
-import { ByteCode, AnimaVM, JITCompiler, OpCode } from './bytecode-rvm/vm';
+import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
 import { Anima } from './anima';
-import { implAot } from './bytecode-rvm/meta';
+import { impl, implAot } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
 
-const vmImpl = implAot
+describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
 const bcCache: Record<string, AbstractByteCode> = {}
 describe('Anima', () => {
     let evaluator = new Anima(vmImpl)
@@ -210,6 +210,58 @@ describe('Anima', () => {
                              (lambda (e) (error-message e)))`)).toBe('"coroutine-yield: not inside a coroutine (or across a host call boundary)"');
         });
 
+        it('coroutines switch inside the driver loop', () => {
+            expect(run(`(define (id-list . xs) xs)
+                        (list (apply id-list '(1)) (+ 1 1) (apply id-list '(3)))`)).toBe("((1) 2 (3))");
+            expect(run(`(define (make-task n) (coroutine-create (lambda () (let loop ((i 0)) (if (< i 20) (begin (coroutine-yield i) (loop (+ i 1))) 'done)))))
+                        (define (build n acc) (if (= n 0) acc (build (- n 1) (cons (make-task n) acc))))
+                        (define (step tasks) (if (null? tasks) '() (let ((t (car tasks))) (coroutine-resume t) (if (eq? (coroutine-status t) 'dead) (step (cdr tasks)) (cons t (step (cdr tasks)))))))
+                        (define (sched tasks rounds) (if (null? tasks) rounds (sched (step tasks) (+ rounds 1))))
+                        (sched (build 1000 '()) 0)`)).toBe("21");
+            expect(run(`(define (chain n) (coroutine-resume (coroutine-create (lambda () (if (= n 0) 'bottom (chain (- n 1)))))))
+                        (chain 100000)`)).toBe("bottom");
+            expect(run(`(define inner-bad (coroutine-create (lambda () (raise 'deep))))
+                        (define outer-ok (coroutine-create (lambda () (try (lambda () (coroutine-resume inner-bad)) (lambda (e) (list 'outer-caught e))))))
+                        (list (coroutine-resume outer-ok) (coroutine-status inner-bad))`)).toBe("((outer-caught deep) dead)");
+            expect(run(`(define dc (coroutine-create (lambda () (coroutine-yield 41) 0)))
+                        (define (helper co) (+ 1 (coroutine-resume co)))
+                        (define (outer-fn) (helper dc))
+                        (list (outer-fn) (outer-fn) (coroutine-status dc))`)).toBe("(42 1 dead)");
+            expect(run(`(define (nest n) (if (= n 0) 0 (+ 1 (coroutine-resume (coroutine-create (lambda () (+ 0 (nest (- n 1)))))))))
+                        (nest 40)`)).toBe("40");
+        });
+
+        it('coroutine-close runs pending dynamic-wind cleanup', () => {
+            expect(run(`(define close-log '())
+                        (define (note x) (set! close-log (cons x close-log)))
+                        (define res-co (coroutine-create (lambda ()
+                          (dynamic-wind (lambda () (note 'outer-open))
+                            (lambda () (dynamic-wind (lambda () (note 'inner-open))
+                                                     (lambda () (coroutine-yield 1) 'unreachable)
+                                                     (lambda () (note 'inner-close))))
+                            (lambda () (note 'outer-close))))))
+                        (coroutine-resume res-co)
+                        (coroutine-close res-co)
+                        (list close-log (coroutine-status res-co))`)).toBe("((outer-close inner-close inner-open outer-open) dead)");
+            expect(run(`(define fresh-co (coroutine-create (lambda () 1)))
+                        (coroutine-close fresh-co)
+                        (coroutine-close fresh-co)
+                        (coroutine-status fresh-co)`)).toBe("dead");
+            expect(run(`(define self-co (coroutine-create (lambda () (coroutine-close self-co))))
+                        (try (lambda () (coroutine-resume self-co)) (lambda (e) (error-message e)))`)).toBe('"coroutine-close: cannot close a running coroutine"');
+            expect(run(`(define err-co (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1)) (lambda () (raise 'cleanup-failed))))))
+                        (coroutine-resume err-co)
+                        (list (try (lambda () (coroutine-close err-co)) (lambda (e) (list 'caught e))) (coroutine-status err-co))`)).toBe("((caught cleanup-failed) dead)");
+            expect(run(`(define yc-co (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1)) (lambda () (coroutine-yield 2))))))
+                        (coroutine-resume yc-co)
+                        (try (lambda () (coroutine-close yc-co)) (lambda (e) (error-message e)))`)).toBe('"coroutine-yield: cannot yield while a coroutine is closing"');
+
+            const hostCo = evaluator.evaluateRaw(evaluator.compileRaw(`(define host-closed #f) (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 'a)) (lambda () (set! host-closed #t)))))`));
+            evaluator.coroutineResume(hostCo);
+            evaluator.coroutineClose(hostCo);
+            expect(run("host-closed")).toBe("#t");
+        });
+
         it('host can resume coroutines across evaluations', () => {
             const co = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda (x) (+ (coroutine-yield (* x 2)) 1)))`));
             expect(evaluator.coroutineResume(co, 5)).toEqual({ done: false, value: 10, values: [10] });
@@ -251,6 +303,28 @@ describe('Anima', () => {
             const hostCo = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda (a b) (receive (x y) (coroutine-yield b a) (+ x y))))`));
             expect(evaluator.coroutineResume(hostCo, 1, 2)).toEqual({ done: false, value: 2, values: [2, 1] });
             expect(evaluator.coroutineResume(hostCo, 10, 20)).toEqual({ done: true, value: 30, values: [30] });
+        });
+
+        it('global lookups stay correct when globals change', () => {
+            expect(run(`(define (k2) 1) (define (use2) (k2)) (list (use2) (begin (set! k2 (lambda () 2)) (use2)))`)).toBe("(1 2)");
+            run(`(define (kk) 1) (define (usek) (kk))`);
+            expect(run("(usek)")).toBe("1");
+            run(`(define (kk) 2)`);
+            expect(run("(usek)")).toBe("2");
+            run(`(define (usem) not-yet-defined)`);
+            expect(() => run("(usem)")).toThrow("not-yet-defined");
+            run(`(define not-yet-defined 5)`);
+            expect(run("(usem)")).toBe("5");
+
+            const bc = evaluator.compileRaw("(+ gx 1)");
+            const vm = new AnimaVM("aot");
+            const scopeA = new Table(); scopeA.set(Symbol.for("gx"), 1);
+            const scopeB = new Table(); scopeB.set(Symbol.for("gx"), 10);
+            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
+            expect(vm.evaluateRaw(bc as ByteCode, scopeB)).toBe(11);
+            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
+            scopeA.set(Symbol.for("gx"), 100);
+            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(101);
         });
 
         it('rejects binding reserved builtins', () => {
@@ -1977,9 +2051,11 @@ describe('Floats, Infinities & NaNs', () => {
     });
 });
 
+});
+
 describe("JIT Compiler Runtime Compilation & Execution", () => {
     const animaScope = () => {
-        const anima = new Anima(vmImpl);
+        const anima = new Anima(implAot);
         return anima.scope;
     };
 
@@ -1992,8 +2068,8 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const doubleClosure = anima.evaluateRaw(code);
         const fnCode = doubleClosure.tmpl.code as ByteCode;
 
-        expect(fnCode.nativeFn).not.toBeNull();
-        expect(typeof fnCode.nativeFn).toBe("function");
+        expect(fnCode.resumeFn).not.toBeNull();
+        expect(typeof fnCode.resumeFn).toBe("function");
 
         expect(anima.evaluateClosure(doubleClosure, [21])).toBe(42);
         expect(anima.evaluateClosure(doubleClosure, [50])).toBe(100);
@@ -2006,7 +2082,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const idClosure = anima.evaluateRaw(code);
         const fnCode = idClosure.tmpl.code as ByteCode;
 
-        expect(fnCode.nativeFn).not.toBeNull();
+        expect(fnCode.resumeFn).not.toBeNull();
         expect(anima.evaluateClosure(idClosure, [42])).toBe(42);
         expect(anima.evaluateClosure(idClosure, [999])).toBe(999);
         expect(anima.evaluateClosure(idClosure, ["hello"])).toBe("hello");
@@ -2035,7 +2111,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
             OpCode.RETURN, 4
         ]);
         const bc = new ByteCode([], inst, 5);
-        JITCompiler.compile(bc);
+        AotCompiler.compile(bc);
 
         const vm = new AnimaVM();
         expect(vm.evaluateRaw(bc, animaScope())).toBe(200);
@@ -2054,7 +2130,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
             OpCode.RETURN, 2
         ]);
         const bc = new ByteCode([mySym], inst, 3);
-        JITCompiler.compile(bc);
+        AotCompiler.compile(bc);
 
         const vm = new AnimaVM();
         const scope = animaScope();
@@ -2066,20 +2142,20 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Function with straight-line ops followed by an unhandled opcode:
         // 0: LOADU32 r1, 50
         // 3: LOADU32 r2, 60
-        // 6: ARITHMETIC(+) r0, r1, r2
+        // 6: CALLBUILTIN(+) dest=r0, start=r1, nargs=2
         // 11: RETURN r0
         const plusSym = Symbol.for("+");
         const inst = new Uint32Array([
             OpCode.LOADU32, 1, 50,
             OpCode.LOADU32, 2, 60,
-            OpCode.ARITHMETIC, 0, 1, 2, 0,
+            OpCode.CALLBUILTIN, 0, 0, 1, 2,
             OpCode.RETURN, 0
         ]);
         const bc = new ByteCode([], inst, 4);
 
         // Compile it with JIT
-        JITCompiler.compile(bc);
-        expect(bc.nativeFn).not.toBeNull();
+        AotCompiler.compile(bc);
+        expect(bc.resumeFn).not.toBeNull();
 
         const vm = new AnimaVM();
         // Evaluating this will run native code for LOADU32 r1, 50 and LOADU32 r2, 60,
@@ -2098,7 +2174,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const branchClosure = anima.evaluateRaw(code);
         const fnCode = branchClosure.tmpl.code as ByteCode;
 
-        expect(fnCode.nativeFn).not.toBeNull();
+        expect(fnCode.resumeFn).not.toBeNull();
         expect(anima.evaluateClosure(branchClosure, [true, 10, 20])).toBe(10);
         expect(anima.evaluateClosure(branchClosure, [false, 10, 20])).toBe(20);
         expect(anima.evaluateClosure(branchClosure, [true, 99, 100])).toBe(99);
@@ -2117,7 +2193,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const fnClosure = anima.evaluateRaw(code);
         const fnCode = fnClosure.tmpl.code as ByteCode;
 
-        expect(fnCode.nativeFn).not.toBeNull();
+        expect(fnCode.resumeFn).not.toBeNull();
         expect(anima.evaluateClosure(fnClosure, [true, true])).toBe("both");
         expect(anima.evaluateClosure(fnClosure, [true, false])).toBe("only-a");
         expect(anima.evaluateClosure(fnClosure, [false, true])).toBe("only-b");
@@ -2136,7 +2212,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const loopClosure = anima.evaluateRaw(code);
         const fnCode = loopClosure.tmpl.code as ByteCode;
 
-        expect(fnCode.nativeFn).not.toBeNull();
+        expect(fnCode.resumeFn).not.toBeNull();
         expect(anima.evaluateClosure(loopClosure, [5, 0])).toBe(15);
         expect(anima.evaluateClosure(loopClosure, [1000, 0])).toBe(500500);
         expect(anima.evaluateClosure(loopClosure, [5000, 0])).toBe(12502500);
@@ -2153,7 +2229,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const sumSqClosure = anima.evaluateRaw(code);
         const fnCode = sumSqClosure.tmpl.code as ByteCode;
 
-        expect(fnCode.nativeFn).not.toBeNull();
+        expect(fnCode.resumeFn).not.toBeNull();
         expect(anima.evaluateClosure(sumSqClosure, [3, 4])).toBe(25);
         expect(anima.evaluateClosure(sumSqClosure, [5, 12])).toBe(169);
         expect(anima.evaluateClosure(sumSqClosure, [6, 8])).toBe(100);
@@ -2169,7 +2245,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const fnClosure = anima.evaluateRaw(code);
         const fnCode = fnClosure.tmpl.code as ByteCode;
 
-        expect(fnCode.nativeFn).not.toBeNull();
+        expect(fnCode.resumeFn).not.toBeNull();
 
         // Run 1
         expect(anima.evaluateClosure(fnClosure, [100])).toBe(105);

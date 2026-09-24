@@ -61,19 +61,30 @@ export class Table implements Iterable<[any, any]> {
         return false;
     }
 
+    // bumped whenever a table used as a global scope changes, so cached global lookups know to refetch
+    static globalsVersion: number = 0;
+    #watched: boolean = false;
+
+    watch(): void {
+        for (let curr: Table | null = this; curr !== null && !curr.#watched; curr = curr.#parent) curr.#watched = true;
+    }
+
     set(key: any, val: any): this {
         if (this.#frozen) throw new Error("Cannot modify a frozen Table");
         this.#map.set(key, val);
+        if (this.#watched) Table.globalsVersion++;
         return this;
     }
 
     delete(key: any): boolean {
         if (this.#frozen) throw new Error("Cannot modify a frozen Table");
+        if (this.#watched) Table.globalsVersion++;
         return this.#map.delete(key);
     }
 
     clear(): void {
         if (this.#frozen) throw new Error("Cannot modify a frozen Table");
+        if (this.#watched) Table.globalsVersion++;
         this.#map.clear();
     }
 

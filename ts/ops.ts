@@ -1,5 +1,5 @@
 import { Cons } from "./list";
-import { ErrorObject, IProcedure, unpackValues } from "./common";
+import { ErrorObject, IProcedure, packValues, unpackValues } from "./common";
 import { Table } from "./table";
 
 const numAt = (name: string, regs: readonly any[], i: number): number => {
@@ -230,3 +230,30 @@ export const PREDICATE_FNS = PREDICATES.map(([name, test]) => (regs: readonly an
     if (nargs !== 1) throw new Error(`${name} requires 1 argument`);
     return test(regs[start]);
 });
+
+export const listToArray = (lst: Cons | null): any[] => lst === null ? [] : [...lst];
+
+const spliceLast = (args: any[]): any[] => {
+    const finalArg = args.pop();
+    if (finalArg instanceof Cons) {
+        for (const v of finalArg) args.push(v);
+    } else if (finalArg !== null) {
+        throw new Error(`apply: last argument must be a list but got ${String(finalArg)}`);
+    }
+    return args;
+};
+
+export const windowApplyArgs = (regs: readonly any[], startReg: number, nargs: number): any[] => {
+    return spliceLast(regs.slice(startReg, startReg + nargs));
+};
+
+export const applyArgsList = (regs: readonly any[], start: number, nargs: number) => {
+    if (nargs !== 1) throw new Error("%apply-args requires 1 argument");
+    const lst = regs[start];
+    return Cons.fromArray(spliceLast(lst === null ? [] : [...lst]));
+};
+
+export const listToValues = (regs: readonly any[], start: number, nargs: number) => {
+    if (nargs !== 1) throw new Error("%list->values requires 1 argument");
+    return packValues(listToArray(regs[start]));
+};

@@ -1,7 +1,6 @@
 import { BS, BSReader, type SerializableBytecode } from "../common"
 import { IBUILTINS } from "../std"
-import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops"
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode } from "./exec"
+import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
 
 const constToString = (s: any): string => {
     if (s === null) {
@@ -89,11 +88,6 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 3;
                 break;
             }
-            case OpCode.HASGLOBAL: {
-                line += `${padOp(OpCode[opcode])} global(${constToString(inst.constants[inst.inst[idx + 1]])})`;
-                idx += 2;
-                break;
-            }
 
             case OpCode.NEWCLOSURE:
                 ops.push(`${lineNum}: ${padOp("NEWCLOSURE")} r${inst.inst[idx + 1]}, tmpl(${inst.inst[idx + 2]}), closure=${constToString(inst.constants[inst.inst[idx + 2]])}`)
@@ -161,20 +155,6 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 4;
                 break;
             }
-            case OpCode.WIND: {
-                const beforeReg = inst.inst[idx + 1];
-                const afterReg = inst.inst[idx + 2];
-                line += `${padOp("WIND")} before=r${beforeReg}, after=r${afterReg}`;
-                idx += 3;
-                break;
-            }
-
-            case OpCode.ENDWIND: {
-                line += `${padOp("ENDWIND")}`;
-                idx += 1;
-                break;
-            }
-
             case OpCode.CALLCC: {
                 line += `${padOp("CALLCC")} proc=r${inst.inst[idx + 1]}`;
                 idx += 2;
@@ -188,84 +168,21 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 break;
             }
 
-            case OpCode.SETRAISEPROC: {
-                const srcReg = inst.inst[idx + 1];
-                line += `${padOp("SETRAISEPROC")} proc=r${srcReg}`;
+            case OpCode.COYIELD:
+                line += `${padOp("COYIELD")} r${inst.inst[idx + 1]}`;
                 idx += 2;
-                break;
-            }
-
-            case OpCode.LIST:
-            case OpCode.CONS:
-            case OpCode.VALUESLIST:
-                line += `${padOp(OpCode[opcode])} dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
-                idx += 4;
-                break;
-
-            case OpCode.CXR:
-            case OpCode.PREDICATE:
-            case OpCode.ARITHMETIC: {
-                const table = opcode === OpCode.CXR ? CXR_PATHS : opcode === OpCode.PREDICATE ? PREDICATES : ARITHMETIC;
-                line += `${padOp(OpCode[opcode])} ${table[inst.inst[idx + 4]][0]}, dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
-                idx += 5;
-                break;
-            }
-
-            case OpCode.GETHANDLERS:
-                line += `${padOp("GETHANDLERS")} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.SETHANDLERS:
-                line += `${padOp("SETHANDLERS")} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.COCREATE:
-                line += `${padOp("COCREATE")} dest=r${inst.inst[idx + 1]}, proc=r${inst.inst[idx + 2]}`;
-                idx += 3;
                 break;
 
             case OpCode.CORESUME:
-                line += `${padOp("CORESUME")} dest=r${inst.inst[idx + 1]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}`;
-                idx += 4;
-                break;
-
-            case OpCode.COYIELD:
-                line += `${padOp("COYIELD")} start=r${inst.inst[idx + 1]}, nargs=${inst.inst[idx + 2]}`;
+            case OpCode.TAILCORESUME:
+                line += `${padOp(OpCode[opcode])} co=r${inst.inst[idx + 1]}, args=r${inst.inst[idx + 2]}`;
                 idx += 3;
                 break;
 
-            case OpCode.CORESUMELIST:
-                line += `${padOp("CORESUMELIST")} dest=r${inst.inst[idx + 1]}, co=r${inst.inst[idx + 2]}, list=r${inst.inst[idx + 3]}`;
-                idx += 4;
+            case OpCode.CALLRT:
+                line += `${padOp("CALLRT")} ${RUNTIME[inst.inst[idx + 1]][0]}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
+                idx += 5;
                 break;
-
-            case OpCode.COYIELDLIST:
-                line += `${padOp("COYIELDLIST")} list=r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.COSTATUS:
-                line += `${padOp("COSTATUS")} dest=r${inst.inst[idx + 1]}, co=r${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-
-            case OpCode.APPLYLIST: {
-                const proc = inst.inst[idx + 1];
-                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
-                line += `${padOp("APPLYLIST")} ${procStr}, list=r${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-            }
-
-            case OpCode.TAILAPPLYLIST: {
-                const proc = inst.inst[idx + 1];
-                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
-                line += `${padOp("TAILAPPLYLIST")} ${procStr}, list=r${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-            }
 
             default:
                 let _: never = opcode
@@ -292,7 +209,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 2
+export const BYTECODE_VERSION = 3
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

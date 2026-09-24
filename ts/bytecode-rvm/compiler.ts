@@ -4,33 +4,32 @@ import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { IBUILTINS_IDX_MAP } from "../std";
 import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops";
-import { BUILTINS_START, OpCode } from "./exec";
+import { BUILTINS_START, OpCode, RUNTIME_IDX } from "./exec";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
-const OP_SET_RAISE_PROC = Symbol.for("%set-raise-proc");
-const OP_HANDLERS = Symbol.for("%handlers");
-const OP_SET_HANDLERS = Symbol.for("%set-handlers!");
-const OP_CO_CREATE = Symbol.for("%coroutine-create");
-const OP_CO_RESUME = Symbol.for("%coroutine-resume");
 const OP_CO_YIELD = Symbol.for("%coroutine-yield");
-const OP_CO_STATUS = Symbol.for("%coroutine-status");
-const OP_CO_RESUME_LIST = Symbol.for("%coroutine-resume-list");
 const OP_CO_YIELD_LIST = Symbol.for("%coroutine-yield-list");
+const OP_CO_RESUME = Symbol.for("%coroutine-resume");
+const OP_CO_RESUME_LIST = Symbol.for("%coroutine-resume-list");
 const OP_APPLY = Symbol.for("%apply");
 const OP_APPLY_MARGS = Symbol.for("%apply-multi")
 
-const WINDOW_INTRINSICS = new Map<symbol, OpCode>([
-    [Symbol.for("%list"), OpCode.LIST],
-    [Symbol.for("%cons"), OpCode.CONS],
-    [Symbol.for("%values->list"), OpCode.VALUESLIST],
-])
+const BUILTIN_INTRINSICS = new Map<symbol, number>([
+    ...[...ARITHMETIC, ...PREDICATES, ...CXR_PATHS].map(([name]) => name),
+    "list",
+    "cons",
+].map(name => [Symbol.for(`%${name}`), IBUILTINS_IDX_MAP.get(Symbol.for(name))!]))
 
-const INDEXED_INTRINSICS = new Map<symbol, { op: OpCode, idx: number }>([
-    ...CXR_PATHS.map(([name], idx): [symbol, { op: OpCode, idx: number }] => [Symbol.for(`%${name}`), { op: OpCode.CXR, idx }]),
-    ...PREDICATES.map(([name], idx): [symbol, { op: OpCode, idx: number }] => [Symbol.for(`%${name}`), { op: OpCode.PREDICATE, idx }]),
-    ...ARITHMETIC.map(([name], idx): [symbol, { op: OpCode, idx: number }] => [Symbol.for(`%${name}`), { op: OpCode.ARITHMETIC, idx }]),
-])
+const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: number }>(([
+    ["%set-raise-proc", "set-raise-proc", 1, 1],
+    ["%handlers", "handlers", 0, 0],
+    ["%set-handlers!", "set-handlers!", 1, 1],
+    ["%coroutine-create", "coroutine-create", 1, 1],
+    ["%coroutine-status", "coroutine-status", 1, 1],
+    ["%coroutine-close", "coroutine-close", 1, 1],
+    ["%values->list", "values->list", 1, 1],
+] as [string, string, number, number][]).map(([form, name, min, max]) => [Symbol.for(form), { idx: RUNTIME_IDX.get(name)!, min, max }]))
 
 interface CmpOpts {
     destReg?: number // where to store dest reg
@@ -115,48 +114,33 @@ export class Compiler {
                 case OP_DEFINE_GLOBAL:
                     this.#compileDefine(expr, opts)
                     return
-                case OP_SET_RAISE_PROC:
-                    this.#compileSetRaiseProc(expr, opts)
-                    return
-                case OP_HANDLERS:
-                    this.#compileRuntimeOp(expr, opts, 0, 0, (start, nargs, dest) => {
-                        if (dest !== undefined) opts.nodes.push({ t: "GetHandlers", destReg: dest })
-                    })
-                    return
-                case OP_SET_HANDLERS:
-                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
-                        opts.nodes.push({ t: "SetHandlers", srcReg: start })
-                        if (dest !== undefined) opts.nodes.push({ t: "LoadValue", destReg: dest, constant: undefined })
-                    })
-                    return
-                case OP_CO_CREATE:
-                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
-                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoCreate", destReg, procReg: start }))
+                case OP_CO_YIELD:
+                    this.#compileRuntimeOp(expr, opts, 0, Infinity, (start, nargs, dest) => {
+                        if (nargs === 1) {
+                            opts.nodes.push({ t: "CoYield", valReg: start, destReg: dest })
+                            return
+                        }
+                        this.#withBuiltinResult(opts, "values", start, nargs, valReg => opts.nodes.push({ t: "CoYield", valReg, destReg: dest }))
                     })
                     return
                 case OP_CO_RESUME:
                     this.#compileRuntimeOp(expr, opts, 1, Infinity, (start, nargs, dest) => {
-                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoResume", destReg, startReg: start, nargs }))
-                    })
-                    return
-                case OP_CO_YIELD:
-                    this.#compileRuntimeOp(expr, opts, 0, Infinity, (start, nargs, dest) => {
-                        opts.nodes.push({ t: "CoYield", startReg: start, nargs, destReg: dest })
+                        this.#withBuiltinResult(opts, "list", start + 1, nargs - 1, listReg => {
+                            opts.nodes.push({ t: "CoResume", coReg: start, listReg, isTail: opts.isTail, destReg: dest })
+                        })
                     })
                     return
                 case OP_CO_RESUME_LIST:
                     this.#compileRuntimeOp(expr, opts, 2, 2, (start, nargs, dest) => {
-                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoResumeList", destReg, coReg: start, listReg: start + 1 }))
+                        opts.nodes.push({ t: "CoResume", coReg: start, listReg: start + 1, isTail: opts.isTail, destReg: dest })
                     })
                     return
                 case OP_CO_YIELD_LIST:
                     this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
-                        opts.nodes.push({ t: "CoYieldList", listReg: start, destReg: dest })
-                    })
-                    return
-                case OP_CO_STATUS:
-                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
-                        this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "CoStatus", destReg, coReg: start }))
+                        this.#withDest(opts, undefined, valReg => {
+                            opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("list->values")!, destReg: valReg, startReg: start, nargs })
+                            opts.nodes.push({ t: "CoYield", valReg, destReg: dest })
+                        })
                     })
                     return
                 case OP_APPLY:
@@ -167,15 +151,17 @@ export class Compiler {
                     return
             }
 
-            const indexed = INDEXED_INTRINSICS.get(operator)
-            if (indexed !== undefined) {
-                this.#compileWindowIntrinsic(expr, indexed.op, opts, indexed.idx)
+            const runtime = RUNTIME_INTRINSICS.get(operator)
+            if (runtime !== undefined) {
+                this.#compileRuntimeOp(expr, opts, runtime.min, runtime.max, (start, nargs, dest) => {
+                    this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "RtCall", rtIdx: runtime.idx, destReg, startReg: start, nargs }))
+                })
                 return
             }
 
-            const windowOp = WINDOW_INTRINSICS.get(operator)
-            if (windowOp !== undefined) {
-                this.#compileWindowIntrinsic(expr, windowOp, opts)
+            const builtinIdx = BUILTIN_INTRINSICS.get(operator)
+            if (builtinIdx !== undefined) {
+                this.#compileWindowIntrinsic(expr, builtinIdx, opts)
                 return
             }
         }
@@ -321,10 +307,10 @@ export class Compiler {
         if (
             lastNode.t === "TailCall" ||
             lastNode.t === "TailApply" ||
-            lastNode.t === "TailApplyList" ||
             lastNode.t === "IBuiltinTail" ||
             lastNode.t === "Return" ||
-            lastNode.t === "TailCallCC"
+            lastNode.t === "TailCallCC" ||
+            (lastNode.t === "CoResume" && lastNode.isTail)
         ) {
             return true // all of these ops alr return
         }
@@ -335,32 +321,21 @@ export class Compiler {
         if (expr.length !== 4) {
             throw new Error(`%dynamic-wind requires 3 arguments (before, thunk, after), got ${expr.length - 1}`);
         }
-        const beforeProcReg = opts.scope.allocTemp();
-        const thunkProcReg = opts.scope.allocTemp();
-        const afterProcReg = opts.scope.allocTemp();
+        // before and after are adjacent so they form the argument window of the wind runtime call
+        const block = opts.scope.regAlloc.allocBlock(3);
+        const beforeProcReg = block, afterProcReg = block + 1, thunkProcReg = block + 2;
 
         this.#compile(expr.cdr.car, { ...opts, destReg: beforeProcReg, isTail: false });
         this.#compile(expr.cdr.cdr.car, { ...opts, destReg: thunkProcReg, isTail: false });
         this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: afterProcReg, isTail: false });
 
-        // Call before()
         opts.nodes.push({ t: "Call", procReg: beforeProcReg, startReg: 0, nargs: 0 });
-
-        // Wind
-        opts.nodes.push({ t: "Wind", beforeReg: beforeProcReg, afterReg: afterProcReg });
-
-        // Call thunk()
+        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("wind")!, destReg, startReg: beforeProcReg, nargs: 2 }));
         opts.nodes.push({ t: "Call", procReg: thunkProcReg, destReg: opts.destReg, startReg: 0, nargs: 0 });
-
-        // EndWind
-        opts.nodes.push({ t: "EndWind" });
-
-        // Call after()
+        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("end-wind")!, destReg, startReg: 0, nargs: 0 }));
         opts.nodes.push({ t: "Call", procReg: afterProcReg, startReg: 0, nargs: 0 });
 
-        opts.scope.freeTemp(beforeProcReg);
-        opts.scope.freeTemp(thunkProcReg);
-        opts.scope.freeTemp(afterProcReg);
+        opts.scope.regAlloc.freeBlock(block, 3);
     }
 
     #compileCallCC(expr: Cons, opts: CmpOpts) {
@@ -395,26 +370,20 @@ export class Compiler {
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
 
+    #withBuiltinResult(opts: CmpOpts, builtin: string, startReg: number, nargs: number, use: (reg: number) => void) {
+        const reg = opts.scope.allocTemp()
+        opts.nodes.push({ t: "IBuiltin", builtinIdx: BUILTINS_START + IBUILTINS_IDX_MAP.get(Symbol.for(builtin))!, destReg: reg, startReg, nargs })
+        use(reg)
+        opts.scope.freeTemp(reg)
+    }
+
     #withDest(opts: CmpOpts, dest: number | undefined, push: (destReg: number) => void) {
         const destReg = dest ?? opts.scope.allocTemp()
         push(destReg)
         if (dest === undefined) opts.scope.freeTemp(destReg)
     }
 
-    #compileSetRaiseProc(expr: Cons, opts: CmpOpts) {
-        if (expr.length !== 2) {
-            throw new Error(`%set-raise-proc requires 1 argument, got ${expr.length - 1}`);
-        }
-        const srcReg = opts.scope.allocTemp();
-        this.#compile(expr.cdr.car, { ...opts, destReg: srcReg, isTail: false });
-        opts.nodes.push({ t: "SetRaiseProc", srcReg });
-        opts.scope.freeTemp(srcReg);
-        if (opts.destReg !== undefined) {
-            opts.nodes.push({ t: "LoadValue", destReg: opts.destReg, constant: undefined });
-        }
-    }
-
-    #compileWindowIntrinsic(expr: Cons, op: OpCode, opts: CmpOpts, tableIdx?: number) {
+    #compileWindowIntrinsic(expr: Cons, builtinIdx: number, opts: CmpOpts) {
         const nargs = expr.cdr === null ? 0 : expr.cdr.length
         const startReg = opts.scope.regAlloc.allocBlock(nargs)
         let curr: any = expr.cdr
@@ -426,15 +395,13 @@ export class Compiler {
         }
 
         const destReg = opts.destReg ?? opts.scope.allocTemp()
-        opts.nodes.push(tableIdx === undefined
-            ? { t: "WindowOp", op, destReg, startReg, nargs }
-            : { t: "IndexedOp", op, idx: tableIdx, destReg, startReg, nargs })
+        opts.nodes.push({ t: "IBuiltin", builtinIdx: BUILTINS_START + builtinIdx, destReg, startReg, nargs })
         if (opts.destReg === undefined) opts.scope.freeTemp(destReg)
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
 
     #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
-        if (WINDOW_INTRINSICS.has(procExpr) || INDEXED_INTRINSICS.has(procExpr)) {
+        if (BUILTIN_INTRINSICS.has(procExpr) || RUNTIME_INTRINSICS.has(procExpr)) {
             throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
         }
         if (typeof procExpr === "symbol") {
@@ -486,12 +453,8 @@ export class Compiler {
 
         const listReg = opts.scope.allocTemp();
         this.#compile(lstExpr, { ...opts, destReg: listReg, isTail: false });
-
-        if (opts.isTail) {
-            opts.nodes.push({ t: "TailApplyList", procReg, listReg });
-        } else {
-            opts.nodes.push({ t: "ApplyList", procReg, destReg: opts.destReg, listReg });
-        }
+        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("apply-args")!, destReg: listReg, startReg: listReg, nargs: 1 });
+        this.#emitApplyNode(opts, procReg, listReg, 1);
 
         opts.scope.freeTemp(listReg);
         if (isTemp) opts.scope.freeTemp(procReg);
@@ -646,8 +609,10 @@ export class Compiler {
         }
 
         // Assume global
-        if (destReg === undefined) return [{t: "HasGlobal", sym: varname}]
-        return [{t: "LoadGlobal", sym: varname, destReg}]
+        if (destReg !== undefined) return [{t: "LoadGlobal", sym: varname, destReg}]
+        const tmpReg = opts.scope.allocTemp()
+        opts.scope.freeTemp(tmpReg)
+        return [{t: "LoadGlobal", sym: varname, destReg: tmpReg}]
     }
 
     #setVar(varname: symbol, opts: CmpOpts, srcReg: number): Node[] {

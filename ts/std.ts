@@ -1,6 +1,6 @@
 import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, packValues, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
-import { ARITHMETIC, opCons, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "./ops";
+import { ARITHMETIC, opCons, makeList, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "./ops";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
 
 /** 
@@ -54,6 +54,7 @@ export const IBUILTINS: BuiltinFunction[] = [
     }),
     // list builtins
     new BuiltinFunction(Symbol.for("cons"), opCons),
+    new BuiltinFunction(Symbol.for("list"), makeList),
     ...CXR_PATHS.map(([name], i) => new BuiltinFunction(Symbol.for(name), CXR_FNS[i])),
     ...PREDICATES.map(([name], i) => new BuiltinFunction(Symbol.for(name), PREDICATE_FNS[i])),
     new BuiltinFunction(Symbol.for("last"), (regs, startReg, nargs) => {
@@ -379,12 +380,12 @@ for(let i = 0; i < IBUILTINS.length; i++) {
 export const stdPreludeScope = () => new Table()
 
 export const STD_PRELUDE = `
-(define $list (lambda args args))
 (define $coroutine-create (lambda (proc) (%coroutine-create proc)))
 (define $coroutine-resume (lambda (co . vals) (%coroutine-resume-list co vals)))
 (define $coroutine-yield (lambda vals (%coroutine-yield-list vals)))
 (define $call-with-values (lambda (producer consumer) (apply consumer (%values->list (producer)))))
 (define $coroutine-status (lambda (co) (%coroutine-status co)))
+(define $coroutine-close (lambda (co) (%coroutine-close co)))
 
 
 (let ((apply-proc #f)

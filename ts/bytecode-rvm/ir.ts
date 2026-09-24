@@ -36,9 +36,6 @@ export type Node = {
     srcReg: number,
     sym: symbol
 } | {
-    t: "HasGlobal",
-    sym: symbol
-} | {
     t: "Label",
     label: JumpLabel
 } | {
@@ -109,12 +106,6 @@ export type Node = {
     destReg: number,
     srcReg: number
 } | {
-    t: "Wind",
-    beforeReg: number,
-    afterReg: number
-} | {
-    t: "EndWind"
-} | {
     t: "CallCC",
     destReg?: number,
     procReg: number
@@ -122,63 +113,21 @@ export type Node = {
     t: "TailCallCC",
     procReg: number
 } | {
-    t: "SetRaiseProc",
-    srcReg: number
-} | {
-    t: "WindowOp",
-    op: OpCode,
-    destReg: number,
-    startReg: number,
-    nargs: number
-} | {
-    t: "IndexedOp",
-    op: OpCode,
-    idx: number,
-    destReg: number,
-    startReg: number,
-    nargs: number
-} | {
-    t: "GetHandlers",
-    destReg: number
-} | {
-    t: "SetHandlers",
-    srcReg: number
-} | {
-    t: "CoCreate",
-    destReg: number,
-    procReg: number
+    t: "CoYield",
+    valReg: number,
+    destReg?: number
 } | {
     t: "CoResume",
+    coReg: number,
+    listReg: number,
+    isTail: boolean,
+    destReg?: number
+} | {
+    t: "RtCall",
+    rtIdx: number,
     destReg: number,
     startReg: number,
     nargs: number
-} | {
-    t: "CoYield",
-    startReg: number,
-    nargs: number,
-    destReg?: number
-} | {
-    t: "CoResumeList",
-    destReg: number,
-    coReg: number,
-    listReg: number
-} | {
-    t: "CoYieldList",
-    listReg: number,
-    destReg?: number
-} | {
-    t: "CoStatus",
-    destReg: number,
-    coReg: number
-} | {
-    t: "ApplyList",
-    procReg: number,
-    destReg?: number,
-    listReg: number
-} | {
-    t: "TailApplyList",
-    procReg: number,
-    listReg: number
 }
 
 export class IR {
@@ -218,10 +167,6 @@ export class IR {
                 }
                 case "SetGlobal": {
                     inst.push(OpCode.SETGLOBAL, node.srcReg, cpool.push(node.sym))
-                    break
-                }
-                case "HasGlobal": {
-                    inst.push(OpCode.HASGLOBAL, cpool.push(node.sym))
                     break
                 }
                 case "Label": {
@@ -302,14 +247,6 @@ export class IR {
                     inst.push(OpCode.MOVE, node.destReg, node.srcReg)
                     break
                 }
-                case "Wind": {
-                    inst.push(OpCode.WIND, node.beforeReg, node.afterReg);
-                    break;
-                }
-                case "EndWind": {
-                    inst.push(OpCode.ENDWIND);
-                    break;
-                }
                 case "CallCC": {
                     inst.push(OpCode.CALLCC, node.procReg);
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
@@ -319,59 +256,18 @@ export class IR {
                     inst.push(OpCode.TAILCALLCC, node.procReg);
                     break;
                 }
-                case "SetRaiseProc": {
-                    inst.push(OpCode.SETRAISEPROC, node.srcReg);
-                    break;
-                }
-                case "WindowOp": {
-                    inst.push(node.op, node.destReg, node.startReg, node.nargs);
-                    break;
-                }
-                case "IndexedOp": {
-                    inst.push(node.op, node.destReg, node.startReg, node.nargs, node.idx);
-                    break;
-                }
-                case "GetHandlers": {
-                    inst.push(OpCode.GETHANDLERS, node.destReg);
-                    break;
-                }
-                case "SetHandlers": {
-                    inst.push(OpCode.SETHANDLERS, node.srcReg);
-                    break;
-                }
-                case "CoCreate": {
-                    inst.push(OpCode.COCREATE, node.destReg, node.procReg);
+                case "CoYield": {
+                    inst.push(OpCode.COYIELD, node.valReg);
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "CoResume": {
-                    inst.push(OpCode.CORESUME, node.destReg, node.startReg, node.nargs);
+                    inst.push(node.isTail ? OpCode.TAILCORESUME : OpCode.CORESUME, node.coReg, node.listReg);
+                    if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
                     break;
                 }
-                case "CoYield": {
-                    inst.push(OpCode.COYIELD, node.startReg, node.nargs);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "CoResumeList": {
-                    inst.push(OpCode.CORESUMELIST, node.destReg, node.coReg, node.listReg);
-                    break;
-                }
-                case "CoYieldList": {
-                    inst.push(OpCode.COYIELDLIST, node.listReg);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "CoStatus": {
-                    inst.push(OpCode.COSTATUS, node.destReg, node.coReg);
-                    break;
-                }
-                case "ApplyList": {
-                    inst.push(OpCode.APPLYLIST, node.procReg, node.listReg);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "TailApplyList": {
-                    inst.push(OpCode.TAILAPPLYLIST, node.procReg, node.listReg);
+                case "RtCall": {
+                    inst.push(OpCode.CALLRT, node.rtIdx, node.destReg, node.startReg, node.nargs);
                     break;
                 }
                 default:

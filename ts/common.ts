@@ -1131,7 +1131,8 @@ export interface AbstractByteCode extends SerializableBytecode {}
 export interface AbstractVM {
     evaluateRaw(code: AbstractByteCode, scope: Table): any,
     evaluateClosure(code: AbstractClosure, scope: Table, args: any[]): any,
-    resumeCoroutine(co: any, args: any[]): { done: boolean, value: any, values: any[] }
+    resumeCoroutine(co: any, args: any[]): { done: boolean, value: any, values: any[] },
+    closeCoroutine(co: any): void
 }
 export interface AbstractCompiler {
     compile(trExpr: any): AbstractByteCode

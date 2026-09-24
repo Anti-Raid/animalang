@@ -47,6 +47,10 @@ export class Anima {
         return this.#vm.resumeCoroutine(co, args)
     }
 
+    public coroutineClose(co: any): void {
+        this.#vm.closeCoroutine(co)
+    }
+
     compileToClosure(s: string, args: any, globals: Table) {
         const bast = new ASP(s, true).parse()
         return this.compileAstToClosure(bast, args, globals)
