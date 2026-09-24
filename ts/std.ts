@@ -1,6 +1,7 @@
 import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
+import { UnhandledSchemeError } from "./bytecode-rvm/exec";
 
 export type CodeEmitter = {
     emit: (str: string) => void
@@ -39,20 +40,6 @@ export class ApplyProc extends IProcedure {
     public name = Symbol.for("apply")
     constructor() {
         super("apply");
-    }
-}
-// Marker for `try` intrinsic proc
-export class TryProc extends IProcedure {
-    public name = Symbol.for("try")
-    constructor() {
-        super("try");
-    }
-}
-// Marker for `call/cc` intrinsic proc
-export class CallCCProc extends IProcedure {
-    public name = Symbol.for("call/cc")
-    constructor() {
-        super("call/cc");
     }
 }
 
@@ -126,8 +113,7 @@ function makeEqCodeGen() {
     };
 }
 
-// Stores all of our builtin funcs
-export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] = [
+export const IBUILTINS: (BuiltinFunction | ApplyProc)[] = [
     new BuiltinFunction(
         Symbol.for("+"),
         (regs, startReg, nargs) => {
@@ -583,10 +569,23 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
         if (nargs != 1) throw new Error("error? requires 1 argument");
         return regs[startReg] instanceof ErrorObject
     }),
+    new BuiltinFunction(Symbol.for("make-error-object"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("make-error-object requires 1 argument");
+        return new ErrorObject(regs[startReg]);
+    }),
+    new BuiltinFunction(Symbol.for("unhandled-error"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("unhandled-error requires 1 argument");
+        const val = regs[startReg];
+        const err = val instanceof ErrorObject ? val.error : val;
+        throw new UnhandledSchemeError(err);
+    }),
     new BuiltinFunction(Symbol.for("error-message"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("error-message requires 1 argument");
-        if(!(regs[startReg] instanceof ErrorObject)) throw new Error("error-message requires the first argument to be an instance of ErrorObject")
-        return regs[startReg].error?.message?.toString() || "<unknown>"
+        if (!(regs[startReg] instanceof ErrorObject)) throw new Error("error-message requires the first argument to be an instance of ErrorObject");
+        const err = regs[startReg].error;
+        if (err instanceof Error) return err.message;
+        if (typeof err === "string") return err;
+        return err?.message?.toString() || String(err);
     }),
     // Builtin predicates
     new BuiltinFunction(Symbol.for("number?"), (regs, startReg, nargs) => {
@@ -689,8 +688,6 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc | TryProc | CallCCProc)[] =
         return regs[startReg] instanceof ErrorObject
     }),
     new ApplyProc(),
-    new TryProc(),
-    new CallCCProc(),
     new BuiltinFunction(Symbol.for("gensym"), (regs, startReg, nargs) => {
         if (nargs > 1) throw new Error("gensym requires 0 or 1 arguments");
         switch (nargs) {
@@ -971,6 +968,66 @@ export const STD_PRELUDE = `
                         (if (null? (car lsts))
                             '()
                             (check (cdr lsts)))))))))
+
+(define $call/cc
+    (lambda (proc)
+        (%call/cc proc)))
+
+(define $call-with-current-continuation $call/cc)
+
+(define $dynamic-wind
+    (lambda (before thunk after)
+        (%dynamic-wind before thunk after)))
+
+(let ((current-handlers '())
+      (raise-proc #f)
+      (with-ex-handler-proc #f)
+      (raise-cont-proc #f)
+      (try-proc #f))
+    (set! raise-proc
+        (lambda (obj)
+            (if (null? current-handlers)
+                (unhandled-error obj)
+                (let ((h (car current-handlers)))
+                    (set! current-handlers (cdr current-handlers))
+                    (h obj)
+                    (raise-proc (make-error-object "handler returned on non-continuable exception"))))))
+
+    (set! with-ex-handler-proc
+        (lambda (handler thunk)
+            (let ((prev current-handlers))
+                (%dynamic-wind
+                    (lambda ()
+                        (set! current-handlers (cons handler current-handlers)))
+                    thunk
+                    (lambda ()
+                        (set! current-handlers prev))))))
+
+    (set! raise-cont-proc
+        (lambda (obj)
+            (if (null? current-handlers)
+                (unhandled-error obj)
+                (let ((h (car current-handlers))
+                      (prev current-handlers))
+                    (%dynamic-wind
+                        (lambda () (set! current-handlers (cdr prev)))
+                        (lambda () (h obj))
+                        (lambda () (set! current-handlers prev)))))))
+
+    (set! try-proc
+        (lambda (thunk catch-proc)
+            (%call/cc
+                (lambda (k)
+                    (with-ex-handler-proc
+                        (lambda (err) (k (catch-proc err)))
+                        thunk)))))
+
+    (%define-global $raise raise-proc)
+    (%define-global $with-exception-handler with-ex-handler-proc)
+    (%define-global $raise-continuable raise-cont-proc)
+    (%define-global $try try-proc)
+
+    (%set-raise-proc raise-proc))
 `
 
 export class Bootstrapper {

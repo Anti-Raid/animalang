@@ -3,6 +3,7 @@ import {
     OP_SET, OP_LETREC, OP_LETSTAR, ensureCanBind,
     OP_AND,
     OP_OR,
+    OP_DEFINE_GLOBAL,
     AbstractClosure,
     Cons
 } from "../common";
@@ -206,12 +207,26 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
     evaluator.registerTransform(OP_DEFINE, (evaluator, expr, orig) => {
         const normalized = normalizeDefine(orig);
-        
-        if (normalized === orig) {
-            return { expanded: orig, state: TransformState.DoChildren };
+        const sym = normalized.cdr.car;
+        const val = normalized.cdr.cdr.car;
+        return {
+            expanded: list(OP_DEFINE_GLOBAL, sym, val),
+            state: TransformState.Recurse
+        };
+    });
+
+    evaluator.registerTransform(OP_DEFINE_GLOBAL, (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length !== 3) {
+            throw new Error("%define-global syntax error: expected (%define-global var value)");
         }
-        
-        return { expanded: normalized, state: TransformState.Recurse };
+        const sym = expr.car;
+        if (typeof sym !== "symbol") {
+            throw new Error("%define-global syntax error: variable must be a symbol");
+        }
+        return {
+            expanded: orig,
+            state: TransformState.DoChildren
+        };
     });
 
     evaluator.registerTransform(OP_LAMBDA, (evaluator, expr, orig) => {
@@ -307,5 +322,85 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         });
 
         return { expanded: undefined, state: TransformState.ReturnImm };
+    });
+
+    evaluator.registerTransform(Symbol.for("guard"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) {
+            throw new Error("guard syntax error: expected (guard (var clause ...) body ...)");
+        }
+        if (!(expr.car instanceof Cons)) {
+            throw new Error("guard syntax error: expected (var clause ...)");
+        }
+        const varSym = expr.car.car;
+        if (typeof varSym !== "symbol") {
+            throw new Error("guard syntax error: variable must be a symbol");
+        }
+
+        const rawClauses = toArray(expr.car.cdr);
+        const lastClause = rawClauses.length > 0 ? rawClauses[rawClauses.length - 1] : null;
+        const hasElse = lastClause instanceof Cons && lastClause.car === OP_ELSE;
+
+        const guard_k = Symbol("guard_k");
+        const guard_r = Symbol("guard_r");
+        const guard_err = Symbol("guard_err");
+        const guard_val = Symbol("guard_val");
+
+        const condClauses: any[] = [...rawClauses];
+        if (!hasElse) {
+            condClauses.push(
+                list(
+                    OP_ELSE,
+                    list(
+                        guard_r,
+                        list(OP_LAMBDA, null, list(Symbol.for("raise-continuable"), guard_err))
+                    )
+                )
+            );
+        }
+
+        const thunkBody = list(
+            OP_LET,
+            list(list(varSym, guard_err)),
+            list(OP_COND, ...condClauses)
+        );
+
+        const handlerBody = list(
+            list(
+                Symbol.for("call/cc"),
+                list(
+                    OP_LAMBDA,
+                    list(guard_r),
+                    list(guard_k, list(OP_LAMBDA, null, thunkBody))
+                )
+            )
+        );
+
+        const bodyExprs = toArray(expr.cdr);
+        const bodyLambda = list(
+            OP_LAMBDA,
+            null,
+            list(
+                OP_LET,
+                list(list(guard_val, wrapMulti(fromArray(bodyExprs)))),
+                list(OP_LAMBDA, null, guard_val)
+            )
+        );
+
+        const expanded = list(
+            list(
+                Symbol.for("call/cc"),
+                list(
+                    OP_LAMBDA,
+                    list(guard_k),
+                    list(
+                        Symbol.for("with-exception-handler"),
+                        list(OP_LAMBDA, list(guard_err), handlerBody),
+                        bodyLambda
+                    )
+                )
+            )
+        );
+
+        return { expanded, state: TransformState.Recurse };
     });
 };

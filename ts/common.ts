@@ -85,6 +85,7 @@ export const OP_ELSE   = Symbol.for("else"); // part of cond but not a special f
 export const OP_QUOTE  = Symbol.for("quote");
 export const OP_AND      = Symbol.for("and");
 export const OP_OR       = Symbol.for("or");
+export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export const SPECIAL_FORMS = new Set([
     OP_DEFINE, 

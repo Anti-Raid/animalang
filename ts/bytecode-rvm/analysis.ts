@@ -2,6 +2,7 @@ import {
   OP_QUOTE,
   OP_LAMBDA,
   OP_SET,
+  OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
 } from "../common";
@@ -67,6 +68,11 @@ export class AstAnalysis {
                 const value = ast.cdr.cdr.car;
                 
                 scope.markMutable(sym);
+                this.visit(value, scope);
+                return;
+            }
+            case OP_DEFINE_GLOBAL: {
+                const value = ast.cdr.cdr.car;
                 this.visit(value, scope);
                 return;
             }

@@ -141,6 +141,42 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 5;
                 break;
             }
+            case OpCode.WIND: {
+                const beforeReg = inst.inst[idx + 1];
+                const afterReg = inst.inst[idx + 2];
+                line += `${padOp("WIND")} before=r${beforeReg}, after=r${afterReg}`;
+                idx += 3;
+                break;
+            }
+
+            case OpCode.ENDWIND: {
+                line += `${padOp("ENDWIND")}`;
+                idx += 1;
+                break;
+            }
+
+            case OpCode.CALLCC: {
+                const destReg = inst.inst[idx + 1];
+                const procReg = inst.inst[idx + 2];
+                line += `${padOp("CALLCC")} proc=r${procReg}, dest=r${destReg}`;
+                idx += 3;
+                break;
+            }
+
+            case OpCode.TAILCALLCC: {
+                const procReg = inst.inst[idx + 1];
+                line += `${padOp("TAILCALLCC")} proc=r${procReg}`;
+                idx += 2;
+                break;
+            }
+
+            case OpCode.SETRAISEPROC: {
+                const srcReg = inst.inst[idx + 1];
+                line += `${padOp("SETRAISEPROC")} proc=r${srcReg}`;
+                idx += 2;
+                break;
+            }
+
             default:
                 let _: never = opcode
         }

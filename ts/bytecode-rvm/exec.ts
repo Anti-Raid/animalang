@@ -13,7 +13,7 @@ import {
     AbstractClosure
 } from "../common";
 import { Cons } from "../list";
-import { ApplyProc, BuiltinFunction, CallCCProc, TryProc, IBUILTINS, BuiltinCodeGenFn } from "../std";
+import { ApplyProc, BuiltinFunction, IBUILTINS, BuiltinCodeGenFn } from "../std";
 
 export const BUILTINS_START = 2**31;
 
@@ -37,27 +37,37 @@ export enum OpCode {
     UNBOX,
     SETBOX,
     MOVE,
+    WIND,
+    ENDWIND,
+    CALLCC,
+    TAILCALLCC,
+    SETRAISEPROC,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.ENDIF]: 1,
+    [OpCode.ENDWIND]: 1,
     [OpCode.NEGATE]: 2,
     [OpCode.HASGLOBAL]: 2,
     [OpCode.ELSE]: 2,
     [OpCode.RETURN]: 2,
+    [OpCode.TAILCALLCC]: 2,
+    [OpCode.SETRAISEPROC]: 2,
     [OpCode.LOADCONST]: 3,
     [OpCode.LOADU32]: 3,
     [OpCode.LOADGLOBAL]: 3,
     [OpCode.SETGLOBAL]: 3,
     [OpCode.IF]: 3,
+    [OpCode.WIND]: 3,
+    [OpCode.CALLCC]: 3,
     [OpCode.NEWCLOSURE]: 3,
     [OpCode.BOX]: 3,
     [OpCode.UNBOX]: 3,
     [OpCode.SETBOX]: 3,
     [OpCode.MOVE]: 3,
-    [OpCode.LOADUPVAR]: 4,
-    [OpCode.SETUPVAR]: 4,
     [OpCode.TAILCALL]: 4,
+    [OpCode.SETUPVAR]: 4,
+    [OpCode.LOADUPVAR]: 4,
     [OpCode.CALL]: 5,
 };
 
@@ -172,12 +182,83 @@ export class Box {
     constructor(public val: any) {}
 }
 
+export class WindPoint {
+    public readonly depth: number;
+
+    constructor(
+        public parent: WindPoint | null,
+        public before: any | null = null,
+        public after: any | null = null
+    ) {
+        this.depth = parent === null ? 0 : parent.depth + 1;
+    }
+}
+
+export type WindAction =
+    | { type: "after"; thunk: any; nextWind: WindPoint | null }
+    | { type: "before"; thunk: any; nextWind: WindPoint | null };
+
+function depthOf(w: WindPoint | null): number {
+    return w === null ? -1 : w.depth;
+}
+
+export function computeWindTransition(fromWind: WindPoint | null, toWind: WindPoint | null): { actions: WindAction[] } {
+    if (fromWind === toWind) {
+        return { actions: [] };
+    }
+
+    // Equalize depth, then walk together, finds the LCA with no arrays.
+    let a = fromWind;
+    let b = toWind;
+    while (depthOf(a) > depthOf(b)) a = a!.parent;
+    while (depthOf(b) > depthOf(a)) b = b!.parent;
+    while (a !== b) {
+        a = a!.parent;
+        b = b!.parent;
+    }
+    const lca = a;
+
+    const actions: WindAction[] = [];
+
+    // Unwind: natural leaf-to-root walk order is already correct. Only nodes with after thunks generate actions.
+    for (let node = fromWind; node !== lca; node = node!.parent) {
+        if (node!.after !== null) {
+            actions.push({ type: "after", thunk: node!.after, nextWind: node!.parent });
+        }
+    }
+
+    // Rewind: collect nodes with before thunks on the path from toWind up to lca,
+    // then insert in root-to-leaf order.
+    const beforeNodes: WindPoint[] = [];
+    for (let node = toWind; node !== lca; node = node!.parent) {
+        if (node!.before !== null) {
+            beforeNodes.push(node!);
+        }
+    }
+    for (let k = beforeNodes.length - 1; k >= 0; k--) {
+        const node = beforeNodes[k];
+        actions.push({ type: "before", thunk: node.before, nextWind: node });
+    }
+
+    return { actions };
+}
+
+export interface PendingWindTransition {
+    actions: WindAction[];
+    actionIdx: number;
+    targetFrame: Frame | null;
+    targetVal: any;
+    targetWind: WindPoint | null;
+}
+
 export class ExecutionContext {
     private static nextId: number = 0;
     public id: number;
     public acc: any = null;
     public epoch: number = 0;
     public currentFrame: Frame | null = null;
+    public wind: WindPoint | null = null;
+    public pendingWind: PendingWindTransition | null = null;
 
     constructor(
         public vm: AbstractVM,
@@ -190,7 +271,8 @@ export class ExecutionContext {
 export class VMContinuation extends IProcedure {
     constructor(
         public frame: Frame | null,
-        public ctxId: number
+        public ctxId: number,
+        public wind: WindPoint | null = null
     ) {
         super("continuation");
     }
@@ -206,7 +288,6 @@ export class Frame {
         public ip: number,
         public parent: Frame | null,
         public retDestReg: number = -1,
-        public trySpot: Frame | null | undefined = undefined,
         public epoch: number = 0
     ) {
         this.code = closure.tmpl.code;
@@ -230,7 +311,7 @@ export class Frame {
     }
 
     thaw(ctx: ExecutionContext): Frame {
-        return new Frame(this.closure, [...this.regs], this.ip, this.parent, this.retDestReg, this.trySpot, ctx.epoch);
+        return new Frame(this.closure, [...this.regs], this.ip, this.parent, this.retDestReg, ctx.epoch);
     }
 
     share(ctx: ExecutionContext): this {
@@ -243,7 +324,15 @@ export class Frame {
     }
 }
 
+export class UnhandledSchemeError extends Error {
+    constructor(public readonly error: any) {
+        super(error instanceof Error ? error.message : String(error));
+    }
+}
+
 export class VMExecutor {
+    public raiseProc: any | null = null;
+
     constructor(public vm: AbstractVM) {}
 
     public execAot(ctx: ExecutionContext, initialFrame: Frame): any {
@@ -268,59 +357,115 @@ export class VMExecutor {
         return ctx.acc;
     }
 
+    public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any): Frame | null {
+        if (err instanceof UnhandledSchemeError) {
+            if (err.error instanceof Error) throw err.error;
+            throw new Error(String(err.error));
+        }
+        if (this.raiseProc !== null && this.raiseProc !== false) {
+            const errObj = (err instanceof ErrorObject)
+                ? err
+                : new ErrorObject(err);
+            return this.invoke(ctx, this.raiseProc, frame, [errObj], 0, 1, false);
+        }
+        if (err instanceof Error) throw err;
+        if (err instanceof ErrorObject) throw new Error(err.error);
+        throw new Error(String(err));
+    }
+
+    public advanceWindTransition(ctx: ExecutionContext): Frame | null {
+        while (ctx.pendingWind !== null) {
+            const trans = ctx.pendingWind;
+
+            if (trans.actionIdx > 0) {
+                const prevAction = trans.actions[trans.actionIdx - 1];
+                if (prevAction.type === "before") {
+                    ctx.wind = prevAction.nextWind;
+                }
+            }
+
+            if (trans.actionIdx < trans.actions.length) {
+                const action = trans.actions[trans.actionIdx++];
+                if (action.type === "after") {
+                    ctx.wind = action.nextWind;
+                }
+
+                if (action.thunk instanceof BuiltinFunction) {
+                    ctx.acc = action.thunk.cb([], 0, 0);
+                    continue;
+                }
+
+                if (action.thunk instanceof Closure) {
+                    const pregs = this.createClosureArg(action.thunk.tmpl, 0, [], 0);
+                    return this.newFrame(ctx, action.thunk, pregs, null);
+                }
+
+                throw new Error(`Attempted to call a non-procedure in dynamic-wind: ${String(action.thunk)}`);
+            }
+
+            const targetFrame = trans.targetFrame;
+            const targetVal = trans.targetVal;
+            const targetWind = trans.targetWind;
+            ctx.pendingWind = null;
+            ctx.wind = targetWind;
+            ctx.acc = targetVal;
+
+            return this.setRetVal(ctx, targetFrame, targetVal);
+        }
+
+        return null;
+    }
+
     public invoke(
         ctx: ExecutionContext,
         proc: any,
-        callerFrame: Frame,
+        callerFrame: Frame | null,
         callerArgs: any[],
         startReg: number,
         nargs: number,
-        isTail: boolean,
-        overrideTrySpot?: Frame | null
+        isTail: boolean
     ): Frame | null {
-        const trySpot = (overrideTrySpot !== undefined) ? overrideTrySpot : callerFrame.trySpot;
-
         if (proc instanceof BuiltinFunction) {
             ctx.acc = proc.cb(callerArgs, startReg, nargs);
-            const target = isTail ? callerFrame.parent : callerFrame;
+            const target = (callerFrame !== null && isTail) ? callerFrame.parent : callerFrame;
             return this.setRetVal(ctx, target, ctx.acc);
         } else if (proc instanceof Closure) {
             const pregs = this.createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
             if (isTail) {
-                if (!callerFrame.isShared(ctx)) {
-                    return this.reset(callerFrame, proc, pregs, trySpot);
+                if (callerFrame !== null && !callerFrame.isShared(ctx)) {
+                    return this.reset(callerFrame, proc, pregs);
                 }
-                return this.newFrame(ctx, proc, pregs, callerFrame.parent, trySpot);
+                return this.newFrame(ctx, proc, pregs, callerFrame !== null ? callerFrame.parent : null);
             }
-            return this.newFrame(ctx, proc, pregs, callerFrame, trySpot);
+            return this.newFrame(ctx, proc, pregs, callerFrame);
         } else if (proc instanceof ApplyProc) {
             const actualProc = callerArgs[startReg];
             const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "apply");
-            return this.invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, overrideTrySpot);
-        } else if (proc instanceof TryProc) {
-            const actualProc = callerArgs[startReg];
-            const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "try");
-            const trapFrame = isTail ? callerFrame.parent : callerFrame;
-
-            try {
-                return this.invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail, trapFrame);
-            } catch (err) {
-                ctx.acc = new ErrorObject(err);
-                return this.setRetVal(ctx, trapFrame, ctx.acc);
-            }
-        } else if (proc instanceof CallCCProc) {
-            callerFrame.share(ctx);
-            const targetFrame = isTail ? callerFrame.parent : callerFrame;
-            const vmCont = new VMContinuation(targetFrame, ctx.id);
-            const userProc = callerArgs[startReg];
-            return this.invoke(ctx, userProc, callerFrame, [vmCont], 0, 1, isTail, overrideTrySpot);
+            return this.invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail);
         } else if (proc instanceof VMContinuation) {
             if (proc.ctxId !== ctx.id) {
                 throw new Error("Cannot invoke a continuation across execution/FFI boundary");
             }
             if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
-            ctx.acc = callerArgs[startReg];
-            return this.setRetVal(ctx, proc.frame, ctx.acc);
+
+            const targetVal = callerArgs[startReg];
+            const { actions } = computeWindTransition(ctx.wind, proc.wind);
+
+            if (actions.length === 0) {
+                ctx.acc = targetVal;
+                ctx.wind = proc.wind;
+                return this.setRetVal(ctx, proc.frame, ctx.acc);
+            }
+
+            ctx.pendingWind = {
+                actions,
+                actionIdx: 0,
+                targetFrame: proc.frame,
+                targetVal,
+                targetWind: proc.wind,
+            };
+
+            return this.advanceWindTransition(ctx);
         } else {
             throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
         }
@@ -333,7 +478,13 @@ export class VMExecutor {
             }
             frame.regs[frame.retDestReg] = val;
             frame.retDestReg = -1;
+            return frame;
         }
+
+        if (frame === null && ctx.pendingWind !== null) {
+            return this.advanceWindTransition(ctx);
+        }
+
         return frame;
     }
 
@@ -341,17 +492,15 @@ export class VMExecutor {
         ctx: ExecutionContext,
         closure: Closure,
         regs: any[],
-        parent: Frame | null,
-        trySpot: Frame | null | undefined = undefined
+        parent: Frame | null
     ): Frame {
-        return new Frame(closure, regs, 0, parent, -1, trySpot, ctx.epoch);
+        return new Frame(closure, regs, 0, parent, -1, ctx.epoch);
     }
 
     public reset(
         frame: Frame,
         closure: Closure,
-        regs: any[],
-        trySpot: Frame | null | undefined = undefined
+        regs: any[]
     ): Frame {
         frame.closure = closure;
         frame.code = closure.tmpl.code;
@@ -359,7 +508,6 @@ export class VMExecutor {
         frame.regs = regs;
         frame.ip = 0;
         frame.retDestReg = -1;
-        frame.trySpot = trySpot;
         return frame;
     }
 
@@ -560,18 +708,50 @@ export class BytecodeInterpreter {
                         frame = executor.invoke(ctx, proc, frame, regs, startReg, nargs, true);
                         break;
                     }
+                    case OpCode.WIND: {
+                        const beforeReg = frame.readNext();
+                        const afterReg = frame.readNext();
+                        ctx.wind = new WindPoint(ctx.wind, regs[beforeReg], regs[afterReg]);
+                        break;
+                    }
+                    case OpCode.ENDWIND: {
+                        if (ctx.wind !== null) {
+                            ctx.wind = ctx.wind.parent;
+                        }
+                        break;
+                    }
+                    case OpCode.CALLCC: {
+                        const destReg = frame.readNext();
+                        const procReg = frame.readNext();
+                        frame.retDestReg = destReg;
+                        frame.share(ctx);
+                        const vmCont = new VMContinuation(frame, ctx.id, ctx.wind);
+                        frame = executor.invoke(ctx, regs[procReg], frame, [vmCont], 0, 1, false);
+                        break;
+                    }
+                    case OpCode.TAILCALLCC: {
+                        const procReg = frame.readNext();
+                        const targetFrame = frame.parent;
+                        if (targetFrame !== null) {
+                            targetFrame.share(ctx);
+                        }
+                        const vmCont = new VMContinuation(targetFrame, ctx.id, ctx.wind);
+                        frame = executor.invoke(ctx, regs[procReg], frame, [vmCont], 0, 1, true);
+                        break;
+                    }
+                    case OpCode.SETRAISEPROC: {
+                        const srcReg = frame.readNext();
+                        executor.raiseProc = regs[srcReg];
+                        break;
+                    }
                     default: {
                         const _: never = opcode;
                         throw new Error(`Unhandled opcode: ${opcode}`);
                     }
                 }
             } catch (err) {
-                if (frame !== null && frame.trySpot !== undefined) {
-                    ctx.acc = new ErrorObject(err);
-                    frame = executor.setRetVal(ctx, frame.trySpot, ctx.acc);
-                    continue;
-                }
-                throw err;
+                frame = executor.handleHostException(ctx, frame, err);
+                continue;
             }
         }
 
@@ -607,6 +787,8 @@ export class JITCompiler {
             "MissingVarError",
             "Closure",
             "BuiltinFunction",
+            "WindPoint",
+            "VMContinuation",
             source
         );
         return factory(
@@ -617,7 +799,9 @@ export class JITCompiler {
             ErrorObject,
             MissingVarError,
             Closure,
-            BuiltinFunction
+            BuiltinFunction,
+            WindPoint,
+            VMContinuation
         );
     }
 
@@ -652,6 +836,10 @@ export class JITCompiler {
                     if (!codeGen && !isBuiltin) {
                         blocks.add(nextIp);
                     }
+                    break;
+                }
+                case OpCode.CALLCC: {
+                    blocks.add(nextIp);
                     break;
                 }
             }
@@ -699,11 +887,7 @@ export class JITCompiler {
         out.emit(`
                     return null;
                 } catch (err) {
-                    if (frame !== null && frame.trySpot !== undefined) {
-                        ctx.acc = new ErrorObject(err);
-                        return executor.setRetVal(ctx, frame.trySpot, ctx.acc);
-                    }
-                    throw err;
+                    return executor.handleHostException(ctx, frame, err);
                 }
             };
         `);
@@ -975,6 +1159,50 @@ export class JITCompiler {
                         return executor.setRetVal(ctx, frame.parent, ctx.acc);
                     `);
                     return;
+                }
+                case OpCode.WIND: {
+                    const beforeReg = inst[ip++];
+                    const afterReg = inst[ip++];
+                    out.emit(`ctx.wind = new WindPoint(ctx.wind, regs[${beforeReg}], regs[${afterReg}]);`);
+                    break;
+                }
+                case OpCode.ENDWIND: {
+                    out.emit(`if (ctx.wind !== null) ctx.wind = ctx.wind.parent;`);
+                    break;
+                }
+                case OpCode.CALLCC: {
+                    const destReg = inst[ip++];
+                    const procReg = inst[ip++];
+                    const nextIp = ip;
+                    out.emit(`
+                        frame.retDestReg = ${destReg};
+                        frame.ip = ${nextIp};
+                        frame.share(ctx);
+                        {
+                            const vmCont = new VMContinuation(frame, ctx.id, ctx.wind);
+                            return executor.invoke(ctx, regs[${procReg}], frame, [vmCont], 0, 1, false);
+                        }
+                    `);
+                    return;
+                }
+                case OpCode.TAILCALLCC: {
+                    const procReg = inst[ip++];
+                    out.emit(`
+                        frame.ip = ${ip};
+                        {
+                            if (frame.parent !== null) {
+                                frame.parent.share(ctx);
+                            }
+                            const vmCont = new VMContinuation(frame.parent, ctx.id, ctx.wind);
+                            return executor.invoke(ctx, regs[${procReg}], frame, [vmCont], 0, 1, true);
+                        }
+                    `);
+                    return;
+                }
+                case OpCode.SETRAISEPROC: {
+                    const srcReg = inst[ip++];
+                    out.emit(`executor.raiseProc = regs[${srcReg}];`);
+                    break;
                 }
                 default: {
                     throw new Error(`Unhandled opcode in JIT: ${opcode}`);

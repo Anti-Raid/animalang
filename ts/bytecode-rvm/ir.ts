@@ -97,6 +97,22 @@ export type Node = {
     t: "SetBox",
     destReg: number,
     srcReg: number
+} | {
+    t: "Wind",
+    beforeReg: number,
+    afterReg: number
+} | {
+    t: "EndWind"
+} | {
+    t: "CallCC",
+    destReg: number,
+    procReg: number
+} | {
+    t: "TailCallCC",
+    procReg: number
+} | {
+    t: "SetRaiseProc",
+    srcReg: number
 }
 
 export class IR {
@@ -218,6 +234,26 @@ export class IR {
                 case "Move": {
                     inst.push(OpCode.MOVE, node.destReg, node.srcReg)
                     break
+                }
+                case "Wind": {
+                    inst.push(OpCode.WIND, node.beforeReg, node.afterReg);
+                    break;
+                }
+                case "EndWind": {
+                    inst.push(OpCode.ENDWIND);
+                    break;
+                }
+                case "CallCC": {
+                    inst.push(OpCode.CALLCC, node.destReg, node.procReg);
+                    break;
+                }
+                case "TailCallCC": {
+                    inst.push(OpCode.TAILCALLCC, node.procReg);
+                    break;
+                }
+                case "SetRaiseProc": {
+                    inst.push(OpCode.SETRAISEPROC, node.srcReg);
+                    break;
                 }
                 default:
                     let _: never = node;

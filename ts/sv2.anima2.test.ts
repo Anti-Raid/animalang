@@ -310,180 +310,164 @@ describe('Anima', () => {
         });
     });
 
-    describe('Try/Catch', () => {
-        it('basic try-catch', () => {
-            expect(run("(try (lambda () + abc) '())")).toContain("Variable 'Symbol(abc)' is not defined");
+    describe('Exception Handling & Dynamic Wind', () => {
+        it('executes dynamic-wind before, body, and after in order', () => {
             expect(run(`
-                (define x (lambda ()
-                    (try (lambda (a) + abc) '(1)))) 
-                (x)
-            `)).toContain("Variable 'Symbol(abc)' is not defined");
-            expect(run(`(try / 1 0 '())`)).toContain("division by zero");
-            expect(run(`
-                (define x (lambda ()
-                    (try (lambda (a) (/ 1 0)) '(1)))) 
-                (x)
-            `)).toContain("division by zero");
-            expect(run(`
-;; A function that loops 100000 times using tail calls, then crashes
-(define (deep-dive n)
-  (if (= n 0)
-      (error "Hit rock bottom")
-      (deep-dive (- n 1))))
-
-;; Wrap it in a single try block
-(try deep-dive 100000 '()) 
-            `)).toContain("Hit rock bottom")
-
-            expect(run(`
-(define (level-1)
-  (error "Level 1 failure"))
-
-(define (level-2)
-  (let ((res (try level-1 '())))
-    (if (error? res)
-        (error "Escalated to Level 2") ;; Throwing from inside error-handling logic!
-        "Success")))
-
-(try level-2 '())
-        `)).toContain("Escalated to Level 2")
-
-            expect(run(`
-(define (risky-math a b c)
-  (if (= c 0)
-      (error "Div by zero")
-      (/ (+ a b) c)))
-
-;; Using apply inside a try!
-(define result (try apply risky-math '(10 20 0) '()))
-result
-        `)).toContain("Div by zero")
-
-            expect(run(`
-(define (ping n)
-  (if (= n 0)
-      (error "Ping Crash!")
-      ;; Ping wraps its call to pong in a try block
-      (try (lambda () (pong (- n 1))) '())))
-
-(define (pong n)
-  (if (= n 0)
-      (error "Pong Crash!")
-      ;; Pong does a standard tail-call to ping
-      (ping (- n 1))))
-
-(error-message (ping 1000))        
-    `)).toBe('"Ping Crash!"')
-
-expect(run(`
-(define (long-chain n)
-  (if (= n 0)
-      (error "Second failure")
-      (long-chain (- n 1))))
-
-(define (level-1)
-  (error "First failure"))
-
-(define (level-2)
-  (let ((res (try level-1 '())))
-    (if (error? res)
-        (long-chain 1000) ;; NOT wrapped in its own try -- must be caught
-                           ;; by whatever try wraps level-2 itself, after
-                           ;; running 1000 tail calls under the OUTER scope
-        "unreachable")))
-
-(try level-2 '())
-`)).toContain("Second failure")
-
-expect(run(`
-(define (safe-add a b) (+ a b))
-(define (crash) (error "Boom"))
-
-(define (test)
-  (let ((ok (try safe-add 1 2 '())))
-    (if (= ok 3)
-        (crash)      ;; must be caught by outer try, not confused by prior success
-        "wrong")))
-
-(error-message (try test '()))
-`)).toBe('"Boom"')
+                (define trace '())
+                (define res (dynamic-wind
+                    (lambda () (set! trace (cons 'before trace)))
+                    (lambda () (set! trace (cons 'body trace)) 42)
+                    (lambda () (set! trace (cons 'after trace)))))
+                (list res trace)
+            `)).toBe('(42 (after body before))');
         });
 
-        it('survives tail-call trapdoor inheritance', () => {
-            // What it tests: If a function inside a `try` tail-calls another function,
-            // the TAILCALL opcode replaces the current CallFrame. Does the new 
-            // CallFrame correctly inherit the trySpot?
+        it('re-executes before and after thunks when jumping with continuations', () => {
             expect(run(`
-                (define (crash-later) (error "Delayed Boom"))
-                (define (tailcaller) (crash-later)) ;; Tailcall!
-                
-                (define (test)
-                    (try tailcaller '()))
-                    
-                (error-message (test))
-            `)).toBe('"Delayed Boom"');
+                (define trace '())
+                (define saved-k #f)
+                (dynamic-wind
+                    (lambda () (set! trace (cons 'enter trace)))
+                    (lambda ()
+                        (call/cc (lambda (k) (set! saved-k k)))
+                        (set! trace (cons 'inside trace)))
+                    (lambda () (set! trace (cons 'exit trace))))
+                (if saved-k
+                    (let ((k saved-k))
+                        (set! saved-k #f)
+                        (k #f))
+                    #f)
+                trace
+            `)).toBe('(exit inside enter exit inside enter)');
         });
 
-        it('prevents Zombie Trapdoors in escaping closures', () => {
-            // What it tests: If a closure is CREATED inside a try block, but 
-            // EXECUTED outside of it, it must NOT use the dead try block's trapdoor. 
-            // It must use the trapdoor of its execution context.
+        it('handles with-exception-handler and raise', () => {
             expect(run(`
-                (define (make-bomb)
-                    (try (lambda () 
-                            (lambda () (error "Zombie Boom"))) 
-                        '()))
-                        
-                (define bomb (make-bomb)) ;; The inner try is now DEAD.
-                
-                (define (test)
-                    (let ((res (try bomb '()))) ;; Wrapped in a NEW outer try
-                        (error-message res)))
-                        
-                (test)
-            `)).toBe('"Zombie Boom"');
+                (call/cc
+                    (lambda (k)
+                        (with-exception-handler
+                            (lambda (err) (k 99))
+                            (lambda () (raise 'boom)))))
+            `)).toBe('99');
         });
 
-        it('clears success paths after multiple nested closure & builtin tries', () => {
+        it('intercepts runtime exceptions like division by zero and missing variables', () => {
             expect(run(`
-                (define (safe-mul a b) (* a b))
-                (define (safe-add a b) (+ a b))
-                (define (crash) (error "Core Meltdown"))
+                (call/cc
+                    (lambda (k)
+                        (with-exception-handler
+                            (lambda (err) (k (error-message err)))
+                            (lambda () (/ 1 0)))))
+            `)).toContain('division by zero');
 
-                (define (test)
-                    (let ((x (try safe-add 10 20 '()))) ;; Sync builtin success
-                        (let ((y (try (lambda () (safe-mul x 2)) '()))) ;; Async closure success
-                            (if (= y 60)
-                                (crash) ;; Outer try must catch this!
-                                "Math failed"))))
-
-                (error-message (try test '()))
-            `)).toBe('"Core Meltdown"');
-        });
-
-        it('intercepts synchronous builtin crashes (Pre-emptive catch)', () => {
-            // What it tests: The specific local try/catch block we added inside TryProc.
-            // If a JS builtin is passed bad arguments directly inside a try block, 
-            // it crashes instantly in JS, bypassing the VM's OpCode loop.
             expect(run(`
-                ;; + is a builtin. We pass it a string to force a JS-level type error.
-                (define (test)
-                    (try + 1 "a" '()))
-                    
-                (error? (test))
-            `)).toBe('#t');
+                (call/cc
+                    (lambda (k)
+                        (with-exception-handler
+                            (lambda (err) (k (error-message err)))
+                            (lambda () undefined-variable-xyz))))
+            `)).toContain("Variable 'Symbol(undefined-variable-xyz)' is not defined");
         });
 
-        it('handles top-level tailcall returns and crashes cleanly', () => {
-            // What it tests: When destReg is undefined and parent is null.
-            // Ensures the fallback to "TOP_LEVEL" correctly exits the VM 
-            // instead of throwing an unhandled JS exception.
-            
-            // Success path
-            expect(run(`(try + 10 20 '())`)).toBe('30');
-            expect(run(`(error-message (try / 10 "b" '()))`)).toContain("requires numbers"); 
+        it('supports raise-continuable where handler returns to call site', () => {
+            expect(run(`
+                (with-exception-handler
+                    (lambda (err) 10)
+                    (lambda () (+ 5 (raise-continuable 'request-five))))
+            `)).toBe('15');
         });
-    })
+
+        it('throws an error if handler returns on non-continuable raise', () => {
+            expect(() => run(`
+                (with-exception-handler
+                    (lambda (err) 42)
+                    (lambda () (raise 'boom)))
+            `)).toThrow(/non-continuable exception/);
+        });
+
+        it('evaluates guard macro correctly', () => {
+            expect(run(`
+                (guard (e
+                        ((= e 1) "one")
+                        ((= e 2) "two")
+                        (else "other"))
+                    (raise 2))
+            `)).toBe('"two"');
+
+            expect(run(`
+                (guard (e
+                        ((= e 1) "one")
+                        (else "fallback"))
+                    (raise 99))
+            `)).toBe('"fallback"');
+
+            expect(run(`
+                (guard (e
+                        (else "error"))
+                    (+ 10 20))
+            `)).toBe('30');
+        });
+
+        it('re-raises to outer guard when no clause matches', () => {
+            expect(run(`
+                (guard (outer
+                        ((= outer 42) "caught-by-outer"))
+                    (guard (inner
+                            ((= inner 1) "caught-by-inner"))
+                        (raise 42)))
+            `)).toBe('"caught-by-outer"');
+        });
+
+        it('supports try helper from prelude', () => {
+            expect(run(`
+                (try
+                    (lambda () (/ 1 0))
+                    (lambda (err) "caught division by zero"))
+            `)).toBe('"caught division by zero"');
+
+            expect(run(`
+                (try
+                    (lambda () (+ 10 20))
+                    (lambda (err) "failed"))
+            `)).toBe('30');
+        });
+
+        it('unwinds with-exception-handler before enclosing dynamic-wind after thunk runs', () => {
+            expect(run(`
+                (define handler-ran #f)
+                (define outer-caught #f)
+                (define saved-k #f)
+
+                (call/cc
+                    (lambda (exit)
+                        (with-exception-handler
+                            (lambda (err)
+                                (set! outer-caught #t)
+                                (exit 999))
+                            (lambda ()
+                                (dynamic-wind
+                                    (lambda () #f)
+                                    (lambda ()
+                                        (with-exception-handler
+                                            (lambda (err)
+                                                (set! handler-ran #t)
+                                                123)
+                                            (lambda ()
+                                                (call/cc (lambda (k) (set! saved-k k))))))
+                                    (lambda ()
+                                        ;; In after thunk: inner handler must be uninstalled!
+                                        (raise 'after-error)))))))
+
+                (if saved-k
+                    (let ((k saved-k))
+                        (set! saved-k #f)
+                        (k #f))
+                    #f)
+
+                (list handler-ran outer-caught)
+            `)).toBe('(#f #t)');
+        });
+    });
 
     describe('Math Operations', () => {
         it('performs basic arithmetic', () => {
@@ -922,10 +906,6 @@ expect(run(`
         expect(plusProc.debugName).toBe("+");
         const applyProc = evaluator.scope.get(Symbol.for("apply"));
         expect(applyProc.debugName).toBe("apply");
-        const tryProc = evaluator.scope.get(Symbol.for("try"));
-        expect(tryProc.debugName).toBe("try");
-        const callccProc = evaluator.scope.get(Symbol.for("call/cc"));
-        expect(callccProc.debugName).toBe("call/cc");
 
         const closure = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (x y) (+ x y))`));
         expect(closure.debugName).toBe("lambda");
@@ -934,6 +914,160 @@ expect(run(`
 
         const cont = evaluator.evaluateRaw(evaluator.compileRaw(`(call/cc (lambda (k) k))`));
         expect(cont.debugName).toBe("continuation");
+    });
+    
+    describe('call/cc + dynamic-wind (multi-shot & multi-level)', () => {
+
+        it('unwinds three nested dynamic-winds innermost-first on a single escape', () => {
+            expect(run(`
+                (define trace '())
+                (define (add! x) (set! trace (cons x trace)))
+
+                (call/cc
+                    (lambda (escape)
+                        (dynamic-wind
+                            (lambda () (add! 'a-in))
+                            (lambda ()
+                                (dynamic-wind
+                                    (lambda () (add! 'b-in))
+                                    (lambda ()
+                                        (dynamic-wind
+                                            (lambda () (add! 'c-in))
+                                            (lambda () (escape 'done))
+                                            (lambda () (add! 'c-out))))
+                                    (lambda () (add! 'b-out))))
+                            (lambda () (add! 'a-out)))))
+
+                trace
+            `)).toBe('(a-out b-out c-out c-in b-in a-in)');
+        });
+
+        it('re-enters two nested dynamic-winds root-to-leaf when a continuation is invoked from outside', () => {
+            expect(run(`
+                (define trace '())
+                (define (add! x) (set! trace (cons x trace)))
+                (define k-inner #f)
+
+                (dynamic-wind
+                    (lambda () (add! 'a-in))
+                    (lambda ()
+                        (dynamic-wind
+                            (lambda () (add! 'b-in))
+                            (lambda ()
+                                (call/cc (lambda (k) (set! k-inner k)))
+                                (add! 'body))
+                            (lambda () (add! 'b-out))))
+                    (lambda () (add! 'a-out)))
+
+                (if k-inner
+                    (let ((k k-inner))
+                        (set! k-inner #f)
+                        (k #f))
+                    #f)
+
+                trace
+            `)).toBe('(a-out b-out body b-in a-in a-out b-out body b-in a-in)');
+        });
+
+        it('supports a multi-shot generator: resuming the same continuation across separate later calls', () => {
+            expect(run(`
+                (define (make-generator lst)
+                    (define return #f)
+                    (define (control-state k)
+                        (define (loop rest)
+                            (if (null? rest)
+                                (return 'done)
+                                (begin
+                                    (set! k (call/cc (lambda (resume-here)
+                                                        (set! control-state resume-here)
+                                                        (return (car rest)))))
+                                    (loop (cdr rest)))))
+                        (loop lst))
+                    (define (generator)
+                        (call/cc (lambda (return-here)
+                                    (set! return return-here)
+                                    (control-state control-state))))
+                    generator)
+
+                (define gen (make-generator '(1 2 3)))
+                (list (gen) (gen) (gen) (gen))
+            `)).toBe('(1 2 3 done)');
+        });
+
+        it('keeps guard/raise state correctly scoped across repeated independent invocations', () => {
+            expect(run(`
+                (define log '())
+                (define (add! x) (set! log (cons x log)))
+
+                (define (try-once tag n)
+                    (guard (e (#t (add! (list tag 'caught e))))
+                        (add! (list tag 'before))
+                        (if (> n 0) (raise n) #f)
+                        (add! (list tag 'after))))
+
+                (try-once 'first 1)
+                (try-once 'second 0)
+                (try-once 'third 2)
+
+                log
+            `)).toBe("((third caught 2) (third before) (second after) (second before) (first caught 1) (first before))");
+        });
+
+        it('keeps a handler installed across two sequential raise-continuable calls', () => {
+            expect(run(`
+                (define trace '())
+                (with-exception-handler
+                    (lambda (e) (set! trace (cons (list 'handled e) trace)) (* e 10))
+                    (lambda ()
+                        (let ((a (raise-continuable 1)))
+                            (let ((b (raise-continuable 2)))
+                                (set! trace (cons (list 'sum (+ a b)) trace))))))
+                trace
+            `)).toBe("((sum 30) (handled 2) (handled 1))");
+        });
+
+        it('lets a continuation escape from inside a dynamic-wind after-thunk, aborting the rest of that thunk', () => {
+            expect(run(`
+                (define escape-target #f)
+                (define trace '())
+                (define (add! x) (set! trace (cons x trace)))
+
+                (call/cc
+                    (lambda (top)
+                        (set! escape-target top)
+                        (dynamic-wind
+                            (lambda () (add! 'in))
+                            (lambda () (add! 'body))
+                            (lambda ()
+                                (add! 'out-start)
+                                (escape-target 'bail)
+                                (add! 'out-end)))))
+
+                trace
+            `)).toBe('(out-start body in)');
+        });
+
+        it('correctly nests dynamic-wind under moderate recursion', () => {
+            expect(run(`
+                (define depth 0)
+                (define max-depth 0)
+                (define (my-max a b) (if (> a b) a b))
+                (define (track-enter) (set! depth (+ depth 1)) (set! max-depth (my-max max-depth depth)))
+                (define (track-exit) (set! depth (- depth 1)))
+
+                (define (loop n)
+                    (dynamic-wind
+                        track-enter
+                        (lambda ()
+                            (if (= n 0)
+                                'done
+                                (loop (- n 1))))
+                        track-exit))
+
+                (let ((result (loop 25)))
+                    (list result depth max-depth))
+            `)).toBe("(done 0 26)");
+        });
     });
 })
 

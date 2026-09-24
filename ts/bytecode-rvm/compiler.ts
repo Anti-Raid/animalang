@@ -1,9 +1,13 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, OP_BEGIN, OP_IF, OP_LAMBDA, OP_QUOTE, OP_SET, OP_DEFINE, unpackLambdaExprArgs, wrapMulti, Cons } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, OP_BEGIN, OP_IF, OP_LAMBDA, OP_QUOTE, OP_SET, OP_DEFINE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { IBUILTINS_IDX_MAP } from "../std";
 import { BUILTINS_START } from "./exec";
+
+const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
+const OP_CALLCC = Symbol.for("%call/cc");
+const OP_SET_RAISE_PROC = Symbol.for("%set-raise-proc");
 
 interface CmpOpts {
     destReg?: number // where to store dest reg
@@ -78,6 +82,18 @@ export class Compiler {
                     return
                 case OP_LAMBDA:
                     this.#compileLambda(expr, opts)
+                    return
+                case OP_DYNAMIC_WIND:
+                    this.#compileDynamicWind(expr, opts)
+                    return
+                case OP_CALLCC:
+                    this.#compileCallCC(expr, opts)
+                    return
+                case OP_DEFINE_GLOBAL:
+                    this.#compileDefine(expr, opts)
+                    return
+                case OP_SET_RAISE_PROC:
+                    this.#compileSetRaiseProc(expr, opts)
                     return
             }
         }
@@ -220,10 +236,84 @@ export class Compiler {
     #nodesEndsInRet(nodes: Node[]) {
         if (nodes.length === 0) return false // we need a return if nodes.length === 0
         const lastNode = nodes[nodes.length-1]
-        if (lastNode.t === "TailCall" || lastNode.t === "IBuiltinTail" || lastNode.t === "Return") {
+        if (
+            lastNode.t === "TailCall" ||
+            lastNode.t === "IBuiltinTail" ||
+            lastNode.t === "Return" ||
+            lastNode.t === "TailCallCC"
+        ) {
             return true // all of these ops alr return
         }
         return false
+    }
+
+    #compileDynamicWind(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 4) {
+            throw new Error(`%dynamic-wind requires 3 arguments (before, thunk, after), got ${expr.length - 1}`);
+        }
+        const beforeProcReg = opts.scope.allocTemp();
+        const thunkProcReg = opts.scope.allocTemp();
+        const afterProcReg = opts.scope.allocTemp();
+
+        this.#compile(expr.cdr.car, { ...opts, destReg: beforeProcReg, isTail: false });
+        this.#compile(expr.cdr.cdr.car, { ...opts, destReg: thunkProcReg, isTail: false });
+        this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: afterProcReg, isTail: false });
+
+        // Call before()
+        const discardBefore = opts.scope.allocTemp();
+        opts.nodes.push({ t: "Call", procReg: beforeProcReg, destReg: discardBefore, startReg: 0, nargs: 0 });
+        opts.scope.freeTemp(discardBefore);
+
+        // Wind
+        opts.nodes.push({ t: "Wind", beforeReg: beforeProcReg, afterReg: afterProcReg });
+
+        // Call thunk()
+        const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg;
+        opts.nodes.push({ t: "Call", procReg: thunkProcReg, destReg: targetReg, startReg: 0, nargs: 0 });
+
+        // EndWind
+        opts.nodes.push({ t: "EndWind" });
+
+        // Call after()
+        const discardAfter = opts.scope.allocTemp();
+        opts.nodes.push({ t: "Call", procReg: afterProcReg, destReg: discardAfter, startReg: 0, nargs: 0 });
+        opts.scope.freeTemp(discardAfter);
+
+        if (opts.destReg === undefined) {
+            opts.scope.freeTemp(targetReg);
+        }
+        opts.scope.freeTemp(beforeProcReg);
+        opts.scope.freeTemp(thunkProcReg);
+        opts.scope.freeTemp(afterProcReg);
+    }
+
+    #compileCallCC(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 2) {
+            throw new Error(`%call/cc requires 1 argument, got ${expr.length - 1}`);
+        }
+        const procReg = opts.scope.allocTemp();
+        this.#compile(expr.cdr.car, { ...opts, destReg: procReg, isTail: false });
+        if (opts.isTail) {
+            opts.nodes.push({ t: "TailCallCC", procReg });
+        } else {
+            const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg;
+            opts.nodes.push({ t: "CallCC", destReg: targetReg, procReg });
+            if (opts.destReg === undefined) opts.scope.freeTemp(targetReg);
+        }
+        opts.scope.freeTemp(procReg);
+    }
+
+    #compileSetRaiseProc(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 2) {
+            throw new Error(`%set-raise-proc requires 1 argument, got ${expr.length - 1}`);
+        }
+        const srcReg = opts.scope.allocTemp();
+        this.#compile(expr.cdr.car, { ...opts, destReg: srcReg, isTail: false });
+        opts.nodes.push({ t: "SetRaiseProc", srcReg });
+        opts.scope.freeTemp(srcReg);
+        if (opts.destReg !== undefined) {
+            opts.nodes.push({ t: "LoadValue", destReg: opts.destReg, constant: undefined });
+        }
     }
 
     // a normal call
