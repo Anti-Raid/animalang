@@ -21,7 +21,6 @@ export const BUILTINS_START = 2**31;
 export enum OpCode {
     LOADCONST,
     LOADU32,
-    NEGATE,
     LOADUPVAR,
     SETUPVAR,
     LOADGLOBAL,
@@ -69,7 +68,6 @@ export enum OpCode {
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.ENDIF]: 1,
     [OpCode.ENDWIND]: 1,
-    [OpCode.NEGATE]: 2,
     [OpCode.HASGLOBAL]: 2,
     [OpCode.ELSE]: 2,
     [OpCode.RETURN]: 2,
@@ -629,14 +627,6 @@ export class BytecodeInterpreter {
                         regs[destReg] = inst[ip++];
                         break;
                     }
-                    case OpCode.NEGATE: {
-                        const reg = inst[ip++];
-                        if (typeof regs[reg] !== "number") {
-                            throw new Error("cannot negate non-number");
-                        }
-                        regs[reg] = -regs[reg];
-                        break;
-                    }
                     case OpCode.LOADUPVAR: {
                         const destReg = inst[ip++];
                         const upvarIdx = inst[ip++];
@@ -1108,17 +1098,6 @@ export class JITCompiler {
                     const destReg = inst[ip++];
                     const u32Val = inst[ip++];
                     out.emit(`regs[${destReg}] = ${u32Val};`);
-                    break;
-                }
-                case OpCode.NEGATE: {
-                    const reg = inst[ip++];
-                    out.emit(`
-                        if (typeof regs[${reg}] !== "number") {
-                            frame.ip = ${opIp};
-                            throw new Error("cannot negate non-number");
-                        }
-                        regs[${reg}] = -regs[${reg}];
-                    `);
                     break;
                 }
                 case OpCode.LOADUPVAR: {

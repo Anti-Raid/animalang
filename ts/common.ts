@@ -590,6 +590,7 @@ export class BS {
     static readonly CLASS = 0x0A
     static readonly UNIQUESYMBOL = 0x0B
     static readonly F64 = 0x0C
+    static readonly CONS = 0x0D
     static readonly UNDEFINED = 0xFF
 
     constructor(initialCapacity: number = 1024) {
@@ -723,6 +724,22 @@ export class BS {
         }
     }
 
+    /**
+     * Writes a cons chain
+     *
+     * Format: <CONS><pair count><car>...<final cdr>
+     */
+    writeCons(cons: Cons): void {
+        let count = 0;
+        for (let curr: any = cons; curr instanceof Cons; curr = curr.cdr) count++;
+        this.#ensureCapacity(2);
+        this.#buffer[this.#length++] = BS.CONS;
+        this.#buffer[this.#length++] = count;
+        let curr: any = cons;
+        for (; curr instanceof Cons; curr = curr.cdr) this.writeValue(curr.car);
+        this.writeValue(curr);
+    }
+
     /** Writes a boolean value */
     writeBool(val: boolean): void {
         this.#ensureCapacity(2);
@@ -775,6 +792,8 @@ export class BS {
             this.writeArray(val);
         } else if (val instanceof Map) {
             this.writeMap(val);
+        } else if (val instanceof Cons) {
+            this.writeCons(val);
         } else if (typeof val === 'object' && 'bsid' in val && 'dump' in val && typeof val.dump === 'function') {
             this.writeSerializable(val as SerializableBytecode);
         } else if (typeof val === 'object') {
@@ -910,6 +929,15 @@ export class BSReader {
                     obj[key as string] = val;
                 }
                 return obj;
+            }
+
+            case BS.CONS: {
+                const count = this.#buffer[this.#cursor++];
+                const cars = new Array(count);
+                for (let i = 0; i < count; i++) cars[i] = this.read();
+                let tail: any = this.read();
+                for (let i = count - 1; i >= 0; i--) tail = new Cons(cars[i], tail);
+                return tail;
             }
 
             case BS.NULL:

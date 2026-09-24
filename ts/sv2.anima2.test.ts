@@ -5,6 +5,7 @@ import { Cons } from './list';
 import { ByteCode, AnimaVM, JITCompiler, OpCode } from './bytecode-rvm/vm';
 import { Anima } from './anima';
 import { implAot } from './bytecode-rvm/meta';
+import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
 
 const vmImpl = implAot
 const bcCache: Record<string, AbstractByteCode> = {}
@@ -1801,6 +1802,35 @@ describe('Floats, Infinities & NaNs', () => {
         ByteCode.register(floatReader);
         const deserializedFloatBc = floatReader.read() as ByteCode;
         expect(s.stringify(evaluator.evaluateRaw(deserializedFloatBc))).toBe("3.75");
+
+        // Quoted list constants (proper, nested, improper)
+        for (const [src, expected] of [
+            ["'(1 2 3)", "(1 2 3)"],
+            ["(car '(1 2))", "1"],
+            ["'((a b) (c . d) \"s\")", "((a b) (c . d) \"s\")"],
+            ["'(1 2 . 3)", "(1 2 . 3)"],
+        ]) {
+            const listBs = new BS();
+            listBs.writeSerializable(evaluator.compileRaw(src) as ByteCode);
+            const listReader = new BSReader(listBs.finalize());
+            ByteCode.register(listReader);
+            expect(s.stringify(evaluator.evaluateRaw(listReader.read() as ByteCode))).toBe(expected);
+        }
+
+        const longList = Cons.fromArray(Array.from({ length: 100000 }, (_, i) => i));
+        const longBs = new BS();
+        longBs.writeValue(longList);
+        const longBack = new BSReader(longBs.finalize()).read() as Cons;
+        expect(longBack instanceof Cons).toBe(true);
+        expect(longBack.length).toBe(100000);
+
+        const full = dumpFull(evaluator.compileRaw("(list 1 '(2 3))") as ByteCode);
+        expect(full[1]).toBe(BYTECODE_VERSION);
+        expect(s.stringify(evaluator.evaluateRaw(readFull(full) as ByteCode))).toBe("(1 (2 3))");
+        const wrongVersion = full.slice();
+        wrongVersion[1] = BYTECODE_VERSION + 1;
+        expect(() => readFull(wrongVersion)).toThrow(`bytecode version ${BYTECODE_VERSION + 1} is not supported`);
+        expect(() => readFull(full.subarray(2))).toThrow("not anima bytecode");
     });
 });
 
@@ -1839,33 +1869,11 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         expect(anima.evaluateClosure(idClosure, ["hello"])).toBe("hello");
     });
 
-    it("executes LOADCONST and NEGATE natively with type error handling", () => {
-        // Construct custom bytecode:
-        // 0: LOADCONST r1, 42
-        // 3: NEGATE r1
-        // 5: RETURN r1
-        const inst = new Uint32Array([
-            OpCode.LOADCONST, 1, 0,
-            OpCode.NEGATE, 1,
-            OpCode.RETURN, 1
-        ]);
-        const bc = new ByteCode([42], inst, 3);
-        const nativeFn = JITCompiler.compile(bc);
-        expect(nativeFn).toBeDefined();
-
-        const vm = new AnimaVM();
-        const res = vm.evaluateRaw(bc, animaScope());
-        expect(res).toBe(-42);
-
-        // Non-number negate throws error
-        const badInst = new Uint32Array([
-            OpCode.LOADCONST, 1, 0,
-            OpCode.NEGATE, 1,
-            OpCode.RETURN, 1
-        ]);
-        const badBc = new ByteCode(["not a number"], badInst, 3);
-        JITCompiler.compile(badBc);
-        expect(() => vm.evaluateRaw(badBc, animaScope())).toThrow(/cannot negate non-number/);
+    it("loads negative and non-integer literals through LOADCONST", () => {
+        const anima = new Anima(implAot);
+        const bc = anima.compileRaw("(+ -42 -0.5 4294967296)") as ByteCode;
+        expect(bc.constants).toEqual(expect.arrayContaining([-42, -0.5, 4294967296]));
+        expect(anima.evaluateRaw(bc)).toBe(4294967253.5);
     });
 
     it("executes BOX, UNBOX, and SETBOX natively", () => {

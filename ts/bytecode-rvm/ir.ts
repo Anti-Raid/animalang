@@ -163,22 +163,12 @@ export class IR {
                 case "LoadValue": {
                     const v = node.constant
 
-                    if (typeof v === "number") {   
-                        if (Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) {
-                            // We can use u32 specialization here
-                            inst.push(OpCode.LOADU32, node.destReg, v);
-                        } else if (Number.isInteger(v) && v >= -1 * 0xFFFFFFFF && v < 0) {
-                            // We can use u32 specialization here but we need to negate after pushing
-                            inst.push(OpCode.LOADU32, node.destReg, Math.abs(v));
-                            inst.push(OpCode.NEGATE, node.destReg)
-                        } else {
-                            inst.push(OpCode.LOADCONST, node.destReg, cpool.push(v))
-                        }
-                        continue
+                    if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) {
+                        inst.push(OpCode.LOADU32, node.destReg, v);
                     } else {
                         inst.push(OpCode.LOADCONST, node.destReg, cpool.push(v))
-                        continue
                     }
+                    continue
                 }
                 case "LoadUpvar": {
                     inst.push(OpCode.LOADUPVAR, node.destReg, node.upvarIdx, node.andUnbox ? 1 : 0)

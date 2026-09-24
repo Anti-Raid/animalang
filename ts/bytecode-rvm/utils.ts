@@ -65,11 +65,6 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 3;
                 break;
 
-            case OpCode.NEGATE:
-                line += `${padOp(OpCode[opcode])} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
             case OpCode.MOVE:
             case OpCode.BOX:
             case OpCode.UNBOX:
@@ -262,14 +257,30 @@ export const deepPrint = (bc: ByteCode) => {
     }
 }
 
+const BYTECODE_MAGIC = 0x414E4D41
+
+// bump whenever opcodes, builtin indices or the serialized layout change
+export const BYTECODE_VERSION = 1
+
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()
     bs.writeValue(b)
-    return bs.finalize()
+    const body = bs.finalize()
+    const out = new Uint32Array(body.length + 2)
+    out[0] = BYTECODE_MAGIC
+    out[1] = BYTECODE_VERSION
+    out.set(body, 2)
+    return out
 }
 
 export const readFull = (b: Uint32Array): SerializableBytecode => {
-    const bsr = new BSReader(b)
+    if (b.length < 2 || b[0] !== BYTECODE_MAGIC) {
+        throw new Error("not anima bytecode (missing header)")
+    }
+    if (b[1] !== BYTECODE_VERSION) {
+        throw new Error(`bytecode version ${b[1]} is not supported (expected ${BYTECODE_VERSION}), recompile from source`)
+    }
+    const bsr = new BSReader(b.subarray(2))
     ByteCode.register(bsr)
     ClosureTemplate.register(bsr)
     Closure.register(bsr)
