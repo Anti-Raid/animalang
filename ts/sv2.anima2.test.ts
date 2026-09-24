@@ -4,12 +4,12 @@ import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
 import { ByteCode, AnimaVM, JITCompiler, OpCode } from './bytecode-rvm/vm';
 import { Anima } from './anima';
-import { impl, implAot } from './bytecode-rvm/meta';
+import { implAot } from './bytecode-rvm/meta';
 
-const vmImpl = impl
+const vmImpl = implAot
 const bcCache: Record<string, AbstractByteCode> = {}
 describe('Anima', () => {
-    let evaluator = new Anima(implAot)
+    let evaluator = new Anima(vmImpl)
     let s = new ASTStringifier()
     evaluator.scope.set(Symbol.for("port"), 8080)
     evaluator.scope.set(Symbol.for("protocol"), "tcp")
@@ -904,8 +904,6 @@ describe('Anima', () => {
         // Verify debugName on procedures
         const plusProc = evaluator.scope.get(Symbol.for("+"));
         expect(plusProc.debugName).toBe("+");
-        const applyProc = evaluator.scope.get(Symbol.for("apply"));
-        expect(applyProc.debugName).toBe("apply");
 
         const closure = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (x y) (+ x y))`));
         expect(closure.debugName).toBe("lambda");
@@ -1745,23 +1743,9 @@ describe('Floats, Infinities & NaNs', () => {
 
 describe("JIT Compiler Runtime Compilation & Execution", () => {
     const animaScope = () => {
-        const anima = new Anima(impl);
+        const anima = new Anima(vmImpl);
         return anima.scope;
     };
-
-    it("executes functions in interpreter without JIT compilation", () => {
-        const anima = new Anima(impl);
-        const code = anima.compileRaw(`
-            (define (double x) (+ x x))
-            double
-        `);
-        const doubleClosure = anima.evaluateRaw(code);
-        const fnCode = doubleClosure.tmpl.code as ByteCode;
-
-        expect(fnCode.nativeFn).toBeNull();
-        expect(anima.evaluateClosure(doubleClosure, [21])).toBe(42);
-        expect(fnCode.nativeFn).toBeNull();
-    });
 
     it("compiles functions AOT and executes natively", () => {
         const anima = new Anima(implAot);

@@ -35,13 +35,6 @@ export class BuiltinFunction extends IProcedure {
     }
 }
 
-// Marker for `apply` intrinsic proc
-export class ApplyProc extends IProcedure {
-    public name = Symbol.for("apply")
-    constructor() {
-        super("apply");
-    }
-}
 
 function makeNumericComparisonCodeGen(op: string) {
     return (emitter: CodeEmitter, startReg: number, nregs: number): string => {
@@ -113,7 +106,7 @@ function makeEqCodeGen() {
     };
 }
 
-export const IBUILTINS: (BuiltinFunction | ApplyProc)[] = [
+export const IBUILTINS: BuiltinFunction[] = [
     new BuiltinFunction(
         Symbol.for("+"),
         (regs, startReg, nargs) => {
@@ -687,7 +680,6 @@ export const IBUILTINS: (BuiltinFunction | ApplyProc)[] = [
         if (nargs != 1) throw new Error("error? requires 1 argument");
         return regs[startReg] instanceof ErrorObject
     }),
-    new ApplyProc(),
     new BuiltinFunction(Symbol.for("gensym"), (regs, startReg, nargs) => {
         if (nargs > 1) throw new Error("gensym requires 0 or 1 arguments");
         switch (nargs) {
@@ -947,27 +939,36 @@ for(let i = 0; i < IBUILTINS.length; i++) {
 export const stdPreludeScope = () => new Table()
 
 export const STD_PRELUDE = `
-(define $map
-    (lambda (f list1 . more)
-        (if (null? more)
-            (let loop ((lst list1))
-                (if (null? lst)
-                    '()
-                    (cons (f (car lst)) (loop (cdr lst)))))
-            (let loop ((lists (cons list1 more)))
-                (let check ((lsts lists))
-                    (if (null? lsts)
-                        (cons (apply f (let get-cars ((lsts lists))
-                                         (if (null? lsts)
-                                             '()
-                                             (cons (car (car lsts)) (get-cars (cdr lsts))))))
-                              (loop (let get-cdrs ((lsts lists))
-                                      (if (null? lsts)
-                                          '()
-                                          (cons (cdr (car lsts)) (get-cdrs (cdr lsts)))))))
-                        (if (null? (car lsts))
-                            '()
-                            (check (cdr lsts)))))))))
+(let ((apply-proc #f)
+      (map-proc #f))
+    (set! apply-proc
+        (lambda (proc . lst)
+            (%apply-multi proc lst)))
+
+    (set! map-proc
+        (lambda (f list1 . more)
+            (if (null? more)
+                (let loop ((lst list1))
+                    (if (null? lst)
+                        '()
+                        (cons (f (car lst)) (loop (cdr lst)))))
+                (let loop ((lists (cons list1 more)))
+                    (let check ((lsts lists))
+                        (if (null? lsts)
+                            (cons (apply-proc f (let get-cars ((lsts lists))
+                                                  (if (null? lsts)
+                                                      '()
+                                                      (cons (car (car lsts)) (get-cars (cdr lsts))))))
+                                  (loop (let get-cdrs ((lsts lists))
+                                          (if (null? lsts)
+                                              '()
+                                              (cons (cdr (car lsts)) (get-cdrs (cdr lsts)))))))
+                            (if (null? (car lsts))
+                                '()
+                                (check (cdr lsts)))))))))
+
+    (%define-global $apply apply-proc)
+    (%define-global $map map-proc))
 
 (define $call/cc
     (lambda (proc)
@@ -1026,6 +1027,7 @@ export const STD_PRELUDE = `
     (%define-global $with-exception-handler with-ex-handler-proc)
     (%define-global $raise-continuable raise-cont-proc)
     (%define-global $try try-proc)
+    (%define-global $try-catch try-proc)
 
     (%set-raise-proc raise-proc))
 `

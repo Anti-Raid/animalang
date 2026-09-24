@@ -538,22 +538,6 @@ export const unpackLambdaExprArgs = (expr: any, ctx?: string): UnpackedLambdaArg
     return { params, remParams }
 }
 
-export const flattenDynamicArgs = (actualArgs: any[], callerArgs: any[], start: number, nargs: number, ctx: string) => {
-    const initialFill = actualArgs.length
-    for (let i = 1+initialFill; i < nargs - 1; i++) {
-        actualArgs.push(callerArgs[start + i]);
-    }
-    const finalArg = callerArgs[start + nargs - 1]
-    if (finalArg instanceof Cons) {
-        actualArgs.push(...finalArg);
-    } else if (finalArg === null) {
-        // Empty list
-    } else {
-        throw new Error(`${ctx}: last argument must be a list but got ${String(finalArg)}`);
-    }
-    return actualArgs
-}
-
 export const wrapMulti = (exprs: any): any => {
     if (exprs === null) return null;
     if (exprs instanceof Cons) {

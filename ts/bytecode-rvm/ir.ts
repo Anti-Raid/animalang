@@ -63,6 +63,17 @@ export type Node = {
     startReg: number,
     nargs: number,
 } | {
+    t: "Apply",
+    procReg: number,
+    destReg: number,
+    startReg: number,
+    nargs: number,
+} | {
+    t: "TailApply",
+    procReg: number,
+    startReg: number,
+    nargs: number,
+} | {
     t: "Return",
     reg: number
 } | {
@@ -192,6 +203,14 @@ export class IR {
                 }
                 case "TailCall": {
                     inst.push(OpCode.TAILCALL, node.procReg, node.startReg, node.nargs)
+                    break
+                }
+                case "Apply": {
+                    inst.push(OpCode.APPLY, node.procReg, node.destReg, node.startReg, node.nargs)
+                    break
+                }
+                case "TailApply": {
+                    inst.push(OpCode.TAILAPPLY, node.procReg, node.startReg, node.nargs)
                     break
                 }
                 case "IBuiltin": {

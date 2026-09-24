@@ -141,6 +141,27 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 5;
                 break;
             }
+
+            case OpCode.TAILAPPLY: {
+                const proc = inst.inst[idx + 1];
+                const startReg = inst.inst[idx + 2];
+                const nargs = inst.inst[idx + 3];
+                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
+                line += `${padOp("TAILAPPLY")} ${procStr}, start=r${startReg}, nargs=${nargs}`;
+                idx += 4;
+                break;
+            }
+
+            case OpCode.APPLY: {
+                const proc = inst.inst[idx + 1];
+                const destReg = inst.inst[idx + 2];
+                const startReg = inst.inst[idx + 3];
+                const nargs = inst.inst[idx + 4];
+                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
+                line += `${padOp("APPLY")} ${procStr}, dest=r${destReg}, start=r${startReg}, nargs=${nargs}`;
+                idx += 5;
+                break;
+            }
             case OpCode.WIND: {
                 const beforeReg = inst.inst[idx + 1];
                 const afterReg = inst.inst[idx + 2];

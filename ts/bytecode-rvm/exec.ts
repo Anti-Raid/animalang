@@ -1,6 +1,5 @@
 import {
     ErrorObject,
-    flattenDynamicArgs,
     Table,
     IProcedure,
     type AbstractVM,
@@ -13,7 +12,7 @@ import {
     AbstractClosure
 } from "../common";
 import { Cons } from "../list";
-import { ApplyProc, BuiltinFunction, IBUILTINS, BuiltinCodeGenFn } from "../std";
+import { BuiltinFunction, IBUILTINS, BuiltinCodeGenFn } from "../std";
 
 export const BUILTINS_START = 2**31;
 
@@ -42,6 +41,8 @@ export enum OpCode {
     CALLCC,
     TAILCALLCC,
     SETRAISEPROC,
+    APPLY,
+    TAILAPPLY,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -66,9 +67,11 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.SETBOX]: 3,
     [OpCode.MOVE]: 3,
     [OpCode.TAILCALL]: 4,
+    [OpCode.TAILAPPLY]: 4,
     [OpCode.SETUPVAR]: 4,
     [OpCode.LOADUPVAR]: 4,
     [OpCode.CALL]: 5,
+    [OpCode.APPLY]: 5,
 };
 
 export type NativeFn = (
@@ -266,6 +269,28 @@ export class ExecutionContext {
     ) {
         this.id = ++ExecutionContext.nextId;
     }
+
+    // for %apply and %apply-multi
+    #spliceLast(rawArgs: any[]): any[] {
+        const actualArgs = rawArgs.slice(0, -1);
+        const finalArg = rawArgs[rawArgs.length - 1];
+        if (finalArg instanceof Cons) {
+            actualArgs.push(...finalArg);
+        } else if (finalArg !== null) {
+            throw new Error(`apply: last argument must be a list but got ${String(finalArg)}`);
+        }
+        return actualArgs;
+    }
+
+    // %apply: register-window version (compile-time-known arity)
+    public flattenDynamicArgs = (regs: any[], startReg: number, nargs: number) => {
+        return this.#spliceLast(regs.slice(startReg, startReg + nargs));
+    }
+
+    // %apply-multi: runtime-list version (unknown arity until runtime)
+    public flattenListArgs = (lst: Cons | null) => {
+        return this.#spliceLast(lst === null ? [] : [...lst]);
+    }
 }
 
 export class VMContinuation extends IProcedure {
@@ -438,10 +463,6 @@ export class VMExecutor {
                 return this.newFrame(ctx, proc, pregs, callerFrame !== null ? callerFrame.parent : null);
             }
             return this.newFrame(ctx, proc, pregs, callerFrame);
-        } else if (proc instanceof ApplyProc) {
-            const actualProc = callerArgs[startReg];
-            const actualArgs = flattenDynamicArgs([], callerArgs, startReg, nargs, "apply");
-            return this.invoke(ctx, actualProc, callerFrame, actualArgs, 0, actualArgs.length, isTail);
         } else if (proc instanceof VMContinuation) {
             if (proc.ctxId !== ctx.id) {
                 throw new Error("Cannot invoke a continuation across execution/FFI boundary");
@@ -708,6 +729,30 @@ export class BytecodeInterpreter {
                         frame = executor.invoke(ctx, proc, frame, regs, startReg, nargs, true);
                         break;
                     }
+                    case OpCode.APPLY: {
+                        const procIdx = frame.readNext();
+                        const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
+                        const destReg = frame.readNext();
+                        const startReg = frame.readNext();
+                        const nargs = frame.readNext();
+                        const actualArgs = ((nargs | 0) === -1)
+                            ? ctx.flattenListArgs(regs[startReg])
+                            : ctx.flattenDynamicArgs(regs, startReg, nargs);
+                        frame.retDestReg = destReg;
+                        frame = executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, false);
+                        break;
+                    }
+                    case OpCode.TAILAPPLY: {
+                        const procIdx = frame.readNext();
+                        const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
+                        const startReg = frame.readNext();
+                        const nargs = frame.readNext();
+                        const actualArgs = ((nargs | 0) === -1)
+                            ? ctx.flattenListArgs(regs[startReg])
+                            : ctx.flattenDynamicArgs(regs, startReg, nargs);
+                        frame = executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, true);
+                        break;
+                    }
                     case OpCode.WIND: {
                         const beforeReg = frame.readNext();
                         const afterReg = frame.readNext();
@@ -768,6 +813,12 @@ export class JITCompiler {
             }
         }
         return null;
+    }
+
+    public static getProcExprFromProcIdx(procIdx: number): string {
+        return procIdx < BUILTINS_START
+            ? `regs[${procIdx}]`
+            : `IBUILTINS[${procIdx - BUILTINS_START}]`;
     }
 
     public static compile(code: ByteCode): NativeFn {
@@ -836,6 +887,10 @@ export class JITCompiler {
                     if (!codeGen && !isBuiltin) {
                         blocks.add(nextIp);
                     }
+                    break;
+                }
+                case OpCode.APPLY: {
+                    blocks.add(nextIp);
                     break;
                 }
                 case OpCode.CALLCC: {
@@ -1143,11 +1198,64 @@ export class JITCompiler {
                             return;
                         }
                     }
+                    const procExpr = this.getProcExprFromProcIdx(procIdx);
                     out.emit(`
                         {
-                            const proc = (${procIdx} < BUILTINS_START) ? regs[${procIdx}] : IBUILTINS[${procIdx} - BUILTINS_START];
+                            const proc = ${procExpr};
                             frame.ip = ${ip};
                             return executor.invoke(ctx, proc, frame, regs, ${startReg}, ${nargs}, true);
+                        }
+                    `);
+                    return;
+                }
+                case OpCode.APPLY: {
+                    const procIdx = inst[ip++];
+                    const destReg = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    const nextIp = ip;
+                    const flattenCall = ((nargs | 0) === -1)
+                        ? `ctx.flattenListArgs(regs[${startReg}])`
+                        : `ctx.flattenDynamicArgs(regs, ${startReg}, ${nargs})`;
+                    const procExpr = this.getProcExprFromProcIdx(procIdx);
+                    out.emit(`
+                        {
+                            const proc = ${procExpr};
+                            const actualArgs = ${flattenCall};
+                            if (proc instanceof BuiltinFunction) {
+                                frame.ip = ${nextIp};
+                                regs[${destReg}] = proc.cb(actualArgs, 0, actualArgs.length);
+                                ctx.acc = regs[${destReg}];
+                                ${blockSet ? `ip = ${nextIp}; continue;` : ""}
+                            } else {
+                                frame.retDestReg = ${destReg};
+                                frame.ip = ${nextIp};
+                                return executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, false);
+                            }
+                        }
+                    `);
+                    return;
+                }
+                case OpCode.TAILAPPLY: {
+                    const procIdx = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    const flattenCall = ((nargs | 0) === -1)
+                        ? `ctx.flattenListArgs(regs[${startReg}])`
+                        : `ctx.flattenDynamicArgs(regs, ${startReg}, ${nargs})`;
+                    const procExpr = this.getProcExprFromProcIdx(procIdx);
+                    out.emit(`
+                        {
+                            const proc = ${procExpr};
+                            const actualArgs = ${flattenCall};
+                            if (proc instanceof BuiltinFunction) {
+                                frame.ip = ${ip};
+                                ctx.acc = proc.cb(actualArgs, 0, actualArgs.length);
+                                return executor.setRetVal(ctx, frame.parent, ctx.acc);
+                            } else {
+                                frame.ip = ${ip};
+                                return executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, true);
+                            }
                         }
                     `);
                     return;

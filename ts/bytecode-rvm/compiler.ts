@@ -8,6 +8,8 @@ import { BUILTINS_START } from "./exec";
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
 const OP_SET_RAISE_PROC = Symbol.for("%set-raise-proc");
+const OP_APPLY = Symbol.for("%apply");
+const OP_APPLY_MARGS = Symbol.for("%apply-multi")
 
 interface CmpOpts {
     destReg?: number // where to store dest reg
@@ -94,6 +96,12 @@ export class Compiler {
                     return
                 case OP_SET_RAISE_PROC:
                     this.#compileSetRaiseProc(expr, opts)
+                    return
+                case OP_APPLY:
+                    this.#compileApply(expr, opts)
+                    return
+                case OP_APPLY_MARGS:
+                    this.#compileApplyMulti(expr, opts)
                     return
             }
         }
@@ -238,6 +246,7 @@ export class Compiler {
         const lastNode = nodes[nodes.length-1]
         if (
             lastNode.t === "TailCall" ||
+            lastNode.t === "TailApply" ||
             lastNode.t === "IBuiltinTail" ||
             lastNode.t === "Return" ||
             lastNode.t === "TailCallCC"
@@ -316,6 +325,74 @@ export class Compiler {
         }
     }
 
+    #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
+        if (typeof procExpr === "symbol") {
+            const resolved = opts.scope.resolve(procExpr);
+            if (resolved.type === "Global") {
+                const builtinsIdx = IBUILTINS_IDX_MAP.get(procExpr);
+                if (builtinsIdx !== undefined) {
+                    return { procReg: BUILTINS_START + builtinsIdx, isTemp: false };
+                }
+            }
+        }
+        const procReg = opts.scope.allocTemp();
+        this.#compile(procExpr, { ...opts, destReg: procReg, isTail: false });
+        return { procReg, isTemp: true };
+    }
+
+    #compileApply(expr: Cons, opts: CmpOpts) {
+        if (expr.length < 3) {
+            throw new Error(`%apply requires at least 2 arguments (proc, ...args, args-lst), got ${expr.length - 1}`);
+        }
+        const procExpr = expr.cdr.car;
+        const argsExprList = expr.cdr.cdr;
+
+        const { procReg, isTemp } = this.#resolveProcReg(procExpr, opts);
+
+        const nargs = argsExprList === null ? 0 : argsExprList.length;
+        const startReg = opts.scope.regAlloc.allocBlock(nargs);
+        let curr: any = argsExprList;
+        let i = 0;
+        while (curr instanceof Cons) {
+            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false });
+            i++;
+            curr = curr.cdr;
+        }
+
+        this.#emitApplyNode(opts, procReg, startReg, nargs);
+
+        opts.scope.regAlloc.freeBlock(startReg, nargs);
+        if (isTemp) opts.scope.freeTemp(procReg);
+    }
+
+    #compileApplyMulti(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 3) {
+            throw new Error(`%apply-multi requires exactly 2 arguments (proc, args-list), got ${expr.length - 1}`);
+        }
+        const procExpr = expr.cdr.car;
+        const lstExpr = expr.cdr.cdr.car;
+
+        const { procReg, isTemp } = this.#resolveProcReg(procExpr, opts);
+
+        // single register holding the whole runtime list — no block, no static count
+        const argReg = opts.scope.allocTemp();
+        this.#compile(lstExpr, { ...opts, destReg: argReg, isTail: false });
+
+        this.#emitApplyNode(opts, procReg, argReg, -1); // -1 sentinel: argReg is a Cons to spread, not a register window
+
+        opts.scope.freeTemp(argReg);
+        if (isTemp) opts.scope.freeTemp(procReg);
+    }
+
+    #emitApplyNode(opts: CmpOpts, procReg: number, startReg: number, nargs: number) {
+        if (opts.isTail) {
+            opts.nodes.push({ t: "TailApply", procReg, startReg, nargs });
+        } else {
+            const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg;
+            opts.nodes.push({ t: "Apply", destReg: targetReg, procReg, startReg, nargs });
+            if (opts.destReg === undefined) opts.scope.freeTemp(targetReg);
+        }
+    }
     // a normal call
     #compileNormalCall(expr: Cons, opts: CmpOpts) {
         // Try IIFE optimizations
@@ -324,8 +401,7 @@ export class Compiler {
         }
 
         // We need to compile the proc and place it on its own tempval
-        const procReg = opts.scope.allocTemp();
-        this.#compile(expr.car, { ...opts, destReg: procReg, isTail: false })
+        const { procReg, isTemp } = this.#resolveProcReg(expr.car, opts);
 
         // Push all arguments to a contiguous reg block
         const nargs = expr.cdr === null ? 0 : expr.cdr.length;
@@ -347,7 +423,7 @@ export class Compiler {
         }
 
         opts.scope.regAlloc.freeBlock(startReg, nargs)
-        opts.scope.freeTemp(procReg)
+        if (isTemp) opts.scope.freeTemp(procReg)
     }
 
     #optIIFE(expr: Cons, opts: CmpOpts): boolean {

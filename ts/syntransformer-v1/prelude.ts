@@ -403,4 +403,20 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
         return { expanded, state: TransformState.Recurse };
     });
+
+    evaluator.registerTransform(Symbol.for("call/cc"), (evaluator, expr, orig) => {
+        return { expanded: cons(Symbol.for("%call/cc"), expr), state: TransformState.DoChildren };
+    });
+
+    evaluator.registerTransform(Symbol.for("call-with-current-continuation"), (evaluator, expr, orig) => {
+        return { expanded: cons(Symbol.for("%call/cc"), expr), state: TransformState.DoChildren };
+    });
+
+    evaluator.registerTransform(Symbol.for("apply"), (evaluator, expr, orig) => {
+        return { expanded: cons(Symbol.for("%apply"), expr), state: TransformState.DoChildren };
+    });
+
+    evaluator.registerTransform(Symbol.for("dynamic-wind"), (evaluator, expr, orig) => {
+        return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
+    });
 };
