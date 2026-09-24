@@ -1,10 +1,11 @@
 import {
     ErrorObject,
+    MissingVarError,
+    UnhandledSchemeError,
+    isTruthy,
     Table,
     IProcedure,
     type AbstractVM,
-    MissingVarError,
-    isTruthy,
     AbstractByteCode,
     BS,
     BSReader,
@@ -12,7 +13,8 @@ import {
     AbstractClosure
 } from "../common";
 import { Cons } from "../list";
-import { BuiltinFunction, IBUILTINS, BuiltinCodeGenFn } from "../std";
+import { opAdd, opSub, opMul, opDiv, opMod, opRem, opNumEq, opEq, opLt, opLe, opGt, opGe, makeList, opCons, opIsNull, opIsPair, CXR_FNS } from "../ops";
+import { BuiltinFunction, IBUILTINS } from "../std";
 
 export const BUILTINS_START = 2**31;
 
@@ -43,6 +45,25 @@ export enum OpCode {
     SETRAISEPROC,
     APPLY,
     TAILAPPLY,
+    ADD,
+    SUB,
+    MUL,
+    DIV,
+    MOD,
+    REM,
+    NUMEQ,
+    EQ,
+    LT,
+    LE,
+    GT,
+    GE,
+    APPLYLIST,
+    TAILAPPLYLIST,
+    LIST,
+    CONS,
+    ISNULL,
+    ISPAIR,
+    CXR,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -72,14 +93,33 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.LOADUPVAR]: 4,
     [OpCode.CALL]: 5,
     [OpCode.APPLY]: 5,
+    [OpCode.APPLYLIST]: 4,
+    [OpCode.TAILAPPLYLIST]: 3,
+    [OpCode.LIST]: 4,
+    [OpCode.CONS]: 4,
+    [OpCode.ISNULL]: 4,
+    [OpCode.ISPAIR]: 4,
+    [OpCode.CXR]: 5,
+    [OpCode.ADD]: 4,
+    [OpCode.SUB]: 4,
+    [OpCode.MUL]: 4,
+    [OpCode.DIV]: 4,
+    [OpCode.MOD]: 4,
+    [OpCode.REM]: 4,
+    [OpCode.NUMEQ]: 4,
+    [OpCode.EQ]: 4,
+    [OpCode.LT]: 4,
+    [OpCode.LE]: 4,
+    [OpCode.GT]: 4,
+    [OpCode.GE]: 4,
 };
 
 export type NativeFn = (
-    ctx: any,
-    frame: any,
-    vm: any,
-    executor: any
-) => any;
+    ctx: ExecutionContext,
+    frame: Frame,
+    vm: AbstractVM,
+    executor: VMExecutor
+) => Frame | null;
 
 export class ByteCode implements AbstractByteCode {
     public bsid = "ByteCode";
@@ -177,8 +217,52 @@ export class Closure extends IProcedure implements AbstractClosure {
     }
 }
 
+const WINDOW_OPS = { opAdd, opSub, opMul, opDiv, opMod, opRem, opNumEq, opEq, opLt, opLe, opGt, opGe, makeList, opCons, opIsNull, opIsPair };
+
+const WINDOW_FN_NAMES: Partial<Record<OpCode, keyof typeof WINDOW_OPS>> = {
+    [OpCode.ADD]: "opAdd",
+    [OpCode.SUB]: "opSub",
+    [OpCode.MUL]: "opMul",
+    [OpCode.DIV]: "opDiv",
+    [OpCode.MOD]: "opMod",
+    [OpCode.REM]: "opRem",
+    [OpCode.NUMEQ]: "opNumEq",
+    [OpCode.EQ]: "opEq",
+    [OpCode.LT]: "opLt",
+    [OpCode.LE]: "opLe",
+    [OpCode.GT]: "opGt",
+    [OpCode.GE]: "opGe",
+    [OpCode.LIST]: "makeList",
+    [OpCode.CONS]: "opCons",
+    [OpCode.ISNULL]: "opIsNull",
+    [OpCode.ISPAIR]: "opIsPair",
+};
+
+
 export const createRegs = (numRegs: number) => {
     return new Array(numRegs).fill(undefined);
+};
+
+export const resolveProc = (regs: readonly any[], procIdx: number): any => {
+    return procIdx < BUILTINS_START ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
+};
+
+const spliceLast = (args: any[]): any[] => {
+    const finalArg = args.pop();
+    if (finalArg instanceof Cons) {
+        for (const v of finalArg) args.push(v);
+    } else if (finalArg !== null) {
+        throw new Error(`apply: last argument must be a list but got ${String(finalArg)}`);
+    }
+    return args;
+};
+
+export const windowApplyArgs = (regs: readonly any[], startReg: number, nargs: number): any[] => {
+    return spliceLast(regs.slice(startReg, startReg + nargs));
+};
+
+export const listApplyArgs = (lst: Cons | null): any[] => {
+    return spliceLast(lst === null ? [] : [...lst]);
 };
 
 export class Box {
@@ -197,17 +281,15 @@ export class WindPoint {
     }
 }
 
-export type WindAction =
-    | { type: "after"; thunk: any; nextWind: WindPoint | null }
-    | { type: "before"; thunk: any; nextWind: WindPoint | null };
+export type WindAction = { type: "after" | "before"; thunk: any; nextWind: WindPoint | null };
 
 function depthOf(w: WindPoint | null): number {
     return w === null ? -1 : w.depth;
 }
 
-export function computeWindTransition(fromWind: WindPoint | null, toWind: WindPoint | null): { actions: WindAction[] } {
+export function computeWindTransition(fromWind: WindPoint | null, toWind: WindPoint | null): WindAction[] {
     if (fromWind === toWind) {
-        return { actions: [] };
+        return [];
     }
 
     // Equalize depth, then walk together, finds the LCA with no arrays.
@@ -243,7 +325,7 @@ export function computeWindTransition(fromWind: WindPoint | null, toWind: WindPo
         actions.push({ type: "before", thunk: node.before, nextWind: node });
     }
 
-    return { actions };
+    return actions;
 }
 
 export interface PendingWindTransition {
@@ -268,28 +350,6 @@ export class ExecutionContext {
         public scope: Table
     ) {
         this.id = ++ExecutionContext.nextId;
-    }
-
-    // for %apply and %apply-multi
-    #spliceLast(rawArgs: any[]): any[] {
-        const actualArgs = rawArgs.slice(0, -1);
-        const finalArg = rawArgs[rawArgs.length - 1];
-        if (finalArg instanceof Cons) {
-            actualArgs.push(...finalArg);
-        } else if (finalArg !== null) {
-            throw new Error(`apply: last argument must be a list but got ${String(finalArg)}`);
-        }
-        return actualArgs;
-    }
-
-    // %apply: register-window version (compile-time-known arity)
-    public flattenDynamicArgs = (regs: any[], startReg: number, nargs: number) => {
-        return this.#spliceLast(regs.slice(startReg, startReg + nargs));
-    }
-
-    // %apply-multi: runtime-list version (unknown arity until runtime)
-    public flattenListArgs = (lst: Cons | null) => {
-        return this.#spliceLast(lst === null ? [] : [...lst]);
     }
 }
 
@@ -323,18 +383,6 @@ export class Frame {
         return this.closure.debugName ?? "lambda";
     }
 
-    readNext(): number {
-        const inst = this.code.inst;
-        if (this.ip >= inst.length) {
-            throw new Error(`internal error: unexpected end of bytecode, instruction pointer out of bounds (${this.ip} >= ${inst.length}).`);
-        }
-        return inst[this.ip++];
-    }
-
-    getConst(idx: number): any {
-        return this.code.constants[idx];
-    }
-
     thaw(ctx: ExecutionContext): Frame {
         return new Frame(this.closure, [...this.regs], this.ip, this.parent, this.retDestReg, ctx.epoch);
     }
@@ -349,37 +397,17 @@ export class Frame {
     }
 }
 
-export class UnhandledSchemeError extends Error {
-    constructor(public readonly error: any) {
-        super(error instanceof Error ? error.message : String(error));
-    }
-}
-
 export class VMExecutor {
     public raiseProc: any | null = null;
 
     constructor(public vm: AbstractVM) {}
 
-    public execAot(ctx: ExecutionContext, initialFrame: Frame): any {
-        let frame: Frame | null = initialFrame;
-
-        while (frame !== null) {
-            ctx.currentFrame = frame;
-
-            if (frame.isShared(ctx)) {
-                frame = frame.thaw(ctx);
-                ctx.currentFrame = frame;
-            }
-
-            if (frame.code.nativeFn !== null) {
-                frame = frame.code.nativeFn(ctx, frame, this.vm, this);
-                continue;
-            }
-
-            throw new Error(`AOT mode encountered uncompiled code in frame: ${frame.debugName}`);
+    public enter(ctx: ExecutionContext, frame: Frame): Frame {
+        if (frame.isShared(ctx)) {
+            frame = frame.thaw(ctx);
         }
-
-        return ctx.acc;
+        ctx.currentFrame = frame;
+        return frame;
     }
 
     public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any): Frame | null {
@@ -428,14 +456,10 @@ export class VMExecutor {
                 throw new Error(`Attempted to call a non-procedure in dynamic-wind: ${String(action.thunk)}`);
             }
 
-            const targetFrame = trans.targetFrame;
-            const targetVal = trans.targetVal;
-            const targetWind = trans.targetWind;
             ctx.pendingWind = null;
-            ctx.wind = targetWind;
-            ctx.acc = targetVal;
-
-            return this.setRetVal(ctx, targetFrame, targetVal);
+            ctx.wind = trans.targetWind;
+            ctx.acc = trans.targetVal;
+            return this.setRetVal(ctx, trans.targetFrame, trans.targetVal);
         }
 
         return null;
@@ -450,27 +474,29 @@ export class VMExecutor {
         nargs: number,
         isTail: boolean
     ): Frame | null {
+        const returnTo = (isTail && callerFrame !== null) ? callerFrame.parent : callerFrame;
+
         if (proc instanceof BuiltinFunction) {
             ctx.acc = proc.cb(callerArgs, startReg, nargs);
-            const target = (callerFrame !== null && isTail) ? callerFrame.parent : callerFrame;
-            return this.setRetVal(ctx, target, ctx.acc);
-        } else if (proc instanceof Closure) {
+            return this.setRetVal(ctx, returnTo, ctx.acc);
+        }
+
+        if (proc instanceof Closure) {
             const pregs = this.createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
-            if (isTail) {
-                if (callerFrame !== null && !callerFrame.isShared(ctx)) {
-                    return this.reset(callerFrame, proc, pregs);
-                }
-                return this.newFrame(ctx, proc, pregs, callerFrame !== null ? callerFrame.parent : null);
+            if (isTail && callerFrame !== null && !callerFrame.isShared(ctx)) {
+                return this.reset(callerFrame, proc, pregs);
             }
-            return this.newFrame(ctx, proc, pregs, callerFrame);
-        } else if (proc instanceof VMContinuation) {
+            return this.newFrame(ctx, proc, pregs, returnTo);
+        }
+
+        if (proc instanceof VMContinuation) {
             if (proc.ctxId !== ctx.id) {
                 throw new Error("Cannot invoke a continuation across execution/FFI boundary");
             }
             if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
 
             const targetVal = callerArgs[startReg];
-            const { actions } = computeWindTransition(ctx.wind, proc.wind);
+            const actions = computeWindTransition(ctx.wind, proc.wind);
 
             if (actions.length === 0) {
                 ctx.acc = targetVal;
@@ -487,9 +513,20 @@ export class VMExecutor {
             };
 
             return this.advanceWindTransition(ctx);
-        } else {
-            throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
         }
+
+        throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
+    }
+
+    public apply(ctx: ExecutionContext, proc: any, frame: Frame, args: any[], isTail: boolean): Frame | null {
+        return this.invoke(ctx, proc, frame, args, 0, args.length, isTail);
+    }
+
+    public callCC(ctx: ExecutionContext, proc: any, frame: Frame, isTail: boolean): Frame | null {
+        const target = isTail ? frame.parent : frame;
+        target?.share(ctx);
+        const k = new VMContinuation(target, ctx.id, ctx.wind);
+        return this.invoke(ctx, proc, frame, [k], 0, 1, isTail);
     }
 
     public setRetVal(ctx: ExecutionContext, frame: Frame | null, val: any): Frame | null {
@@ -566,34 +603,34 @@ export class VMExecutor {
 export class BytecodeInterpreter {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
         let frame: Frame | null = initialFrame;
-
         while (frame !== null) {
-            ctx.currentFrame = frame;
+            frame = BytecodeInterpreter.step(ctx, executor.enter(ctx, frame), executor);
+        }
+        return ctx.acc;
+    }
 
-            if (frame.isShared(ctx)) {
-                frame = frame.thaw(ctx);
-                ctx.currentFrame = frame;
-            }
+    public static step(ctx: ExecutionContext, frame: Frame, executor: VMExecutor): Frame | null {
+        const regs = frame.regs;
+        const inst = frame.code.inst;
+        const constants = frame.code.constants;
+        let ip = frame.ip;
 
-            const regs = frame.regs;
-
-            try {
-                const opcode: OpCode = frame.readNext();
+        try {
+            while (true) {
+                const opcode: OpCode = inst[ip++];
                 switch (opcode) {
                     case OpCode.LOADCONST: {
-                        const destReg = frame.readNext();
-                        const constIdx = frame.readNext();
-                        regs[destReg] = frame.getConst(constIdx);
+                        const destReg = inst[ip++];
+                        regs[destReg] = constants[inst[ip++]];
                         break;
                     }
                     case OpCode.LOADU32: {
-                        const destReg = frame.readNext();
-                        const u32Val = frame.readNext();
-                        regs[destReg] = u32Val;
+                        const destReg = inst[ip++];
+                        regs[destReg] = inst[ip++];
                         break;
                     }
                     case OpCode.NEGATE: {
-                        const reg = frame.readNext();
+                        const reg = inst[ip++];
                         if (typeof regs[reg] !== "number") {
                             throw new Error("cannot negate non-number");
                         }
@@ -601,22 +638,22 @@ export class BytecodeInterpreter {
                         break;
                     }
                     case OpCode.LOADUPVAR: {
-                        const destReg = frame.readNext();
-                        const upvarIdx = frame.readNext();
-                        const andUnbox = frame.readNext();
+                        const destReg = inst[ip++];
+                        const upvarIdx = inst[ip++];
+                        const andUnbox = inst[ip++];
                         regs[destReg] = andUnbox ? (frame.upvars[upvarIdx] as Box).val : frame.upvars[upvarIdx];
                         break;
                     }
                     case OpCode.SETUPVAR: {
-                        const srcReg = frame.readNext();
-                        const upvarIdx = frame.readNext();
-                        const andBox = frame.readNext();
+                        const srcReg = inst[ip++];
+                        const upvarIdx = inst[ip++];
+                        const andBox = inst[ip++];
                         frame.upvars[upvarIdx] = andBox ? new Box(regs[srcReg]) : regs[srcReg];
                         break;
                     }
                     case OpCode.LOADGLOBAL: {
-                        const destReg = frame.readNext();
-                        const varname = frame.getConst(frame.readNext()) as symbol;
+                        const destReg = inst[ip++];
+                        const varname = constants[inst[ip++]] as symbol;
                         if (!ctx.scope.has(varname)) {
                             throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`);
                         }
@@ -624,86 +661,87 @@ export class BytecodeInterpreter {
                         break;
                     }
                     case OpCode.SETGLOBAL: {
-                        const srcReg = frame.readNext();
-                        const varname = frame.getConst(frame.readNext()) as symbol;
-                        ctx.scope.set(varname, regs[srcReg]);
+                        const srcReg = inst[ip++];
+                        ctx.scope.set(constants[inst[ip++]], regs[srcReg]);
                         break;
                     }
                     case OpCode.HASGLOBAL: {
-                        const varname = frame.getConst(frame.readNext()) as symbol;
+                        const varname = constants[inst[ip++]] as symbol;
                         if (!ctx.scope.has(varname)) {
                             throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`);
                         }
                         break;
                     }
                     case OpCode.IF: {
-                        const condReg = frame.readNext();
-                        const elseOffset = frame.readNext();
+                        const condReg = inst[ip++];
+                        const elseOffset = inst[ip++];
                         if (!isTruthy(regs[condReg])) {
-                            frame.ip = elseOffset;
+                            ip = elseOffset;
                         }
                         break;
                     }
                     case OpCode.ELSE: {
-                        const endOffset = frame.readNext();
-                        frame.ip = endOffset;
+                        ip = inst[ip];
                         break;
                     }
                     case OpCode.ENDIF: {
                         break;
                     }
                     case OpCode.NEWCLOSURE: {
-                        const destReg = frame.readNext();
-                        const tidx = frame.readNext();
-                        const template = frame.getConst(tidx) as ClosureTemplate;
+                        const destReg = inst[ip++];
+                        const template = constants[inst[ip++]] as ClosureTemplate;
                         regs[destReg] = Closure.create(template, regs, frame.upvars);
                         break;
                     }
                     case OpCode.BOX: {
-                        const destReg = frame.readNext();
-                        const srcReg = frame.readNext();
-                        regs[destReg] = new Box(regs[srcReg]);
+                        const destReg = inst[ip++];
+                        regs[destReg] = new Box(regs[inst[ip++]]);
                         break;
                     }
                     case OpCode.UNBOX: {
-                        const destReg = frame.readNext();
-                        const srcReg = frame.readNext();
-                        regs[destReg] = (regs[srcReg] as Box).val;
+                        const destReg = inst[ip++];
+                        regs[destReg] = (regs[inst[ip++]] as Box).val;
                         break;
                     }
                     case OpCode.SETBOX: {
-                        const destReg = frame.readNext();
-                        const srcReg = frame.readNext();
-                        (regs[destReg] as Box).val = regs[srcReg];
+                        const destReg = inst[ip++];
+                        (regs[destReg] as Box).val = regs[inst[ip++]];
                         break;
                     }
                     case OpCode.MOVE: {
-                        const destReg = frame.readNext();
-                        const srcReg = frame.readNext();
-                        regs[destReg] = regs[srcReg];
+                        const destReg = inst[ip++];
+                        regs[destReg] = regs[inst[ip++]];
                         break;
                     }
                     case OpCode.RETURN: {
-                        const reg = frame.readNext();
-                        ctx.acc = regs[reg];
-                        frame = executor.setRetVal(ctx, frame.parent, ctx.acc);
-                        break;
+                        ctx.acc = regs[inst[ip++]];
+                        frame.ip = ip;
+                        return executor.setRetVal(ctx, frame.parent, ctx.acc);
                     }
                     case OpCode.CALL: {
-                        const procIdx = frame.readNext();
-                        const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
-                        const destReg = frame.readNext();
-                        const startReg = frame.readNext();
-                        const nargs = frame.readNext();
+                        const procIdx = inst[ip++];
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+
+                        if (procIdx >= BUILTINS_START) {
+                            regs[destReg] = IBUILTINS[procIdx - BUILTINS_START].cb(regs, startReg, nargs);
+                            break;
+                        }
+                        const proc = regs[procIdx];
+                        if (proc instanceof BuiltinFunction) {
+                            regs[destReg] = proc.cb(regs, startReg, nargs);
+                            break;
+                        }
+
+                        frame.ip = ip;
                         frame.retDestReg = destReg;
-                        frame = executor.invoke(ctx, proc, frame, regs, startReg, nargs, false);
-                        break;
+                        return executor.invoke(ctx, proc, frame, regs, startReg, nargs, false);
                     }
                     case OpCode.TAILCALL: {
-                        const procIdx = frame.readNext();
-                        const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
-                        const startReg = frame.readNext();
-                        const nargs = frame.readNext();
+                        const proc = resolveProc(regs, inst[ip++]);
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
 
                         if (proc === frame.closure && !frame.isShared(ctx)) {
                             const tmpl = proc.tmpl;
@@ -721,41 +759,47 @@ export class BytecodeInterpreter {
                                 if (tmpl.remParams !== null) {
                                     regs[numPos] = restList;
                                 }
-                                frame.ip = 0;
+                                ip = 0;
                                 break;
                             }
                         }
 
-                        frame = executor.invoke(ctx, proc, frame, regs, startReg, nargs, true);
-                        break;
+                        frame.ip = ip;
+                        return executor.invoke(ctx, proc, frame, regs, startReg, nargs, true);
                     }
                     case OpCode.APPLY: {
-                        const procIdx = frame.readNext();
-                        const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
-                        const destReg = frame.readNext();
-                        const startReg = frame.readNext();
-                        const nargs = frame.readNext();
-                        const actualArgs = ((nargs | 0) === -1)
-                            ? ctx.flattenListArgs(regs[startReg])
-                            : ctx.flattenDynamicArgs(regs, startReg, nargs);
+                        const proc = resolveProc(regs, inst[ip++]);
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        frame.ip = ip;
                         frame.retDestReg = destReg;
-                        frame = executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, false);
-                        break;
+                        return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), false);
                     }
                     case OpCode.TAILAPPLY: {
-                        const procIdx = frame.readNext();
-                        const proc = (procIdx < BUILTINS_START) ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
-                        const startReg = frame.readNext();
-                        const nargs = frame.readNext();
-                        const actualArgs = ((nargs | 0) === -1)
-                            ? ctx.flattenListArgs(regs[startReg])
-                            : ctx.flattenDynamicArgs(regs, startReg, nargs);
-                        frame = executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, true);
-                        break;
+                        const proc = resolveProc(regs, inst[ip++]);
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        frame.ip = ip;
+                        return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), true);
+                    }
+                    case OpCode.APPLYLIST: {
+                        const proc = resolveProc(regs, inst[ip++]);
+                        const destReg = inst[ip++];
+                        const listReg = inst[ip++];
+                        frame.ip = ip;
+                        frame.retDestReg = destReg;
+                        return executor.apply(ctx, proc, frame, listApplyArgs(regs[listReg]), false);
+                    }
+                    case OpCode.TAILAPPLYLIST: {
+                        const proc = resolveProc(regs, inst[ip++]);
+                        const listReg = inst[ip++];
+                        frame.ip = ip;
+                        return executor.apply(ctx, proc, frame, listApplyArgs(regs[listReg]), true);
                     }
                     case OpCode.WIND: {
-                        const beforeReg = frame.readNext();
-                        const afterReg = frame.readNext();
+                        const beforeReg = inst[ip++];
+                        const afterReg = inst[ip++];
                         ctx.wind = new WindPoint(ctx.wind, regs[beforeReg], regs[afterReg]);
                         break;
                     }
@@ -766,27 +810,122 @@ export class BytecodeInterpreter {
                         break;
                     }
                     case OpCode.CALLCC: {
-                        const destReg = frame.readNext();
-                        const procReg = frame.readNext();
+                        const destReg = inst[ip++];
+                        const procReg = inst[ip++];
+                        frame.ip = ip;
                         frame.retDestReg = destReg;
-                        frame.share(ctx);
-                        const vmCont = new VMContinuation(frame, ctx.id, ctx.wind);
-                        frame = executor.invoke(ctx, regs[procReg], frame, [vmCont], 0, 1, false);
-                        break;
+                        return executor.callCC(ctx, regs[procReg], frame, false);
                     }
                     case OpCode.TAILCALLCC: {
-                        const procReg = frame.readNext();
-                        const targetFrame = frame.parent;
-                        if (targetFrame !== null) {
-                            targetFrame.share(ctx);
-                        }
-                        const vmCont = new VMContinuation(targetFrame, ctx.id, ctx.wind);
-                        frame = executor.invoke(ctx, regs[procReg], frame, [vmCont], 0, 1, true);
-                        break;
+                        const procReg = inst[ip++];
+                        frame.ip = ip;
+                        return executor.callCC(ctx, regs[procReg], frame, true);
                     }
                     case OpCode.SETRAISEPROC: {
-                        const srcReg = frame.readNext();
-                        executor.raiseProc = regs[srcReg];
+                        executor.raiseProc = regs[inst[ip++]];
+                        break;
+                    }
+                    case OpCode.ADD: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opAdd(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.SUB: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opSub(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.MUL: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opMul(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.DIV: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opDiv(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.MOD: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opMod(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.REM: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opRem(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.NUMEQ: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opNumEq(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.EQ: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opEq(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.LT: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opLt(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.LE: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opLe(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.GT: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opGt(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.GE: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opGe(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.LIST: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = makeList(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.CONS: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opCons(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.ISNULL: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opIsNull(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.ISPAIR: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = opIsPair(regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.CXR: {
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        regs[destReg] = CXR_FNS[inst[ip++]](regs, startReg, nargs);
                         break;
                     }
                     default: {
@@ -794,31 +933,55 @@ export class BytecodeInterpreter {
                         throw new Error(`Unhandled opcode: ${opcode}`);
                     }
                 }
-            } catch (err) {
-                frame = executor.handleHostException(ctx, frame, err);
-                continue;
             }
+        } catch (err) {
+            frame.ip = ip;
+            return executor.handleHostException(ctx, frame, err);
+        }
+    }
+}
+
+const JIT_DEPS = {
+    IBUILTINS,
+    isTruthy,
+    Box,
+    MissingVarError,
+    Closure,
+    BuiltinFunction,
+    WindPoint,
+    ...WINDOW_OPS,
+    CXR_FNS,
+    windowApplyArgs,
+    listApplyArgs,
+};
+
+export class JITCompiler {
+    public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
+        let frame: Frame | null = initialFrame;
+
+        while (frame !== null) {
+            frame = executor.enter(ctx, frame);
+            const nativeFn = frame.code.nativeFn;
+            if (nativeFn === null) {
+                throw new Error(`AOT mode encountered uncompiled code in frame: ${frame.debugName}`);
+            }
+            frame = nativeFn(ctx, frame, ctx.vm, executor);
         }
 
         return ctx.acc;
     }
-}
 
-export class JITCompiler {
-    public static getBuiltinFunctionCodeGen(procIdx: number): BuiltinCodeGenFn | null {
-        if (procIdx >= BUILTINS_START) {
-            const builtin = IBUILTINS[procIdx - BUILTINS_START];
-            if (builtin instanceof BuiltinFunction && builtin.codeGenFn) {
-                return builtin.codeGenFn;
+    public static compileAll(code: ByteCode): void {
+        if (code.nativeFn === null) {
+            this.compile(code);
+        }
+        for (const c of code.constants) {
+            if (c instanceof ClosureTemplate) {
+                this.compileAll(c.code);
+            } else if (c instanceof Closure) {
+                this.compileAll(c.tmpl.code);
             }
         }
-        return null;
-    }
-
-    public static getProcExprFromProcIdx(procIdx: number): string {
-        return procIdx < BUILTINS_START
-            ? `regs[${procIdx}]`
-            : `IBUILTINS[${procIdx - BUILTINS_START}]`;
     }
 
     public static compile(code: ByteCode): NativeFn {
@@ -829,31 +992,17 @@ export class JITCompiler {
 
     public static generateFunction(code: ByteCode): NativeFn {
         const source = this.generateSource(code);
-        const factory = new Function(
-            "IBUILTINS",
-            "BUILTINS_START",
-            "isTruthy",
-            "Box",
-            "ErrorObject",
-            "MissingVarError",
-            "Closure",
-            "BuiltinFunction",
-            "WindPoint",
-            "VMContinuation",
-            source
-        );
-        return factory(
-            IBUILTINS,
-            BUILTINS_START,
-            isTruthy,
-            Box,
-            ErrorObject,
-            MissingVarError,
-            Closure,
-            BuiltinFunction,
-            WindPoint,
-            VMContinuation
-        );
+        const factory = new Function(...Object.keys(JIT_DEPS), source);
+        return factory(...Object.values(JIT_DEPS));
+    }
+
+    private static builtinIdx(procIdx: number): number | null {
+        return procIdx >= BUILTINS_START ? procIdx - BUILTINS_START : null;
+    }
+
+    private static procExpr(procIdx: number): string {
+        const bidx = this.builtinIdx(procIdx);
+        return bidx === null ? `regs[${procIdx}]` : `IBUILTINS[${bidx}]`;
     }
 
     // Finds basic blocks that point to start of next inst
@@ -863,40 +1012,25 @@ export class JITCompiler {
         const blocks = new Set<number>([0]);
         let ip = 0;
         while (ip < inst.length) {
-            const opIp = ip;
             const opcode: OpCode = inst[ip];
-            const len = INSTRUCTION_LENGTHS[opcode] ?? 1;
-            const nextIp = opIp + len;
+            const nextIp = ip + (INSTRUCTION_LENGTHS[opcode] ?? 1);
 
             switch (opcode) {
-                case OpCode.IF: {
-                    const elseOffset = inst[opIp + 2];
+                case OpCode.IF:
                     blocks.add(nextIp);
-                    blocks.add(elseOffset);
+                    blocks.add(inst[ip + 2]);
                     break;
-                }
-                case OpCode.ELSE: {
-                    const endOffset = inst[opIp + 1];
-                    blocks.add(endOffset);
+                case OpCode.ELSE:
+                    blocks.add(inst[ip + 1]);
                     break;
-                }
-                case OpCode.CALL: {
-                    const procIdx = inst[opIp + 1];
-                    const codeGen = this.getBuiltinFunctionCodeGen(procIdx);
-                    const isBuiltin = procIdx >= BUILTINS_START && IBUILTINS[procIdx - BUILTINS_START] instanceof BuiltinFunction;
-                    if (!codeGen && !isBuiltin) {
-                        blocks.add(nextIp);
-                    }
+                case OpCode.CALL:
+                    if (inst[ip + 1] < BUILTINS_START) blocks.add(nextIp);
                     break;
-                }
-                case OpCode.APPLY: {
+                case OpCode.APPLY:
+                case OpCode.APPLYLIST:
+                case OpCode.CALLCC:
                     blocks.add(nextIp);
                     break;
-                }
-                case OpCode.CALLCC: {
-                    blocks.add(nextIp);
-                    break;
-                }
             }
 
             ip = nextIp;
@@ -908,7 +1042,6 @@ export class JITCompiler {
         const inst = code.inst;
         const out = new CodeEmitter();
         const basicBlocks = this.findBasicBlocks(inst);
-        const blockSet = new Set(basicBlocks);
 
         out.emit(`
             return function(ctx, frame, vm, executor) {
@@ -921,6 +1054,7 @@ export class JITCompiler {
         if (basicBlocks.length <= 1) {
             this.emitInstructions(out, inst, 0, inst.length, null);
         } else {
+            const blockSet = new Set(basicBlocks);
             out.emit(`
                 let ip = frame.ip;
                 while (true) {
@@ -991,26 +1125,19 @@ export class JITCompiler {
                     const destReg = inst[ip++];
                     const upvarIdx = inst[ip++];
                     const andUnbox = inst[ip++];
-                    if (andUnbox) {
-                        out.emit(`regs[${destReg}] = (upvars[${upvarIdx}]).val;`);
-                    } else {
-                        out.emit(`regs[${destReg}] = upvars[${upvarIdx}];`);
-                    }
+                    out.emit(`regs[${destReg}] = upvars[${upvarIdx}]${andUnbox ? ".val" : ""};`);
                     break;
                 }
                 case OpCode.SETUPVAR: {
                     const srcReg = inst[ip++];
                     const upvarIdx = inst[ip++];
                     const andBox = inst[ip++];
-                    if (andBox) {
-                        out.emit(`upvars[${upvarIdx}] = new Box(regs[${srcReg}]);`);
-                    } else {
-                        out.emit(`upvars[${upvarIdx}] = regs[${srcReg}];`);
-                    }
+                    out.emit(`upvars[${upvarIdx}] = ${andBox ? `new Box(regs[${srcReg}])` : `regs[${srcReg}]`};`);
                     break;
                 }
-                case OpCode.LOADGLOBAL: {
-                    const destReg = inst[ip++];
+                case OpCode.LOADGLOBAL:
+                case OpCode.HASGLOBAL: {
+                    const destReg = opcode === OpCode.LOADGLOBAL ? inst[ip++] : null;
                     const symConstIdx = inst[ip++];
                     out.emit(`
                         {
@@ -1019,7 +1146,7 @@ export class JITCompiler {
                                 frame.ip = ${opIp};
                                 throw new MissingVarError("Variable '" + String(varname) + "' is not defined in the current scope.");
                             }
-                            regs[${destReg}] = ctx.scope.get(varname);
+                            ${destReg !== null ? `regs[${destReg}] = ctx.scope.get(varname);` : ""}
                         }
                     `);
                     break;
@@ -1030,62 +1157,31 @@ export class JITCompiler {
                     out.emit(`ctx.scope.set(constants[${symConstIdx}], regs[${srcReg}]);`);
                     break;
                 }
-                case OpCode.HASGLOBAL: {
-                    const symConstIdx = inst[ip++];
-                    out.emit(`
-                        {
-                            const varname = constants[${symConstIdx}];
-                            if (!ctx.scope.has(varname)) {
-                                frame.ip = ${opIp};
-                                throw new MissingVarError("Variable '" + String(varname) + "' is not defined in the current scope.");
-                            }
-                        }
-                    `);
-                    break;
-                }
                 case OpCode.IF: {
                     const condReg = inst[ip++];
                     const elseOffset = inst[ip++];
-                    const thenOffset = ip;
                     if (blockSet) {
-                        out.emit(`
-                            if (isTruthy(regs[${condReg}])) {
-                                ip = ${thenOffset};
-                                continue;
-                            } else {
-                                ip = ${elseOffset};
-                                continue;
-                            }
-                        `);
+                        out.emit(`ip = isTruthy(regs[${condReg}]) ? ${ip} : ${elseOffset}; continue;`);
                         return;
-                    } else {
-                        out.emit(`if (isTruthy(regs[${condReg}])) {`);
                     }
+                    out.emit(`if (isTruthy(regs[${condReg}])) {`);
                     break;
                 }
                 case OpCode.ELSE: {
                     const endOffset = inst[ip++];
                     if (blockSet) {
-                        out.emit(`
-                            ip = ${endOffset};
-                            continue;
-                        `);
+                        out.emit(`ip = ${endOffset}; continue;`);
                         return;
-                    } else {
-                        out.emit(`} else {`);
                     }
+                    out.emit(`} else {`);
                     break;
                 }
                 case OpCode.ENDIF: {
                     if (blockSet) {
-                        out.emit(`
-                            ip = ${ip};
-                            continue;
-                        `);
+                        out.emit(`ip = ${ip}; continue;`);
                         return;
-                    } else {
-                        out.emit(`}`);
                     }
+                    out.emit(`}`);
                     break;
                 }
                 case OpCode.BOX: {
@@ -1097,13 +1193,13 @@ export class JITCompiler {
                 case OpCode.UNBOX: {
                     const destReg = inst[ip++];
                     const srcReg = inst[ip++];
-                    out.emit(`regs[${destReg}] = (regs[${srcReg}]).val;`);
+                    out.emit(`regs[${destReg}] = regs[${srcReg}].val;`);
                     break;
                 }
                 case OpCode.SETBOX: {
                     const destReg = inst[ip++];
                     const srcReg = inst[ip++];
-                    out.emit(`(regs[${destReg}]).val = regs[${srcReg}];`);
+                    out.emit(`regs[${destReg}].val = regs[${srcReg}];`);
                     break;
                 }
                 case OpCode.MOVE: {
@@ -1123,89 +1219,49 @@ export class JITCompiler {
                     const destReg = inst[ip++];
                     const startReg = inst[ip++];
                     const nargs = inst[ip++];
-                    const nextIp = ip;
-                    const codeGenFn = this.getBuiltinFunctionCodeGen(procIdx);
-                    if (codeGenFn) {
-                        out.emit(`frame.ip = ${nextIp};`);
-                        const res = codeGenFn(out, startReg, nargs, destReg);
-                        if (typeof res === "string") {
-                            out.emit(`regs[${destReg}] = ${res};`);
-                            out.emit(`ctx.acc = regs[${destReg}];`);
-                        } else if (res === undefined) {
-                            out.emit(`ctx.acc = regs[${destReg}];`);
-                        }
+                    const bidx = this.builtinIdx(procIdx);
+
+                    if (bidx !== null) {
+                        out.emit(`
+                            frame.ip = ${ip};
+                            regs[${destReg}] = IBUILTINS[${bidx}].cb(regs, ${startReg}, ${nargs});
+                            ctx.acc = regs[${destReg}];
+                        `);
                         break;
                     }
 
-                    if (procIdx >= BUILTINS_START) {
-                        const builtin = IBUILTINS[procIdx - BUILTINS_START];
-                        if (builtin instanceof BuiltinFunction) {
-                            out.emit(`
-                                frame.ip = ${nextIp};
-                                regs[${destReg}] = IBUILTINS[${procIdx - BUILTINS_START}].cb(regs, ${startReg}, ${nargs});
+                    out.emit(`
+                        {
+                            const proc = regs[${procIdx}];
+                            frame.ip = ${ip};
+                            if (proc instanceof BuiltinFunction) {
+                                regs[${destReg}] = proc.cb(regs, ${startReg}, ${nargs});
                                 ctx.acc = regs[${destReg}];
-                            `);
-                            break;
-                        } else {
-                            out.emit(`
+                                ${blockSet ? `ip = ${ip}; continue;` : ""}
+                            } else {
                                 frame.retDestReg = ${destReg};
-                                frame.ip = ${nextIp};
-                                return executor.invoke(ctx, IBUILTINS[${procIdx - BUILTINS_START}], frame, regs, ${startReg}, ${nargs}, false);
-                            `);
-                            return;
-                        }
-                    } else {
-                        out.emit(`
-                            {
-                                const proc = regs[${procIdx}];
-                                if (proc instanceof BuiltinFunction) {
-                                    frame.ip = ${nextIp};
-                                    regs[${destReg}] = proc.cb(regs, ${startReg}, ${nargs});
-                                    ctx.acc = regs[${destReg}];
-                                    ${blockSet ? `ip = ${nextIp}; continue;` : ""}
-                                } else {
-                                    frame.retDestReg = ${destReg};
-                                    frame.ip = ${nextIp};
-                                    return executor.invoke(ctx, proc, frame, regs, ${startReg}, ${nargs}, false);
-                                }
+                                return executor.invoke(ctx, proc, frame, regs, ${startReg}, ${nargs}, false);
                             }
-                        `);
-                        return;
-                    }
+                        }
+                    `);
+                    return;
                 }
                 case OpCode.TAILCALL: {
                     const procIdx = inst[ip++];
                     const startReg = inst[ip++];
                     const nargs = inst[ip++];
-                    const codeGenFn = this.getBuiltinFunctionCodeGen(procIdx);
-                    if (codeGenFn) {
-                        out.emit(`frame.ip = ${ip};`);
-                        const res = codeGenFn(out, startReg, nargs);
-                        if (typeof res === "string") {
-                            out.emit(`ctx.acc = ${res};`);
-                        }
-                        out.emit(`return executor.setRetVal(ctx, frame.parent, ctx.acc);`);
+                    const bidx = this.builtinIdx(procIdx);
+                    out.emit(`frame.ip = ${ip};`);
+
+                    if (bidx !== null) {
+                        out.emit(`
+                            ctx.acc = IBUILTINS[${bidx}].cb(regs, ${startReg}, ${nargs});
+                            return executor.setRetVal(ctx, frame.parent, ctx.acc);
+                        `);
                         return;
                     }
-                    if (procIdx >= BUILTINS_START) {
-                        const builtin = IBUILTINS[procIdx - BUILTINS_START];
-                        if (builtin instanceof BuiltinFunction) {
-                            out.emit(`
-                                frame.ip = ${ip};
-                                ctx.acc = IBUILTINS[${procIdx - BUILTINS_START}].cb(regs, ${startReg}, ${nargs});
-                                return executor.setRetVal(ctx, frame.parent, ctx.acc);
-                            `);
-                            return;
-                        }
-                    }
-                    const procExpr = this.getProcExprFromProcIdx(procIdx);
-                    out.emit(`
-                        {
-                            const proc = ${procExpr};
-                            frame.ip = ${ip};
-                            return executor.invoke(ctx, proc, frame, regs, ${startReg}, ${nargs}, true);
-                        }
-                    `);
+
+                    out.emit(`return executor.invoke(ctx, regs[${procIdx}], frame, regs, ${startReg}, ${nargs}, true);`);
                     return;
                 }
                 case OpCode.APPLY: {
@@ -1213,26 +1269,10 @@ export class JITCompiler {
                     const destReg = inst[ip++];
                     const startReg = inst[ip++];
                     const nargs = inst[ip++];
-                    const nextIp = ip;
-                    const flattenCall = ((nargs | 0) === -1)
-                        ? `ctx.flattenListArgs(regs[${startReg}])`
-                        : `ctx.flattenDynamicArgs(regs, ${startReg}, ${nargs})`;
-                    const procExpr = this.getProcExprFromProcIdx(procIdx);
                     out.emit(`
-                        {
-                            const proc = ${procExpr};
-                            const actualArgs = ${flattenCall};
-                            if (proc instanceof BuiltinFunction) {
-                                frame.ip = ${nextIp};
-                                regs[${destReg}] = proc.cb(actualArgs, 0, actualArgs.length);
-                                ctx.acc = regs[${destReg}];
-                                ${blockSet ? `ip = ${nextIp}; continue;` : ""}
-                            } else {
-                                frame.retDestReg = ${destReg};
-                                frame.ip = ${nextIp};
-                                return executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, false);
-                            }
-                        }
+                        frame.ip = ${ip};
+                        frame.retDestReg = ${destReg};
+                        return executor.apply(ctx, ${this.procExpr(procIdx)}, frame, windowApplyArgs(regs, ${startReg}, ${nargs}), false);
                     `);
                     return;
                 }
@@ -1240,23 +1280,29 @@ export class JITCompiler {
                     const procIdx = inst[ip++];
                     const startReg = inst[ip++];
                     const nargs = inst[ip++];
-                    const flattenCall = ((nargs | 0) === -1)
-                        ? `ctx.flattenListArgs(regs[${startReg}])`
-                        : `ctx.flattenDynamicArgs(regs, ${startReg}, ${nargs})`;
-                    const procExpr = this.getProcExprFromProcIdx(procIdx);
                     out.emit(`
-                        {
-                            const proc = ${procExpr};
-                            const actualArgs = ${flattenCall};
-                            if (proc instanceof BuiltinFunction) {
-                                frame.ip = ${ip};
-                                ctx.acc = proc.cb(actualArgs, 0, actualArgs.length);
-                                return executor.setRetVal(ctx, frame.parent, ctx.acc);
-                            } else {
-                                frame.ip = ${ip};
-                                return executor.invoke(ctx, proc, frame, actualArgs, 0, actualArgs.length, true);
-                            }
-                        }
+                        frame.ip = ${ip};
+                        return executor.apply(ctx, ${this.procExpr(procIdx)}, frame, windowApplyArgs(regs, ${startReg}, ${nargs}), true);
+                    `);
+                    return;
+                }
+                case OpCode.APPLYLIST: {
+                    const procIdx = inst[ip++];
+                    const destReg = inst[ip++];
+                    const listReg = inst[ip++];
+                    out.emit(`
+                        frame.ip = ${ip};
+                        frame.retDestReg = ${destReg};
+                        return executor.apply(ctx, ${this.procExpr(procIdx)}, frame, listApplyArgs(regs[${listReg}]), false);
+                    `);
+                    return;
+                }
+                case OpCode.TAILAPPLYLIST: {
+                    const procIdx = inst[ip++];
+                    const listReg = inst[ip++];
+                    out.emit(`
+                        frame.ip = ${ip};
+                        return executor.apply(ctx, ${this.procExpr(procIdx)}, frame, listApplyArgs(regs[${listReg}]), true);
                     `);
                     return;
                 }
@@ -1281,15 +1327,10 @@ export class JITCompiler {
                 case OpCode.CALLCC: {
                     const destReg = inst[ip++];
                     const procReg = inst[ip++];
-                    const nextIp = ip;
                     out.emit(`
+                        frame.ip = ${ip};
                         frame.retDestReg = ${destReg};
-                        frame.ip = ${nextIp};
-                        frame.share(ctx);
-                        {
-                            const vmCont = new VMContinuation(frame, ctx.id, ctx.wind);
-                            return executor.invoke(ctx, regs[${procReg}], frame, [vmCont], 0, 1, false);
-                        }
+                        return executor.callCC(ctx, regs[${procReg}], frame, false);
                     `);
                     return;
                 }
@@ -1297,19 +1338,44 @@ export class JITCompiler {
                     const procReg = inst[ip++];
                     out.emit(`
                         frame.ip = ${ip};
-                        {
-                            if (frame.parent !== null) {
-                                frame.parent.share(ctx);
-                            }
-                            const vmCont = new VMContinuation(frame.parent, ctx.id, ctx.wind);
-                            return executor.invoke(ctx, regs[${procReg}], frame, [vmCont], 0, 1, true);
-                        }
+                        return executor.callCC(ctx, regs[${procReg}], frame, true);
                     `);
                     return;
                 }
                 case OpCode.SETRAISEPROC: {
                     const srcReg = inst[ip++];
                     out.emit(`executor.raiseProc = regs[${srcReg}];`);
+                    break;
+                }
+                case OpCode.ADD:
+                case OpCode.SUB:
+                case OpCode.MUL:
+                case OpCode.DIV:
+                case OpCode.MOD:
+                case OpCode.REM:
+                case OpCode.NUMEQ:
+                case OpCode.EQ:
+                case OpCode.LT:
+                case OpCode.LE:
+                case OpCode.GT:
+                case OpCode.GE:
+                case OpCode.LIST:
+                case OpCode.CONS:
+                case OpCode.ISNULL:
+                case OpCode.ISPAIR:
+                {
+                    const destReg = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    out.emit(`regs[${destReg}] = ${WINDOW_FN_NAMES[opcode]}(regs, ${startReg}, ${nargs});`);
+                    break;
+                }
+                case OpCode.CXR: {
+                    const destReg = inst[ip++];
+                    const startReg = inst[ip++];
+                    const nargs = inst[ip++];
+                    const idx = inst[ip++];
+                    out.emit(`regs[${destReg}] = CXR_FNS[${idx}](regs, ${startReg}, ${nargs});`);
                     break;
                 }
                 default: {
@@ -1319,10 +1385,7 @@ export class JITCompiler {
         }
 
         if (blockSet && ip < inst.length) {
-            out.emit(`
-                ip = ${ip};
-                continue;
-            `);
+            out.emit(`ip = ${ip}; continue;`);
         }
     }
 }

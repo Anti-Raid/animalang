@@ -1,18 +1,7 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
+import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
+import { opAdd, opSub, opMul, opDiv, opMod, opRem, opNumEq, opEq, opLt, opLe, opGt, opGe, opCons, opIsNull, opIsPair, CXR_PATHS, CXR_FNS } from "./ops";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
-import { UnhandledSchemeError } from "./bytecode-rvm/exec";
-
-export type CodeEmitter = {
-    emit: (str: string) => void
-}
-
-export type BuiltinCodeGenFn = (
-    emitter: CodeEmitter,
-    startReg: number,
-    nregs: number,
-    destReg?: number
-) => string | void;
 
 /** 
  * A builtin function. 
@@ -23,346 +12,27 @@ export type BuiltinCodeGenFn = (
  * state of any BuiltinFunction must be well-defined/valid 
 */
 export class BuiltinFunction extends IProcedure {
-    public codeGenFn?: BuiltinCodeGenFn;
-
     constructor(
         public name: symbol,
         public cb: (regs: readonly any[], startReg: number, nargs: number) => any,
-        codeGenFn?: BuiltinCodeGenFn,
     ) {
         super(name.description || Symbol.keyFor(name));
-        this.codeGenFn = codeGenFn;
     }
 }
 
-
-function makeNumericComparisonCodeGen(op: string) {
-    return (emitter: CodeEmitter, startReg: number, nregs: number): string => {
-        if (nregs === 0) {
-            emitter.emit(`throw new Error("${op} requires at least 1 argument");`);
-            return "false";
-        }
-        for (let i = 0; i < nregs; i++) {
-            emitter.emit(`
-                if (typeof regs[${startReg + i}] !== "number") {
-                    throw new Error("${op} requires numbers, but received " + typeof regs[${startReg + i}]);
-                }
-            `);
-        }
-        if (nregs === 1) {
-            return "true";
-        }
-        if (nregs === 2) {
-            return `(regs[${startReg}] ${op} regs[${startReg + 1}])`;
-        }
-        const terms: string[] = [];
-        for (let i = 0; i < nregs - 1; i++) {
-            terms.push(`regs[${startReg + i}] ${op} regs[${startReg + i + 1}]`);
-        }
-        return `(${terms.join(" && ")})`;
-    };
-}
-
-function makeNumericEqualityCodeGen() {
-    return (emitter: CodeEmitter, startReg: number, nregs: number): string => {
-        if (nregs === 0) {
-            emitter.emit(`throw new Error("= requires at least 1 argument");`);
-            return "false";
-        }
-        for (let i = 0; i < nregs; i++) {
-            emitter.emit(`
-                if (typeof regs[${startReg + i}] !== "number") {
-                    throw new Error("= requires numbers, but received " + typeof regs[${startReg + i}]);
-                }
-            `);
-        }
-        if (nregs === 1) {
-            return "true";
-        }
-        if (nregs === 2) {
-            return `(regs[${startReg}] === regs[${startReg + 1}])`;
-        }
-        const terms: string[] = [];
-        for (let i = 1; i < nregs; i++) {
-            terms.push(`regs[${startReg}] === regs[${startReg + i}]`);
-        }
-        return `(${terms.join(" && ")})`;
-    };
-}
-
-function makeEqCodeGen() {
-    return (emitter: CodeEmitter, startReg: number, nregs: number): string => {
-        if (nregs === 0) {
-            emitter.emit(`throw new Error("eq? requires at least 1 argument");`);
-            return "false";
-        }
-        if (nregs === 1) return "true";
-        if (nregs === 2) return `(regs[${startReg}] === regs[${startReg + 1}])`;
-        const terms: string[] = [];
-        for (let i = 1; i < nregs; i++) {
-            terms.push(`regs[${startReg}] === regs[${startReg + i}]`);
-        }
-        return `(${terms.join(" && ")})`;
-    };
-}
-
 export const IBUILTINS: BuiltinFunction[] = [
-    new BuiltinFunction(
-        Symbol.for("+"),
-        (regs, startReg, nargs) => {
-            let acc = 0; 
-            for (let i = startReg; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`+ requires numbers, but received ${typeof val}`);
-                acc += val
-            }
-            return acc
-        },
-        (emitter, startReg, nregs) => {
-            if (nregs === 0) {
-                return "0";
-            }
-            for (let i = 0; i < nregs; i++) {
-                emitter.emit(`
-                    if (typeof regs[${startReg + i}] !== "number") {
-                        throw new Error("+ requires numbers, but received " + typeof regs[${startReg + i}]);
-                    }
-                `);
-            }
-            if (nregs === 1) {
-                return `regs[${startReg}]`;
-            }
-            const terms: string[] = [];
-            for (let i = 0; i < nregs; i++) {
-                terms.push(`regs[${startReg + i}]`);
-            }
-            return `(${terms.join(" + ")})`;
-        }
-    ),
-    new BuiltinFunction(
-        Symbol.for("-"),
-        (regs, startReg, nargs) => {
-            if (nargs === 0) throw new Error("- requires at least 1 argument");
-            
-            if (nargs === 1) {
-                const val = regs[startReg];
-                if (typeof val !== "number") throw new Error(`- requires numbers, but received ${typeof val}`);
-                return -val; 
-            }
-
-            let acc = regs[startReg];
-            if (typeof acc !== "number") throw new Error(`- requires numbers, but received ${typeof acc}`);
-            for (let i = startReg + 1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`- requires numbers, but received ${typeof val}`);
-                acc -= val
-            }
-            return acc
-        },
-        (emitter, startReg, nregs) => {
-            if (nregs === 0) {
-                emitter.emit(`throw new Error("- requires at least 1 argument");`);
-                return "0";
-            }
-            for (let i = 0; i < nregs; i++) {
-                emitter.emit(`
-                    if (typeof regs[${startReg + i}] !== "number") {
-                        throw new Error("- requires numbers, but received " + typeof regs[${startReg + i}]);
-                    }
-                `);
-            }
-            if (nregs === 1) {
-                return `(-regs[${startReg}])`;
-            }
-            const terms: string[] = [];
-            for (let i = 0; i < nregs; i++) {
-                terms.push(`regs[${startReg + i}]`);
-            }
-            return `(${terms.join(" - ")})`;
-        }
-    ),
-    new BuiltinFunction(
-        Symbol.for("*"),
-        (regs, startReg, nargs) => {
-            let acc = 1; 
-            for (let i = startReg; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`* requires numbers, but received ${typeof val}`);
-                acc *= val
-            }
-            return acc
-        },
-        (emitter, startReg, nregs) => {
-            if (nregs === 0) {
-                return "1";
-            }
-            for (let i = 0; i < nregs; i++) {
-                emitter.emit(`
-                    if (typeof regs[${startReg + i}] !== "number") {
-                        throw new Error("* requires numbers, but received " + typeof regs[${startReg + i}]);
-                    }
-                `);
-            }
-            if (nregs === 1) {
-                return `regs[${startReg}]`;
-            }
-            const terms: string[] = [];
-            for (let i = 0; i < nregs; i++) {
-                terms.push(`regs[${startReg + i}]`);
-            }
-            return `(${terms.join(" * ")})`;
-        }
-    ),
-    new BuiltinFunction(
-        Symbol.for("/"),
-        (regs, startReg, nargs) => {
-            if (nargs === 0) throw new Error("/ requires at least 1 argument");
-            
-            if (nargs === 1) {
-                const val = regs[startReg];
-                if (typeof val !== "number") throw new Error(`/ requires numbers, but received ${typeof val}`);
-                if (val === 0) throw new Error("division by zero");
-                return 1/val; 
-            }
-
-            let acc = regs[startReg];
-            if (typeof acc !== "number") throw new Error(`/ requires numbers, but received ${typeof acc}`);
-            for (let i = startReg + 1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`/ requires numbers, but received ${typeof val}`);
-                if (val === 0) throw new Error("division by zero");
-                acc /= val
-            }
-            return acc
-        },
-        (emitter, startReg, nregs) => {
-            if (nregs === 0) {
-                emitter.emit(`throw new Error("/ requires at least 1 argument");`);
-                return "0";
-            }
-            for (let i = 0; i < nregs; i++) {
-                emitter.emit(`
-                    if (typeof regs[${startReg + i}] !== "number") {
-                        throw new Error("/ requires numbers, but received " + typeof regs[${startReg + i}]);
-                    }
-                `);
-            }
-            if (nregs === 1) {
-                emitter.emit(`
-                    if (regs[${startReg}] === 0) throw new Error("division by zero");
-                `);
-                return `(1 / regs[${startReg}])`;
-            }
-            for (let i = 1; i < nregs; i++) {
-                emitter.emit(`
-                    if (regs[${startReg + i}] === 0) throw new Error("division by zero");
-                `);
-            }
-            const terms: string[] = [];
-            for (let i = 0; i < nregs; i++) {
-                terms.push(`regs[${startReg + i}]`);
-            }
-            return `(${terms.join(" / ")})`;
-        }
-    ),
-    new BuiltinFunction(
-        Symbol.for("modulo"),
-        (regs, startReg, nargs) => {
-            if(nargs !== 2) throw new Error("modulo requires 2 arguments");
-            const a = regs[startReg] 
-            const b = regs[startReg+1]
-            if (typeof a !== "number" || typeof b !== "number") throw new Error(`modulo: requires numbers, but received ${typeof a}/${typeof b}`);
-            if (b === 0) throw new Error("modulo: division by zero");
-            return ((a % b) + b) % b
-        },
-        (emitter, startReg, nregs) => {
-            if (nregs !== 2) {
-                emitter.emit(`throw new Error("modulo requires 2 arguments");`);
-                return "0";
-            }
-            emitter.emit(`
-                if (typeof regs[${startReg}] !== "number" || typeof regs[${startReg + 1}] !== "number") {
-                    throw new Error("modulo: requires numbers, but received " + typeof regs[${startReg}] + "/" + typeof regs[${startReg + 1}]);
-                }
-                if (regs[${startReg + 1}] === 0) {
-                    throw new Error("modulo: division by zero");
-                }
-            `);
-            return `(((regs[${startReg}] % regs[${startReg + 1}]) + regs[${startReg + 1}]) % regs[${startReg + 1}])`;
-        }
-    ),
-    new BuiltinFunction(
-        Symbol.for("remainder"),
-        (regs, startReg, nargs) => {
-            if(nargs !== 2) throw new Error("remainder requires 2 arguments");
-            const a = regs[startReg] 
-            const b = regs[startReg+1]
-            if (typeof a !== "number" || typeof b !== "number") throw new Error(`remainder: requires numbers, but received ${typeof a}/${typeof b}`);
-            if (b === 0) throw new Error("remainder: division by zero");
-            return a % b
-        },
-        (emitter, startReg, nregs) => {
-            if (nregs !== 2) {
-                emitter.emit(`throw new Error("remainder requires 2 arguments");`);
-                return "0";
-            }
-            emitter.emit(`
-                if (typeof regs[${startReg}] !== "number" || typeof regs[${startReg + 1}] !== "number") {
-                    throw new Error("remainder: requires numbers, but received " + typeof regs[${startReg}] + "/" + typeof regs[${startReg + 1}]);
-                }
-                if (regs[${startReg + 1}] === 0) {
-                    throw new Error("remainder: division by zero");
-                }
-            `);
-            return `(regs[${startReg}] % regs[${startReg + 1}])`;
-        }
-    ),
-    new BuiltinFunction(Symbol.for("list"), (regs, startReg, nargs) => {
-        let tail: any = null;
-        for (let i = startReg + nargs - 1; i >= startReg; i--) {
-            tail = new Cons(regs[i], tail);
-        }
-        return tail;
-    }),
-    new BuiltinFunction(
-        Symbol.for("="),
-        (regs, startReg, nargs) => {
-            if (nargs === 0) throw new Error("= requires at least 1 argument");
-            
-            let start = regs[startReg];
-            if (typeof start !== "number") throw new Error(`= requires numbers, but received ${typeof start}`);
-            let res = true
-            for (let i = startReg+1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`= requires numbers, but received ${typeof val}`);
-                if (val !== start) {
-                    res = false
-                    break
-                }
-            }
-            return res
-        },
-        makeNumericEqualityCodeGen()
-    ),
-    new BuiltinFunction(
-        Symbol.for("eq?"),
-        (regs, startReg, nargs) => {
-            // DEVIATION: normal scheme requires arity 2, anima extends this to arity >=1
-            if (nargs === 0) throw new Error("eq? requires at least 1 argument");
-            
-            let start = regs[startReg];
-            let res = true
-            for (let i = startReg+1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (val !== start) {
-                    res = false
-                    break
-                }
-            }
-            return res
-        },
-        makeEqCodeGen()
-    ),
+    new BuiltinFunction(Symbol.for("+"), opAdd),
+    new BuiltinFunction(Symbol.for("-"), opSub),
+    new BuiltinFunction(Symbol.for("*"), opMul),
+    new BuiltinFunction(Symbol.for("/"), opDiv),
+    new BuiltinFunction(Symbol.for("modulo"), opMod),
+    new BuiltinFunction(Symbol.for("remainder"), opRem),
+    new BuiltinFunction(Symbol.for("="), opNumEq),
+    new BuiltinFunction(Symbol.for("eq?"), opEq),
+    new BuiltinFunction(Symbol.for("<"), opLt),
+    new BuiltinFunction(Symbol.for("<="), opLe),
+    new BuiltinFunction(Symbol.for(">"), opGt),
+    new BuiltinFunction(Symbol.for(">="), opGe),
     new BuiltinFunction(Symbol.for("eqv?"), (regs, startReg, nargs) => {
         // DEVIATION: normal scheme requires arity 2, anima extends this to arity >=1
         if (nargs === 0) throw new Error("eqv? requires at least 1 argument");
@@ -392,109 +62,9 @@ export const IBUILTINS: BuiltinFunction[] = [
         }
         return res
     }),
-    new BuiltinFunction(
-        Symbol.for("<"),
-        (regs, startReg, nargs) => {
-            if (nargs === 0) throw new Error("< requires at least 1 argument");
-            
-            let prev = regs[startReg];
-            if (typeof prev !== "number") throw new Error(`< requires numbers, but received ${typeof prev}`);
-            for (let i = startReg+1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`< requires numbers, but received ${typeof val}`);
-                if (!(prev < val)) {
-                    return false
-                }
-                prev = val
-            }
-            return true
-        },
-        makeNumericComparisonCodeGen("<")
-    ),
-    new BuiltinFunction(
-        Symbol.for("<="),
-        (regs, startReg, nargs) => {
-            if (nargs === 0) throw new Error("<= requires at least 1 argument");
-            
-            let prev = regs[startReg];
-            if (typeof prev !== "number") throw new Error(`<= requires numbers, but received ${typeof prev}`);
-            for (let i = startReg+1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`<= requires numbers, but received ${typeof val}`);
-                if (!(prev <= val)) {
-                    return false
-                }
-                prev = val
-            }
-            return true
-        },
-        makeNumericComparisonCodeGen("<=")
-    ),
-    new BuiltinFunction(
-        Symbol.for(">"),
-        (regs, startReg, nargs) => {
-            if (nargs === 0) throw new Error("> requires at least 1 argument");
-            
-            let prev = regs[startReg];
-            if (typeof prev !== "number") throw new Error(`> requires numbers, but received ${typeof prev}`);
-            for (let i = startReg+1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`> requires numbers, but received ${typeof val}`);
-                if (!(prev > val)) {
-                    return false
-                }
-                prev = val
-            }
-            return true
-        },
-        makeNumericComparisonCodeGen(">")
-    ),
-    new BuiltinFunction(
-        Symbol.for(">="),
-        (regs, startReg, nargs) => {
-            if (nargs === 0) throw new Error(">= requires at least 1 argument");
-            
-            let prev = regs[startReg];
-            if (typeof prev !== "number") throw new Error(`>= requires numbers, but received ${typeof prev}`);
-            for (let i = startReg+1; i < startReg+nargs; i++) {
-                const val = regs[i]
-                if (typeof val !== "number") throw new Error(`>= requires numbers, but received ${typeof val}`);
-                if (!(prev >= val)) {
-                    return false
-                }
-                prev = val
-            }
-            return true
-        },
-        makeNumericComparisonCodeGen(">=")
-    ),
     // list builtins
-    new BuiltinFunction(Symbol.for("car"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("car requires 1 argument");
-        const val = regs[startReg];
-        if (val instanceof Cons) {
-            return val.car;
-        } else if (val === null) {
-            throw new Error("car requires a non-empty list");
-        } else {
-            throw new Error("car requires a list");
-        }
-    }),
-    new BuiltinFunction(Symbol.for("cdr"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("cdr requires 1 argument");
-        const val = regs[startReg];
-        if (val instanceof Cons) { 
-            return val.cdr;
-        } else if (val === null) {
-            throw new Error("cdr requires a non-empty list");
-        } else {
-            throw new Error(`cdr requires a list but got ${val}`);
-        }
-    }),
-    new BuiltinFunction(Symbol.for("cons"), (regs, startReg, nargs) => {
-        if (nargs != 2) throw new Error("cons requires 2 arguments [cons a d]");
-        return Cons.pair(regs[startReg], regs[startReg+1])
-    }),
+    new BuiltinFunction(Symbol.for("cons"), opCons),
+    ...CXR_PATHS.map(([name], i) => new BuiltinFunction(Symbol.for(name), CXR_FNS[i])),
     new BuiltinFunction(Symbol.for("last"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("last requires 1 argument");
         const val = regs[startReg];
@@ -643,15 +213,8 @@ export const IBUILTINS: BuiltinFunction[] = [
         if (val instanceof Cons) return !val.isImproper() && !val.isCyclic();
         return false;
     }),
-    new BuiltinFunction(Symbol.for("pair?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("pair? requires 1 argument");
-        const val = regs[startReg];
-        return val instanceof Cons;
-    }),
-    new BuiltinFunction(Symbol.for("null?"), (regs, startReg, nargs) => {
-        if (nargs != 1) throw new Error("null? requires 1 argument");
-        return regs[startReg] === null;
-    }),
+    new BuiltinFunction(Symbol.for("pair?"), opIsPair),
+    new BuiltinFunction(Symbol.for("null?"), opIsNull),
     new BuiltinFunction(Symbol.for("empty?"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("empty? requires 1 argument");
         const val = regs[startReg];
@@ -934,11 +497,15 @@ export const IBUILTINS: BuiltinFunction[] = [
 export const IBUILTINS_IDX_MAP = new Map<symbol, number>()
 for(let i = 0; i < IBUILTINS.length; i++) {
     IBUILTINS_IDX_MAP.set(IBUILTINS[i].name, i)
+    RESERVED_BUILTINS.add(IBUILTINS[i].name)
 }
 
 export const stdPreludeScope = () => new Table()
 
 export const STD_PRELUDE = `
+(define $list (lambda args args))
+
+
 (let ((apply-proc #f)
       (map-proc #f))
     (set! apply-proc
@@ -1054,7 +621,9 @@ export class Bootstrapper {
         
             // If the func starts with a $, its public
             if (symName.startsWith("$")) {
-                publicScope.set(Symbol.for(symName.replace('$', '')), value);
+                const publicSym = Symbol.for(symName.replace('$', ''));
+                publicScope.set(publicSym, value);
+                RESERVED_BUILTINS.add(publicSym);
             }
         }
 

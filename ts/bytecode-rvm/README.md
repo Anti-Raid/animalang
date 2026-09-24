@@ -84,8 +84,18 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 ### `%apply-multi`
 - **Form**: `(%apply-multi <proc> <lst>)`
 - **Semantics**:
-  - Dynamic runtime-list variant of `apply` where all arguments are provided in a Scheme list `<lst>` (e.g. from variadic rest parameters).
-  - Emits `OpCode.APPLY` or `OpCode.TAILAPPLY` with `nargs = -1`, directing the interpreter and JIT compiler to unpack `<lst>` dynamically at runtime.
+  - Runtime-list variant of `%apply`: the elements of `<lst>` are the arguments, with the last element spliced in the same way (e.g. `$apply` passes its rest parameter here).
+  - Emits `OpCode.APPLYLIST` (in non-tail position) or `OpCode.TAILAPPLYLIST` (in tail position) with the register holding `<lst>`.
+
+### Arithmetic intrinsics
+- **Forms**: `(%+ <arg> ...)`, `%-`, `%*`, `%/`, `%modulo`, `%remainder`, `%=`, `%eq?`, `%<`, `%<=`, `%>`, `%>=`
+- **Semantics**:
+  - Compiles to a single opcode (`ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `REM`, `NUMEQ`, `EQ`, `LT`, `LE`, `GT`, `GE`) over the register window `[startReg, startReg + nargs)`, with the usual Scheme variadic behaviour (`(%- x)` negates, `(%/ x)` is `1/x`, comparisons chain).
+  - Intrinsics are not values, so they cannot be passed to `%apply` / `%apply-multi`.
+
+### List intrinsics
+- **Forms**: `(%list <arg> ...)`, `(%cons a d)`, `(%null? x)`, `(%pair? x)`
+- **Semantics**: Each compiles to one opcode (`LIST`, `CONS`, `ISNULL`, `ISPAIR`) over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
 
 ## Standard Library & Prelude Mappings
 
@@ -100,6 +110,15 @@ The standard library builds the public Scheme procedures on top of these `%` int
             (%apply-multi proc lst)))
     ```
 - `call/cc` and `call-with-current-continuation`: Wraps `(%call/cc proc)`
+- `+ - * / modulo remainder = eq? < <= > >=`:
+  - The syntax transformer rewrites direct calls into the matching intrinsic, e.g. `(+ a b c)` becomes `(%+ a b c)`.
+  - Uses as a value (e.g. `(map + xs ys)`) get the builtin of the same name, whose callback is the same operation function the opcode runs (`ts/ops.ts`), so there is no duplicated logic.
+- `cons null? pair?`: Direct calls are rewritten to the matching `%` form. Uses as a value get the builtin of the same name, whose callback is the same function the opcode runs (`ts/ops.ts`).
+- `car`, `cdr`, `caar` ... `cddddr` (all compositions up to 4 levels) and `first second third`: Direct calls are rewritten to `%` forms (e.g. `(third x)` becomes `(%third x)`), which all compile to one `CXR` opcode indexing `CXR_PATHS` in `ts/ops.ts`. Uses as a value get the builtin of the same name, which runs the same function, so errors name the procedure either way (e.g. `third: list is too short`).
+- `list`:
+  - Direct calls `(list a b ...)` are rewritten to `(%list a b ...)`.
+  - Uses as a value resolve to the prelude procedure `(define $list (lambda args args))`, since a rest parameter is already a fresh list.
+- Builtins cannot be rebound.
 - `dynamic-wind`: Wraps `(%dynamic-wind before thunk after)`
 - `with-exception-handler`:
   Implemented on top of `%dynamic-wind` to manage the active handler stack across continuation captures and invocations:

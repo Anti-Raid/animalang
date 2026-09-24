@@ -8,6 +8,7 @@ import {
     Cons
 } from "../common";
 import { MacroEvaluator, TransformState } from "./macro";
+import { CXR_PATHS } from "../ops";
 
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
@@ -251,7 +252,8 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         }
 
         if (defines.length === 0) {
-            return { expanded: cons(OP_LAMBDA, cons(args, rawBody)), state: TransformState.DoChildren };
+            const transformedBody = fromArray(toArray(rawBody).map(stmt => evaluator.transform(stmt)));
+            return { expanded: cons(OP_LAMBDA, cons(args, transformedBody)), state: TransformState.ReturnImm };
         }
 
         if (body.length === 0) {
@@ -419,4 +421,16 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     evaluator.registerTransform(Symbol.for("dynamic-wind"), (evaluator, expr, orig) => {
         return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
     });
+
+    for (const name of ["+", "-", "*", "/", "modulo", "remainder", "=", "eq?", "<", "<=", ">", ">=", "list", "cons", "null?", "pair?"]) {
+        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
+            return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
+        });
+    }
+
+    for (const [name] of CXR_PATHS) {
+        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
+            return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
+        });
+    }
 };

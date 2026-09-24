@@ -3,13 +3,35 @@ import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { IBUILTINS_IDX_MAP } from "../std";
-import { BUILTINS_START } from "./exec";
+import { CXR_PATHS } from "../ops";
+import { BUILTINS_START, OpCode } from "./exec";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
 const OP_SET_RAISE_PROC = Symbol.for("%set-raise-proc");
 const OP_APPLY = Symbol.for("%apply");
 const OP_APPLY_MARGS = Symbol.for("%apply-multi")
+
+const WINDOW_INTRINSICS = new Map<symbol, OpCode>([
+    [Symbol.for("%+"), OpCode.ADD],
+    [Symbol.for("%-"), OpCode.SUB],
+    [Symbol.for("%*"), OpCode.MUL],
+    [Symbol.for("%/"), OpCode.DIV],
+    [Symbol.for("%modulo"), OpCode.MOD],
+    [Symbol.for("%remainder"), OpCode.REM],
+    [Symbol.for("%="), OpCode.NUMEQ],
+    [Symbol.for("%eq?"), OpCode.EQ],
+    [Symbol.for("%<"), OpCode.LT],
+    [Symbol.for("%<="), OpCode.LE],
+    [Symbol.for("%>"), OpCode.GT],
+    [Symbol.for("%>="), OpCode.GE],
+    [Symbol.for("%list"), OpCode.LIST],
+    [Symbol.for("%cons"), OpCode.CONS],
+    [Symbol.for("%null?"), OpCode.ISNULL],
+    [Symbol.for("%pair?"), OpCode.ISPAIR],
+])
+
+const CXR_INTRINSICS = new Map<symbol, number>(CXR_PATHS.map(([name], i) => [Symbol.for(`%${name}`), i]))
 
 interface CmpOpts {
     destReg?: number // where to store dest reg
@@ -103,6 +125,18 @@ export class Compiler {
                 case OP_APPLY_MARGS:
                     this.#compileApplyMulti(expr, opts)
                     return
+            }
+
+            const cxrIdx = CXR_INTRINSICS.get(operator)
+            if (cxrIdx !== undefined) {
+                this.#compileWindowIntrinsic(expr, OpCode.CXR, opts, cxrIdx)
+                return
+            }
+
+            const windowOp = WINDOW_INTRINSICS.get(operator)
+            if (windowOp !== undefined) {
+                this.#compileWindowIntrinsic(expr, windowOp, opts)
+                return
             }
         }
 
@@ -247,6 +281,7 @@ export class Compiler {
         if (
             lastNode.t === "TailCall" ||
             lastNode.t === "TailApply" ||
+            lastNode.t === "TailApplyList" ||
             lastNode.t === "IBuiltinTail" ||
             lastNode.t === "Return" ||
             lastNode.t === "TailCallCC"
@@ -325,7 +360,29 @@ export class Compiler {
         }
     }
 
+    #compileWindowIntrinsic(expr: Cons, op: OpCode, opts: CmpOpts, cxrIdx?: number) {
+        const nargs = expr.cdr === null ? 0 : expr.cdr.length
+        const startReg = opts.scope.regAlloc.allocBlock(nargs)
+        let curr: any = expr.cdr
+        let i = 0
+        while (curr instanceof Cons) {
+            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false })
+            i++
+            curr = curr.cdr
+        }
+
+        const destReg = opts.destReg ?? opts.scope.allocTemp()
+        opts.nodes.push(cxrIdx === undefined
+            ? { t: "WindowOp", op, destReg, startReg, nargs }
+            : { t: "Cxr", idx: cxrIdx, destReg, startReg, nargs })
+        if (opts.destReg === undefined) opts.scope.freeTemp(destReg)
+        opts.scope.regAlloc.freeBlock(startReg, nargs)
+    }
+
     #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
+        if (WINDOW_INTRINSICS.has(procExpr) || CXR_INTRINSICS.has(procExpr)) {
+            throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
+        }
         if (typeof procExpr === "symbol") {
             const resolved = opts.scope.resolve(procExpr);
             if (resolved.type === "Global") {
@@ -346,7 +403,6 @@ export class Compiler {
         }
         const procExpr = expr.cdr.car;
         const argsExprList = expr.cdr.cdr;
-
         const { procReg, isTemp } = this.#resolveProcReg(procExpr, opts);
 
         const nargs = argsExprList === null ? 0 : argsExprList.length;
@@ -374,13 +430,18 @@ export class Compiler {
 
         const { procReg, isTemp } = this.#resolveProcReg(procExpr, opts);
 
-        // single register holding the whole runtime list — no block, no static count
-        const argReg = opts.scope.allocTemp();
-        this.#compile(lstExpr, { ...opts, destReg: argReg, isTail: false });
+        const listReg = opts.scope.allocTemp();
+        this.#compile(lstExpr, { ...opts, destReg: listReg, isTail: false });
 
-        this.#emitApplyNode(opts, procReg, argReg, -1); // -1 sentinel: argReg is a Cons to spread, not a register window
+        if (opts.isTail) {
+            opts.nodes.push({ t: "TailApplyList", procReg, listReg });
+        } else {
+            const destReg = opts.destReg ?? opts.scope.allocTemp();
+            opts.nodes.push({ t: "ApplyList", procReg, destReg, listReg });
+            if (opts.destReg === undefined) opts.scope.freeTemp(destReg);
+        }
 
-        opts.scope.freeTemp(argReg);
+        opts.scope.freeTemp(listReg);
         if (isTemp) opts.scope.freeTemp(procReg);
     }
 

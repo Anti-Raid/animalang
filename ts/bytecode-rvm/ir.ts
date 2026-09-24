@@ -124,6 +124,27 @@ export type Node = {
 } | {
     t: "SetRaiseProc",
     srcReg: number
+} | {
+    t: "WindowOp",
+    op: OpCode,
+    destReg: number,
+    startReg: number,
+    nargs: number
+} | {
+    t: "Cxr",
+    idx: number,
+    destReg: number,
+    startReg: number,
+    nargs: number
+} | {
+    t: "ApplyList",
+    procReg: number,
+    destReg: number,
+    listReg: number
+} | {
+    t: "TailApplyList",
+    procReg: number,
+    listReg: number
 }
 
 export class IR {
@@ -272,6 +293,22 @@ export class IR {
                 }
                 case "SetRaiseProc": {
                     inst.push(OpCode.SETRAISEPROC, node.srcReg);
+                    break;
+                }
+                case "WindowOp": {
+                    inst.push(node.op, node.destReg, node.startReg, node.nargs);
+                    break;
+                }
+                case "Cxr": {
+                    inst.push(OpCode.CXR, node.destReg, node.startReg, node.nargs, node.idx);
+                    break;
+                }
+                case "ApplyList": {
+                    inst.push(OpCode.APPLYLIST, node.procReg, node.destReg, node.listReg);
+                    break;
+                }
+                case "TailApplyList": {
+                    inst.push(OpCode.TAILAPPLYLIST, node.procReg, node.listReg);
                     break;
                 }
                 default:

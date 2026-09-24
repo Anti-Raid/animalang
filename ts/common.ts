@@ -71,6 +71,12 @@ export class ErrorObject {
     constructor(public error: any) {}
 }
 
+export class UnhandledSchemeError extends Error {
+    constructor(public readonly error: any) {
+        super(error instanceof Error ? error.message : String(error));
+    }
+}
+
 // Special Forms
 export const OP_DEFINE = Symbol.for("define");
 export const OP_SET    = Symbol.for("set!")
@@ -102,6 +108,11 @@ export const SPECIAL_FORMS = new Set([
     OP_AND,
     OP_OR
 ])
+
+export const RESERVED_BUILTINS = new Set([
+    "+", "-", "*", "/", "modulo", "remainder", "=", "eq?", "<", "<=", ">", ">=", "list", "cons", "car", "cdr", "null?", "pair?",
+    "apply", "call/cc", "call-with-current-continuation", "dynamic-wind",
+].map(name => Symbol.for(name)))
 
 export class ASPTokenError extends Error {
     pos: number;
@@ -500,6 +511,10 @@ export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxC
 
     if (SPECIAL_FORMS.has(param)) {
         throw new Error(`${String(param)}: bad syntax`)
+    }
+
+    if (RESERVED_BUILTINS.has(param)) {
+        throw new Error(`${syntaxCtx}: cannot bind builtin ${Symbol.keyFor(param)}`)
     }
 }
 

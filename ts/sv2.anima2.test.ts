@@ -56,6 +56,69 @@ describe('Anima', () => {
             expect(run("(+ (let [(x 1)] x) 1)")).toBe("2");
         });
 
+        it('arithmetic intrinsics and prelude procedures', () => {
+            expect(run("(+)")).toBe("0");
+            expect(run("(*)")).toBe("1");
+            expect(run("(+ 5)")).toBe("5");
+            expect(run("(- 5)")).toBe("-5");
+            expect(run("(/ 4)")).toBe("0.25");
+            expect(run("(- 10 1 2 3)")).toBe("4");
+            expect(run("(modulo -7 3)")).toBe("2");
+            expect(run("(remainder -7 3)")).toBe("-1");
+            expect(run("(= 2 2 2)")).toBe("#t");
+            expect(run("(< 1 3 2)")).toBe("#f");
+            expect(run("(eq? 'a 'a)")).toBe("#t");
+            expect(run("(map + '(1 2) '(10 20))")).toBe("(11 22)");
+            expect(run("(apply * '(2 3 4))")).toBe("24");
+            expect(run("(apply + 1 2 '(3 4))")).toBe("10");
+            expect(run("(let ((ap apply)) (ap + 1 '(2 3)))")).toBe("6");
+            expect(run("(let ((ap apply)) (ap list 1 '(2 3)))")).toBe("(1 2 3)");
+            expect(() => run("(apply + 1 2)")).toThrow("last argument must be a list");
+            expect(run("(list)")).toBe("()");
+            expect(run("(list 1 (+ 1 1) 3)")).toBe("(1 2 3)");
+            expect(run("(map list '(1 2) '(3 4))")).toBe("((1 3) (2 4))");
+            expect(run("(car (cons 1 2))")).toBe("1");
+            expect(run("(cdr '(1 2))")).toBe("(2)");
+            expect(run("(null? '())")).toBe("#t");
+            expect(run("(pair? 1)")).toBe("#f");
+            expect(run("(map car '((1) (2)))")).toBe("(1 2)");
+            expect(() => run("(car '())")).toThrow("car: list is too short");
+            expect(() => run("(cdr 5)")).toThrow("cdr: expected a pair but got 5");
+            expect(() => run("(cons 1)")).toThrow("cons requires 2 arguments");
+            expect(run("(cadr '(1 2 3))")).toBe("2");
+            expect(run("(cddr '(1 2 3))")).toBe("(3)");
+            expect(run("(caar '((1) 2))")).toBe("1");
+            expect(run("(caddr '(1 2 3))")).toBe("3");
+            expect(run("(cadddr '(1 2 3 4))")).toBe("4");
+            expect(run("(map cadr '((1 2) (3 4)))")).toBe("(2 4)");
+            expect(() => run("(cadr '(1))")).toThrow("cadr: list is too short");
+            expect(() => run("(cadr 5)")).toThrow("cadr: expected a pair but got 5");
+            expect(() => run("(cadr 1 2)")).toThrow("cadr requires 1 argument");
+            expect(() => run("(lambda (cddr) 1)")).toThrow("cannot bind builtin cddr");
+            expect(run("(first '(1 2 3))")).toBe("1");
+            expect(run("(second '(1 2 3))")).toBe("2");
+            expect(run("(third '(1 2 3))")).toBe("3");
+            expect(run("(map second '((1 2) (3 4)))")).toBe("(2 4)");
+            expect(() => run("(third '(1 2))")).toThrow("third: list is too short");
+            expect(() => run("(let ((f third)) (f '(1 2)))")).toThrow("third: list is too short");
+            expect(run("(let ((f <)) (f 1 2))")).toBe("#t");
+            expect(() => run("(+ 1 \"a\")")).toThrow("+ requires numbers, but received string");
+            expect(() => run("(-)")).toThrow("- requires at least 1 argument");
+            expect(() => run("(< \"a\")")).toThrow("< requires numbers, but received string");
+            expect(() => run("(modulo 1 2 3)")).toThrow("modulo requires 2 arguments");
+            expect(() => run("(/ 1 0)")).toThrow("division by zero");
+        });
+
+        it('rejects binding reserved builtins', () => {
+            expect(() => run("(lambda (+) 1)")).toThrow("cannot bind builtin +");
+            expect(() => run("(let ((< 1)) <)")).toThrow("cannot bind builtin <");
+            expect(() => run("(define apply 1)")).toThrow("cannot bind builtin apply");
+            expect(() => run("(set! = 1)")).toThrow("cannot bind builtin =");
+            expect(() => run("(lambda (list) 1)")).toThrow("cannot bind builtin list");
+            expect(() => run("(lambda (car) car)")).toThrow("cannot bind builtin car");
+            expect(() => run("(define map 1)")).toThrow("cannot bind builtin map");
+        });
+
         it('comparisons', () => {
             expect(run("(< 1 2 3)")).toBe("#t");
             expect(run("(< 1 3 2)")).toBe("#f");
@@ -1852,13 +1915,13 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Function with straight-line ops followed by an unhandled opcode:
         // 0: LOADU32 r1, 50
         // 3: LOADU32 r2, 60
-        // 6: CALL IBUILTIN(+) dest=r0, start=r1, nargs=2 (CALL is unhandled in JIT Phase 1)
-        // 11: RETURN r0
+        // 6: ADD r0, r1, r2
+        // 10: RETURN r0
         const plusSym = Symbol.for("+");
         const inst = new Uint32Array([
             OpCode.LOADU32, 1, 50,
             OpCode.LOADU32, 2, 60,
-            OpCode.CALL, (2**31), 0, 1, 2,
+            OpCode.ADD, 0, 1, 2,
             OpCode.RETURN, 0
         ]);
         const bc = new ByteCode([], inst, 4);
