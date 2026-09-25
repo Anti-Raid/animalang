@@ -61,7 +61,7 @@ export class AnimaVM implements AbstractVM {
     // stack traceback of a suspended coroutine (empty if it has not started or is dead)
     public traceback(co: Coroutine, msg?: string): string {
         if (!(co instanceof Coroutine)) throw new Error("traceback: expected a coroutine");
-        return formatTraceback(frameInfos(co.frame), msg, co.ctx.tailHistory);
+        return formatTraceback(frameInfos(co.frame), msg);
     }
 
     #run(ctx: ExecutionContext, frame: Frame): any {

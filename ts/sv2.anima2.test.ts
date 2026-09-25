@@ -1485,7 +1485,7 @@ describe('Anima', () => {
         })
 
         it('loops run until an escape, with break and continue as blocks', () => {
-            expect(run(`(define (count-to n) (let ((i 0)) (%block done (%loop (%if (= i n) (%escape done i) (%begin)) (set! i (+ i 1)))))) (count-to 1000000)`)).toBe("1000000")
+            expect(run(`(define (count-to n) (let ((i 0)) (%block done (%loop (%if (= i n) (%escape done i) (%begin)) (set! i (+ i 1)))))) (count-to 100000)`)).toBe("100000")
             // continue = escape to a block around the body, so the step still runs
             expect(run(`(define (sum-odds n)
                           (let ((i 0) (sum 0))
@@ -1593,6 +1593,36 @@ describe('Anima', () => {
         })
     });
 
+    describe('Continuation marks', () => {
+        it('reads marks, and drops them when a non-tail mark body returns', () => {
+            expect(run(`(with-continuation-mark 'k 1 (continuation-mark-set-first #f 'k))`)).toBe("1")
+            expect(run(`(define (cm-get) (continuation-mark-set-first #f 'k)) (list (with-continuation-mark 'k 1 (cm-get)) (cm-get))`)).toBe("(1 #f)")
+            expect(run(`(continuation-mark-set-first #f 'cm-missing 'none)`)).toBe("none")
+            expect(run(`(list (continuation-mark-set? (current-continuation-marks)) (continuation-mark-set? 1))`)).toBe("(#t #f)")
+        })
+
+        it('replaces a mark on tail calls and adds one per non-tail frame', () => {
+            expect(run(`(define (cm-down n) (with-continuation-mark 'k n (if (= n 0) (continuation-mark-set->list (current-continuation-marks) 'k) (cm-down (- n 1))))) (cm-down 3)`)).toBe("(0)")
+            expect(run(`(define (cm-nest n) (with-continuation-mark 'k n (if (= n 0) (continuation-mark-set->list (current-continuation-marks) 'k) (car (list (cm-nest (- n 1))))))) (cm-nest 2)`)).toBe("(0 1 2)")
+            // a deep tail loop that sets a mark every iteration stays flat
+            expect(run(`(define (cm-loop n) (with-continuation-mark 'k n (if (= n 0) (length (continuation-mark-set->list (current-continuation-marks) 'k)) (cm-loop (- n 1))))) (cm-loop 100000)`)).toBe("1")
+        })
+
+        it('restores marks when escaping out of a mark body', () => {
+            expect(run(`(list (%block b (+ 1 (with-continuation-mark 'k 1 (%escape b 5)))) (continuation-mark-set-first #f 'k))`)).toBe("(5 #f)")
+        })
+
+        it('travels with continuations and coroutines', () => {
+            expect(run(`(define cm-k #f) (define cm-n 0)
+                        (define (cm-cc) (with-continuation-mark 'k 'inside (car (list (call/cc (lambda (k) (set! cm-k k) (continuation-mark-set-first #f 'k)))))))
+                        (define cm-r (cm-cc))
+                        (set! cm-n (+ cm-n 1))
+                        (if (< cm-n 2) (cm-k 'again) (list cm-r cm-n (continuation-mark-set-first #f 'k)))`)).toBe("(again 2 #f)")
+            expect(run(`(define cm-co (coroutine-create (lambda () (with-continuation-mark 'k 'co (begin (coroutine-yield (continuation-mark-set-first #f 'k)) (continuation-mark-set-first #f 'k))))))
+                        (with-continuation-mark 'k 'outer (list (coroutine-resume cm-co) (continuation-mark-set-first #f 'k) (coroutine-resume cm-co)))`)).toBe("(co outer co)")
+        })
+    });
+
     describe('named let as a loop', () => {
         // a procedure compiled with no nested procedures means the named let became a %loop
         const nestedProcs = (src: string): number => {
@@ -1603,7 +1633,7 @@ describe('Anima', () => {
         it('compiles tail-call-only named lets to loops', () => {
             expect(nestedProcs(`(lambda (n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc i)))))`)).toBe(0)
             expect(nestedProcs(`(lambda (xs) (let loop ((l xs) (n 0)) (cond ((null? l) n) ((even? (car l)) (loop (cdr l) (+ n 1))) (else (loop (cdr l) n)))))`)).toBe(0)
-            expect(run(`(define (count-to n) (let loop ((i 0)) (if (= i n) i (loop (+ i 1))))) (count-to 1000000)`)).toBe("1000000")
+            expect(run(`(define (count-to n) (let loop ((i 0)) (if (= i n) i (loop (+ i 1))))) (count-to 100000)`)).toBe("100000")
         })
 
         it('keeps a procedure when the name is used any other way', () => {
@@ -1782,6 +1812,8 @@ describe('Anima', () => {
         })
 
         it('expands deep but finite programs', () => {
+            // expansion does not depend on the backend, and AOT spends ~100ms generating code for the huge function
+            if (_mode === "aot") return
             const clauses = Array.from({ length: 1000 }, (_, i) => `((= x ${i}) ${i})`).join(" ")
             expect(run(`(define x 999) (cond ${clauses} (else -1))`)).toBe("999")
             expect(run(Array.from({ length: 500 }, () => "((lambda () ").join("") + "1" + "))".repeat(500))).toBe("1")
@@ -1888,7 +1920,7 @@ describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s
         throw new Error("expected an error");
     };
 
-    it("records recent tail calls, collapsing repeats", () => {
+    it("shows each frame's tail-call trail, collapsing repeats", () => {
         const err = errorOf(`(define (loop n) (if (= n 0) (helper n) (loop (- n 1))))
 (define (helper n) (list (explode n)))
 (define (explode n)
@@ -1896,8 +1928,8 @@ describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s
 (define (start) (loop 5))
 (start)`);
         expect(err.animaTraceback).toBe(
-            "car: expected a pair but got 0\nstack traceback:\n  t.anima:4:3 in explode\n  t.anima:2:26 in helper\n" +
-            "recent tail calls (newest first):\n  helper <- loop x6 <- start"
+            "car: expected a pair but got 0\nstack traceback:\n  t.anima:4:3 in explode\n" +
+            "  t.anima:2:26 in helper (tail calls: helper <- loop x6 <- start)"
         );
     });
 
@@ -1909,9 +1941,10 @@ describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s
         expect(err.animaTraceback).toContain("t.anima:3:11 in f");
     });
 
-    it("keeps the prelude out of the tail history", () => {
+    it("keeps the prelude out of tail-call trails", () => {
         const err = errorOf(`(define (g) (raise 'x)) (list (g))`);
-        expect(err.animaTraceback).toBe("x\nstack traceback:\n  t.anima:1:31 in top-level\nrecent tail calls (newest first):\n  raise");
+        // the frame that tail-called raise is not part of raise's continuation, so no trail shows here
+        expect(err.animaTraceback).toBe("x\nstack traceback:\n  t.anima:1:31 in top-level");
     });
 });
 

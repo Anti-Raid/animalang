@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, CORE_CURRENT_MARKS, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -22,6 +22,8 @@ interface BlockTarget {
     destReg?: number
     isTail: boolean
     fnDepth: number
+    // how many non-tail %with-mark regions enclose the block (escaping out of any more restores the marks first)
+    markDepth: number
     parent: BlockTarget | undefined
 }
 
@@ -33,6 +35,7 @@ interface CmpOpts {
     pos?: SourcePos // position of the enclosing form
     blocks?: BlockTarget // enclosing %blocks, innermost first
     fnDepth?: number // how many %lambdas deep we are; escapes cannot cross one
+    markRegions?: number[] // for each enclosing non-tail %with-mark, where it saved the marks (outermost first)
     name?: string // name for a lambda compiled directly as this value
 
     // From pass 1
@@ -128,6 +131,12 @@ export class Compiler {
                     return
                 case CORE_LOOP:
                     this.#compileLoop(expr, opts)
+                    return
+                case CORE_WITH_MARK:
+                    this.#compileWithMark(expr, opts)
+                    return
+                case CORE_CURRENT_MARKS:
+                    if (opts.destReg !== undefined) opts.nodes.push({ t: "CurrentMarks", destReg: opts.destReg })
                     return
                 case OP_DYNAMIC_WIND:
                     this.#compileDynamicWind(expr, opts)
@@ -372,7 +381,10 @@ export class Compiler {
     // (%block name body ...): the value of the body, or of an (%escape name value) jumping to its end
     #compileBlock(expr: Cons, opts: CmpOpts) {
         const end = new JumpLabel()
-        const target: BlockTarget = { name: expr.cdr.car, end, destReg: opts.destReg, isTail: opts.isTail, fnDepth: opts.fnDepth ?? 0, parent: opts.blocks }
+        const target: BlockTarget = {
+            name: expr.cdr.car, end, destReg: opts.destReg, isTail: opts.isTail, fnDepth: opts.fnDepth ?? 0,
+            markDepth: opts.markRegions?.length ?? 0, parent: opts.blocks,
+        }
         opts.nodes.push({ t: "Block", end })
         this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, blocks: target })
         opts.nodes.push({ t: "Label", label: end })
@@ -390,7 +402,29 @@ export class Compiler {
         const valueOpts = { ...opts, destReg: target.destReg, isTail: target.isTail }
         if (expr.cdr.cdr !== null) this.#compile(expr.cdr.cdr.car, valueOpts)
         else this.#compile(undefined, valueOpts)
+        const regions = opts.markRegions ?? []
+        if (regions.length > target.markDepth) opts.nodes.push({ t: "MarkRestore", reg: regions[target.markDepth] })
         opts.nodes.push({ t: "Jump", label: target.end })
+    }
+
+    // (%with-mark key value body): in tail position the mark goes on the current frame (replacing its value for the key)
+    // and stays until the frame returns; otherwise the body runs as a new frame, so the marks are saved and put back after
+    #compileWithMark(expr: Cons, opts: CmpOpts) {
+        const [key, value, body] = expr.cdr.toArray()
+        const saved = opts.isTail ? -1 : opts.scope.regAlloc.allocBlock(2)
+        if (!opts.isTail) opts.nodes.push({ t: "MarkSave", reg: saved })
+        const kv = opts.scope.regAlloc.allocBlock(2)
+        this.#compile(key, { ...opts, destReg: kv, isTail: false })
+        this.#compile(value, { ...opts, destReg: kv + 1, isTail: false })
+        opts.nodes.push({ t: "SetMark", keyReg: kv, valReg: kv + 1 })
+        opts.scope.regAlloc.freeBlock(kv, 2)
+        if (opts.isTail) {
+            this.#compile(body, opts)
+            return
+        }
+        this.#compile(body, { ...opts, markRegions: [...(opts.markRegions ?? []), saved] })
+        opts.nodes.push({ t: "MarkRestore", reg: saved })
+        opts.scope.regAlloc.freeBlock(saved, 2)
     }
 
     // (%loop body ...): repeats forever; only an %escape leaves it

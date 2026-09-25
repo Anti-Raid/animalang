@@ -23,38 +23,45 @@ import {
 import { Cons } from "../list";
 import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList } from "../ops";
 import { BuiltinFunction, IBUILTINS } from "../std";
+import { ContinuationMarkSet, markFirst, markOwn, markSet, markValues, recordTailMark, TAIL_TRAIL, type Marks, type TailTrail } from "../marks";
 import { BUILTIN_INLINES, RUNTIME_INLINES } from "./inline";
 
 export const BUILTINS_START = 2**31;
 
+// Operands are u32s; reg[x] = register x, constant = a constant-pool index, ip = an instruction index.
+// Non-tail CALL/APPLY/CALLCC/CORESUME/COYIELD leave their result in the accumulator, read by a following MOVEACC.
 export enum OpCode {
-    LOADCONST,
-    LOADU32,
-    LOADUPVAR,
-    SETUPVAR,
-    LOADGLOBAL,
-    SETGLOBAL,
-    IF,
-    ELSE,
-    ENDIF,
-    CALL,
-    RETURN,
-    NEWCLOSURE,
-    BOX,
-    UNBOX,
-    SETBOX,
-    MOVE,
-    CALLCC,
-    APPLY,
-    MOVEACC,
-    COYIELD,
-    CALLRT,
-    CORESUME,
-    BLOCK,
-    LOOP,
-    ENDLOOP,
-    JUMP,
-    UNPACK,
+    LOADCONST,   // dst constant       reg[dst] = constants[constant]
+    LOADU32,     // dst n              reg[dst] = n (a small non-negative integer)
+    LOADUPVAR,   // dst i unbox        reg[dst] = upvars[i] (its box's value if unbox)
+    SETUPVAR,    // src i box          upvars[i] = reg[src] (in a new box if box)
+    LOADGLOBAL,  // dst constant       reg[dst] = global named constants[constant]
+    SETGLOBAL,   // src constant       global named constants[constant] = reg[src]
+    IF,          // cond elseIp        jump to elseIp if reg[cond] is false
+    ELSE,        // endIp              end of the then branch: jump past the else branch
+    ENDIF,       //                    marks the end of an if (for structured AOT code)
+    CALL,        // proc start n tail  call reg[proc] (or builtin proc - BUILTINS_START) on reg[start .. start+n)
+    RETURN,      // src                return reg[src] from the function
+    NEWCLOSURE,  // dst constant       reg[dst] = closure of the template constants[constant], capturing its upvars
+    BOX,         // dst src            reg[dst] = new box holding reg[src]
+    UNBOX,       // dst src            reg[dst] = value of the box reg[src]
+    SETBOX,      // box src            the box reg[box] now holds reg[src]
+    MOVE,        // dst src            reg[dst] = reg[src]
+    CALLCC,      // proc tail          call reg[proc] with the current continuation
+    APPLY,       // proc start n tail  like CALL, with the last argument a list spread into the arguments
+    MOVEACC,     // dst                reg[dst] = accumulator (the last call's result)
+    COYIELD,     // val                yield reg[val] (already packed multiple values) from the running coroutine
+    CALLRT,      // rt dst start n     reg[dst] = RUNTIME[rt] applied to reg[start .. start+n)
+    CORESUME,    // co list tail       resume coroutine reg[co] with the values in the list reg[list]
+    BLOCK,       // endIp              start of a %block ending at endIp (for structured AOT code)
+    LOOP,        // endIp              start of a %loop ending at endIp; its body starts after this
+    ENDLOOP,     // headIp             end of a %loop's body: jump back to headIp
+    JUMP,        // target             an %escape: jump to target (the end of a %block)
+    UNPACK,      // src start n flags  spread reg[src]'s multiple values over reg[start .. start+n) (+ rest list; see UNPACK_*)
+    SETMARK,     // key val            set continuation mark reg[key] = reg[val] on the current frame
+    MARKSAVE,    // dst                reg[dst], reg[dst+1] = current marks and logical frame, then start a new logical frame
+    MARKRESTORE, // src                marks and logical frame = reg[src], reg[src+1]
+    CURMARKS,    // dst                reg[dst] = the current continuation marks, as a mark set
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -85,6 +92,10 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.ENDLOOP]: 2,
     [OpCode.JUMP]: 2,
     [OpCode.UNPACK]: 5,
+    [OpCode.SETMARK]: 3,
+    [OpCode.MARKSAVE]: 2,
+    [OpCode.MARKRESTORE]: 2,
+    [OpCode.CURMARKS]: 2,
 };
 
 // UNPACK flags
@@ -104,8 +115,9 @@ export const restValues = (vals: any[], count: number): Cons | null => Cons.from
 
 export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecutor) => Frame | null;
 
-// `depth` counts nested direct calls on the js stack; past MAX_JS_DEPTH calls go through heap frames instead
-export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, ...args: any[]) => any;
+// `depth` counts nested direct calls on the js stack; past MAX_JS_DEPTH calls go through heap frames instead. `marks` is
+// the continuation's mark list and `mframe` the logical frame the function runs in (a tail call keeps its caller's)
+export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, ...args: any[]) => any;
 
 export class ByteCode implements AbstractByteCode {
     public bsid = "ByteCode";
@@ -119,6 +131,10 @@ export class ByteCode implements AbstractByteCode {
     // how often direct code of this function resumed a coroutine in a nested driver loop: past a few, it suspends to heap
     // frames instead, where resuming is a cheap switch inside one loop
     public nestedResumes: number = 0;
+    // how often a tail call from this function's heap code into a direct entry came back as a Suspend (e.g. a long chain
+    // of tail calls reaching the depth limit): past a few, its heap code tail calls through heap frames, which run such
+    // chains in constant space without unwinding the js stack
+    public tailSuspends: number = 0;
 
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
@@ -340,8 +356,6 @@ export class ExecutionContext {
     public coroutine: Coroutine | null = null;
     // a throwaway resumer for nested resumes: control coming back here ends the nested driver loop
     public barrier: boolean = false;
-    // recent tail calls, newest last (only recorded by debug code)
-    public tailHistory: { name: string, count: number }[] = [];
 
     constructor(
         public vm: AbstractVM,
@@ -349,21 +363,11 @@ export class ExecutionContext {
     ) {
         this.id = ++ExecutionContext.nextId;
     }
-
-    recordTail(proc: any): void {
-        const name = proc instanceof IProcedure ? proc.debugName ?? "?" : proc instanceof OpaqueValue ? proc.typeName : String(proc);
-        const hist = this.tailHistory;
-        const last = hist[hist.length - 1];
-        if (last !== undefined && last.name === name) {
-            last.count++;
-            return;
-        }
-        hist.push({ name, count: 1 });
-        if (hist.length > TAIL_HISTORY_SIZE) hist.shift();
-    }
 }
 
-const TAIL_HISTORY_SIZE = 16;
+// how debug code names a tail-called procedure in the tail-call trails
+export const tailName = (proc: any): string =>
+    proc instanceof IProcedure ? proc.debugName ?? "?" : proc instanceof OpaqueValue ? proc.typeName : String(proc);
 
 export type CoroutineStatus = "suspended" | "running" | "normal" | "dead";
 
@@ -408,12 +412,15 @@ export class Frame {
     // exact position of the last instruction run, when debug code knows it better than ip
     public posIp: number = -1;
 
+    // `marks`: the continuation marks visible in this frame; `mframe`: its logical frame (a tail call keeps its caller's)
     constructor(
         public closure: Closure,
         public regs: any[],
         public ip: number,
         public parent: Frame | null,
-        public ctx: ExecutionContext
+        public ctx: ExecutionContext,
+        public marks: Marks = null,
+        public mframe: number = 0
     ) {
         this.code = closure.tmpl.code;
         this.upvars = closure.upvars;
@@ -425,7 +432,7 @@ export class Frame {
     }
 
     thaw(ctx: ExecutionContext): Frame {
-        return new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx);
+        return new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx, this.marks, this.mframe);
     }
 
     share(ctx: ExecutionContext): this {
@@ -528,7 +535,9 @@ export class VMExecutor {
             if (isTail && callerFrame !== null && !callerFrame.isShared(ctx)) {
                 return this.reset(callerFrame, proc, pregs);
             }
-            return this.newFrame(ctx, proc, pregs, returnTo);
+            // a tail call continues its caller's logical frame, so it keeps its marks
+            if (callerFrame === null) return this.newFrame(ctx, proc, pregs, returnTo);
+            return this.newFrame(ctx, proc, pregs, returnTo, callerFrame.marks, isTail ? callerFrame.mframe : callerFrame.mframe + 1);
         }
 
         if (proc instanceof VMContinuation) {
@@ -581,9 +590,11 @@ export class VMExecutor {
         ctx: ExecutionContext,
         closure: Closure,
         regs: any[],
-        parent: Frame | null
+        parent: Frame | null,
+        marks: Marks = null,
+        mframe: number = 0
     ): Frame {
-        return new Frame(closure, regs, 0, parent, ctx);
+        return new Frame(closure, regs, 0, parent, ctx, marks, mframe);
     }
 
     public reset(
@@ -626,14 +637,14 @@ export class VMExecutor {
         return closureRegs;
     }
 
-    public callDirectRest(ctx: ExecutionContext, proc: Closure, args: any[], depth: number): any {
+    public callDirectRest(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
         const code = proc.tmpl.code;
         const numPos = code.directRestArity;
         let rest: Cons | null = null;
         for (let i = args.length - 1; i >= numPos; i--) rest = new Cons(args[i], rest);
         args.length = numPos;
         args.push(rest);
-        return code.directFn!(ctx, proc, this, depth, ...args);
+        return code.directFn!(ctx, proc, this, depth, marks, mframe, ...args);
     }
 
     // --- continuations and dynamic-wind ---
@@ -860,34 +871,37 @@ export class VMExecutor {
 
 type RuntimeFn = (ctx: ExecutionContext, executor: VMExecutor, regs: readonly any[], start: number, nargs: number) => any;
 
-export type FrameInfo = { name: string, pos: SourcePos | null };
+// `tails`: the tail calls that led to the frame's current procedure (recorded by debug code), oldest first
+export type FrameInfo = { name: string, pos: SourcePos | null, tails: TailTrail | null };
 
 export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] => {
     const out: FrameInfo[] = [];
     for (let f = frame, i = 0; f !== null; f = f.parent, i++) {
-        if (i >= level) out.push({ name: f.debugName, pos: f.code.positionAt(Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)) });
+        if (i >= level) out.push({
+            name: f.debugName,
+            pos: f.code.positionAt(Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)),
+            tails: markOwn(f.marks, f.mframe, TAIL_TRAIL, null),
+        });
     }
     return out;
 };
 
-export const formatTraceback = (frames: FrameInfo[], msg?: string, tailHistory: { name: string, count: number }[] = []): string => {
-    const lines = frames.map(f => `\n  ${formatPos(f.pos)} in ${f.name}`).join("");
-    const tails = tailHistory.length === 0 ? "" : "\nrecent tail calls (newest first):\n  " +
-        tailHistory.map(t => t.count > 1 ? `${t.name} x${t.count}` : t.name).reverse().join(" <- ");
-    return `${msg !== undefined ? msg + "\n" : ""}stack traceback:${lines}${tails}`;
+export const formatTraceback = (frames: FrameInfo[], msg?: string): string => {
+    const tails = (t: TailTrail | null) => t === null || t.length === 0 ? "" :
+        ` (tail calls: ${t.map(c => c.count > 1 ? `${c.name} x${c.count}` : c.name).reverse().join(" <- ")})`;
+    const lines = frames.map(f => `\n  ${formatPos(f.pos)} in ${f.name}${tails(f.tails)}`).join("");
+    return `${msg !== undefined ? msg + "\n" : ""}stack traceback:${lines}`;
 };
 
 // (%debug-frames k args) / (%debug-traceback k args): args is ([coroutine] [msg] [level]), k the caller's continuation
 const debugTarget = (ctx: ExecutionContext, regs: readonly any[], start: number) => {
     let frame = (regs[start] as VMContinuation).frame;
-    let target = ctx;
     const args = listToArray(regs[start + 1]);
     if (args[0] instanceof Coroutine) {
         const co = args.shift() as Coroutine;
-        target = co.ctx;
         if (co !== ctx.coroutine) frame = co.frame;
     }
-    return { frame, args, tailHistory: target.tailHistory };
+    return { frame, args };
 };
 
 const tracebackMessage = (msg: any): string | undefined => {
@@ -896,6 +910,11 @@ const tracebackMessage = (msg: any): string | undefined => {
     if (msg instanceof ErrorObject) return msg.error instanceof Error ? msg.error.message : String(msg.error);
     if (msg instanceof Error) return msg.message;
     return new ASTStringifier().stringify(msg);
+};
+
+const markSetArg = (who: string, set: any): Marks => {
+    if (!(set instanceof ContinuationMarkSet)) throw new Error(`${who}: expected a continuation mark set`);
+    return set.marks;
 };
 
 export const RUNTIME: [name: string, fn: RuntimeFn][] = [
@@ -916,16 +935,19 @@ export const RUNTIME: [name: string, fn: RuntimeFn][] = [
         return Cons.fromArray(frameInfos(frame, level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
     }],
     ["debug-traceback", (ctx, executor, regs, start) => {
-        const { frame, args, tailHistory } = debugTarget(ctx, regs, start);
+        const { frame, args } = debugTarget(ctx, regs, start);
         const msg = typeof args[0] === "number" ? undefined : args.shift();
         const level = typeof args[0] === "number" ? args[0] : 0;
-        return formatTraceback(frameInfos(frame, level), tracebackMessage(msg), tailHistory);
+        return formatTraceback(frameInfos(frame, level), tracebackMessage(msg));
     }],
     // Lua's truncation of multiple values to one: the first value, or <#void> for none
     ["first-value", (ctx, executor, regs, start) => {
         const val = regs[start];
         return val instanceof MultipleValues ? val.values[0] : val;
     }],
+    // (%marks-first set key none) / (%marks->list set key): continuation-mark-set-first / ->list
+    ["marks-first", (ctx, executor, regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2])],
+    ["marks->list", (ctx, executor, regs, start) => Cons.fromArray(markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1]))],
 ];
 
 export const RUNTIME_IDX = new Map(RUNTIME.map(([name], idx) => [name, idx]));
@@ -1026,6 +1048,28 @@ export class BytecodeInterpreter {
                         if ((flags & UNPACK_REST) !== 0) regs[startReg + count] = restValues(vals, count);
                         break;
                     }
+                    case OpCode.SETMARK: {
+                        const keyReg = inst[ip++];
+                        frame.marks = markSet(frame.marks, frame.mframe, regs[keyReg], regs[inst[ip++]]);
+                        break;
+                    }
+                    case OpCode.MARKSAVE: {
+                        const reg = inst[ip++];
+                        regs[reg] = frame.marks;
+                        regs[reg + 1] = frame.mframe;
+                        frame.mframe++;
+                        break;
+                    }
+                    case OpCode.MARKRESTORE: {
+                        const reg = inst[ip++];
+                        frame.marks = regs[reg];
+                        frame.mframe = regs[reg + 1];
+                        break;
+                    }
+                    case OpCode.CURMARKS: {
+                        regs[inst[ip++]] = new ContinuationMarkSet(frame.marks);
+                        break;
+                    }
                     case OpCode.NEWCLOSURE: {
                         const destReg = inst[ip++];
                         const template = constants[inst[ip++]] as ClosureTemplate;
@@ -1062,7 +1106,7 @@ export class BytecodeInterpreter {
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
-                        if (isTail && frame.code.debug) ctx.recordTail(proc);
+                        if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(proc));
 
                         if (!isTail && proc instanceof BuiltinFunction) {
                             ctx.acc = proc.cb(regs, startReg, nargs);
@@ -1107,7 +1151,7 @@ export class BytecodeInterpreter {
                         const coReg = inst[ip++];
                         const listReg = inst[ip++];
                         const isTail = inst[ip++] !== 0;
-                        if (isTail && frame.code.debug) ctx.recordTail(regs[coReg]);
+                        if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(regs[coReg]));
                         frame.ip = ip;
                         return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]));
                     }
@@ -1123,14 +1167,14 @@ export class BytecodeInterpreter {
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
-                        if (isTail && frame.code.debug) ctx.recordTail(proc);
+                        if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(proc));
                         frame.ip = ip;
                         return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), isTail);
                     }
                     case OpCode.CALLCC: {
                         const procReg = inst[ip++];
                         const isTail = inst[ip++] !== 0;
-                        if (isTail && frame.code.debug) ctx.recordTail(regs[procReg]);
+                        if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(regs[procReg]));
                         frame.ip = ip;
                         return executor.callCC(ctx, regs[procReg], frame, isTail);
                     }
@@ -1149,6 +1193,10 @@ export class BytecodeInterpreter {
 
 const JIT_DEPS = {
     IBUILTINS,
+    markSet,
+    recordTailMark,
+    tailName,
+    ContinuationMarkSet,
     MultipleValues,
     unpackForBinding,
     restValues,
@@ -1188,7 +1236,10 @@ type AotInst = { at?: number } & (
     | { k: "MoveAcc"; dst: number }
     | { k: "CallBuiltin"; builtin: number; dst: number; start: number; nargs: number; resume: number }
     | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number }
-    | { k: "Unpack"; src: number; start: number; count: number; flags: number });
+    | { k: "Unpack"; src: number; start: number; count: number; flags: number }
+    | { k: "SetMark"; key: number; val: number }
+    | { k: "MarkSave" | "MarkRestore"; reg: number }
+    | { k: "CurMarks"; dst: number });
 
 type AotTerm = { at?: number } & (
     // `escape` jumps leave a %block early; `loopBack` jumps close a %loop
@@ -1207,6 +1258,8 @@ type AotTerm = { at?: number } & (
 type AotBlock = { start: number; insts: AotInst[]; term: AotTerm };
 
 const STRUCTURE_MISMATCH = Symbol("structure mismatch");
+
+const MAX_STRUCTURED_NESTING = 250;
 
 export class AotCompiler {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
@@ -1424,6 +1477,18 @@ export class AotCompiler {
                     case OpCode.UNPACK:
                         insts.push({ k: "Unpack", src: inst[ip++], start: inst[ip++], count: inst[ip++], flags: inst[ip++] });
                         break;
+                    case OpCode.SETMARK:
+                        insts.push({ k: "SetMark", key: inst[ip++], val: inst[ip++] });
+                        break;
+                    case OpCode.MARKSAVE:
+                        insts.push({ k: "MarkSave", reg: inst[ip++] });
+                        break;
+                    case OpCode.MARKRESTORE:
+                        insts.push({ k: "MarkRestore", reg: inst[ip++] });
+                        break;
+                    case OpCode.CURMARKS:
+                        insts.push({ k: "CurMarks", dst: inst[ip++] });
+                        break;
                     case OpCode.COYIELD:
                         term = { k: "Yield", val: inst[ip++], resume: ip };
                         break;
@@ -1476,11 +1541,13 @@ const windowRegs = (start: number, nargs: number): number[] => Array.from({ leng
 // which registers each resume-mode block needs on entry, and which ones the function ever writes
 class Liveness {
     readonly written: number[];
+    readonly #writtenSet: Set<number>;
     readonly liveIn: Map<number, Set<number>>;
     readonly entryLive: Set<number>;
 
     constructor(blocks: AotBlock[], numReg: number) {
         this.written = Liveness.#writtenRegs(blocks, numReg);
+        this.#writtenSet = new Set(this.written);
         this.liveIn = Liveness.#compute(blocks);
         this.entryLive = new Set(this.liveIn.get(0));
         for (const block of blocks) {
@@ -1492,8 +1559,7 @@ class Liveness {
     // registers to write back to frame.regs before leaving at `resume`: live there and possibly changed, plus `extra`
     spillsFor(resume: number, extra: number[] = []): number[] {
         const regs = new Set(extra);
-        const written = new Set(this.written);
-        for (const r of this.liveIn.get(resume) ?? []) if (written.has(r)) regs.add(r);
+        for (const r of this.liveIn.get(resume) ?? []) if (this.#writtenSet.has(r)) regs.add(r);
         return [...regs].sort((a, b) => a - b);
     }
 
@@ -1526,6 +1592,8 @@ class Liveness {
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
             case "CallBuiltin": case "RtCall": return windowRegs(inst.start, inst.nargs);
             case "Unpack": return [inst.src];
+            case "SetMark": return [inst.key, inst.val];
+            case "MarkRestore": return [inst.reg, inst.reg + 1];
             default: return [];
         }
     }
@@ -1533,6 +1601,7 @@ class Liveness {
     // registers an instruction overwrites
     static #instDefs(inst: AotInst): number[] {
         if (inst.k === "Unpack") return windowRegs(inst.start, inst.count + ((inst.flags & UNPACK_REST) !== 0 ? 1 : 0));
+        if (inst.k === "MarkSave") return [inst.reg, inst.reg + 1];
         return "dst" in inst && inst.k !== "SetBox" ? [inst.dst] : [];
     }
 
@@ -1589,10 +1658,14 @@ class Liveness {
     }
 }
 
+const MAX_INDENT = 16;
+const INDENTS = Array.from({ length: MAX_INDENT + 1 }, (_, i) => "    ".repeat(i));
+
 // accumulates generated js, re-indenting it by brace depth
 export class CodeEmitter {
     private lines: string[] = [];
     private depth: number = 0;
+    // deeper code is not indented further: indenting by depth makes the output quadratic in deeply nested code
 
     emit(str: string): void {
         const rawLines = str.split("\n");
@@ -1605,7 +1678,7 @@ export class CodeEmitter {
                 lineDepth = Math.max(0, this.depth - 1);
             }
 
-            this.lines.push("    ".repeat(lineDepth) + trimmed);
+            this.lines.push(INDENTS[Math.min(lineDepth, MAX_INDENT)] + trimmed);
 
             for (const ch of trimmed) {
                 if (ch === "{" || ch === "[") this.depth++;
@@ -1630,7 +1703,7 @@ abstract class FunctionEmitter extends CodeEmitter {
 
     protected debugHooks(x: { at?: number }, tailProc?: string): string {
         if (!this.debug || x.at === undefined) return "";
-        return `${this.debugPos(x.at + 1)}${tailProc !== undefined ? ` ctx.recordTail(${tailProc});` : ""}`;
+        return `${this.debugPos(x.at + 1)}${tailProc !== undefined ? ` ${this.marksVar} = recordTailMark(${this.marksVar}, ${this.mframeVar}, tailName(${tailProc}));` : ""}`;
     }
 
     protected tailProcOf(term: AotTerm): string | undefined {
@@ -1660,6 +1733,10 @@ abstract class FunctionEmitter extends CodeEmitter {
 
     // the check that one more nested direct call is allowed (as `&& ...`)
     protected abstract readonly depthCheck: string;
+
+    // where the running function's continuation marks and logical frame are
+    protected abstract readonly marksVar: string;
+    protected abstract readonly mframeVar: string;
 
     protected emitSwitchBody(): void {
         for (let i = 0; i < this.blocks.length; i++) {
@@ -1758,6 +1835,14 @@ abstract class FunctionEmitter extends CodeEmitter {
             }
             case "MoveAcc":
                 return this.emit(`r${inst.dst} = ${this.accExpr};`);
+            case "SetMark":
+                return this.emit(`${this.marksVar} = markSet(${this.marksVar}, ${this.mframeVar}, r${inst.key}, r${inst.val});`);
+            case "MarkSave":
+                return this.emit(`r${inst.reg} = ${this.marksVar}; r${inst.reg + 1} = ${this.mframeVar}; ${this.mframeVar}++;`);
+            case "MarkRestore":
+                return this.emit(`${this.marksVar} = r${inst.reg}; ${this.mframeVar} = r${inst.reg + 1};`);
+            case "CurMarks":
+                return this.emit(`r${inst.dst} = new ContinuationMarkSet(${this.marksVar});`);
             case "Unpack": {
                 const moves = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i} = tmp[${i}];`);
                 if ((inst.flags & UNPACK_REST) !== 0) moves.push(`r${inst.start + inst.count} = restValues(tmp, ${inst.count});`);
@@ -1796,6 +1881,8 @@ class ResumeEmitter extends FunctionEmitter {
     protected readonly endOfCode = "return null;";
     // resume functions run from the driver loop, at the base of the js stack
     protected readonly depthCheck = "";
+    protected readonly marksVar = "frame.marks";
+    protected readonly mframeVar = "frame.mframe";
     readonly #liveness: Liveness;
 
     constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false) {
@@ -1805,19 +1892,32 @@ class ResumeEmitter extends FunctionEmitter {
 
     // follows jumps through empty blocks (left by loops and blocks) to where control really goes, saving dispatches
     #thread(target: number): number {
+        if (this.debug) return target;
         const byStart = this.#blocksByStart ??= new Map(this.blocks.map(b => [b.start, b]));
+        const seen: number[] = [];
+        let end = target;
         for (let steps = 0; steps < this.blocks.length; steps++) {
-            const block = byStart.get(target);
-            if (block === undefined || block.insts.length !== 0 || this.debug) return target;
+            const known = this.#threaded.get(end);
+            if (known !== undefined) {
+                end = known;
+                break;
+            }
+            const block = byStart.get(end);
+            if (block === undefined || block.insts.length !== 0) break;
             const term = block.term;
-            if (term.k === "Jump") target = term.target;
-            else if (term.k === "Block" || term.k === "Loop") target = term.body;
-            else return target;
+            let next: number;
+            if (term.k === "Jump") next = term.target;
+            else if (term.k === "Block" || term.k === "Loop") next = term.body;
+            else break;
+            seen.push(end);
+            end = next;
         }
-        return target;
+        for (const start of seen) this.#threaded.set(start, end);
+        return end;
     }
 
     #blocksByStart: Map<number, AotBlock> | null = null;
+    readonly #threaded = new Map<number, number>();
 
     protected jump(target: number, next: number): string {
         return super.jump(this.#thread(target), next);
@@ -1861,14 +1961,15 @@ class ResumeEmitter extends FunctionEmitter {
     // frames on top of this frame's caller, as the call is a tail call.
     #tailCall(proc: string, args: string, nargs: string, heapCall: string): string {
         return `
-            if (${this.directGuard(proc, nargs)} || ${this.restGuard(proc, nargs)}) {
+            if (frame.code.tailSuspends < ${DIRECT_SUSPEND_LIMIT} && (${this.directGuard(proc, nargs)} || ${this.restGuard(proc, nargs)})) {
                 let val;
                 try {
                     val = ${proc}.tmpl.code.directArity !== -1
-                        ? ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, 1${args === "" ? "" : ", " + args})
-                        : executor.callDirectRest(ctx, ${proc}, [${args}], 1);
+                        ? ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, 1, frame.marks, frame.mframe${args === "" ? "" : ", " + args})
+                        : executor.callDirectRest(ctx, ${proc}, [${args}], 1, frame.marks, frame.mframe);
                 } catch (e) {
                     if (!(e instanceof Suspend)) throw e;
+                    frame.code.tailSuspends++;
                     if (frame.parent !== null) e.push(frame.parent);
                     return executor.resumeSuspend(ctx, e);
                 }
@@ -1922,9 +2023,9 @@ class ResumeEmitter extends FunctionEmitter {
                         frame.ip = ${term.resume};
                         ${this.#spills(live.spillsFor(term.resume, windowRegs(term.start, term.nargs)))}
                         if (${this.directGuard("proc", `${term.nargs}`)}) {
-                            ${this.#directCall(`proc.tmpl.code.directFn(ctx, proc, executor, 1${term.nargs > 0 ? ", " + this.argList(term.start, term.nargs) : ""})`)}
+                            ${this.#directCall(`proc.tmpl.code.directFn(ctx, proc, executor, 1, frame.marks, frame.mframe + 1${term.nargs > 0 ? ", " + this.argList(term.start, term.nargs) : ""})`)}
                         } else if (${this.restGuard("proc", `${term.nargs}`)}) {
-                            ${this.#directCall(`executor.callDirectRest(ctx, proc, [${this.argList(term.start, term.nargs)}], 1)`)}
+                            ${this.#directCall(`executor.callDirectRest(ctx, proc, [${this.argList(term.start, term.nargs)}], 1, frame.marks, frame.mframe + 1)`)}
                         } else if (proc instanceof BuiltinFunction) {
                             ctx.acc = proc.cb(regs, ${term.start}, ${term.nargs});
                         } else {
@@ -2002,6 +2103,8 @@ class ResumeEmitter extends FunctionEmitter {
 class DirectEmitter extends FunctionEmitter {
     protected readonly accExpr = "acc";
     protected readonly depthCheck = " && depth < MAX_JS_DEPTH";
+    protected readonly marksVar = "marks";
+    protected readonly mframeVar = "mframe";
     // this function's own arity, when a call to its own closure can call it by name (no rest parameter)
     #selfArity = -1;
     protected readonly endOfCode = "return undefined;";
@@ -2024,7 +2127,7 @@ class DirectEmitter extends FunctionEmitter {
         const locals = Array.from({ length: this.numReg }, (_, i) => i < arity ? `r${i} = a${i}` : `r${i}`);
         const allRegs = Array.from({ length: this.numReg }, (_, i) => `r${i}`).join(", ");
         this.emit(`
-            function direct$(ctx, closure, executor, depth${params}) {
+            function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
                 const upvars = closure.upvars;
                 let ip = 0, rip = 0, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
@@ -2056,7 +2159,7 @@ class DirectEmitter extends FunctionEmitter {
                     const sig = e instanceof Suspend ? e : Suspend.error(e);
                     sig.entered = closure;
                     if (rip !== -1) {
-                        const f = new Frame(closure, [${allRegs}], rip, null, ctx);
+                        const f = new Frame(closure, [${allRegs}], rip, null, ctx, marks, mframe);
                         ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : ""}
                         sig.push(f);
                     }
@@ -2082,10 +2185,25 @@ class DirectEmitter extends FunctionEmitter {
 
     readonly #blockLabels = new Map<number, string>();
 
+    // how deeply the structured code nests so far; V8 fails to compile js nested thousands of levels deep, so past
+    // MAX_STRUCTURED_NESTING the direct entry falls back to switch dispatch
+    #nesting = 0;
+
     #walk(index: Map<number, number>, from: number, stop: number): void {
         const { blocks, inst } = this;
         let i = index.get(from);
         if (i === undefined) throw STRUCTURE_MISMATCH;
+        if (++this.#nesting > MAX_STRUCTURED_NESTING) throw STRUCTURE_MISMATCH;
+        try {
+            this.#walkRegion(index, i, stop);
+        } finally {
+            this.#nesting--;
+        }
+    }
+
+    #walkRegion(index: Map<number, number>, first: number, stop: number): void {
+        const { blocks, inst } = this;
+        let i: number | undefined = first;
         while (i < blocks.length && blocks[i].start < stop) {
             const block = blocks[i];
             const next = i + 1 < blocks.length ? blocks[i + 1].start : inst.length;
@@ -2152,11 +2270,11 @@ class DirectEmitter extends FunctionEmitter {
         return `
             rip = -1;
             if (${this.directGuard(proc, `${nargs}`)}) {
-                const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, depth + 1${nargs > 0 ? ", " + args : ""});
+                const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
                 return val;
             }
             if (${this.restGuard(proc, `${nargs}`)}) {
-                const val = executor.callDirectRest(ctx, ${proc}, [${args}], depth + 1);
+                const val = executor.callDirectRest(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
                 return val;
             }
             if (${proc} instanceof BuiltinFunction) return ${proc}.cb([${args}], 0, ${nargs});
@@ -2181,11 +2299,11 @@ class DirectEmitter extends FunctionEmitter {
                         const proc = r${term.proc};
                         rip = ${term.resume};
                         ${term.nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
-                            acc = direct$(ctx, proc, executor, depth + 1${term.nargs > 0 ? ", " + args : ""});
+                            acc = direct$(ctx, proc, executor, depth + 1, marks, mframe + 1${term.nargs > 0 ? ", " + args : ""});
                         } else ` : ""}if (${this.directGuard("proc", `${term.nargs}`)}) {
-                            acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1${term.nargs > 0 ? ", " + args : ""});
+                            acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, marks, mframe + 1${term.nargs > 0 ? ", " + args : ""});
                         } else if (${this.restGuard("proc", `${term.nargs}`)}) {
-                            acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1);
+                            acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1, marks, mframe + 1);
                         } else if (proc instanceof BuiltinFunction) {
                             acc = proc.cb([${args}], 0, ${term.nargs});
                         } else {
@@ -2219,10 +2337,10 @@ class DirectEmitter extends FunctionEmitter {
                         if (proc instanceof BuiltinFunction) {
                             ${done} proc.cb(args, 0, args.length);
                         } else if (${this.directGuard("proc", "args.length")}) {
-                            ${term.isTail ? "const val =" : "acc ="} proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ...args);
+                            ${term.isTail ? "const val =" : "acc ="} proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, marks, ${term.isTail ? "mframe" : "mframe + 1"}, ...args);
                             ${term.isTail ? "return val;" : ""}
                         } else if (${this.restGuard("proc", "args.length")}) {
-                            ${term.isTail ? "const val =" : "acc ="} executor.callDirectRest(ctx, proc, args, depth + 1);
+                            ${term.isTail ? "const val =" : "acc ="} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${term.isTail ? "mframe" : "mframe + 1"});
                             ${term.isTail ? "return val;" : ""}
                         } else {
                             throw Suspend.invoke(proc, args);

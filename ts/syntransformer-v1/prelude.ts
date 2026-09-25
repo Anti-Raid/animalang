@@ -16,6 +16,8 @@ import {
     CORE_LET,
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
+    CORE_WITH_MARK,
+    CORE_CURRENT_MARKS,
     SOURCE_POS,
     AbstractClosure,
     Cons
@@ -262,6 +264,27 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     ] as const) {
         evaluator.registerTransform(core, lowerTo(core, validate));
     }
+    coreForm(Symbol.for("with-continuation-mark"), CORE_WITH_MARK, orig => {
+        if (orig.length !== 4) throw new Error("with-continuation-mark must be in format (with-continuation-mark key value body)");
+    });
+    // direct calls skip the prelude procedure (and its optional-argument list); a #f set means the current marks
+    evaluator.registerTransform(Symbol.for("continuation-mark-set-first"), (evaluator, expr, orig) => {
+        const args = toArray(expr);
+        if (args.length < 2 || args.length > 3) throw new Error("continuation-mark-set-first requires 2 or 3 arguments");
+        const [set, key, none] = args;
+        const current = list(CORE_CURRENT_MARKS);
+        const setExpr = set === false ? current : (() => {
+            const tmp = Symbol("marks");
+            return list(CORE_LET, list(list(tmp, set)), list(CORE_IF, tmp, tmp, current));
+        })();
+        return { expanded: list(Symbol.for("%marks-first"), setExpr, key, args.length === 3 ? none : false), state: TransformState.Recurse };
+    });
+    evaluator.registerTransform(Symbol.for("current-continuation-marks"), lowerTo(CORE_CURRENT_MARKS, orig => {
+        if (orig.length !== 1) throw new Error("current-continuation-marks takes no arguments");
+    }));
+    evaluator.registerTransform(CORE_CURRENT_MARKS, lowerTo(CORE_CURRENT_MARKS, orig => {
+        if (orig.length !== 1) throw new Error("%current-marks takes no arguments");
+    }));
     coreForm(OP_SET, CORE_SET, orig => {
         if (orig.length !== 3) throw new Error(`set! must have 2 arguments`);
         if (typeof orig.cdr.car !== "symbol") throw new Error(`${String(orig.cdr.car)} not symbol`);

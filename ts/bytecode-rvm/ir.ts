@@ -137,6 +137,22 @@ export type Node = {
     rest: boolean,
     strict: boolean
 } | {
+    // set a continuation mark on the current frame
+    t: "SetMark",
+    keyReg: number,
+    valReg: number
+} | {
+    // save the marks into reg and reg + 1, then start a new logical frame
+    t: "MarkSave",
+    reg: number
+} | {
+    // put back marks saved by MarkSave
+    t: "MarkRestore",
+    reg: number
+} | {
+    t: "CurrentMarks",
+    destReg: number
+} | {
     // an %escape: jump to the end of a %block
     t: "Jump",
     label: JumpLabel
@@ -211,6 +227,18 @@ export class IR {
                     inst.push(OpCode.ENDIF)
                     break
                 }
+                case "SetMark":
+                    inst.push(OpCode.SETMARK, node.keyReg, node.valReg)
+                    break
+                case "MarkSave":
+                    inst.push(OpCode.MARKSAVE, node.reg)
+                    break
+                case "MarkRestore":
+                    inst.push(OpCode.MARKRESTORE, node.reg)
+                    break
+                case "CurrentMarks":
+                    inst.push(OpCode.CURMARKS, node.destReg)
+                    break
                 case "Unpack": {
                     inst.push(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
                     break

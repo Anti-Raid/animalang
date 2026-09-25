@@ -81,6 +81,7 @@ export const BUILTIN_INLINES = new Map<string, InlineFn>([
     ["vector-empty?", unaryInline((a, slow) => `(Array.isArray(${a}) ? ${a}.length === 0 : ${slow})`)],
     ["table-empty?", unaryInline((a, slow) => `(${a} instanceof Table ? ${a}.size === 0 : ${slow})`)],
     ["table-frozen?", unaryInline((a, slow) => `(${a} instanceof Table ? ${a}.frozen : ${slow})`)],
+    ["continuation-mark-set?", unaryInline(a => `${a} instanceof ContinuationMarkSet`)],
 
     ["vector-length", unaryInline((v, slow) => `(Array.isArray(${v}) ? ${v}.length : ${slow})`)],
     ["vector-ref", (args, slow) => args.length !== 2 ? null : `(${vectorIndexOk(args[0], args[1])} ? ${args[0]}[${args[1]}] : ${slow})`],

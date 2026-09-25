@@ -113,6 +113,9 @@ export const CORE_LET = Symbol.for("%let");
 // ones are dropped unless formals has a rest variable (Lua); %let-values/strict raises an error instead (Scheme)
 export const CORE_LET_VALUES = Symbol.for("%let-values");
 export const CORE_LET_VALUES_STRICT = Symbol.for("%let-values/strict");
+// (%with-mark key value body): body runs with a continuation mark; (%current-marks): the current continuation's marks
+export const CORE_WITH_MARK = Symbol.for("%with-mark");
+export const CORE_CURRENT_MARKS = Symbol.for("%current-marks");
 export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
@@ -150,6 +153,8 @@ export const SPECIAL_FORMS = new Set([
     CORE_LET,
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
+    CORE_WITH_MARK,
+    CORE_CURRENT_MARKS,
     OP_DEFINE_GLOBAL,
     OP_AT,
 ])

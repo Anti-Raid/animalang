@@ -28,6 +28,8 @@ export const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, ma
     ["%debug-frames", "debug-frames", 2, 2],
     ["%debug-traceback", "debug-traceback", 2, 2],
     ["%first-value", "first-value", 1, 1],
+    ["%marks-first", "marks-first", 3, 3],
+    ["%marks->list", "marks->list", 2, 2],
 ] as [string, string, number, number][]).map(([form, name, min, max]) => [Symbol.for(form), { idx: RUNTIME_IDX.get(name)!, min, max }]))
 
 // runtime intrinsics that may run Scheme code (closing a coroutine runs its dynamic-wind after-thunks)

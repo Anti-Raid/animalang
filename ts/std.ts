@@ -436,6 +436,16 @@ export const STD_PRELUDE = `
     (lambda (before thunk after)
         (%dynamic-wind before thunk after)))
 
+(define $current-continuation-marks
+    (lambda () (%current-marks)))
+
+(define $continuation-mark-set-first
+    (lambda (set key . none)
+        (%marks-first (if set set (%current-marks)) key (if (null? none) #f (car none)))))
+
+(define $continuation-mark-set->list
+    (lambda (set key) (%marks->list set key)))
+
 (define $debug-frames
     (lambda args
         (%call/cc (lambda (k) (%debug-frames k args)))))

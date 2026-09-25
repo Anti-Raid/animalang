@@ -1,6 +1,7 @@
 import { Cons } from "./list";
 import { ErrorObject, IProcedure, packValues, unpackValues } from "./common";
 import { Table } from "./table";
+import { ContinuationMarkSet } from "./marks";
 
 const numAt = (name: string, regs: readonly any[], i: number): number => {
     const val = regs[i];
@@ -224,6 +225,7 @@ export const PREDICATES: [name: string, test: (val: any) => boolean][] = [
     }],
     ["table-empty?", val => requireTable("table-empty?", val).size === 0],
     ["table-frozen?", val => requireTable("table-frozen?", val).frozen],
+    ["continuation-mark-set?", val => val instanceof ContinuationMarkSet],
 ];
 
 export const PREDICATE_FNS = PREDICATES.map(([name, test]) => (regs: readonly any[], start: number, nargs: number) => {

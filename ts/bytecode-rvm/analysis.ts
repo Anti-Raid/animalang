@@ -10,6 +10,8 @@ import {
   CORE_IF,
   CORE_BEGIN,
   CORE_LOOP,
+  CORE_WITH_MARK,
+  CORE_CURRENT_MARKS,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
@@ -265,6 +267,13 @@ class CallLiveness {
                 const target = blocks.get(ast.cdr.car) ?? new Set<VariableMetadata>();
                 return ast.cdr.cdr === null ? target : this.expr(ast.cdr.cdr.car, scope, target, blocks);
             }
+            // key and value, then the body (in the mark's tail position); none of it is a call
+            case CORE_WITH_MARK: {
+                const [key, value, body] = ast.cdr.toArray();
+                return this.expr(key, scope, this.expr(value, scope, this.expr(body, scope, out, blocks), blocks), blocks);
+            }
+            case CORE_CURRENT_MARKS:
+                return out;
             case CORE_LOOP: {
                 // the end of the body flows back to its start: iterate until the live set at the start is stable
                 let head: Live = this.#loopHeads.get(ast) ?? new Set();
