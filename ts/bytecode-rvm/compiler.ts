@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, OP_BEGIN, OP_IF, OP_LAMBDA, OP_QUOTE, OP_SET, OP_DEFINE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -107,22 +107,19 @@ export class Compiler {
 
         if (typeof operator === "symbol") {
             switch (operator) {
-                case OP_BEGIN:
+                case CORE_BEGIN:
                     this.#compileBegin(expr, opts)
                     return
-                case OP_IF:
+                case CORE_IF:
                     this.#compileIfCall(expr, opts)
                     return
-                case OP_QUOTE:
+                case CORE_QUOTE:
                     this.#compileQuote(expr, opts)
                     return
-                case OP_DEFINE:
-                    this.#compileDefine(expr, opts)
-                    return
-                case OP_SET:
+                case CORE_SET:
                     this.#compileSet(expr, opts)
                     return
-                case OP_LAMBDA:
+                case CORE_LAMBDA:
                     this.#compileLambda(expr, opts, name)
                     return
                 case OP_DYNAMIC_WIND:
@@ -525,7 +522,7 @@ export class Compiler {
         // if we have a non-variadic IIFE ((lambda (params...) body) args...), then we can optimize it down
         // to BLOCK/ENDBLOCK instead of doing a whole function call
         const first = expr.car;
-        if (first instanceof Cons && (first.car === OP_LAMBDA)) {
+        if (first instanceof Cons && (first.car === CORE_LAMBDA)) {
             const rawParams = first.cdr.car;
             // Non-variadic params: null (empty list) or proper Cons list
             if (rawParams === null || (rawParams instanceof Cons && !rawParams.isImproper())) {

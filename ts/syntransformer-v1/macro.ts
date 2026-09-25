@@ -1,4 +1,4 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Table, OP_QUOTE, OP_AT, SOURCE_POS } from "../common"
+import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Table, OP_QUOTE, CORE_QUOTE, OP_AT, SOURCE_POS } from "../common"
 import { Bootstrapper } from "../std";
 
 export enum TransformState {
@@ -48,7 +48,7 @@ export class MacroEvaluator {
 
     // (%at file line col expr) becomes expr with a source position attached, before any macro sees it
     #stripAt(ast: any): any {
-        if (!(ast instanceof Cons) || ast.car === OP_QUOTE) return ast
+        if (!(ast instanceof Cons) || ast.car === OP_QUOTE || ast.car === CORE_QUOTE) return ast
         if (ast.car === OP_AT) {
             const [file, line, col, expr] = ast.length === 5 ? ast.toArray().slice(1) : []
             if (typeof file !== "string" || typeof line !== "number" || typeof col !== "number") {
@@ -78,7 +78,6 @@ export class MacroEvaluator {
     #transform(ast: any, depth: number): any {
         if (ast instanceof Cons) {
             const op = ast.car;
-            if (op === OP_QUOTE) return ast; // cannot desugar a quote
 
             if (depth > MAX_TRANSFORM_DEPTH) {
                 throw new Error(`Macro expansion limit exceeded while expanding macro ${String(op)}`);

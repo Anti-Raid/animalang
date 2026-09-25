@@ -4,6 +4,12 @@ import {
     OP_AND,
     OP_OR,
     OP_DEFINE_GLOBAL,
+    OP_QUOTE,
+    CORE_IF,
+    CORE_LAMBDA,
+    CORE_QUOTE,
+    CORE_BEGIN,
+    CORE_SET,
     AbstractClosure,
     Cons
 } from "../common";
@@ -36,7 +42,7 @@ const removeBegin = (expr: any): any => {
     let curr: any = expr;
     while (curr instanceof Cons) {
         const exp = curr.car;
-        if (exp instanceof Cons && exp.car === OP_BEGIN) {
+        if (exp instanceof Cons && (exp.car === OP_BEGIN || exp.car === CORE_BEGIN)) {
             result.push(...toArray(removeBegin(exp.cdr)));
         } else {
             result.push(exp);
@@ -70,6 +76,32 @@ const normalizeDefine = (stmt: any): any => {
 };
 
 export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
+    // surface forms that map one to one onto core forms (the core form itself is accepted too, e.g. from a transpiler)
+    const lowerTo = (core: symbol, validate: (orig: Cons) => void, state = TransformState.DoChildren) => (evaluator: MacroEvaluator, expr: any, orig: any) => {
+        validate(orig);
+        return { expanded: cons(core, expr), state };
+    };
+    const coreForm = (surface: symbol, core: symbol, validate: (orig: Cons) => void, state?: TransformState) => {
+        evaluator.registerTransform(surface, lowerTo(core, validate, state));
+        evaluator.registerTransform(core, lowerTo(core, validate, state));
+    };
+
+    coreForm(OP_IF, CORE_IF, orig => {
+        if (orig.length !== 4) {
+            throw new Error(`if condition must be in format ["if", condition, true_expr, false_expr] but only have ${orig.length - 1} arguments`);
+        }
+    });
+    coreForm(OP_BEGIN, CORE_BEGIN, () => {});
+    // quoted data is never transformed
+    coreForm(OP_QUOTE, CORE_QUOTE, orig => {
+        if (orig.length !== 2) throw new Error(`quote must be in format ["quote", expr] but have ${orig.length - 1} arguments`);
+    }, TransformState.ReturnImm);
+    coreForm(OP_SET, CORE_SET, orig => {
+        if (orig.length !== 3) throw new Error(`set! must have 2 arguments`);
+        if (typeof orig.cdr.car !== "symbol") throw new Error(`${String(orig.cdr.car)} not symbol`);
+        ensureCanBind(orig.cdr.car, undefined, "set!");
+    });
+
     evaluator.registerTransform(OP_COND, (evaluator, expr, orig) => {
         if (expr === null) return { expanded: undefined, state: TransformState.ReturnImm };
 
@@ -198,14 +230,6 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(lambdaExpr, fromArray(dummyVals)), state: TransformState.Recurse };
     });
 
-    evaluator.registerTransform(OP_SET, (evaluator, expr, orig) => {
-        if (!(orig instanceof Cons) || orig.length !== 3) throw new Error(`set! must have 2 arguments`);
-        if (typeof expr.car !== "symbol") throw new Error(`${String(expr.car)} not symbol`);
-        ensureCanBind(expr.car, undefined, "set!");
-        
-        return { expanded: orig, state: TransformState.DoChildren };
-    });
-
     evaluator.registerTransform(OP_DEFINE, (evaluator, expr, orig) => {
         const normalized = normalizeDefine(orig);
         const sym = normalized.cdr.car;
@@ -230,7 +254,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         };
     });
 
-    evaluator.registerTransform(OP_LAMBDA, (evaluator, expr, orig) => {
+    const lambdaTransform = (evaluator: MacroEvaluator, expr: any, orig: any) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`lambda syntax error`);
         const args = expr.car;
         const rawBody = removeBegin(expr.cdr);
@@ -253,7 +277,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
         if (defines.length === 0) {
             const transformedBody = fromArray(toArray(rawBody).map(stmt => evaluator.transform(stmt)));
-            return { expanded: cons(OP_LAMBDA, cons(args, transformedBody)), state: TransformState.ReturnImm };
+            return { expanded: cons(CORE_LAMBDA, cons(args, transformedBody)), state: TransformState.ReturnImm };
         }
 
         if (body.length === 0) {
@@ -266,7 +290,9 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             expanded: list(OP_LAMBDA, args, letrecExpr), 
             state: TransformState.Recurse 
         };
-    });
+    };
+    evaluator.registerTransform(OP_LAMBDA, lambdaTransform);
+    evaluator.registerTransform(CORE_LAMBDA, lambdaTransform);
 
     evaluator.registerTransform(OP_AND, (evaluator, expr, orig) => {
         if (expr === null) {

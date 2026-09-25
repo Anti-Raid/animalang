@@ -29,6 +29,20 @@ describe('Anima', () => {
     };
 
     describe('Primitives, Strings & Symbols', () => {
+        it('core forms: surface syntax lowers to % forms, which can also be written directly', () => {
+            expect(run(`''a`)).toBe("(quote a)")
+            expect(run(`'(if (lambda (x) x) (begin 1))`)).toBe("(if (lambda (x) x) (begin 1))")
+            expect(run(`(quote (%if 1 2 3))`)).toBe("(%if 1 2 3)")
+            expect(run(`(%if #f 1 (%begin 2 3))`)).toBe("3")
+            expect(run(`((%lambda (x) (define y (+ x 1)) (* y 2)) 4)`)).toBe("10")
+            expect(run(`(define cf-v 1) (%set! cf-v (%quote (a b))) cf-v`)).toBe("(a b)")
+            expect(() => run(`(if 1 2)`)).toThrow("if condition must be in format")
+            expect(() => run(`(%if 1 2)`)).toThrow("if condition must be in format")
+            expect(() => run(`(quote 1 2)`)).toThrow("quote must be in format")
+            expect(() => run(`(define %if 1)`)).toThrow()
+            expect(() => run(`(lambda (%lambda) 1)`)).toThrow()
+            expect(() => run(`(let ((%quote 1)) %quote)`)).toThrow()
+        })
         it('inlined predicates agree with the builtins', () => {
             const vals = `(list 0 -0.0 1 -3 4 2.5 +inf.0 -inf.0 +nan.0 "" "a" #t #f 'sym '() '(1) '(1 . 2) (vector) (vector 1) {} {1 2} car (lambda () 1) <#void>)`
             const safe = ["null?", "pair?", "list?", "number?", "integer?", "positive?", "negative?", "zero?", "infinite?", "finite?", "nan?",

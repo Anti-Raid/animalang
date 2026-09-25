@@ -91,8 +91,16 @@ export const OP_ELSE   = Symbol.for("else"); // part of cond but not a special f
 export const OP_QUOTE  = Symbol.for("quote");
 export const OP_AND      = Symbol.for("and");
 export const OP_OR       = Symbol.for("or");
-export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 export const OP_AT = Symbol.for("%at");
+
+// the core language: the only special forms the compiler accepts (besides the other % intrinsics);
+// the syntax transformer lowers all surface syntax to these
+export const CORE_IF = Symbol.for("%if");
+export const CORE_LAMBDA = Symbol.for("%lambda");
+export const CORE_QUOTE = Symbol.for("%quote");
+export const CORE_BEGIN = Symbol.for("%begin");
+export const CORE_SET = Symbol.for("%set!");
+export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
 
@@ -118,6 +126,13 @@ export const SPECIAL_FORMS = new Set([
     Symbol.for("receive"),
     Symbol.for("let-values"),
     Symbol.for("let*-values"),
+    CORE_IF,
+    CORE_LAMBDA,
+    CORE_QUOTE,
+    CORE_BEGIN,
+    CORE_SET,
+    OP_DEFINE_GLOBAL,
+    OP_AT,
 ])
 
 export const RESERVED_BUILTINS = new Set([
@@ -654,7 +669,7 @@ export const wrapMulti = (exprs: any): any => {
     if (exprs === null) return null;
     if (exprs instanceof Cons) {
         if (exprs.cdr === null) return exprs.car;
-        return new Cons(OP_BEGIN, exprs);
+        return new Cons(CORE_BEGIN, exprs);
     }
     return exprs;
 }

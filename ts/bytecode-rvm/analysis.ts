@@ -1,7 +1,7 @@
 import {
-  OP_QUOTE,
-  OP_LAMBDA,
-  OP_SET,
+  CORE_QUOTE,
+  CORE_LAMBDA,
+  CORE_SET,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
@@ -35,9 +35,9 @@ export class AstAnalysis {
 
         const op = ast.car;
         switch (op) {
-            case OP_QUOTE:
+            case CORE_QUOTE:
                 return; // don't touch quoted
-            case OP_LAMBDA: {
+            case CORE_LAMBDA: {
                 const body = ast.cdr.cdr;
                 
                 const lambdaScope = new AnalysisScope(scope);
@@ -63,7 +63,7 @@ export class AstAnalysis {
                 }
                 return;
             }
-            case OP_SET: {
+            case CORE_SET: {
                 const sym = ast.cdr.car;
                 const value = ast.cdr.cdr.car;
                 

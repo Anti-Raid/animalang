@@ -1,8 +1,10 @@
 # Compiler Syntax Specification
 
-This document details the exact syntax forms and special forms handled directly by the compiler, as well as the exposed compiler intrinsics and their standard prelude mappings.
+This document specifies the core language the compiler accepts, the compiler intrinsics, and how surface syntax and the standard prelude map onto them.
 
-## Syntax Forms
+The compiler only understands `%` forms. Every special form users write (`if`, `lambda`, `let`, `cond`, `define`, ...) is surface syntax that the syntax transformer (`syntransformer-v1`) validates and lowers to the core forms below; anything else in the compiler's input is a variable reference, a literal or a call. Frontends such as transpilers can emit core forms directly. All surface and core form names are reserved and cannot be bound.
+
+## Core Language
 
 ### Atoms and Literals
 
@@ -10,31 +12,18 @@ This document details the exact syntax forms and special forms handled directly 
 - **Null**: The empty list (`'()`).
 - **Primitives**: Numbers, strings, booleans, and undefined constants.
 
-### Special Forms
+### Core Forms
 
-- **`begin`**
-  - Form: `(begin <expr> ...)`
-  - Sequentially evaluates all child expressions. Only the final child yields the value of the `begin` expression and preserves tail position. Empty `(begin)` evaluates to `undefined`.
+| Core form | Surface syntax | Semantics |
+|---|---|---|
+| `(%begin <expr> ...)` | `begin` | Evaluates the expressions in order; the last one gives the value and keeps tail position. `(%begin)` is `undefined`. |
+| `(%if <cond> <then> <else>)` | `if` (exactly 3 arguments) | Evaluates `<cond>`, then one branch; both branches keep tail position. |
+| `(%quote <datum>)` | `quote`, `'datum` | Yields `<datum>` unevaluated. Quoted data is never transformed, so `''a` is the list `(quote a)`. |
+| `(%lambda <params> <body> ...)` | `lambda` | Creates a closure. `<params>` is `(p ...)` or `(p ... . rest)`. Internal `define`s in the body are turned into a `letrec` first. |
+| `(%set! <symbol> <expr>)` | `set!` | Updates the binding of `<symbol>` according to lexical scoping. |
+| `(%define-global <symbol> <expr>)` | `define` at top level (after `(define (f ...) ...)` becomes a lambda) | Binds `<symbol>` in the global scope. |
 
-- **`if`**
-  - Form: `(if <condition> <then-expr> <else-expr>)`
-  - Evaluates `<condition>`. If truthy, evaluates `<then-expr>`; otherwise evaluates `<else-expr>`. Both branches inherit the tail position of the enclosing expression.
-
-- **`quote`**
-  - Form: `(quote <datum>)`
-  - Yields `<datum>` as a literal data structure without evaluating it.
-
-- **`define`**
-  - Form: `(define <symbol> <val-expr>)`
-  - Evaluates `<val-expr>` and binds `<symbol>` in the global scope.
-
-- **`set!`**
-  - Form: `(set! <symbol> <val-expr>)`
-  - Evaluates `<val-expr>` and updates the binding of `<symbol>` according to lexical scoping.
-
-- **`lambda`**
-  - Form: `(lambda (<param> ...) <body>)` or `(lambda (<param> ... . <rest-param>) <body>)`
-  - Creates a closure capturing its lexical environment, with either fixed arity or variadic parameters.
+`let`, `let*`, `letrec`, named `let`, `cond`, `and`, `or`, `guard`, `receive`, `let-values` and `let*-values` are pure surface syntax built from these (for example `let` becomes an immediately applied `%lambda`, which the compiler turns into a block instead of a call).
 
 ### Procedure Calls
 
@@ -47,7 +36,7 @@ This document details the exact syntax forms and special forms handled directly 
 
 ## Compiler Intrinsics (`%` Forms)
 
-The compiler directly recognizes the following low-level `%` intrinsics:
+Besides the core forms, the compiler directly recognizes the following low-level `%` intrinsics:
 
 ### `%dynamic-wind`
 - **Form**: `(%dynamic-wind <before> <thunk> <after>)`
@@ -69,10 +58,6 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 ### `%set-raise-proc`
 - **Form**: `(%set-raise-proc <proc>)`
 - **Semantics**: Registers `<proc>` as the runtime exception raising procedure on the execution context. When host exceptions or runtime errors occur, the VM delegates to this procedure to trigger Scheme-level exception handling.
-
-### `%define-global`
-- **Form**: `(%define-global <symbol> <val-expr>)`
-- **Semantics**: Evaluates `<val-expr>` and binds `<symbol>` directly in the global scope (an alias of `define` for prelude use).
 
 ### `%apply`
 - **Form**: `(%apply <proc> <arg> ... <lst>)`
