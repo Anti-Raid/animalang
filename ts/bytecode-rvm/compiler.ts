@@ -22,6 +22,9 @@ const BUILTIN_INTRINSICS = new Map<symbol, number>([
     "vector-ref",
     "vector-set!",
     "vector-length",
+    "table-ref",
+    "table-set!",
+    "table-has?",
 ].map(name => [Symbol.for(`%${name}`), IBUILTINS_IDX_MAP.get(Symbol.for(name))!]))
 
 const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: number }>(([

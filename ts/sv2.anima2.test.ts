@@ -29,6 +29,36 @@ describe('Anima', () => {
     };
 
     describe('Primitives, Strings & Symbols', () => {
+        it('inlined n-ary arithmetic agrees with the builtins', () => {
+            const outcome = (src: string) => {
+                try {
+                    return run(src)
+                } catch (e: any) {
+                    return `error: ${e.message}`
+                }
+            }
+            const argSets = [[], ["7"], ["0"], ["-0.0"], ["2", "3"], ["6", "0"], ["1", "2", "3"], ["3", "2", "1"], ["5", "5", "5"],
+                ["8", "2", "0", "1"], ["+nan.0", "1"], ["+inf.0", "-inf.0", "2"], ["1", "\"x\""], ["\"x\"", "1", "2"], ["1", "2", "#t"]]
+            for (const op of ["+", "-", "*", "/", "=", "<", "<=", ">", ">=", "eq?"]) {
+                for (const args of argSets) {
+                    const list = args.join(" ")
+                    // direct calls inside a procedure are inlined in AOT; apply always goes through the builtin
+                    const direct = outcome(`((lambda () (${op} ${list})))`)
+                    const viaApply = outcome(`(apply ${op} (list ${list}))`)
+                    expect(direct, `(${op} ${list})`).toBe(viaApply)
+                }
+            }
+        })
+        it('table intrinsics inline and fall back to the builtin for errors', () => {
+            expect(run(`(define tt {"a" 1 "v" <#void>}) (define (tget t k) (table-ref t k)) (list (tget tt "a") (tget tt "v") (table-ref tt "zz" 7))`)).toBe("(1 <#void> 7)")
+            expect(run(`(define tp {"x" 1}) (define tc (table-chain tp)) (define (tget2 t k) (table-ref t k)) (table-set! tc "y" 2) (list (tget2 tc "x") (tget2 tc "y") (table-has? tc "x") (table-has? tp "y"))`)).toBe("(1 2 #t #f)")
+            expect(run(`(define (tput! t k v) (table-set! t k v)) (define tw {}) (list (tput! tw "k" 5) (table-ref tw "k"))`)).toBe("(<#void> 5)")
+            expect(() => run(`(define (tget3 t k) (table-ref t k)) (tget3 {"a" 1} "b")`)).toThrow("table-ref: key not found: b")
+            expect(() => run(`(define (tget4 t k) (table-ref t k)) (tget4 5 "b")`)).toThrow("table-ref requires a table")
+            expect(() => run(`(define (tput2! t) (table-set! t "a" 2)) (define tf {"a" 1}) (table-freeze! tf) (tput2! tf)`)).toThrow("Cannot modify a frozen Table")
+            expect(() => run(`(define (thas t) (table-has? t 1)) (thas '())`)).toThrow("table-has? requires a table")
+            expect(run(`(map table-has? (list {1 2} {}) (list 1 1))`)).toBe("(#t #f)")
+        })
         it('core forms: surface syntax lowers to % forms, which can also be written directly', () => {
             expect(run(`''a`)).toBe("(quote a)")
             expect(run(`'(if (lambda (x) x) (begin 1))`)).toBe("(if (lambda (x) x) (begin 1))")

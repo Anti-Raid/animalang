@@ -9,6 +9,8 @@ export const isTruthy = (val: any): boolean => {
 }   
 
 // @internal
+const DEEP_EQUAL_MISSING = Symbol("missing");
+
 export const isDeepEqual = (a: any, b: any): boolean => {
     // If simple eqv? logic works, return true as no more work needed
     if (Object.is(a, b)) return true;
@@ -17,8 +19,8 @@ export const isDeepEqual = (a: any, b: any): boolean => {
     if (a instanceof Table && b instanceof Table) {
         if (a.size !== b.size) return false;
         for (const [key, val] of a.entries()) {
-            if (!b.has(key)) return false;
-            if (!isDeepEqual(val, b.get(key))) return false;
+            const other = b.lookup(key, DEEP_EQUAL_MISSING);
+            if (other === DEEP_EQUAL_MISSING || !isDeepEqual(val, other)) return false;
         }
         return true;
     }

@@ -29,15 +29,9 @@ export class Table implements Iterable<[any, any]> {
         this.#frozen = Boolean(val);
     }
 
+    // host convenience; `lookup` tells a missing key apart from a stored undefined
     get(key: any): any {
-        let curr: Table | null = this;
-        while (curr !== null) {
-            if (curr.#map.has(key)) {
-                return curr.#map.get(key);
-            }
-            curr = curr.#parent;
-        }
-        return undefined;
+        return this.lookup(key, undefined);
     }
 
     lookup(key: any, missing: any): any {

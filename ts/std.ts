@@ -21,6 +21,8 @@ export class BuiltinFunction extends IProcedure {
     }
 }
 
+const MISSING_KEY = Symbol("missing key");
+
 const vectorIndexOk = (v: string, k: string) => `Array.isArray(${v}) && Number.isInteger(${k}) && ${k} >= 0 && ${k} < ${v}.length`;
 
 export const IBUILTINS: BuiltinFunction[] = [
@@ -264,27 +266,23 @@ export const IBUILTINS: BuiltinFunction[] = [
         const tbl = regs[startReg];
         if (!(tbl instanceof Table)) throw new Error("table-ref requires a table");
         const key = regs[startReg + 1];
-        if (tbl.has(key)) {
-            return tbl.get(key);
-        }
+        const val = tbl.lookup(key, MISSING_KEY);
+        if (val !== MISSING_KEY) return val;
         if (nargs === 3) {
             return regs[startReg + 2];
         }
         throw new Error(`table-ref: key not found: ${String(key)}`);
-    }),
+    }, ([t, k, ...rest], slow, tmp) => k === undefined || rest.length > 0 ? null : `(${t} instanceof Table && (${tmp} = ${t}.lookup(${k}, MISSING)) !== MISSING ? ${tmp} : ${slow})`),
     new BuiltinFunction(Symbol.for("table-is?"), (regs, startReg, nargs) => {
         if (nargs < 3 || nargs > 4) throw new Error("table-is? requires 3 or 4 arguments (table-is? tbl key expected [default])");
         const tbl = regs[startReg];
         if (!(tbl instanceof Table)) throw new Error("table-is? requires a table");
         const key = regs[startReg + 1];
         const expected = regs[startReg + 2];
-        let val: any;
-        if (tbl.has(key)) {
-            val = tbl.get(key);
-        } else if (nargs === 4) {
+        let val = tbl.lookup(key, MISSING_KEY);
+        if (val === MISSING_KEY) {
+            if (nargs !== 4) return false;
             val = regs[startReg + 3];
-        } else {
-            return false;
         }
         return isDeepEqual(val, expected);
     }),
@@ -294,13 +292,13 @@ export const IBUILTINS: BuiltinFunction[] = [
         if (!(tbl instanceof Table)) throw new Error("table-set! requires a table");
         tbl.set(regs[startReg + 1], regs[startReg + 2]);
         return undefined;
-    }),
+    }, (args, slow) => args.length !== 3 ? null : `(${args[0]} instanceof Table && !${args[0]}.frozen ? (${args[0]}.set(${args[1]}, ${args[2]}), undefined) : ${slow})`),
     new BuiltinFunction(Symbol.for("table-has?"), (regs, startReg, nargs) => {
         if (nargs !== 2) throw new Error("table-has? requires 2 arguments (table-has? tbl key)");
         const tbl = regs[startReg];
         if (!(tbl instanceof Table)) throw new Error("table-has? requires a table");
         return tbl.has(regs[startReg + 1]);
-    }),
+    }, (args, slow) => args.length !== 2 ? null : `(${args[0]} instanceof Table ? ${args[0]}.has(${args[1]}) : ${slow})`),
     new BuiltinFunction(Symbol.for("table-delete!"), (regs, startReg, nargs) => {
         if (nargs !== 2) throw new Error("table-delete! requires 2 arguments (table-delete! tbl key)");
         const tbl = regs[startReg];

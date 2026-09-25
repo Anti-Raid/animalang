@@ -1682,7 +1682,7 @@ abstract class FunctionEmitter extends CodeEmitter {
     protected inlineBuiltin(builtin: number, start: number, nargs: number): string | null {
         const inline = IBUILTINS[builtin].inline;
         if (inline === undefined) return null;
-        return inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`IBUILTINS[${builtin}].cb`, start, nargs));
+        return inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`IBUILTINS[${builtin}].cb`, start, nargs), "tmp");
     }
 }
 
@@ -1736,7 +1736,7 @@ class ResumeEmitter extends FunctionEmitter {
             function(ctx, frame, executor) {
                 const regs = frame.regs;
                 const upvars = frame.upvars;
-                let ip = frame.ip;
+                let ip = frame.ip, tmp;
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 try {
                     while (true) {
@@ -1864,7 +1864,7 @@ class DirectEmitter extends FunctionEmitter {
         this.emit(`
             function(ctx, closure, executor${params}) {
                 const upvars = closure.upvars;
-                let ip = 0, rip = 0, acc${this.debug ? ", dip = 0" : ""};
+                let ip = 0, rip = 0, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 try {
         `);

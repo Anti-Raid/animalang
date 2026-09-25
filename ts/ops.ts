@@ -3,17 +3,26 @@ import { ErrorObject, IProcedure, packValues, unpackValues } from "./common";
 import { Table } from "./table";
 
 // AOT inlining: given the js expressions of the arguments and of a call to the builtin itself (the fallback, which
-// reports errors), returns a js expression computing the result, or null to always call the builtin
-export type InlineFn = (args: string[], slow: string) => string | null;
+// reports errors), returns a js expression computing the result, or null to always call the builtin. `tmp` names a
+// scratch variable the expression may assign; `MISSING` and `Table` are also in scope
+export type InlineFn = (args: string[], slow: string, tmp: string) => string | null;
 
-const binaryInline = (op: string, guard: (a: string, b: string) => string): InlineFn => (args, slow) => {
-    if (args.length !== 2) return null;
-    const [a, b] = args;
-    return `(${guard(a, b)} ? ${a} ${op} ${b} : ${slow})`;
+const allNumbers = (args: string[]) => args.map(a => `typeof ${a} === "number"`).join(" && ");
+
+// (op a b c) => ((a op b) op c) when every argument is a number; `unary` handles a single argument
+const foldInline = (op: string, empty: string | null, unary: (a: string) => string, divisors = false): InlineFn => (args, slow) => {
+    if (args.length === 0) return empty;
+    const nonZero = divisors ? (args.length === 1 ? args : args.slice(1)).map(d => ` && ${d} !== 0`).join("") : "";
+    const value = args.length === 1 ? unary(args[0]) : args.slice(1).reduce((acc, b) => `(${acc} ${op} ${b})`, args[0]);
+    return `(${allNumbers(args)}${nonZero} ? ${value} : ${slow})`;
 };
 
-const numeric = (a: string, b: string) => `typeof ${a} === "number" && typeof ${b} === "number"`;
-const numericInline = (op: string) => binaryInline(op, numeric);
+// (op a b c) => a op b && b op c when every argument is a number
+const chainInline = (op: string): InlineFn => (args, slow) => {
+    if (args.length === 0) return null;
+    const tests = args.slice(1).map((b, i) => `${args[i]} ${op} ${b}`);
+    return `(${allNumbers(args)} ? ${tests.length > 0 ? tests.join(" && ") : "true"} : ${slow})`;
+};
 
 const numAt = (name: string, regs: readonly any[], i: number): number => {
     const val = regs[i];
@@ -139,18 +148,18 @@ export const opGe = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const ARITHMETIC: [name: string, fn: (regs: readonly any[], start: number, nargs: number) => any, inline?: InlineFn][] = [
-    ["+", opAdd, numericInline("+")],
-    ["-", opSub, numericInline("-")],
-    ["*", opMul, numericInline("*")],
-    ["/", opDiv, binaryInline("/", (a, b) => `${numeric(a, b)} && ${b} !== 0`)],
+    ["+", opAdd, foldInline("+", "0", a => a)],
+    ["-", opSub, foldInline("-", null, a => `-${a}`)],
+    ["*", opMul, foldInline("*", "1", a => a)],
+    ["/", opDiv, foldInline("/", null, a => `1 / ${a}`, true)],
     ["modulo", opMod],
     ["remainder", opRem],
-    ["=", opNumEq, numericInline("===")],
-    ["eq?", opEq, args => args.length === 2 ? `${args[0]} === ${args[1]}` : null],
-    ["<", opLt, numericInline("<")],
-    ["<=", opLe, numericInline("<=")],
-    [">", opGt, numericInline(">")],
-    [">=", opGe, numericInline(">=")],
+    ["=", opNumEq, chainInline("===")],
+    ["eq?", opEq, args => args.length === 0 ? null : `(${args.length === 1 ? "true" : args.slice(1).map(b => `${args[0]} === ${b}`).join(" && ")})`],
+    ["<", opLt, chainInline("<")],
+    ["<=", opLe, chainInline("<=")],
+    [">", opGt, chainInline(">")],
+    [">=", opGe, chainInline(">=")],
 ];
 
 export const ARITHMETIC_FNS = ARITHMETIC.map(([, fn]) => fn);

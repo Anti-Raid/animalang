@@ -448,7 +448,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
     });
 
-    for (const name of ["list", "cons", "vector-ref", "vector-set!", "vector-length", "coroutine-create", "coroutine-resume", "coroutine-yield", "coroutine-status", "coroutine-close"]) {
+    for (const name of ["list", "cons", "vector-ref", "vector-set!", "vector-length", "table-ref", "table-set!", "table-has?", "coroutine-create", "coroutine-resume", "coroutine-yield", "coroutine-status", "coroutine-close"]) {
         evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
             return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
         });

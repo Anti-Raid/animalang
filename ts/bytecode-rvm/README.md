@@ -82,6 +82,10 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Forms**: `(%list <arg> ...)`, `(%cons a d)`
 - **Semantics**: Each compiles to a `CALL` of the `list` / `cons` builtin over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
 
+### Table intrinsics
+- **Forms**: `(%table-ref t k [default])`, `(%table-set! t k v)`, `(%table-has? t k)`
+- **Semantics**: Direct calls to `table-ref`, `table-set!` and `table-has?` are rewritten to these. Each compiles to a `CALL` of the builtin with the same name; the AOT emitter inlines the 2-argument `table-ref` (one chained `lookup`), `table-set!` on an unfrozen table and `table-has?`, falling back to the builtin for errors, defaults and frozen tables.
+
 ### Vector intrinsics
 - **Forms**: `(%vector-ref v k)`, `(%vector-set! v k val)`, `(%vector-length v)`
 - **Semantics**: Direct calls to `vector-ref`, `vector-set!` and `vector-length` are rewritten to these. Each compiles to a `CALL` of the builtin with the same name; the AOT emitter inlines them as a guarded JS array access and falls back to the builtin (and its error messages) when the guard fails.
@@ -111,7 +115,7 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Semantics**: Walk the frames of `<k>` (or of a suspended coroutine) and return a list of `#(name file line col)` records, or a traceback string. Used by the prelude's `debug-frames` and `debug-traceback`.
 
 ### How intrinsics are compiled
-- **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines builtins that define an `inline` expression (an `InlineFn` next to the builtin in `ops.ts`/`std.ts`: arithmetic, `eq?`, every predicate, every `c[ad]+r`, `list`, `cons` and the vector intrinsics), keeping a call to the builtin as the fallback so errors are unchanged. Builtins are never tail called: a builtin call in tail position compiles as a call followed by `RETURN`, since it cannot grow the Scheme stack.
+- **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines builtins that define an `inline` expression (an `InlineFn` next to the builtin in `ops.ts`/`std.ts`: arithmetic, `eq?`, every predicate, every `c[ad]+r`, `list`, `cons`, and the table and vector intrinsics), keeping a call to the builtin as the fallback so errors are unchanged. Builtins are never tail called: a builtin call in tail position compiles as a call followed by `RETURN`, since it cannot grow the Scheme stack.
 - **Runtime operations that only need the execution context** (`%coroutine-create`, `%coroutine-status`, `%coroutine-close`, `%handlers`, `%set-handlers!`, `%set-raise-proc`, the wind/unwind steps of `%dynamic-wind`, and internal helpers with no public builtin: `%values->list`, `%debug-frames`, `%debug-traceback` and the list/apply conversions behind `%coroutine-yield-list` and `%apply-multi`) compile to `CALLRT idx dst start nargs`, where `idx` indexes the `RUNTIME` table in `exec.ts`.
 - **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `isTail` operand; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
 
