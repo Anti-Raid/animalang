@@ -330,7 +330,6 @@ export class ExecutionContext {
     public id: number;
     public acc: any = null;
     public epoch: number = 0;
-    public currentFrame: Frame | null = null;
     public wind: WindPoint | null = null;
     public pendingWind: PendingWindTransition | null = null;
     public handlers: Cons | null = null;
@@ -422,7 +421,7 @@ export class Frame {
     }
 
     thaw(ctx: ExecutionContext): Frame {
-        return new Frame(this.closure, [...this.regs], this.ip, this.parent, ctx);
+        return new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx);
     }
 
     share(ctx: ExecutionContext): this {
@@ -501,7 +500,6 @@ export class VMExecutor {
         if (frame.isShared(ctx)) {
             frame = frame.thaw(ctx);
         }
-        ctx.currentFrame = frame;
         return frame;
     }
 
@@ -536,13 +534,11 @@ export class VMExecutor {
             if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
 
             const targetVal = callerArgs[startReg];
-            const actions = computeWindTransition(ctx.wind, proc.wind);
-
-            if (actions.length === 0) {
+            if (ctx.wind === proc.wind) {
                 ctx.acc = targetVal;
-                ctx.wind = proc.wind;
-                return this.setRetVal(ctx, proc.frame, ctx.acc);
+                return this.setRetVal(ctx, proc.frame, targetVal);
             }
+            const actions = computeWindTransition(ctx.wind, proc.wind);
 
             ctx.pendingWind = {
                 actions,
@@ -611,9 +607,9 @@ export class VMExecutor {
             }
         }
 
-        const closureRegs: any[] = [];
+        const closureRegs: any[] = createRegs(template.code.numReg);
         for (let i = 0; i < arity; i++) {
-            closureRegs.push(args[startOffset + i]);
+            closureRegs[i] = args[startOffset + i];
         }
 
         if (template.remParams !== null) {
@@ -621,11 +617,8 @@ export class VMExecutor {
             for (let i = nargs - 1; i >= arity; i--) {
                 restList = new Cons(args[startOffset + i], restList);
             }
-            closureRegs.push(restList);
+            closureRegs[arity] = restList;
         }
-
-        const numReg = template.code.numReg;
-        while (closureRegs.length < numReg) closureRegs.push(undefined);
         return closureRegs;
     }
 
@@ -1214,18 +1207,19 @@ export class AotCompiler {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
         let frame: Frame | null = initialFrame;
 
-        while (frame !== null) {
-            const frameCtx: ExecutionContext = frame.ctx;
-            frame = executor.enter(frameCtx, frame);
-            const resumeFn = frame.code.resumeFn;
-            if (resumeFn === null) {
-                throw new Error(`AOT mode encountered uncompiled code in frame: ${frame.debugName}`);
-            }
-            try {
+        // one try around the loop: any error ends the run
+        try {
+            while (frame !== null) {
+                const frameCtx: ExecutionContext = frame.ctx;
+                frame = executor.enter(frameCtx, frame);
+                const resumeFn = frame.code.resumeFn;
+                if (resumeFn === null) {
+                    throw new Error(`AOT mode encountered uncompiled code in frame: ${frame.debugName}`);
+                }
                 frame = resumeFn(frameCtx, frame, executor);
-            } catch (err) {
-                throw err instanceof EscapedError ? err.error : err;
             }
+        } catch (err) {
+            throw err instanceof EscapedError ? err.error : err;
         }
 
         return ctx.acc;
