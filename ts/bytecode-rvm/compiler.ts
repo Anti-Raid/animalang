@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -25,6 +25,7 @@ const BUILTIN_INTRINSICS = new Map<symbol, number>([
     "table-ref",
     "table-set!",
     "table-has?",
+    "table-border",
 ].map(name => [Symbol.for(`%${name}`), IBUILTINS_IDX_MAP.get(Symbol.for(name))!]))
 
 const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: number }>(([
@@ -39,12 +40,24 @@ const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: numb
     ["%debug-traceback", "debug-traceback", 2, 2],
 ] as [string, string, number, number][]).map(([form, name, min, max]) => [Symbol.for(form), { idx: RUNTIME_IDX.get(name)!, min, max }]))
 
+// a %block that %escape can jump to: where its value goes and how its code ends
+interface BlockTarget {
+    name: symbol
+    end: JumpLabel
+    destReg?: number
+    isTail: boolean
+    fnDepth: number
+    parent: BlockTarget | undefined
+}
+
 interface CmpOpts {
     destReg?: number // where to store dest reg
     isTail: boolean // whether this is a tail-call or not (for tco)
     nodes: Node[]
     scope: CompilerScope,
     pos?: SourcePos // position of the enclosing form
+    blocks?: BlockTarget // enclosing %blocks, innermost first
+    fnDepth?: number // how many %lambdas deep we are; escapes cannot cross one
     name?: string // name for a lambda compiled directly as this value
 
     // From pass 1
@@ -124,6 +137,18 @@ export class Compiler {
                     return
                 case CORE_LAMBDA:
                     this.#compileLambda(expr, opts, name)
+                    return
+                case CORE_LET:
+                    this.#compileLet(expr, opts)
+                    return
+                case CORE_BLOCK:
+                    this.#compileBlock(expr, opts)
+                    return
+                case CORE_ESCAPE:
+                    this.#compileEscape(expr, opts)
+                    return
+                case CORE_LOOP:
+                    this.#compileLoop(expr, opts)
                     return
                 case OP_DYNAMIC_WIND:
                     this.#compileDynamicWind(expr, opts)
@@ -314,13 +339,52 @@ export class Compiler {
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
         const body = expr.cdr.cdr;
-        this.#compile(wrapMulti(body), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope })
+        this.#compile(wrapMulti(body), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
         const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName);
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
+    }
+
+    // (%block name body ...): the value of the body, or of an (%escape name value) jumping to its end
+    #compileBlock(expr: Cons, opts: CmpOpts) {
+        const end = new JumpLabel()
+        const target: BlockTarget = { name: expr.cdr.car, end, destReg: opts.destReg, isTail: opts.isTail, fnDepth: opts.fnDepth ?? 0, parent: opts.blocks }
+        opts.nodes.push({ t: "Block", end })
+        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, blocks: target })
+        opts.nodes.push({ t: "Label", label: end })
+    }
+
+    #compileEscape(expr: Cons, opts: CmpOpts) {
+        const name: symbol = expr.cdr.car
+        let target = opts.blocks
+        while (target !== undefined && target.name !== name) target = target.parent
+        if (target === undefined) throw new Error(`%escape: no enclosing block named ${String(name.description)}`)
+        if (target.fnDepth !== (opts.fnDepth ?? 0)) {
+            throw new Error(`%escape: cannot escape to block ${String(name.description)} from inside a lambda`)
+        }
+        // the value is computed as if it were the block's own value: into its register, in its tail position
+        const valueOpts = { ...opts, destReg: target.destReg, isTail: target.isTail }
+        if (expr.cdr.cdr !== null) this.#compile(expr.cdr.cdr.car, valueOpts)
+        else this.#compile(undefined, valueOpts)
+        opts.nodes.push({ t: "Jump", label: target.end })
+    }
+
+    // (%loop body ...): repeats forever; only an %escape leaves it
+    #compileLoop(expr: Cons, opts: CmpOpts) {
+        const head = new JumpLabel()
+        const end = new JumpLabel()
+        opts.nodes.push({ t: "Loop", end })
+        opts.nodes.push({ t: "Label", label: head })
+        let curr: any = expr.cdr
+        while (curr instanceof Cons) {
+            this.#compile(curr.car, { ...opts, destReg: undefined, isTail: false })
+            curr = curr.cdr
+        }
+        opts.nodes.push({ t: "EndLoop", head })
+        opts.nodes.push({ t: "Label", label: end })
     }
 
     #nodesEndsInRet(nodes: Node[]) {
@@ -492,11 +556,6 @@ export class Compiler {
     }
     // a normal call
     #compileNormalCall(expr: Cons, opts: CmpOpts) {
-        // Try IIFE optimizations
-        if(this.#optIIFE(expr, opts)) {
-            return
-        }
-
         // We need to compile the proc and place it on its own tempval
         const { procReg, isTemp } = this.#resolveProcReg(expr.car, opts);
 
@@ -521,57 +580,32 @@ export class Compiler {
         if (isTemp) opts.scope.freeTemp(procReg)
     }
 
-    #optIIFE(expr: Cons, opts: CmpOpts): boolean {
-        // if we have a non-variadic IIFE ((lambda (params...) body) args...), then we can optimize it down
-        // to BLOCK/ENDBLOCK instead of doing a whole function call
-        const first = expr.car;
-        if (first instanceof Cons && (first.car === CORE_LAMBDA)) {
-            const rawParams = first.cdr.car;
-            // Non-variadic params: null (empty list) or proper Cons list
-            if (rawParams === null || (rawParams instanceof Cons && !rawParams.isImproper())) {
-                const ascope = opts.analyzer.scopeMap.get(first);
-                if (!ascope) throw new Error(`internal error: could not find ascope for expr ${first}`);
+    // (%let ((x init) ...) body ...): inits are evaluated in the outer scope, then bound in a block of this function
+    #compileLet(expr: Cons, opts: CmpOpts) {
+        const ascope = opts.analyzer.scopeMap.get(expr)
+        if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
+        const bindings = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
 
-                const params = rawParams === null ? [] : rawParams.toArray();
-                const body = first.cdr.cdr;
-                const args = expr.cdr === null ? [] : expr.cdr.toArray();
-                if (params.length !== args.length) {
-                    throw new Error(`expected exactly ${params.length} args, got ${args.length}`);
-                }
-                
-                // Bind all arguments outside new block scope
-                const argRegs: number[] = [];
-                for(let i = 0; i < args.length; i++) {
-                    const tempReg = opts.scope.allocTemp();
-                    this.#compile(args[i], { ...opts, destReg: tempReg, isTail: false, name: typeof params[i] === "symbol" ? params[i].description : undefined });
-                    argRegs.push(tempReg);
-                }
-
-                // Now enter block
-                opts.scope.enterBlock()
-                const seen = new Set<symbol>();
-                for(let i = 0; i < params.length; i++) {
-                    ensureCanBind(params[i], seen, "lambda")
-                    const inf = ascope.getVarinfo(params[i]);
-                    if(!inf) throw new Error("Could not fetch varinfo")
-                    
-                    const destReg = opts.scope.addLocal(params[i])            
-                    if(inf.isBoxed) {
-                        opts.nodes.push({ t: "Box", srcReg: argRegs[i], destReg });
-                    } else {
-                        opts.nodes.push({ t: "Move", srcReg: argRegs[i], destReg });
-                    }
-                }
-
-                this.#compile(wrapMulti(body), {...opts, ascope})
-                opts.scope.exitBlock()
-                for (const reg of argRegs) {
-                    opts.scope.freeTemp(reg);
-                }
-                return true;
-            }
+        const initRegs: number[] = []
+        for (const binding of bindings) {
+            const reg = opts.scope.allocTemp()
+            this.#compile(binding.cdr.car, { ...opts, destReg: reg, isTail: false, name: binding.car.description })
+            initRegs.push(reg)
         }
-        return false;
+
+        opts.scope.enterBlock()
+        const seen = new Set<symbol>()
+        for (let i = 0; i < bindings.length; i++) {
+            const sym = bindings[i].car
+            ensureCanBind(sym, seen, "let")
+            const inf = ascope.getVarinfo(sym)
+            if (!inf) throw new Error("Could not fetch varinfo")
+            const destReg = opts.scope.addLocal(sym)
+            opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: initRegs[i], destReg })
+        }
+        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope })
+        opts.scope.exitBlock()
+        for (const reg of initRegs) opts.scope.freeTemp(reg)
     }
 
     #getVar(varname: symbol, opts: CmpOpts, destReg?: number): Node[] {

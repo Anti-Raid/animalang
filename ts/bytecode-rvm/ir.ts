@@ -117,6 +117,22 @@ export type Node = {
     isTail: boolean,
     destReg?: number
 } | {
+    // start of a %block whose escapes jump to `end`
+    t: "Block",
+    end: JumpLabel
+} | {
+    // start of a %loop ending at `end`; its head is the label right after
+    t: "Loop",
+    end: JumpLabel
+} | {
+    // back edge of a %loop
+    t: "EndLoop",
+    head: JumpLabel
+} | {
+    // an %escape: jump to the end of a %block
+    t: "Jump",
+    label: JumpLabel
+} | {
     // marks where the following code came from (goes into the line table, emits nothing)
     t: "Pos",
     pos: SourcePos
@@ -185,6 +201,15 @@ export class IR {
                 }
                 case "EndIf": {
                     inst.push(OpCode.ENDIF)
+                    break
+                }
+                case "Block":
+                case "Loop":
+                case "EndLoop":
+                case "Jump": {
+                    const op = { Block: OpCode.BLOCK, Loop: OpCode.LOOP, EndLoop: OpCode.ENDLOOP, Jump: OpCode.JUMP }[node.t]
+                    const jidx = inst.push(op, -1) - 1
+                    jumpIdxs.set(jidx, node.t === "EndLoop" ? node.head : node.t === "Jump" ? node.label : node.end)
                     break
                 }
                 case "Call": {

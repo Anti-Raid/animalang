@@ -2,6 +2,9 @@ import {
   CORE_QUOTE,
   CORE_LAMBDA,
   CORE_SET,
+  CORE_BLOCK,
+  CORE_ESCAPE,
+  CORE_LET,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
@@ -69,6 +72,33 @@ export class AstAnalysis {
                 
                 scope.markMutable(sym);
                 this.visit(value, scope);
+                return;
+            }
+            // (%let ((x init) ...) body ...): inits are evaluated outside, body inside a block scope
+            case CORE_LET: {
+                const letScope = new AnalysisScope(scope, false);
+                let binding: any = ast.cdr.car;
+                while (binding instanceof Cons) {
+                    this.visit(binding.car.cdr.car, scope);
+                    letScope.define(binding.car.car);
+                    binding = binding.cdr;
+                }
+                this.scopeMap.set(ast, letScope);
+                let curr: any = ast.cdr.cdr;
+                while (curr instanceof Cons) {
+                    this.visit(curr.car, letScope);
+                    curr = curr.cdr;
+                }
+                return;
+            }
+            // block names are labels, not variables
+            case CORE_BLOCK:
+            case CORE_ESCAPE: {
+                let curr: any = ast.cdr.cdr;
+                while (curr instanceof Cons) {
+                    this.visit(curr.car, scope);
+                    curr = curr.cdr;
+                }
                 return;
             }
             case OP_DEFINE_GLOBAL: {

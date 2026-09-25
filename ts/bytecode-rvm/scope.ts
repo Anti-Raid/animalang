@@ -8,11 +8,12 @@ export class VariableMetadata {
     constructor(public mutable: boolean = false, public isCaptured: boolean = false, ) {}
 }
 
+// a function body (%lambda, or the top level) or a block inside one (%let); only function boundaries capture
 export class AnalysisScope {
     #vals = new Map<symbol, VariableMetadata>()
     outer: AnalysisScope | null;
 
-    constructor(outer: AnalysisScope | null) {
+    constructor(outer: AnalysisScope | null, readonly isFunction: boolean = true) {
         this.outer = outer;
     }
 
@@ -32,41 +33,27 @@ export class AnalysisScope {
         return null;
     }
 
+    // the variable's metadata, marked captured if a function boundary lies between here and its definition
+    #use(sym: symbol): VariableMetadata | null {
+        let crossedFunction = false;
+        for (let scope: AnalysisScope | null = this; scope !== null; scope = scope.outer) {
+            const meta = scope.#vals.get(sym);
+            if (meta !== undefined) {
+                if (crossedFunction) meta.isCaptured = true;
+                return meta;
+            }
+            if (scope.isFunction) crossedFunction = true;
+        }
+        return null;
+    }
+
     readVar(sym: symbol): boolean {
-        if (this.#vals.has(sym)) {
-            return true; // Found locally
-        }
-        
-        if (this.outer && this.outer.readVar(sym)) {
-            this.outer.markCaptured(sym);
-            return true;
-        }
-        return false;
-    }
-
-    markCaptured(sym: symbol) {
-        if (this.#vals.has(sym)) {
-            this.#vals.get(sym)!.isCaptured = true;
-        } else if (this.outer) {
-            this.outer.markCaptured(sym);
-        }
-    }
-
-    findVarScope(sym: symbol): AnalysisScope | null {
-        if (this.#vals.has(sym)) return this;
-        return this.outer ? this.outer.findVarScope(sym) : null;
+        return this.#use(sym) !== null;
     }
 
     markMutable(sym: symbol) {
-        const ownerScope = this.findVarScope(sym);
-        if (ownerScope) {
-            const meta = ownerScope.#vals.get(sym)!;
-            meta.mutable = true;
-            // If the scope where it's defined is an ancestor of the current scope, it's captured!
-            if (ownerScope !== this) {
-                meta.isCaptured = true;
-            }
-        }
+        const meta = this.#use(sym);
+        if (meta !== null) meta.mutable = true;
     }
 }
 

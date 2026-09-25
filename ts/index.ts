@@ -1,6 +1,7 @@
 export * from './anima';
 export { impl as implRvm, implAot as implRvmAot } from './bytecode-rvm/meta'
 export { Table } from './table';
+export { Env } from './env';
 export { BuiltinFunction } from './std';
 export { Cons } from './list';
 

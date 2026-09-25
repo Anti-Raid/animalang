@@ -4,6 +4,7 @@ import {
     UnhandledSchemeError,
     isTruthy,
     Table,
+    Env,
     IProcedure,
     type AbstractVM,
     AbstractByteCode,
@@ -46,6 +47,10 @@ export enum OpCode {
     COYIELD,
     CALLRT,
     CORESUME,
+    BLOCK,
+    LOOP,
+    ENDLOOP,
+    JUMP,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -71,6 +76,10 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.COYIELD]: 2,
     [OpCode.CALLRT]: 5,
     [OpCode.CORESUME]: 4,
+    [OpCode.BLOCK]: 2,
+    [OpCode.LOOP]: 2,
+    [OpCode.ENDLOOP]: 2,
+    [OpCode.JUMP]: 2,
 };
 
 export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecutor) => Frame | null;
@@ -311,7 +320,7 @@ export class ExecutionContext {
 
     constructor(
         public vm: AbstractVM,
-        public scope: Table
+        public scope: Env
     ) {
         this.id = ++ExecutionContext.nextId;
     }
@@ -341,7 +350,7 @@ export class Coroutine extends OpaqueValue {
     public resumer: { ctx: ExecutionContext, frame: Frame | null } | null = null;
     public readonly ctx: ExecutionContext;
 
-    constructor(public readonly proc: any, vm: AbstractVM, scope: Table) {
+    constructor(public readonly proc: any, vm: AbstractVM, scope: Env) {
         super();
         this.ctx = new ExecutionContext(vm, scope);
         this.ctx.coroutine = this;
@@ -736,7 +745,7 @@ export class VMExecutor {
     // runs a coroutine to its next yield or return in a nested driver loop and returns the value (used by the host and by direct-mode code)
 
     public coResumeNested(ctx: ExecutionContext | null, co: any, args: any[]): any {
-        const barrier = new ExecutionContext(this.vm, co instanceof Coroutine ? co.ctx.scope : new Table());
+        const barrier = new ExecutionContext(this.vm, co instanceof Coroutine ? co.ctx.scope : new Env());
         barrier.barrier = true;
         const outer = ctx?.coroutine ?? null;
         const frame = this.coResume(barrier, null, co, args);
@@ -959,6 +968,17 @@ export class BytecodeInterpreter {
                     case OpCode.ENDIF: {
                         break;
                     }
+                    // BLOCK and LOOP only mark structure (their operand is the end, used by AOT)
+                    case OpCode.BLOCK:
+                    case OpCode.LOOP: {
+                        ip++;
+                        break;
+                    }
+                    case OpCode.ENDLOOP:
+                    case OpCode.JUMP: {
+                        ip = inst[ip];
+                        break;
+                    }
                     case OpCode.NEWCLOSURE: {
                         const destReg = inst[ip++];
                         const template = constants[inst[ip++]] as ClosureTemplate;
@@ -1098,6 +1118,7 @@ const JIT_DEPS = {
     MAX_JS_DEPTH,
     MAX_NESTED_RESUMES,
     Table,
+    Env,
     Frame,
     Suspend,
 };
@@ -1119,7 +1140,9 @@ type AotInst = { at?: number } & (
     | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number });
 
 type AotTerm = { at?: number } & (
-    | { k: "Jump"; target: number }
+    // `escape` jumps leave a %block early; `loopBack` jumps close a %loop
+    | { k: "Jump"; target: number; escape?: boolean; loopBack?: boolean }
+    | { k: "Block" | "Loop"; body: number; end: number }
     | { k: "Branch"; cond: number; then: number; else: number }
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
@@ -1181,7 +1204,7 @@ export class AotCompiler {
 
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
         const source = this.generateSource(code, tmpl);
-        const globalCache: Record<number, { scope: Table | null, version: number, value: any }> = {};
+        const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (let ip = 0; ip < code.inst.length; ip += INSTRUCTION_LENGTHS[code.inst[ip] as OpCode]) {
             if (code.inst[ip] === OpCode.LOADGLOBAL) globalCache[ip] = { scope: null, version: -1, value: undefined };
         }
@@ -1215,6 +1238,13 @@ export class AotCompiler {
                     blocks.add(inst[ip + 2]);
                     break;
                 case OpCode.ELSE:
+                    blocks.add(inst[ip + 1]);
+                    break;
+                case OpCode.BLOCK:
+                case OpCode.LOOP:
+                case OpCode.ENDLOOP:
+                case OpCode.JUMP:
+                    blocks.add(nextIp);
                     blocks.add(inst[ip + 1]);
                     break;
                 case OpCode.COYIELD:
@@ -1298,6 +1328,18 @@ export class AotCompiler {
                         break;
                     case OpCode.ENDIF:
                         term = { k: "Jump", target: ip };
+                        break;
+                    case OpCode.BLOCK:
+                    case OpCode.LOOP: {
+                        const end = inst[ip++];
+                        term = { k: opcode === OpCode.BLOCK ? "Block" : "Loop", body: ip, end };
+                        break;
+                    }
+                    case OpCode.ENDLOOP:
+                        term = { k: "Jump", target: inst[ip++], loopBack: true };
+                        break;
+                    case OpCode.JUMP:
+                        term = { k: "Jump", target: inst[ip++], escape: true };
                         break;
                     case OpCode.CALL: {
                         const procIdx = inst[ip++];
@@ -1448,6 +1490,7 @@ class Liveness {
     static #successors(term: AotTerm): number[] {
         switch (term.k) {
             case "Jump": return [term.target];
+            case "Block": case "Loop": return [term.body];
             case "Branch": return [term.then, term.else];
             case "Call": case "Yield": return [term.resume];
             case "Apply": case "CallCC": case "CoResume": return term.isTail ? [] : [term.resume];
@@ -1570,12 +1613,12 @@ abstract class FunctionEmitter extends CodeEmitter {
     protected jump(target: number, next: number): string {
         if (target === next && target < this.inst.length) return "";
         if (target >= this.inst.length) return this.endOfCode;
-        return `ip = ${target}; continue;`;
+        return `ip = ${target}; continue top;`;
     }
 
     protected branch(term: Extract<AotTerm, { k: "Branch" }>, next: number): string {
         if (term.then === next) return `if (!isTruthy(r${term.cond})) { ${this.jump(term.else, -1)} }`;
-        return `ip = isTruthy(r${term.cond}) ? ${term.then} : ${term.else}; continue;`;
+        return `ip = isTruthy(r${term.cond}) ? ${term.then} : ${term.else}; continue top;`;
     }
 
     protected procExpr(proc: ProcRef): string {
@@ -1618,7 +1661,7 @@ abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`
                     {
                         const cache = GLOBAL_CACHE[${inst.ip}];
-                        if (cache.scope === ctx.scope && cache.version === Table.globalsVersion) {
+                        if (cache.scope === ctx.scope && cache.version === Env.globalsVersion) {
                             r${inst.dst} = cache.value;
                         } else {
                             const val = ctx.scope.lookup(CONSTANTS[${inst.sym}], MISSING);
@@ -1628,7 +1671,7 @@ abstract class FunctionEmitter extends CodeEmitter {
                             }
                             ctx.scope.watch();
                             cache.scope = ctx.scope;
-                            cache.version = Table.globalsVersion;
+                            cache.version = Env.globalsVersion;
                             cache.value = val;
                             r${inst.dst} = val;
                         }
@@ -1739,7 +1782,7 @@ class ResumeEmitter extends FunctionEmitter {
                 let ip = frame.ip, tmp;
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 try {
-                    while (true) {
+                    top: while (true) {
                         switch (ip) {
         `);
         this.emitSwitchBody();
@@ -1764,6 +1807,9 @@ class ResumeEmitter extends FunctionEmitter {
                 return this.emit(this.jump(term.target, next));
             case "Branch":
                 return this.emit(this.branch(term, next));
+            case "Block":
+            case "Loop":
+                return this.emit(this.jump(term.body, next));
             case "Call":
                 return this.emit(`
                     {
@@ -1795,7 +1841,7 @@ class ResumeEmitter extends FunctionEmitter {
                         if (proc === frame.closure && !frame.isShared(ctx)) {
                             ${this.selfMoves(term)}
                             ip = 0;
-                            continue;
+                            continue top;
                         }
                         frame.ip = ${term.ip};
                         ${this.#spills(windowRegs(term.start, term.nargs))}
@@ -1871,14 +1917,14 @@ class DirectEmitter extends FunctionEmitter {
         const structured = this.#structuredBody();
         if (structured !== null) {
             this.emit(`
-                    for (;;) {
+                    top: for (;;) {
                         ${structured}
                         return undefined;
                     }
             `);
         } else {
             this.emit(`
-                    while (true) {
+                    top: while (true) {
                         switch (ip) {
             `);
             this.emitSwitchBody();
@@ -1916,6 +1962,8 @@ class DirectEmitter extends FunctionEmitter {
         return body.toString();
     }
 
+    readonly #blockLabels = new Map<number, string>();
+
     #walk(index: Map<number, number>, from: number, stop: number): void {
         const { blocks, inst } = this;
         let i = index.get(from);
@@ -1940,7 +1988,38 @@ class DirectEmitter extends FunctionEmitter {
                 if (i === undefined) throw STRUCTURE_MISMATCH;
                 continue;
             }
+            if (term.k === "Block" || term.k === "Loop") {
+                if (term.body !== next) throw STRUCTURE_MISMATCH;
+                if (term.k === "Block") {
+                    // escapes to the block's end become `break` of a label unique to this block
+                    const label = `B${block.start}`;
+                    const outer = this.#blockLabels.get(term.end);
+                    this.#blockLabels.set(term.end, label);
+                    this.emit(`${label}: {`);
+                    this.#walk(index, term.body, term.end);
+                    this.emit(`}`);
+                    if (outer === undefined) this.#blockLabels.delete(term.end);
+                    else this.#blockLabels.set(term.end, outer);
+                } else {
+                    this.emit(`for (;;) {`);
+                    this.#walk(index, term.body, term.end);
+                    this.emit(`}`);
+                }
+                if (term.end >= stop) return;
+                i = index.get(term.end);
+                if (i === undefined) throw STRUCTURE_MISMATCH;
+                continue;
+            }
             if (term.k === "Jump") {
+                if (term.escape) {
+                    const label = this.#blockLabels.get(term.target);
+                    if (label === undefined) throw STRUCTURE_MISMATCH;
+                    this.emit(`break ${label};`);
+                    i++;
+                    continue;
+                }
+                // the back edge closing the loop being walked: the js for loop repeats by itself
+                if (term.loopBack) return;
                 if (term.target < stop) throw STRUCTURE_MISMATCH;
                 return;
             }
@@ -1978,6 +2057,9 @@ class DirectEmitter extends FunctionEmitter {
                 return this.emit(this.jump(term.target, next));
             case "Branch":
                 return this.emit(this.branch(term, next));
+            case "Block":
+            case "Loop":
+                return this.emit(this.jump(term.body, next));
             case "Call": {
                 const args = this.argList(term.start, term.nargs);
                 return this.emit(`
@@ -2010,7 +2092,7 @@ class DirectEmitter extends FunctionEmitter {
                         if (proc === closure) {
                             ${this.selfMoves(term)}
                             ip = 0;
-                            continue;
+                            continue top;
                         }
                         ${this.#tailCall("proc", term.start, term.nargs)}
                     }

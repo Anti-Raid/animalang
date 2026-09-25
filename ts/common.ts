@@ -1,7 +1,8 @@
 import { Cons } from "./list";
 import { Table } from "./table";
+import { Env } from "./env";
 
-export { Cons, Table };
+export { Cons, Table, Env };
 
 /** Returns if a value is truthy or not */
 export const isTruthy = (val: any): boolean => {
@@ -102,6 +103,12 @@ export const CORE_LAMBDA = Symbol.for("%lambda");
 export const CORE_QUOTE = Symbol.for("%quote");
 export const CORE_BEGIN = Symbol.for("%begin");
 export const CORE_SET = Symbol.for("%set!");
+// structured control flow within one function: (%block name body ...), (%escape name [expr]), (%loop body ...)
+export const CORE_BLOCK = Symbol.for("%block");
+export const CORE_ESCAPE = Symbol.for("%escape");
+export const CORE_LOOP = Symbol.for("%loop");
+// (%let ((x init) ...) body ...): lexical bindings without a lambda
+export const CORE_LET = Symbol.for("%let");
 export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
@@ -133,6 +140,10 @@ export const SPECIAL_FORMS = new Set([
     CORE_QUOTE,
     CORE_BEGIN,
     CORE_SET,
+    CORE_BLOCK,
+    CORE_ESCAPE,
+    CORE_LOOP,
+    CORE_LET,
     OP_DEFINE_GLOBAL,
     OP_AT,
 ])
@@ -1220,8 +1231,8 @@ export interface AbstractClosure extends SerializableBytecode {}
 // eslint-disable-next-line
 export interface AbstractByteCode extends SerializableBytecode {}
 export interface AbstractVM {
-    evaluateRaw(code: AbstractByteCode, scope: Table): any,
-    evaluateClosure(code: AbstractClosure, scope: Table, args: any[]): any,
+    evaluateRaw(code: AbstractByteCode, scope: Env): any,
+    evaluateClosure(code: AbstractClosure, scope: Env, args: any[]): any,
     resumeCoroutine(co: any, args: any[]): { done: boolean, value: any, values: any[] },
     closeCoroutine(co: any): void,
     traceback(co: any, msg?: string): string

@@ -1,10 +1,10 @@
 // Made w/ lots of help from gemini cli
-import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, ASPParseError, BS, BSReader } from './common';
+import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, Env, ASPParseError, BS, BSReader } from './common';
 import { describe, it, expect } from 'vitest';
 import { Cons } from './list';
 import { BuiltinFunction } from './std';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
-import { BUILTINS_START } from './bytecode-rvm/exec';
+import { BUILTINS_START, INSTRUCTION_LENGTHS } from './bytecode-rvm/exec';
 import { Anima } from './anima';
 import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
@@ -29,6 +29,11 @@ describe('Anima', () => {
     };
 
     describe('Primitives, Strings & Symbols', () => {
+        it('table-border is the array-part border and is inlined', () => {
+            expect(run(`(define (tb t) (table-border t)) (let ((t {1 "a" 2 "b" 3 "c"})) (table-set! t 2 <#void>) (list (tb t) (tb {}) (tb {"x" 1}) (table-size t)))`)).toBe("(1 0 0 2)")
+            expect(run(`(let ((t {})) (table-set! t 2 "b") (table-set! t 1 "a") (table-border t))`)).toBe("2")
+            expect(() => run(`(define (tb2 t) (table-border t)) (tb2 '())`)).toThrow("table-border requires a table")
+        })
         it('inlined n-ary arithmetic agrees with the builtins', () => {
             const outcome = (src: string) => {
                 try {
@@ -50,8 +55,8 @@ describe('Anima', () => {
             }
         })
         it('table intrinsics inline and fall back to the builtin for errors', () => {
-            expect(run(`(define tt {"a" 1 "v" <#void>}) (define (tget t k) (table-ref t k)) (list (tget tt "a") (tget tt "v") (table-ref tt "zz" 7))`)).toBe("(1 <#void> 7)")
-            expect(run(`(define tp {"x" 1}) (define tc (table-chain tp)) (define (tget2 t k) (table-ref t k)) (table-set! tc "y" 2) (list (tget2 tc "x") (tget2 tc "y") (table-has? tc "x") (table-has? tp "y"))`)).toBe("(1 2 #t #f)")
+            expect(run(`(define tt {"a" 1 "v" <#void>}) (define (tget t k) (table-ref t k)) (list (tget tt "a") (table-has? tt "v") (table-ref tt "zz" 7))`)).toBe("(1 #f 7)")
+            expect(run(`(define tp {"x" 1}) (define (tget2 t k) (table-ref t k)) (table-set! tp "y" 2) (list (tget2 tp "x") (tget2 tp "y") (table-has? tp "x") (table-has? tp "z"))`)).toBe("(1 2 #t #f)")
             expect(run(`(define (tput! t k v) (table-set! t k v)) (define tw {}) (list (tput! tw "k" 5) (table-ref tw "k"))`)).toBe("(<#void> 5)")
             expect(() => run(`(define (tget3 t k) (table-ref t k)) (tget3 {"a" 1} "b")`)).toThrow("table-ref: key not found: b")
             expect(() => run(`(define (tget4 t k) (table-ref t k)) (tget4 5 "b")`)).toThrow("table-ref requires a table")
@@ -411,8 +416,8 @@ describe('Anima', () => {
 
             const bc = evaluator.compileRaw("(+ gx 1)");
             const vm = new AnimaVM("aot");
-            const scopeA = new Table(); scopeA.set(Symbol.for("gx"), 1);
-            const scopeB = new Table(); scopeB.set(Symbol.for("gx"), 10);
+            const scopeA = new Env(); scopeA.set(Symbol.for("gx"), 1);
+            const scopeB = new Env(); scopeB.set(Symbol.for("gx"), 10);
             expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
             expect(vm.evaluateRaw(bc as ByteCode, scopeB)).toBe(11);
             expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
@@ -1471,6 +1476,153 @@ describe('Anima', () => {
         })
     });
 
+    describe('Structured control flow (%block / %escape / %loop)', () => {
+        it('blocks yield their body or an escaped value', () => {
+            expect(run(`(%block k 1 2)`)).toBe("2")
+            expect(run(`(%block k (%escape k 5) 6)`)).toBe("5")
+            expect(run(`(%block k (%escape k))`)).toBe("<#void>")
+            expect(run(`(%block a (+ 1 (%block b (%escape a 10))))`)).toBe("10")
+            expect(run(`(%block a (+ 1 (%block b (%escape b 10))))`)).toBe("11")
+            expect(run(`(%block k (%block k (%escape k 1)) 2)`)).toBe("2")
+        })
+
+        it('loops run until an escape, with break and continue as blocks', () => {
+            expect(run(`(define (count-to n) (let ((i 0)) (%block done (%loop (%if (= i n) (%escape done i) (%begin)) (set! i (+ i 1)))))) (count-to 1000000)`)).toBe("1000000")
+            // continue = escape to a block around the body, so the step still runs
+            expect(run(`(define (sum-odds n)
+                          (let ((i 0) (sum 0))
+                            (%block break
+                              (%loop
+                                (%if (> i n) (%escape break sum) (%begin))
+                                (%block continue
+                                  (%if (even? i) (%escape continue) (%begin))
+                                  (set! sum (+ sum i)))
+                                (set! i (+ i 1))))))
+                        (sum-odds 10)`)).toBe("25")
+            // nested loops: escaping the inner one only
+            expect(run(`(define (pairs n) (let ((i 0) (acc '()))
+                          (%block outer (%loop
+                            (%if (= i n) (%escape outer (reverse acc)) (%begin))
+                            (let ((j 0))
+                              (%block inner (%loop
+                                (%if (= j i) (%escape inner) (%begin))
+                                (set! acc (cons (list i j) acc))
+                                (set! j (+ j 1)))))
+                            (set! i (+ i 1))))))
+                        (pairs 3)`)).toBe("((1 0) (2 0) (2 1))")
+        })
+
+        it('early return from a function is an escape in tail position', () => {
+            expect(run(`(define (find-first pred xs)
+                          (let ((l xs))
+                            (%block return
+                              (%loop
+                                (%if (null? l) (%escape return #f) (%begin))
+                                (%if (pred (car l)) (%escape return (car l)) (%begin))
+                                (set! l (cdr l))))))
+                        (find-first even? '(1 3 4 5 6))`)).toBe("4")
+            // a named let is a real lambda, so escaping out of it is rejected
+            expect(() => run(`(%block return (let loop ((l '(1))) (%escape return l)))`)).toThrow("from inside a lambda")
+            // the escaped value is computed in tail position, so this does not grow the stack
+            expect(run(`(define (down n) (%block k (%if (= n 0) (%escape k 'done) (%escape k (down (- n 1)))))) (down 100000)`)).toBe("done")
+        })
+
+        it('each iteration can capture its own variable', () => {
+            expect(run(`(let ((fs '()) (i 0))
+                          (%block d (%loop
+                            (%if (= i 3) (%escape d) (%begin))
+                            (let ((j i)) (set! fs (cons (lambda () j) fs)))
+                            (set! i (+ i 1))))
+                          (map (lambda (f) (f)) fs))`)).toBe("(2 1 0)")
+        })
+
+        it('works across call/cc re-entry and coroutine yields', () => {
+            // i is a variable (a location), so a re-entry continues from its current value rather than from 1;
+            // entries bounds the re-entries, since the continuation includes the rest of the program
+            expect(run(`(define saved #f)
+                        (define hits 0)
+                        (define entries 0)
+                        (define (loop-with-k)
+                          (let ((i 0))
+                            (%block done (%loop
+                              (%if (>= i 3) (%escape done i) (%begin))
+                              (%if (= i 1) (call/cc (lambda (k) (set! saved k))) (%begin))
+                              (set! hits (+ hits 1))
+                              (set! i (+ i 1))))))
+                        (define r (loop-with-k))
+                        (set! entries (+ entries 1))
+                        (%if (< entries 3) (saved #f) (list r hits entries))`)).toBe("(5 5 3)")
+            expect(run(`(define gen (coroutine-create (lambda () (let ((i 0)) (%block d (%loop (%if (= i 3) (%escape d 'end) (%begin)) (coroutine-yield i) (set! i (+ i 1))))))))
+                        (list (coroutine-resume gen) (coroutine-resume gen) (coroutine-resume gen) (coroutine-resume gen))`)).toBe("(0 1 2 end)")
+        })
+
+        it('rejects escapes that leave a lambda or name no block', () => {
+            expect(() => run(`(%block k (map (lambda (x) (%escape k x)) '(1)))`)).toThrow("cannot escape to block k from inside a lambda")
+            expect(() => run(`(%escape nope 1)`)).toThrow("no enclosing block named nope")
+            expect(() => run(`(%block 5 1)`)).toThrow("%block requires a block name symbol")
+            // a let is an inlined lambda, so escaping through it is fine
+            expect(run(`(%block k (let ((x 1)) (%escape k (+ x 1))))`)).toBe("2")
+        })
+
+        it('keeps the structured direct entry in AOT', () => {
+            if (_mode !== "aot") return
+            const f = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (n) (let ((i 0)) (%block d (%loop (%if (= i n) (%escape d i) (%begin)) (set! i (+ i 1))))))`))
+            expect(f.tmpl.code.directFn).not.toBeNull()
+        })
+    });
+
+    describe('%let', () => {
+        // whether a variable is boxed shows up as BOX instructions in the procedure's code
+        const boxesIn = (src: string): number => {
+            const closure = evaluator.evaluateRaw(evaluator.compileRaw(src))
+            const inst: Uint32Array = closure.tmpl.code.inst
+            let boxes = 0
+            for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) if (inst[ip] === OpCode.BOX) boxes++
+            return boxes
+        }
+
+        it('does not box variables that are only read inside a let', () => {
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (let* ((y (+ x n))) (+ x y n))))`)).toBe(0)
+            // captured by a real lambda: boxed
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (+ x n))))`)).toBe(2)
+            // assigned: boxed (continuations must see it as one location)
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (set! x n) x))`)).toBe(1)
+        })
+
+        it('turns immediately applied lambdas into lets', () => {
+            expect(run(`((lambda (a b) (+ a b)) 1 2)`)).toBe("3")
+            expect(run(`((lambda (a . rest) (list a rest)) 1 2 3)`)).toBe("(1 (2 3))")
+            expect(run(`((lambda args args) 1 2)`)).toBe("(1 2)")
+            expect(run(`((lambda () (define z 4) (* z z)))`)).toBe("16")
+            // escapes pass through them like any let
+            expect(run(`(%block k ((lambda (x) (%escape k (* x 10))) 4))`)).toBe("40")
+            // a wrong argument count stays a real call and fails at runtime
+            expect(() => run(`((lambda (a b) a) 1)`)).toThrow()
+        })
+
+        it('scopes like let, let* and letrec', () => {
+            expect(run(`(let ((x 1)) (let ((x 2) (y x)) (list x y)))`)).toBe("(2 1)")
+            expect(run(`(let* ((x 1) (y (+ x 1))) (list x y))`)).toBe("(1 2)")
+            expect(run(`(letrec ((ev? (lambda (n) (if (= n 0) #t (od? (- n 1))))) (od? (lambda (n) (if (= n 0) #f (ev? (- n 1)))))) (ev? 10))`)).toBe("#t")
+            expect(run(`(let () 5)`)).toBe("5")
+            expect(run(`(%let ((a 1) (b 2)) (define c 3) (+ a b c))`)).toBe("6")
+            expect(() => run(`(%let ((a 1) (a 2)) a)`)).toThrow("duplicate parameter name")
+            expect(() => run(`(%let (a) a)`)).toThrow("let binding bad syntax")
+        })
+    });
+
+    describe('Macro expansion limits', () => {
+        it('stops a macro that keeps expanding into itself through a body', () => {
+            expect(() => run(`(anima-macro self-ref (list 'lambda '() (list 'self-ref))) (self-ref)`)).toThrow(/nested too deeply|expansion limit/)
+        })
+
+        it('expands deep but finite programs', () => {
+            const clauses = Array.from({ length: 1000 }, (_, i) => `((= x ${i}) ${i})`).join(" ")
+            expect(run(`(define x 999) (cond ${clauses} (else -1))`)).toBe("999")
+            expect(run(Array.from({ length: 500 }, () => "((lambda () ").join("") + "1" + "))".repeat(500))).toBe("1")
+        })
+    });
+
     describe('Debugging & tracebacks', () => {
         const runFile = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src, "t.anima"));
         const errorOf = (src: string): any => {
@@ -1595,6 +1747,37 @@ describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s
     it("keeps the prelude out of the tail history", () => {
         const err = errorOf(`(define (g) (raise 'x)) (list (g))`);
         expect(err.animaTraceback).toBe("x\nstack traceback:\n  t.anima:1:31 in top-level\nrecent tail calls (newest first):\n  raise");
+    });
+});
+
+describe("Table internals", () => {
+    it('border() is always a valid border and contents match a plain Map under random edits', () => {
+        let seed = 12345
+        const rand = (n: number) => {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            return seed % n
+        }
+        const problems: string[] = []
+        for (let round = 0; round < 20; round++) {
+            const t = new Table()
+            const model = new Map<any, any>()
+            for (let step = 0; step < 150; step++) {
+                const key = rand(10) === 0 ? `s${rand(3)}` : rand(12) + 1
+                if (rand(3) === 0) {
+                    t.set(key, undefined)
+                    model.delete(key)
+                } else {
+                    const val = rand(100)
+                    t.set(key, val)
+                    model.set(key, val)
+                }
+                const n = t.border()
+                if ((n > 0 && !t.has(n)) || t.has(n + 1)) problems.push(`round ${round} step ${step}: ${n} is not a border`)
+                if (t.size !== model.size) problems.push(`round ${round} step ${step}: size ${t.size} != ${model.size}`)
+            }
+            for (const [k, v] of model) if (t.get(k) !== v) problems.push(`round ${round}: ${k} is ${t.get(k)}, expected ${v}`)
+        }
+        expect(problems).toEqual([])
     });
 });
 
@@ -1981,15 +2164,6 @@ describe('Tables (using Table class)', () => {
         const entries = [...t.entries()];
         expect(entries.length).toBe(3);
 
-        // Chaining
-        const child = t.chained();
-        expect(child.parent).toBe(t);
-        expect(child.get("name")).toBe("Willow");
-        child.set("name", "Luna");
-        expect(child.get("name")).toBe("Luna");
-        expect(t.get("name")).toBe("Willow");
-        expect(child.size).toBe(4);
-
         // JS freeze
         t.frozen = true;
         expect(t.frozen).toBe(true);
@@ -2011,63 +2185,36 @@ describe('Tables (using Table class)', () => {
         expect(rawT.get("count")).toBe(5);
     });
 
-    it('supports table-chain, table-entries and table-current-entries in Scheme', () => {
-        const script = `
-            (let ((parent {"a" 1 "b" 2}))
-              (let ((child (table-chain parent)))
-                (begin
-                  (table-set! child "b" 20)
-                  (table-set! child "c" 30)
-                  (list
-                    (table-ref child "a")
-                    (table-ref child "b")
-                    (table-ref parent "b")
-                    (table-size child)
-                    (vector-length (table-current-entries child))
-                    (vector-length (table-current-entries parent))
-                    (vector-length (table-entries child))))))
-        `;
-        expect(run(script)).toBe("(1 20 2 4 2 2 4)");
+    it('stores keys 1..n in an array part and treats <#void> as absent', () => {
+        const t = new Table();
+        t.set(2, "b"); t.set(1, "a"); t.set("k", "v"); t.set(3, "c");
+        expect(t.border()).toBe(3);
+        expect([...t.entries()]).toEqual([[1, "a"], [2, "b"], [3, "c"], ["k", "v"]]);
 
-        // table-chain with frozen = #t
-        const frozenChildScript = `
-            (let ((parent {"a" 1}))
-              (let ((child (table-chain parent #t)))
-                (table-frozen? child)))
-        `;
-        expect(run(frozenChildScript)).toBe("#t");
+        // removing from the middle keeps the array part dense; the rest stays reachable
+        t.set(2, undefined);
+        expect(t.border()).toBe(1);
+        expect(t.has(2)).toBe(false);
+        expect(t.get(3)).toBe("c");
+        expect(t.size).toBe(3);
+        t.set(2, "B");
+        expect(t.border()).toBe(3);
+        expect([...t.keys()]).toEqual([1, 2, 3, "k"]);
+
+        // 1.0 and 1 are the same key, and so are 0 and -0
+        t.set(1.0, "one"); t.set(-0, "zero");
+        expect(t.get(1)).toBe("one");
+        expect(t.get(0)).toBe("zero");
+
+        expect(() => t.set(NaN, 1)).toThrow("table key cannot be NaN");
+        expect(() => t.set(undefined, 1)).toThrow("table key cannot be <#void>");
+        expect(t.get(NaN)).toBeUndefined();
     });
 
-    it('supports chained tables', () => {
-        const root = new Table();
-        root.set("a", 1);
-        root.set("b", 2);
-
-        const child = root.chained();
-        child.set("b", 20);
-        child.set("c", 30);
-
-        expect(child.parent).toBe(root);
-        expect(child.size).toBe(4);
-        expect(child.has("a")).toBe(true);
-        expect(child.get("a")).toBe(1);
-        expect(child.get("b")).toBe(20);
-        expect(root.get("b")).toBe(2);
-        expect(child.get("missing")).toBeUndefined();
-        expect(child.has("missing")).toBe(false);
-
-        // grandchild chaining
-        const grand = child.chained();
-        expect(grand.parent).toBe(child);
-        expect(grand.has("a")).toBe(true);
-        expect(grand.get("a")).toBe(1);
-        expect(grand.get("b")).toBe(20);
-        expect(grand.get("c")).toBe(30);
-        expect(grand.has("missing")).toBe(false);
-        // currentEntries only returns own entries
-        expect([...root.currentEntries()]).toEqual([["a", 1], ["b", 2]]);
-        expect([...child.currentEntries()]).toEqual([["b", 20], ["c", 30]]);
-        expect([...grand.currentEntries()]).toEqual([]);
+    it('table-set! of <#void> removes the key in Scheme', () => {
+        expect(run(`(let ((t {"a" 1 "b" 2})) (table-set! t "a" <#void>) (list (table-has? t "a") (table-size t) (table-ref t "a" 'gone)))`)).toBe("(#f 1 gone)")
+        expect(run(`(let ((t {1 "x" 2 "y" 3 "z"})) (table-set! t 2 <#void>) (list (table-size t) (table-ref t 3) (vector-length (table-entries t))))`)).toBe(`(2 "z" 2)`)
+        expect(run(`(table-size {"a" <#void>})`)).toBe("0")
     });
 });
 

@@ -1,4 +1,4 @@
-import { ASTStringifier, ErrorObject, Table, unpackValues, type AbstractVM } from "../common";
+import { ASTStringifier, ErrorObject, Env, unpackValues, type AbstractVM } from "../common";
 import { OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 
 export {
@@ -25,13 +25,13 @@ export class AnimaVM implements AbstractVM {
         this.executor = new VMExecutor(this);
     }
 
-    public evaluateRaw(code: ByteCode, scope: Table): any {
+    public evaluateRaw(code: ByteCode, scope: Env): any {
         const ctx = new ExecutionContext(this, scope);
         const topClosure = new Closure(new ClosureTemplate([], null, code, []), [], "top-level");
         return this.#run(ctx, this.executor.newFrame(ctx, topClosure, createRegs(code.numReg), null));
     }
 
-    public evaluateClosure(code: Closure, scope: Table, args: any[]): any {
+    public evaluateClosure(code: Closure, scope: Env, args: any[]): any {
         const ctx = new ExecutionContext(this, scope);
         const cargs = this.executor.createClosureArg(code.tmpl, args.length, args, 0);
         return this.#run(ctx, this.executor.newFrame(ctx, code, cargs, null));

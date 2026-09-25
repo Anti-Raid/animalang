@@ -10,10 +10,14 @@ import {
     CORE_QUOTE,
     CORE_BEGIN,
     CORE_SET,
+    CORE_BLOCK,
+    CORE_ESCAPE,
+    CORE_LOOP,
+    CORE_LET,
     AbstractClosure,
     Cons
 } from "../common";
-import { MacroEvaluator, TransformState } from "./macro";
+import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
 import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops";
 
 const cons = (a: any, b: any) => new Cons(a, b);
@@ -75,6 +79,41 @@ const normalizeDefine = (stmt: any): any => {
     throw new Error(`define syntax error`);
 };
 
+// a body (of a lambda or let) with internal defines gets them as a letrec; `build(body, done)` makes the form around
+// it, `done` saying whether the body is already transformed (otherwise the result is transformed again)
+const lowerBody = (evaluator: MacroEvaluator, rawBody: any, form: string, build: (body: any, done: boolean) => any): TransformResult => {
+    const flat = removeBegin(rawBody);
+    if (flat === null) throw new Error(`${form} body must contain at least one expression`);
+
+    const defines: any[] = [];
+    const body: any[] = [];
+    for (const stmt of toArray(flat)) {
+        if (stmt instanceof Cons && stmt.car === OP_DEFINE) {
+            const normalizedStmt = normalizeDefine(stmt);
+            defines.push(list(normalizedStmt.cdr.car, normalizedStmt.cdr.cdr.car));
+        } else {
+            body.push(stmt);
+        }
+    }
+
+    if (defines.length === 0) {
+        return { expanded: build(fromArray(body.map(stmt => evaluator.transform(stmt))), true), state: TransformState.ReturnImm };
+    }
+    if (body.length === 0) {
+        throw new Error(`${form} body must contain at least one expression after internal/local defines etc.`);
+    }
+    return { expanded: build(list(cons(OP_LETREC, cons(fromArray(defines), fromArray(body)))), false), state: TransformState.Recurse };
+};
+
+const letBindings = (form: string, bindingsCons: any): [symbol, any][] => {
+    if (bindingsCons !== null && !(bindingsCons instanceof Cons)) throw new Error(`${form} bindings must be a list of form ((var expr)...)`);
+    return toArray(bindingsCons).map(binding => {
+        if (!(binding instanceof Cons) || !(binding.cdr instanceof Cons) || binding.cdr.cdr !== null) throw new Error(`${form} binding bad syntax`);
+        if (typeof binding.car !== "symbol") throw new Error(`${form} binding name must be a symbol`);
+        return [binding.car, binding.cdr.car];
+    });
+};
+
 export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     // surface forms that map one to one onto core forms (the core form itself is accepted too, e.g. from a transpiler)
     const lowerTo = (core: symbol, validate: (orig: Cons) => void, state = TransformState.DoChildren) => (evaluator: MacroEvaluator, expr: any, orig: any) => {
@@ -96,10 +135,54 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     coreForm(OP_QUOTE, CORE_QUOTE, orig => {
         if (orig.length !== 2) throw new Error(`quote must be in format ["quote", expr] but have ${orig.length - 1} arguments`);
     }, TransformState.ReturnImm);
+    const blockName = (form: string, orig: Cons) => {
+        if (!(orig.cdr instanceof Cons) || typeof orig.cdr.car !== "symbol") throw new Error(`${form} requires a block name symbol`);
+    };
+    for (const [core, validate] of [
+        [CORE_BLOCK, (orig: Cons) => blockName("%block", orig)],
+        [CORE_ESCAPE, (orig: Cons) => {
+            blockName("%escape", orig);
+            if (orig.length > 3) throw new Error("%escape must be in format (%escape name [value])");
+        }],
+        [CORE_LOOP, () => {}],
+    ] as const) {
+        evaluator.registerTransform(core, lowerTo(core, validate));
+    }
     coreForm(OP_SET, CORE_SET, orig => {
         if (orig.length !== 3) throw new Error(`set! must have 2 arguments`);
         if (typeof orig.cdr.car !== "symbol") throw new Error(`${String(orig.cdr.car)} not symbol`);
         ensureCanBind(orig.cdr.car, undefined, "set!");
+    });
+
+    evaluator.registerTransform(CORE_LET, (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`let bad syntax`);
+        const bindings = letBindings("let", expr.car);
+        return lowerBody(evaluator, expr.cdr, "let", (body, done) => {
+            const inits = bindings.map(([name, init]) => list(name, done ? evaluator.transform(init) : init));
+            return cons(CORE_LET, cons(fromArray(inits), body));
+        });
+    });
+
+    // an immediately applied lambda is just a let
+    evaluator.setApplicationTransform((evaluator, expr) => {
+        const head = expr.car;
+        if (!(head instanceof Cons) || (head.car !== OP_LAMBDA && head.car !== CORE_LAMBDA) || !(head.cdr instanceof Cons) || head.cdr.cdr === null) return null;
+        const args = toArray(expr.cdr);
+        const bindings: any[] = [];
+        let params: any = head.cdr.car;
+        while (params instanceof Cons) {
+            if (bindings.length >= args.length) return null;
+            bindings.push(list(params.car, args[bindings.length]));
+            params = params.cdr;
+        }
+        if (params === null) {
+            if (bindings.length !== args.length) return null;
+        } else if (typeof params === "symbol") {
+            bindings.push(list(params, cons(Symbol.for("list"), fromArray(args.slice(bindings.length)))));
+        } else {
+            return null;
+        }
+        return { expanded: cons(CORE_LET, cons(fromArray(bindings), head.cdr.cdr)), state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(OP_COND, (evaluator, expr, orig) => {
@@ -168,8 +251,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             return { expanded: namedLetExpr, state: TransformState.Recurse };
         }
         
-        const lambdaExpr = cons(OP_LAMBDA, cons(paramsList, bodyCons));
-        return { expanded: cons(lambdaExpr, exprsList), state: TransformState.Recurse };
+        return { expanded: cons(CORE_LET, cons(fromArray(params.map((p, i) => list(p, exprs[i]))), bodyCons)), state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(OP_LETSTAR, (evaluator, expr, orig) => {
@@ -183,7 +265,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
         // No bindings
         if (bindingsCons === null) {
-            return { expanded: list(cons(OP_LAMBDA, cons(null, body))), state: TransformState.Recurse };
+            return { expanded: cons(CORE_LET, cons(null, body)), state: TransformState.Recurse };
         }
 
         const bindings = toArray(bindingsCons);
@@ -194,8 +276,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
                 throw new Error(`let* binding bad syntax`);
             }
             if (typeof binding.car !== "symbol") throw new Error("let* binding name must be a symbol");
-            const lambda = cons(OP_LAMBDA, cons(list(binding.car), currentExpr));
-            currentExpr = list(list(lambda, binding.cdr.car));
+            currentExpr = list(cons(CORE_LET, cons(list(list(binding.car, binding.cdr.car)), currentExpr)));
         }
         return { expanded: currentExpr.car, state: TransformState.Recurse };
     });
@@ -211,7 +292,6 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
         const bindings = toArray(bindingsCons);
         const params: symbol[] = [];
-        const dummyVals: any[] = []; 
         const setExprs: any[] = [];  
 
         for (const binding of bindings) {
@@ -221,13 +301,11 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
             if (typeof binding.car !== "symbol") throw new Error("letrec binding name must be a symbol");
             params.push(binding.car);
-            dummyVals.push(undefined); 
             setExprs.push(list(OP_SET, binding.car, binding.cdr.car)); 
         }
 
         const allBody = fromArray([...setExprs, ...toArray(body)]);
-        const lambdaExpr = cons(OP_LAMBDA, cons(fromArray(params), allBody));
-        return { expanded: cons(lambdaExpr, fromArray(dummyVals)), state: TransformState.Recurse };
+        return { expanded: cons(CORE_LET, cons(fromArray(params.map(p => list(p, undefined))), allBody)), state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(OP_DEFINE, (evaluator, expr, orig) => {
@@ -257,39 +335,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     const lambdaTransform = (evaluator: MacroEvaluator, expr: any, orig: any) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`lambda syntax error`);
         const args = expr.car;
-        const rawBody = removeBegin(expr.cdr);
-        if (rawBody === null) throw new Error("lambda body must contain at least one expression");
-
-        const defines: any[] = [];
-        const body: any[] = [];
-
-        let curr: any = rawBody;
-        while (curr instanceof Cons) {
-            const stmt = curr.car;
-            if (stmt instanceof Cons && stmt.car === OP_DEFINE) {
-                const normalizedStmt = normalizeDefine(stmt);
-                defines.push(list(normalizedStmt.cdr.car, normalizedStmt.cdr.cdr.car));
-            } else {
-                body.push(stmt);
-            }
-            curr = curr.cdr;
-        }
-
-        if (defines.length === 0) {
-            const transformedBody = fromArray(toArray(rawBody).map(stmt => evaluator.transform(stmt)));
-            return { expanded: cons(CORE_LAMBDA, cons(args, transformedBody)), state: TransformState.ReturnImm };
-        }
-
-        if (body.length === 0) {
-            throw new Error("lambda body must contain at least one expression after internal/local defines etc.");
-        }
-
-        // Keep the outer lambda and put the letrec inside its body!
-        const letrecExpr = cons(OP_LETREC, cons(fromArray(defines), fromArray(body)));
-        return { 
-            expanded: list(OP_LAMBDA, args, letrecExpr), 
-            state: TransformState.Recurse 
-        };
+        return lowerBody(evaluator, expr.cdr, "lambda", body => cons(CORE_LAMBDA, cons(args, body)));
     };
     evaluator.registerTransform(OP_LAMBDA, lambdaTransform);
     evaluator.registerTransform(CORE_LAMBDA, lambdaTransform);
@@ -448,7 +494,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
     });
 
-    for (const name of ["list", "cons", "vector-ref", "vector-set!", "vector-length", "table-ref", "table-set!", "table-has?", "coroutine-create", "coroutine-resume", "coroutine-yield", "coroutine-status", "coroutine-close"]) {
+    for (const name of ["list", "cons", "vector-ref", "vector-set!", "vector-length", "table-ref", "table-set!", "table-has?", "table-border", "coroutine-create", "coroutine-resume", "coroutine-yield", "coroutine-status", "coroutine-close"]) {
         evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
             return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
         });

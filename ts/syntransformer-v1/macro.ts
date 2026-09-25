@@ -1,4 +1,4 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Table, OP_QUOTE, CORE_QUOTE, OP_AT, SOURCE_POS } from "../common"
+import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Env, OP_QUOTE, CORE_QUOTE, OP_AT, SOURCE_POS } from "../common"
 import { Bootstrapper } from "../std";
 
 export enum TransformState {
@@ -20,7 +20,7 @@ export class MacroEvaluator {
     readonly #transformers: Map<symbol, Transform>
     readonly #bootstrapper: Bootstrapper
 
-    scope: Table
+    scope: Env
     readonly expandcmp: AbstractCompiler
     readonly expandvm: AbstractVM;
 
@@ -30,7 +30,7 @@ export class MacroEvaluator {
         this.expandvm = meta.vm(maxSteps)
         this.#transformers = new Map<symbol, Transform>()
         this.#bootstrapper = new Bootstrapper()
-        this.scope = new Table()
+        this.scope = new Env()
     }
 
     init() {
@@ -42,9 +42,29 @@ export class MacroEvaluator {
         this.#transformers.set(onsym, transform)
     }
 
-    transform(ast: any): any {
-        return this.#transform(this.#stripAt(ast), 0)
+    // a rewrite for calls whose operator is not a transformer keyword; returns null to leave the call alone
+    #applicationTransform: ((evaluator: MacroEvaluator, expr: Cons) => TransformResult | null) | null = null
+
+    setApplicationTransform(transform: (evaluator: MacroEvaluator, expr: Cons) => TransformResult | null) {
+        this.#applicationTransform = transform
     }
+
+    // expansions on the path to the transformer currently running, or -1 outside one
+    #depth = -1
+
+    transform(ast: any): any {
+        // called from inside a transformer (e.g. for a lambda body): keep counting toward the expansion limit
+        if (this.#depth >= 0) return this.#transform(ast, this.#depth)
+        try {
+            return this.#transform(this.#stripAt(ast), 0)
+        } catch (e) {
+            if (e instanceof RangeError && /call stack/i.test(e.message)) {
+                throw new Error("program is nested too deeply to expand (or a macro keeps expanding into itself)")
+            }
+            throw e
+        }
+    }
+
 
     // (%at file line col expr) becomes expr with a source position attached, before any macro sees it
     #stripAt(ast: any): any {
@@ -83,31 +103,42 @@ export class MacroEvaluator {
                 throw new Error(`Macro expansion limit exceeded while expanding macro ${String(op)}`);
             }
 
-            // recursively expand the macro
-            if (typeof op === "symbol" && this.#transformers.has(op)) {
-                const transformer = this.#transformers.get(op)!;
-                const transformed = transformer(this, ast.cdr, ast);
-                const pos = SOURCE_POS.get(ast);
-                if (pos !== undefined && transformed.expanded instanceof Cons && !SOURCE_POS.has(transformed.expanded)) {
-                    SOURCE_POS.set(transformed.expanded, pos);
+            // recursively expand the macro (transformers that transform subforms themselves continue from this depth)
+            const transformer = typeof op === "symbol" ? this.#transformers.get(op) : undefined;
+            if (transformer !== undefined || (typeof op !== "symbol" && this.#applicationTransform !== null)) {
+                const outer = this.#depth;
+                this.#depth = depth;
+                let transformed: TransformResult | null;
+                try {
+                    transformed = transformer !== undefined ? transformer(this, ast.cdr, ast) : this.#applicationTransform!(this, ast);
+                } finally {
+                    this.#depth = outer;
                 }
-
-                switch (transformed.state) {
-                    case TransformState.Recurse:
-                        return this.#transform(transformed.expanded, depth + 1);
-                    case TransformState.DoChildren:
-                        return this.#mapTransform(transformed.expanded, depth + 1);
-                    case TransformState.ReturnImm:
-                        return transformed.expanded;
-                }
+                if (transformed !== null) return this.#continue(ast, transformed, depth);
             }
 
             // go through children
-            return this.#mapTransform(ast, depth + 1);
+            return this.#mapTransform(ast, depth);
         }
 
         // if no transformations apply, just return the original ast
         return ast;
+    }
+
+    #continue(ast: Cons, transformed: TransformResult, depth: number): any {
+        const pos = SOURCE_POS.get(ast);
+        if (pos !== undefined && transformed.expanded instanceof Cons && !SOURCE_POS.has(transformed.expanded)) {
+            SOURCE_POS.set(transformed.expanded, pos);
+        }
+        // only expanding an expansion again counts toward the limit, so deep but finite nesting is fine
+        switch (transformed.state) {
+            case TransformState.Recurse:
+                return this.#transform(transformed.expanded, depth + 1);
+            case TransformState.DoChildren:
+                return this.#mapTransform(transformed.expanded, depth);
+            case TransformState.ReturnImm:
+                return transformed.expanded;
+        }
     }
 
     #mapTransform(list: any, depth: number): any {

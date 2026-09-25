@@ -1,4 +1,4 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, packValues, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
+import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, packValues, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table, Env } from "./common";
 import { Cons } from "./list";
 import { ARITHMETIC, opCons, makeList, CXR_PATHS, CXR_FNS, CXR_INLINES, PREDICATES, PREDICATE_FNS, PREDICATE_INLINES, listInline, consInline, type InlineFn } from "./ops";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
@@ -336,24 +336,11 @@ export const IBUILTINS: BuiltinFunction[] = [
         if (!(tbl instanceof Table)) throw new Error("table-copy requires a table");
         return tbl.copy();
     }),
-    new BuiltinFunction(Symbol.for("table-chain"), (regs, startReg, nargs) => {
-        if (nargs < 1 || nargs > 2) throw new Error("table-chain requires 1 or 2 arguments (table-chain parent [frozen])");
-        const parent = regs[startReg];
-        if (!(parent instanceof Table)) throw new Error("table-chain requires a parent table");
-        const frozen = nargs === 2 ? isTruthy(regs[startReg + 1]) : false;
-        return parent.chained(frozen);
-    }),
     new BuiltinFunction(Symbol.for("table-entries"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("table-entries requires 1 argument");
         const tbl = regs[startReg];
         if (!(tbl instanceof Table)) throw new Error("table-entries requires a table");
         return [...tbl.entries()];
-    }),
-    new BuiltinFunction(Symbol.for("table-current-entries"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("table-current-entries requires 1 argument");
-        const tbl = regs[startReg];
-        if (!(tbl instanceof Table)) throw new Error("table-current-entries requires a table");
-        return [...tbl.currentEntries()];
     }),
     new BuiltinFunction(Symbol.for("table-freeze!"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("table-freeze! requires 1 argument");
@@ -374,6 +361,12 @@ export const IBUILTINS: BuiltinFunction[] = [
         }
         return target;
     }),
+    new BuiltinFunction(Symbol.for("table-border"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("table-border requires 1 argument");
+        const tbl = regs[startReg];
+        if (!(tbl instanceof Table)) throw new Error("table-border requires a table");
+        return tbl.border();
+    }, ([t], slow) => t === undefined ? null : `(${t} instanceof Table ? ${t}.border() : ${slow})`),
     new BuiltinFunction(Symbol.for("reverse"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("reverse requires 1 argument");
         let lst = regs[startReg];
@@ -394,7 +387,7 @@ for(let i = 0; i < IBUILTINS.length; i++) {
     RESERVED_BUILTINS.add(IBUILTINS[i].name)
 }
 
-export const stdPreludeScope = () => new Table()
+export const stdPreludeScope = () => new Env()
 
 export const STD_PRELUDE = `
 (define $coroutine-create (lambda (proc) (%coroutine-create proc)))
@@ -507,7 +500,7 @@ export const STD_PRELUDE = `
 `
 
 export class Bootstrapper {
-    #bootstrappedPreludes: Map<string, Table> = new Map()
+    #bootstrappedPreludes: Map<string, Env> = new Map()
 
     /** Set up the public scope for the given vm and compiler instance */
     setupPublicScope(impl: AnimaMeta, cmp: AbstractCompiler, vm: AbstractVM, evaluator: MacroEvaluator) {
@@ -523,9 +516,9 @@ export class Bootstrapper {
         vm.evaluateRaw(PRELUDE_BC, privScope)
 
         /* Base scope */
-        const publicScope = new Table(); 
+        const publicScope = new Env();
         const named = new Set<IProcedure>()
-        for (const [sym, value] of privScope.entries()) {
+        for (const [sym, value] of privScope.ownEntries()) {
             const symName = Symbol.keyFor(sym) || sym.description || "%Unknown";
         
             // If the func starts with a $, its public

@@ -20,10 +20,16 @@ The compiler only understands `%` forms. Every special form users write (`if`, `
 | `(%if <cond> <then> <else>)` | `if` (exactly 3 arguments) | Evaluates `<cond>`, then one branch; both branches keep tail position. |
 | `(%quote <datum>)` | `quote`, `'datum` | Yields `<datum>` unevaluated. Quoted data is never transformed, so `''a` is the list `(quote a)`. |
 | `(%lambda <params> <body> ...)` | `lambda` | Creates a closure. `<params>` is `(p ...)` or `(p ... . rest)`. Internal `define`s in the body are turned into a `letrec` first. |
+| `(%let ((<symbol> <init>) ...) <body> ...)` | `let`, `let*` (nested), `letrec` (void inits then `%set!`), and any immediately applied lambda `((lambda (p ...) body) arg ...)` | Evaluates the inits in the enclosing scope, then binds them in a block of the current function (registers, no closure). Internal `define`s in the body become a `letrec`. |
 | `(%set! <symbol> <expr>)` | `set!` | Updates the binding of `<symbol>` according to lexical scoping. |
 | `(%define-global <symbol> <expr>)` | `define` at top level (after `(define (f ...) ...)` becomes a lambda) | Binds `<symbol>` in the global scope. |
+| `(%block <name> <body> ...)` | none yet | Evaluates the body; its value is the last expression's, or the value of an `%escape` to `<name>`. Keeps tail position. |
+| `(%escape <name> [<expr>])` | none yet | Leaves the innermost enclosing `%block` called `<name>` with `<expr>` (default `<#void>`), computed as that block's value (in its tail position if the block is in tail position). |
+| `(%loop <body> ...)` | none yet | Repeats the body forever; only an `%escape` leaves it. |
 
-`let`, `let*`, `letrec`, named `let`, `cond`, `and`, `or`, `guard`, `receive`, `let-values` and `let*-values` are pure surface syntax built from these (for example `let` becomes an immediately applied `%lambda`, which the compiler turns into a block instead of a call).
+Block names are labels, not variables. An `%escape` cannot leave a `%lambda` (a compile error); `%let`, and so every `let` form, is not a lambda, so escapes pass through it. `break` is an escape to a block around a loop, `continue` an escape to a block around its body, and an early return an escape to a block around a function body. These compile to jumps inside one function (`BLOCK end`, `LOOP end`, `ENDLOOP head`, `JUMP target`), which the AOT direct entry emits as labeled JS blocks, `for (;;)` loops and `break`s. Variables assigned in a loop are still boxed (every `set!` variable is, so continuations see them as shared locations), so a `%loop` over mutated variables costs about the same as a named `let`.
+
+`let`, `let*`, `letrec`, named `let`, `cond`, `and`, `or`, `guard`, `receive`, `let-values` and `let*-values` are pure surface syntax built from these (for example `let` becomes `%let`, which binds variables in the current function instead of calling a lambda).
 
 ### Procedure Calls
 
@@ -83,8 +89,8 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Semantics**: Each compiles to a `CALL` of the `list` / `cons` builtin over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
 
 ### Table intrinsics
-- **Forms**: `(%table-ref t k [default])`, `(%table-set! t k v)`, `(%table-has? t k)`
-- **Semantics**: Direct calls to `table-ref`, `table-set!` and `table-has?` are rewritten to these. Each compiles to a `CALL` of the builtin with the same name; the AOT emitter inlines the 2-argument `table-ref` (one chained `lookup`), `table-set!` on an unfrozen table and `table-has?`, falling back to the builtin for errors, defaults and frozen tables.
+- **Forms**: `(%table-ref t k [default])`, `(%table-set! t k v)`, `(%table-has? t k)`, `(%table-border t)`
+- **Semantics**: Direct calls to `table-ref`, `table-set!`, `table-has?` and `table-border` are rewritten to these. Each compiles to a `CALL` of the builtin with the same name; the AOT emitter inlines the 2-argument `table-ref` (one `lookup`), `table-set!` on an unfrozen table, `table-has?` and `table-border`, falling back to the builtin for errors, defaults and frozen tables.
 
 ### Vector intrinsics
 - **Forms**: `(%vector-ref v k)`, `(%vector-set! v k val)`, `(%vector-length v)`
@@ -177,13 +183,13 @@ This section describes how compiled code runs. The code lives in `exec.ts` (runt
 ## Pipeline
 
 1. The syntax transformer (`syntransformer-v1`) expands macros and rewrites calls to builtins into `%` intrinsic forms.
-2. `analysis.ts` works out which variables are captured or mutated (those live in `Box`es).
+2. `analysis.ts` works out which variables are mutated (`set!`) or captured, meaning used from inside a nested `%lambda` (a `%let` is not a boundary); those live in `Box`es.
 3. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers, and `IR.lower` turns those into a `ByteCode` (a `Uint32Array` of instructions plus a constant pool).
 4. The bytecode runs either in the interpreter (`BytecodeInterpreter`) or, in `"aot"` mode, is compiled to JS functions (`AotCompiler`).
 
 ## Execution contexts
 
-An `ExecutionContext` holds the state of one line of execution: the global scope (`Table`), the accumulator (`acc`), the dynamic-wind stack (`wind`), the exception handler stack (`handlers`), the continuation epoch and the direct-call depth. Every `evaluateRaw`/`evaluateClosure` call gets a new context, and so does every coroutine.
+An `ExecutionContext` holds the state of one line of execution: the global environment (`Env`), the accumulator (`acc`), the dynamic-wind stack (`wind`), the exception handler stack (`handlers`), the continuation epoch and the direct-call depth. Every `evaluateRaw`/`evaluateClosure` call gets a new context, and so does every coroutine.
 
 ## Frames and the driver loop
 
@@ -204,7 +210,7 @@ Each compiled function gets two JS functions from the same AOT IR (`AotCompiler.
 
 Direct code has no heap frames, so when something needs them (`call/cc`, invoking a continuation, a call that cannot be made directly, a host error, the depth limit, a coroutine switch) it throws a `Suspend`. Each direct function it passes through rebuilds its own `Frame` from its locals at `rip` (the resume point of the call it was making; `rip = -1` marks a tail call, which adds no frame). The heap-mode caller that started the direct chain attaches its frame and performs the pending action (`executor.resumeSuspend`), after which execution continues in resume mode.
 
-Global variable reads are cached per instruction site, keyed by the scope and `Table.globalsVersion`, which changes whenever a table used as a global scope is modified.
+Global variable reads are cached per instruction site, keyed by the environment and `Env.globalsVersion`, which changes whenever an environment compiled code has read globals from is modified.
 
 ## Coroutines
 

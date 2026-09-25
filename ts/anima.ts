@@ -1,4 +1,4 @@
-import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, ASTStringifier, Table, OP_LAMBDA, Cons } from "./common"
+import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, ASTStringifier, Env, OP_LAMBDA, Cons } from "./common"
 import { Bootstrapper } from "./std"
 import { MacroEvaluator } from "./syntransformer-v1/macro"
 import { registerCoreSyntax } from "./syntransformer-v1/prelude"
@@ -6,12 +6,12 @@ import { registerCoreSyntax } from "./syntransformer-v1/prelude"
 export class Anima {
     #vm: AbstractVM
     #comp: AbstractCompiler
-    #scope: Table
+    #scope: Env
     #impl: AnimaMeta
     #bootstrapper: Bootstrapper
     #evaluator: MacroEvaluator
 
-    get scope(): Table {
+    get scope(): Env {
         return this.#scope
     }
 
@@ -55,12 +55,12 @@ export class Anima {
         return this.#vm.traceback(co, msg)
     }
 
-    compileToClosure(s: string, args: any, globals: Table) {
+    compileToClosure(s: string, args: any, globals: Env) {
         const bast = new ASP(s, true).parse()
         return this.compileAstToClosure(bast, args, globals)
     }
 
-    compileAstToClosure(bast: any, args: any, globals: Table): AbstractClosure {
+    compileAstToClosure(bast: any, args: any, globals: Env): AbstractClosure {
         const ast = Cons.list(OP_LAMBDA, args, bast)
         const bc = this.compileRawAst(ast)
         const res = this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
