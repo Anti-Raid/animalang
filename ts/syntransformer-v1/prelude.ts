@@ -16,6 +16,7 @@ import {
     CORE_LET,
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
+    SOURCE_POS,
     AbstractClosure,
     Cons
 } from "../common";
@@ -121,6 +122,110 @@ const letBindings = (form: string, bindingsCons: any): [symbol, any][] => {
         if (typeof binding.car !== "symbol") throw new Error(`${form} binding name must be a symbol`);
         return [binding.car, binding.cdr.car];
     });
+};
+
+const NOT_A_LOOP = Symbol("not a loop");
+
+// Turns a named let whose name is only ever called in tail position of its body, with the right number of arguments,
+// into a %loop, so no procedure is created. Hidden carrier variables hold the next iteration's arguments; they are
+// assigned right before jumping to the next iteration and read right after, so they stay plain registers. The
+// parameters are bound fresh from them every iteration, as calls would. Returns null (keep the procedure) if `name` is
+// used any other way: as a value, in a non-tail call, from a nested lambda, or assigned.
+const namedLetAsLoop = (evaluator: MacroEvaluator, name: symbol, params: symbol[], inits: any[], body: any): any => {
+    // a parameter of the same name shadows the loop in the whole body
+    if (params.includes(name)) return null;
+    const carriers = params.map(p => Symbol(p.description));
+    const done = Symbol("done");
+    const next = Symbol("next");
+
+    const keepPos = (to: any, from: any) => {
+        const pos = SOURCE_POS.get(from);
+        if (pos !== undefined && to instanceof Cons) SOURCE_POS.set(to, pos);
+        return to;
+    };
+    const binds = (formals: any): boolean => {
+        while (formals instanceof Cons) {
+            if (formals.car === name) return true;
+            formals = formals.cdr;
+        }
+        return formals === name;
+    };
+    const mentions = (e: any): boolean =>
+        e === name || (e instanceof Cons && e.car !== CORE_QUOTE && (mentions(e.car) || mentions(e.cdr)));
+    type TailBlocks = ReadonlySet<symbol>;
+    const seq = (exprs: any, tail: boolean, blocks: TailBlocks): any => {
+        const items = toArray(exprs);
+        return fromArray(items.map((e, i) => rw(e, tail && i === items.length - 1, blocks)));
+    };
+    // `tail`: whether e's value is the value of the loop body. `blocks`: the labels of enclosing %blocks whose value is
+    // the value of the loop body, so an %escape to one of them gives its value in tail position wherever it is (this is
+    // how a loop nested in this one, itself a %block, exits by calling this loop)
+    const rw = (e: any, tail: boolean, blocks: TailBlocks): any => {
+        if (e === name) throw NOT_A_LOOP;
+        if (!(e instanceof Cons)) return e;
+        const op = e.car;
+        switch (op) {
+            case CORE_QUOTE:
+                return e;
+            case CORE_LAMBDA:
+                if (binds(e.cdr.car) || !mentions(e.cdr.cdr)) return e;
+                throw NOT_A_LOOP;
+            case CORE_IF: {
+                const [cond, then, otherwise] = e.toArray().slice(1);
+                return keepPos(list(CORE_IF, rw(cond, false, blocks), rw(then, tail, blocks), rw(otherwise, tail, blocks)), e);
+            }
+            case CORE_BEGIN:
+                return keepPos(cons(CORE_BEGIN, seq(e.cdr, tail, blocks)), e);
+            case CORE_SET:
+                if (e.cdr.car === name) throw NOT_A_LOOP;
+                return keepPos(list(CORE_SET, e.cdr.car, rw(e.cdr.cdr.car, false, blocks)), e);
+            case OP_DEFINE_GLOBAL:
+                return keepPos(list(op, e.cdr.car, rw(e.cdr.cdr.car, false, blocks)), e);
+            case CORE_LET:
+            case CORE_LET_VALUES:
+            case CORE_LET_VALUES_STRICT: {
+                const bindings = toArray(e.cdr.car);
+                const shadowed = bindings.some(b => binds(op === CORE_LET ? list(b.car) : b.car));
+                const newBindings = bindings.map(b => list(b.car, rw(b.cdr.car, false, blocks)));
+                return keepPos(cons(op, cons(fromArray(newBindings), shadowed ? e.cdr.cdr : seq(e.cdr.cdr, tail, blocks))), e);
+            }
+            case CORE_BLOCK: {
+                // a block in tail position gives the loop body's value; one that is not hides any outer block of its name
+                const label = e.cdr.car;
+                const inner = new Set(blocks);
+                if (tail) inner.add(label);
+                else inner.delete(label);
+                return keepPos(cons(op, cons(label, seq(e.cdr.cdr, tail, inner))), e);
+            }
+            case CORE_ESCAPE:
+                return e.cdr.cdr === null ? e : keepPos(list(op, e.cdr.car, rw(e.cdr.cdr.car, blocks.has(e.cdr.car), blocks)), e);
+            case CORE_LOOP:
+                return keepPos(cons(op, seq(e.cdr, false, blocks)), e);
+        }
+        if (op === name) {
+            const args = toArray(e.cdr);
+            if (!tail || args.length !== params.length) throw NOT_A_LOOP;
+            const sets = args.map((a, i) => list(CORE_SET, carriers[i], rw(a, false, blocks)));
+            return keepPos(cons(CORE_BEGIN, fromArray([...sets, list(CORE_ESCAPE, next)])), e);
+        }
+        // a call or intrinsic: operator and operands are all values
+        return keepPos(fromArray(toArray(e).map(x => rw(x, false, blocks))), e);
+    };
+
+    const lambda = evaluator.transform(cons(OP_LAMBDA, cons(fromArray(params), body)));
+    let loopBody: any;
+    try {
+        loopBody = seq(lambda.cdr.cdr, true, new Set());
+    } catch (e) {
+        if (e === NOT_A_LOOP) return null;
+        throw e;
+    }
+    return list(CORE_LET, fromArray(carriers.map((c, i) => list(c, evaluator.transform(inits[i])))),
+        list(CORE_BLOCK, done,
+            list(CORE_LOOP,
+                list(CORE_BLOCK, next,
+                    list(CORE_LET, fromArray(params.map((p, i) => list(p, carriers[i]))),
+                        list(CORE_ESCAPE, done, cons(CORE_BEGIN, loopBody)))))));
 };
 
 export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
@@ -273,6 +378,8 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         const exprsList = fromArray(exprs);
 
         if (loopName) {
+            const loop = namedLetAsLoop(evaluator, loopName, params, exprs, bodyCons);
+            if (loop !== null) return { expanded: loop, state: TransformState.ReturnImm };
             const lambdaExpr = cons(OP_LAMBDA, cons(paramsList, bodyCons));
             const letrecBindings = list(list(loopName, lambdaExpr));
             const letrecExpr = list(OP_LETREC, letrecBindings, loopName);

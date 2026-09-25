@@ -113,8 +113,12 @@ export class ByteCode implements AbstractByteCode {
     public directFn: DirectFn | null = null;
     public directArity: number = -1;
     public directRestArity: number = -1;
-    // how often a direct call of this function ended in a suspend for call/cc, a continuation or a yield (see resumeSuspend)
+    // how often a direct call of this function ended in a suspend for call/cc, a continuation, a yield or a resume (see
+    // resumeSuspend)
     public controlSuspends: number = 0;
+    // how often direct code of this function resumed a coroutine in a nested driver loop: past a few, it suspends to heap
+    // frames instead, where resuming is a cheap switch inside one loop
+    public nestedResumes: number = 0;
 
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
@@ -455,7 +459,7 @@ export class Suspend {
     // the outermost direct function this passed through, i.e. the one heap code called directly
     entered: Closure | null = null;
 
-    // `control`: suspended for call/cc, invoking a continuation or a yield, rather than for depth or an error
+    // `control`: suspended for call/cc, invoking a continuation, a yield or a coroutine resume, rather than for depth or an error
     constructor(public readonly action: SuspendAction | null, public readonly error?: any, public readonly control: boolean = false) {}
 
     push(frame: Frame) {
@@ -480,7 +484,7 @@ export class Suspend {
     }
 
     static resume(co: any, args: any[]) {
-        return new Suspend((ctx, executor, caller) => executor.coResume(ctx, caller, co, args));
+        return new Suspend((ctx, executor, caller) => executor.coResume(ctx, caller, co, args), undefined, true);
     }
 
     static yield(val: any) {
@@ -845,7 +849,8 @@ export class VMExecutor {
 
     #runLoop(ctx: ExecutionContext, frame: Frame): void {
         if ((this.vm as any).mode === "aot") {
-            AotCompiler.compileAll(frame.code, frame.closure.tmpl);
+            // compiled code already had its nested templates compiled with it
+            if (frame.code.resumeFn === null) AotCompiler.compileAll(frame.code, frame.closure.tmpl);
             AotCompiler.run(ctx, frame, this);
         } else {
             BytecodeInterpreter.run(ctx, frame, this);
@@ -1798,6 +1803,30 @@ class ResumeEmitter extends FunctionEmitter {
         this.#liveness = new Liveness(blocks, numReg);
     }
 
+    // follows jumps through empty blocks (left by loops and blocks) to where control really goes, saving dispatches
+    #thread(target: number): number {
+        const byStart = this.#blocksByStart ??= new Map(this.blocks.map(b => [b.start, b]));
+        for (let steps = 0; steps < this.blocks.length; steps++) {
+            const block = byStart.get(target);
+            if (block === undefined || block.insts.length !== 0 || this.debug) return target;
+            const term = block.term;
+            if (term.k === "Jump") target = term.target;
+            else if (term.k === "Block" || term.k === "Loop") target = term.body;
+            else return target;
+        }
+        return target;
+    }
+
+    #blocksByStart: Map<number, AotBlock> | null = null;
+
+    protected jump(target: number, next: number): string {
+        return super.jump(this.#thread(target), next);
+    }
+
+    protected branch(term: Extract<AotTerm, { k: "Branch" }>, next: number): string {
+        return super.branch({ ...term, then: this.#thread(term.then), else: this.#thread(term.else) }, next);
+    }
+
     protected recordIp(ip: number): string {
         return `frame.ip = ${ip};`;
     }
@@ -1824,6 +1853,28 @@ class ResumeEmitter extends FunctionEmitter {
                 e.push(frame);
                 return executor.resumeSuspend(ctx, e);
             }
+        `;
+    }
+
+    // A tail call from heap code: through the callee's direct entry when it has one (the js stack does not grow, since
+    // this returns right after), else a heap frame replacing this one. A Suspend out of the direct callee rebuilds its
+    // frames on top of this frame's caller, as the call is a tail call.
+    #tailCall(proc: string, args: string, nargs: string, heapCall: string): string {
+        return `
+            if (${this.directGuard(proc, nargs)} || ${this.restGuard(proc, nargs)}) {
+                let val;
+                try {
+                    val = ${proc}.tmpl.code.directArity !== -1
+                        ? ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, 1${args === "" ? "" : ", " + args})
+                        : executor.callDirectRest(ctx, ${proc}, [${args}], 1);
+                } catch (e) {
+                    if (!(e instanceof Suspend)) throw e;
+                    if (frame.parent !== null) e.push(frame.parent);
+                    return executor.resumeSuspend(ctx, e);
+                }
+                return executor.setRetVal(ctx, frame.parent, val);
+            }
+            ${heapCall}
         `;
     }
 
@@ -1884,9 +1935,14 @@ class ResumeEmitter extends FunctionEmitter {
                 `);
             case "TailCall":
                 return this.emit(`
-                    frame.ip = ${term.ip};
-                    ${this.#spills(windowRegs(term.start, term.nargs))}
-                    return executor.invoke(ctx, r${term.proc}, frame, regs, ${term.start}, ${term.nargs}, true);
+                    {
+                        const proc = r${term.proc};
+                        ${this.#tailCall("proc", this.argList(term.start, term.nargs), `${term.nargs}`, `
+                            frame.ip = ${term.ip};
+                            ${this.#spills(windowRegs(term.start, term.nargs))}
+                            return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, true);
+                        `)}
+                    }
                 `);
             case "MaybeSelfTailCall":
                 return this.emit(`
@@ -1897,9 +1953,11 @@ class ResumeEmitter extends FunctionEmitter {
                             ip = 0;
                             continue top;
                         }
-                        frame.ip = ${term.ip};
-                        ${this.#spills(windowRegs(term.start, term.nargs))}
-                        return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, true);
+                        ${this.#tailCall("proc", this.argList(term.start, term.nargs), `${term.nargs}`, `
+                            frame.ip = ${term.ip};
+                            ${this.#spills(windowRegs(term.start, term.nargs))}
+                            return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, true);
+                        `)}
                     }
                 `);
             case "Apply": {
@@ -2192,7 +2250,7 @@ class DirectEmitter extends FunctionEmitter {
                 }
                 return this.emit(`
                     rip = ${term.resume};
-                    if (executor.nestedResumes >= MAX_NESTED_RESUMES) throw Suspend.resume(r${term.co}, listToArray(r${term.list}));
+                    if (executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > ${DIRECT_SUSPEND_LIMIT}) throw Suspend.resume(r${term.co}, listToArray(r${term.list}));
                     acc = executor.coResumeNested(ctx, r${term.co}, listToArray(r${term.list}));
                     ${this.jump(term.resume, next)}
                 `);

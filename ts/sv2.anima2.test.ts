@@ -1519,8 +1519,10 @@ describe('Anima', () => {
                                 (%if (pred (car l)) (%escape return (car l)) (%begin))
                                 (set! l (cdr l))))))
                         (find-first even? '(1 3 4 5 6))`)).toBe("4")
-            // a named let is a real lambda, so escaping out of it is rejected
-            expect(() => run(`(%block return (let loop ((l '(1))) (%escape return l)))`)).toThrow("from inside a lambda")
+            // a named let used only as a loop compiles to a %loop, so escaping out of it is fine
+            expect(run(`(%block return (let loop ((l '(1 2))) (%if (null? l) 'none (%escape return (car l)))))`)).toBe("1")
+            // one whose name is used as a value stays a procedure, so escaping out of it is rejected
+            expect(() => run(`(%block return (let loop ((l '(1))) (list loop) (%escape return l)))`)).toThrow("from inside a lambda")
             // the escaped value is computed in tail position, so this does not grow the stack
             expect(run(`(define (down n) (%block k (%if (= n 0) (%escape k 'done) (%escape k (down (- n 1)))))) (down 100000)`)).toBe("done")
         })
@@ -1588,6 +1590,88 @@ describe('Anima', () => {
                                     (return 'done)))))))
                         (define (collect g acc) (let ((v (g))) (if (eq? v 'done) (reverse acc) (collect g (cons v acc)))))
                         (let ((xs (collect (make-cc-gen 50) '()))) (list (length xs) (car xs) (car (reverse xs)) (apply + xs)))`)).toBe("(50 0 49 1225)")
+        })
+    });
+
+    describe('named let as a loop', () => {
+        // a procedure compiled with no nested procedures means the named let became a %loop
+        const nestedProcs = (src: string): number => {
+            const f = evaluator.evaluateRaw(evaluator.compileRaw(src))
+            return f.tmpl.code.constants.filter((c: any) => c instanceof Object && ("tmpl" in c || "upvarLocs" in c)).length
+        }
+
+        it('compiles tail-call-only named lets to loops', () => {
+            expect(nestedProcs(`(lambda (n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc i)))))`)).toBe(0)
+            expect(nestedProcs(`(lambda (xs) (let loop ((l xs) (n 0)) (cond ((null? l) n) ((even? (car l)) (loop (cdr l) (+ n 1))) (else (loop (cdr l) n)))))`)).toBe(0)
+            expect(run(`(define (count-to n) (let loop ((i 0)) (if (= i n) i (loop (+ i 1))))) (count-to 1000000)`)).toBe("1000000")
+        })
+
+        it('keeps a procedure when the name is used any other way', () => {
+            // non-tail recursion
+            expect(nestedProcs(`(lambda () (let fact ((n 5)) (if (= n 0) 1 (* n (fact (- n 1))))))`)).toBe(1)
+            expect(run(`(let fact ((n 5)) (if (= n 0) 1 (* n (fact (- n 1)))))`)).toBe("120")
+            // used as a value, called from a nested lambda, assigned, wrong argument count
+            expect(run(`(let loop ((i 0)) (if (= i 2) (procedure? loop) (loop (+ i 1))))`)).toBe("#t")
+            expect(run(`(let loop ((l '(1 2 3)) (acc 0)) (if (null? l) acc (apply loop (list (cdr l) (+ acc (car l))))))`)).toBe("6")
+            expect(run(`(let loop ((i 0)) (if (< i 3) ((lambda () (loop (+ i 1)))) i))`)).toBe("3")
+            expect(() => run(`(let loop ((i 0)) (if (< i 3) (loop) i))`)).toThrow("expected exactly 1 args, got 0")
+        })
+
+        it('handles set! on the loop name and on its parameters', () => {
+            // assigning the name keeps the procedure, and later calls go to the new value
+            const setName = `(let loop ((i 0)) (if (= i 0) (begin (set! loop (lambda (x) (list 'replaced x))) (loop 1)) i))`
+            expect(nestedProcs(`(lambda () ${setName})`)).toBeGreaterThan(0)
+            expect(run(setName)).toBe("(replaced 1)")
+            // assigning a parameter keeps the loop; each iteration still gets a fresh variable
+            const setParam = `(let loop ((i 0) (acc '())) (if (= i 3) (reverse acc) (begin (set! i (+ i 1)) (loop i (cons i acc)))))`
+            expect(nestedProcs(`(lambda () ${setParam})`)).toBe(0)
+            expect(run(setParam)).toBe("(1 2 3)")
+            expect(run(`(let loop ((i 0) (fs '())) (if (= i 3) (map (lambda (f) (f)) fs) (let ((g (lambda () i))) (set! i (* i 10)) (loop (+ (/ i 10) 1) (cons g fs)))))`)).toBe("(20 10 0)")
+        })
+
+        it('converts nested loops whose inner loop exits by calling the outer one', () => {
+            const grid = `(let outer ((i 0) (acc '())) (if (= i 3) (reverse acc) (let inner ((j 0) (acc acc)) (if (= j 2) (outer (+ i 1) acc) (inner (+ j 1) (cons (list i j) acc))))))`
+            expect(nestedProcs(`(lambda () ${grid})`)).toBe(0)
+            expect(run(grid)).toBe("((0 0) (0 1) (1 0) (1 1) (2 0) (2 1))")
+            // an escape to a block that is not in tail position is not a tail call, even if an outer block of the same
+            // name is: (outer 1) here is an argument of +, so this is recursion (result 2), not a loop (result 1)
+            const shadowed = `(let outer ((i 0)) (if (= i 1) i (%block b (+ 1 (%block b (%escape b (outer 1)))))))`
+            expect(nestedProcs(`(lambda () ${shadowed})`)).toBeGreaterThan(0)
+            expect(run(shadowed)).toBe("2")
+        })
+
+        it('is not confused by a parameter with the loop name', () => {
+            // (loop 5) calls the parameter, not the loop
+            expect(run(`(let loop ((loop (lambda (x) (* x 2)))) (loop 5))`)).toBe("10")
+        })
+
+        it('is not confused by a define of the loop name', () => {
+            // an internal define shadows the loop name for the whole body
+            expect(run(`(let loop ((i 0)) (define (loop x) (* x 100)) (loop 5))`)).toBe("500")
+            // defining a global of that name leaves the local binding (and the loop) alone
+            const defGlobal = `(let loop ((i 0)) (%define-global nl-global-loop 42) (if (= i 3) i (loop (+ i 1))))`
+            expect(nestedProcs(`(lambda () ${defGlobal})`)).toBe(0)
+            expect(run(`(list ${defGlobal} nl-global-loop)`)).toBe("(3 42)")
+            expect(run(`(list (let loop ((i 0)) (%define-global loop 42) (if (= i 3) i (loop (+ i 1)))) loop)`)).toBe("(3 42)")
+        })
+
+        it('updates in parallel and binds fresh variables every iteration', () => {
+            expect(run(`(let loop ((a 1) (b 2) (n 3)) (if (= n 0) (list a b) (loop b a (- n 1))))`)).toBe("(2 1)")
+            expect(run(`(let loop ((i 0) (fs '())) (if (= i 3) (map (lambda (f) (f)) fs) (loop (+ i 1) (cons (lambda () i) fs))))`)).toBe("(2 1 0)")
+            expect(run(`(let loop ((i 3)) (let ((loop (lambda (x) (* x 10)))) (loop i)))`)).toBe("30")
+            expect(run(`(let loop ((i 0) (acc '())) (define sq (* i i)) (if (= i 3) (reverse acc) (loop (+ i 1) (cons sq acc))))`)).toBe("(0 1 4)")
+        })
+
+        it('works with call/cc re-entry and coroutines inside the loop', () => {
+            expect(run(`(define nl-k #f) (define nl-n 0)
+                        (define nl-r (let loop ((i 0) (acc '()))
+                          (if (= i 3) (reverse acc)
+                              (begin (if (= i 1) (call/cc (lambda (k) (set! nl-k k))) #f)
+                                     (loop (+ i 1) (cons i acc))))))
+                        (set! nl-n (+ nl-n 1))
+                        (if (< nl-n 3) (nl-k #f) (list nl-r nl-n))`)).toBe("((0 1 2) 3)")
+            expect(run(`(define nl-co (coroutine-create (lambda () (let loop ((i 0)) (if (= i 3) 'end (begin (coroutine-yield i) (loop (+ i 1))))))))
+                        (list (coroutine-resume nl-co) (coroutine-resume nl-co) (coroutine-resume nl-co) (coroutine-resume nl-co))`)).toBe("(0 1 2 end)")
         })
     });
 
