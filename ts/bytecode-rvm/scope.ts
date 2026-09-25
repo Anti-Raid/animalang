@@ -3,7 +3,13 @@ import type { UpVarLoc } from "./exec";
 export type Resolve = { type: "Global" } | { type: "Local", index: number } | { type: "Upvar", index: number }
 
 export class VariableMetadata {
-    get isBoxed() { return this.isCaptured || this.mutable }
+    // a captured variable is shared with a closure. An assigned one must be a single location for continuations, which
+    // restore a frame's registers when re-entered: that is only visible if it is read after a call (where a continuation
+    // may be captured) before being assigned again, so otherwise it can stay a plain register
+    get isBoxed() { return this.isCaptured || (this.mutable && this.liveAcrossCall) }
+
+    // set by AstAnalysis's second pass
+    liveAcrossCall: boolean = false
 
     constructor(public mutable: boolean = false, public isCaptured: boolean = false, ) {}
 }

@@ -29,7 +29,7 @@ The compiler only understands `%` forms. Every special form users write (`if`, `
 | `(%escape <name> [<expr>])` | none yet | Leaves the innermost enclosing `%block` called `<name>` with `<expr>` (default `<#void>`), computed as that block's value (in its tail position if the block is in tail position). |
 | `(%loop <body> ...)` | none yet | Repeats the body forever; only an `%escape` leaves it. |
 
-Block names are labels, not variables. An `%escape` cannot leave a `%lambda` (a compile error); `%let`, and so every `let` form, is not a lambda, so escapes pass through it. `break` is an escape to a block around a loop, `continue` an escape to a block around its body, and an early return an escape to a block around a function body. These compile to jumps inside one function (`BLOCK end`, `LOOP end`, `ENDLOOP head`, `JUMP target`), which the AOT direct entry emits as labeled JS blocks, `for (;;)` loops and `break`s. Variables assigned in a loop are still boxed (every `set!` variable is, so continuations see them as shared locations), so a `%loop` over mutated variables costs about the same as a named `let`.
+Block names are labels, not variables. An `%escape` cannot leave a `%lambda` (a compile error); `%let`, and so every `let` form, is not a lambda, so escapes pass through it. `break` is an escape to a block around a loop, `continue` an escape to a block around its body, and an early return an escape to a block around a function body. These compile to jumps inside one function (`BLOCK end`, `LOOP end`, `ENDLOOP head`, `JUMP target`), which the AOT direct entry emits as labeled JS blocks, `for (;;)` loops and `break`s. Variables assigned in a loop stay plain registers unless they are read after a call in the loop (see the boxing rule below).
 
 `let`, `let*`, `letrec`, named `let`, `cond`, `and`, `or`, `guard`, `receive`, `let-values` and `let*-values` are pure surface syntax built from these (for example `let` becomes `%let`, which binds variables in the current function instead of calling a lambda).
 
@@ -189,7 +189,7 @@ This section describes how compiled code runs. The code lives in `exec.ts` (runt
 ## Pipeline
 
 1. The syntax transformer (`syntransformer-v1`) expands macros and rewrites calls to builtins into `%` intrinsic forms.
-2. `analysis.ts` works out which variables are mutated (`set!`) or captured, meaning used from inside a nested `%lambda` (a `%let` is not a boundary); those live in `Box`es.
+2. `analysis.ts` works out which variables live in `Box`es: those captured (used from inside a nested `%lambda`; a `%let` is not a boundary), and those assigned with `set!` that are live across a call, i.e. read after a call that may run Scheme code before being assigned again. A continuation captured during such a call restores the frame's registers when re-entered, so only then would a register copy differ from a shared location. A second, backward liveness pass over the core forms (with a fixed point for `%loop`, and `%escape` flowing to its block's continuation) finds them; calls of builtins and of runtime intrinsics that never run Scheme code do not count.
 3. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers, and `IR.lower` turns those into a `ByteCode` (a `Uint32Array` of instructions plus a constant pool).
 4. The bytecode runs either in the interpreter (`BytecodeInterpreter`) or, in `"aot"` mode, is compiled to JS functions (`AotCompiler`).
 

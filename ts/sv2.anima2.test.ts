@@ -22,8 +22,6 @@ describe('Anima', () => {
     const run = (expr: string) => {
         if (bcCache[expr]) return s.stringify(evaluator.evaluateRaw(bcCache[expr]))
         const bc = evaluator.compileRaw(expr)
-        console.log(expr)
-        evaluator.deepPrint(bc)
         bcCache[expr] = bc
         return s.stringify(evaluator.evaluateRaw(bc));
     };
@@ -1585,8 +1583,28 @@ describe('Anima', () => {
             expect(boxesIn(`(lambda (n) (let ((x 1)) (let* ((y (+ x n))) (+ x y n))))`)).toBe(0)
             // captured by a real lambda: boxed
             expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (+ x n))))`)).toBe(2)
-            // assigned: boxed (continuations must see it as one location)
-            expect(boxesIn(`(lambda (n) (let ((x 1)) (set! x n) x))`)).toBe(1)
+            // assigned but never read after a call: a plain register
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (set! x n) x))`)).toBe(0)
+            expect(boxesIn(`(lambda (f) (let ((x 1)) (f) (set! x 2) x))`)).toBe(0)
+            // assigned and read after a call (a continuation captured there must see later assignments): boxed
+            expect(boxesIn(`(lambda (f) (let ((x 1)) (set! x 2) (f) x))`)).toBe(1)
+            // a loop counter read after a call in the body is live across it
+            expect(boxesIn(`(lambda (f n) (let ((i 0)) (%block d (%loop (%if (= i n) (%escape d i) (%begin)) (f) (set! i (+ i 1))))))`)).toBe(1)
+            // ... but with no calls in the loop it stays a register
+            expect(boxesIn(`(lambda (n) (let ((i 0) (s 0)) (%block d (%loop (%if (= i n) (%escape d s) (%begin)) (set! s (+ s i)) (set! i (+ i 1))))))`)).toBe(0)
+        })
+
+        it('keeps location semantics for assigned variables across continuations', () => {
+            // x is assigned after the capture and read after re-entry, so it must be one location (boxed)
+            expect(run(`(define ls-k #f) (define ls-n 0)
+                        (define (ls-f) (let ((x 0)) (call/cc (lambda (k) (set! ls-k k))) (set! ls-n (+ ls-n 1)) (let ((r x)) (set! x 10) r)))
+                        (define ls-r (ls-f))
+                        (if (< ls-n 2) (ls-k #f) (list ls-r ls-n))`)).toBe("(10 2)")
+            // y is always assigned before it is read after the capture, so a register is indistinguishable
+            expect(run(`(define lt-k #f) (define lt-n 0)
+                        (define (lt-f) (let ((y 0)) (call/cc (lambda (k) (set! lt-k k))) (set! y (+ lt-n 100)) (set! lt-n (+ lt-n 1)) y))
+                        (define lt-r (lt-f))
+                        (if (< lt-n 2) (lt-k #f) (list lt-r lt-n))`)).toBe("(101 2)")
         })
 
         it('turns immediately applied lambdas into lets', () => {

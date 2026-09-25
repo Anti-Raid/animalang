@@ -3,8 +3,8 @@ import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { IBUILTINS_IDX_MAP } from "../std";
-import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops";
 import { BUILTINS_START, OpCode, RUNTIME_IDX } from "./exec";
+import { BUILTIN_INTRINSICS, RUNTIME_INTRINSICS } from "./intrinsics";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
@@ -14,32 +14,6 @@ const OP_CO_RESUME = Symbol.for("%coroutine-resume");
 const OP_CO_RESUME_LIST = Symbol.for("%coroutine-resume-list");
 const OP_APPLY = Symbol.for("%apply");
 const OP_APPLY_MARGS = Symbol.for("%apply-multi")
-
-const BUILTIN_INTRINSICS = new Map<symbol, number>([
-    ...[...ARITHMETIC, ...PREDICATES, ...CXR_PATHS].map(([name]) => name),
-    "list",
-    "cons",
-    "vector-ref",
-    "vector-set!",
-    "vector-length",
-    "table-ref",
-    "table-set!",
-    "table-has?",
-    "table-border",
-].map(name => [Symbol.for(`%${name}`), IBUILTINS_IDX_MAP.get(Symbol.for(name))!]))
-
-const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: number }>(([
-    ["%set-raise-proc", "set-raise-proc", 1, 1],
-    ["%handlers", "handlers", 0, 0],
-    ["%set-handlers!", "set-handlers!", 1, 1],
-    ["%coroutine-create", "coroutine-create", 1, 1],
-    ["%coroutine-status", "coroutine-status", 1, 1],
-    ["%coroutine-close", "coroutine-close", 1, 1],
-    ["%values->list", "values->list", 1, 1],
-    ["%debug-frames", "debug-frames", 2, 2],
-    ["%debug-traceback", "debug-traceback", 2, 2],
-    ["%first-value", "first-value", 1, 1],
-] as [string, string, number, number][]).map(([form, name, min, max]) => [Symbol.for(form), { idx: RUNTIME_IDX.get(name)!, min, max }]))
 
 // a %block that %escape can jump to: where its value goes and how its code ends
 interface BlockTarget {
