@@ -6,7 +6,7 @@ import { BuiltinFunction } from './std';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
 import { BUILTINS_START } from './bytecode-rvm/exec';
 import { Anima } from './anima';
-import { impl, implAot } from './bytecode-rvm/meta';
+import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
 
 describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
@@ -29,6 +29,54 @@ describe('Anima', () => {
     };
 
     describe('Primitives, Strings & Symbols', () => {
+        it('inlined predicates agree with the builtins', () => {
+            const vals = `(list 0 -0.0 1 -3 4 2.5 +inf.0 -inf.0 +nan.0 "" "a" #t #f 'sym '() '(1) '(1 . 2) (vector) (vector 1) {} {1 2} car (lambda () 1) <#void>)`
+            const safe = ["null?", "pair?", "list?", "number?", "integer?", "positive?", "negative?", "zero?", "infinite?", "finite?", "nan?",
+                "boolean?", "void?", "symbol?", "string?", "procedure?", "error?", "vector?", "table?", "empty?"]
+            for (const p of safe) {
+                expect(run(`(define (inl-${p} xs) (if (null? xs) '() (cons (${p} (car xs)) (inl-${p} (cdr xs))))) (inl-${p} ${vals})`)).toBe(run(`(map ${p} ${vals})`))
+            }
+            expect(run(`(define (evens xs) (if (null? xs) '() (cons (list (even? (car xs)) (odd? (car xs))) (evens (cdr xs))))) (evens (list 0 1 -3 -4 7))`)).toBe("((#t #f) (#f #t) (#f #t) (#t #f) (#f #t))")
+            expect(() => run(`(define (ev x) (even? x)) (ev 2.5)`)).toThrow("even? requires an integer")
+            expect(() => run(`(define (od x) (odd? x)) (od "a")`)).toThrow("odd? requires an integer")
+            expect(run(`(list (vector-empty? (vector)) (table-empty? {}) (table-frozen? {1 2}))`)).toBe("(#t #t #f)")
+            expect(() => run(`(define (ve x) (vector-empty? x)) (ve '())`)).toThrow("vector-empty? requires a vector")
+            expect(() => run(`(define (te x) (table-empty? x)) (te 1)`)).toThrow("table-empty? requires a table")
+        })
+        it('vector intrinsics inline and fall back to the builtin for errors', () => {
+            expect(run(`(define v (vector 1 2 3)) (list (vector-ref v 0) (vector-length v) (begin (vector-set! v 1 9) (vector-ref v 1)))`)).toBe("(1 3 9)")
+            expect(run(`(define (vsum v i acc) (if (= i (vector-length v)) acc (vsum v (+ i 1) (+ acc (vector-ref v i))))) (vsum (vector 1 2 3 4) 0 0)`)).toBe("10")
+            expect(run(`(define (vlast v) (vector-ref v (- (vector-length v) 1))) (vlast (vector 4 5 6))`)).toBe("6")
+            expect(run(`(define (put! v) (vector-set! v 0 'x)) (define w (vector 1)) (list (put! w) w)`)).toBe("(<#void> #(x))")
+            expect(run(`(map vector-length (list (vector) (vector 1 2)))`)).toBe("(0 2)")
+            expect(() => run(`(define (at v i) (vector-ref v i)) (at (vector 1) 5)`)).toThrow("vector-ref: index 5 out of bounds for vector of length 1")
+            expect(() => run(`(vector-ref (vector 1) 0.5)`)).toThrow("vector-ref: index 0.5 out of bounds")
+            expect(() => run(`(vector-set! '(1) 0 2)`)).toThrow("vector-set! requires a vector")
+            expect(() => run(`(define (len v) (vector-length v)) (len 5)`)).toThrow("vector-length requires a vector")
+        })
+
+        it('builtins in tail position are inlined with the same semantics', () => {
+            expect(run(`(define (f x) (car x)) (f '(7 8))`)).toBe("7")
+            expect(run(`(define (g a b) (+ a b)) (g 2 3)`)).toBe("5")
+            expect(() => run(`(define (h a b) (+ a b)) (h "x" 1)`)).toThrow("+ requires numbers, but received string")
+            expect(() => run(`(define (f2 x) (car x)) (f2 '())`)).toThrow("car: list is too short")
+        })
+        it('reverse', () => {
+            expect(run("(reverse '(1 2 3))")).toBe("(3 2 1)")
+            expect(run("(reverse '())")).toBe("()")
+            expect(run("(reverse (list 1 (list 2 3)))")).toBe("((2 3) 1)")
+            expect(() => run("(reverse '(1 . 2))")).toThrow("reverse requires a proper list")
+            expect(() => run("(reverse 5)")).toThrow("reverse requires a proper list")
+        })
+        it('parses string escapes and raw control characters', () => {
+            const str = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src))
+            expect(str('"a\nb\tc"')).toBe("a\nb\tc")
+            expect(str('"a\\nb\\tc\\\\d\\"e"')).toBe('a\nb\tc\\d"e')
+            expect(str('"\\u0041\\x42;\\x1F600;\\a\\0"')).toBe("AB\u{1F600}\x07\0")
+            expect(str('"\u0001\u001f"')).toBe("\u0001\u001f")
+            expect(() => str('"\\q"')).toThrow("unknown escape")
+            expect(() => str('"\\u12"')).toThrow("bad \\u escape")
+        })
         it('evaluates boolean primitives', () => {
             expect(run("#t")).toBe("#t");
             expect(run("#f")).toBe("#f");
@@ -1188,9 +1236,11 @@ describe('Anima', () => {
         expect(plusProc.debugName).toBe("+");
 
         const closure = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (x y) (+ x y))`));
-        expect(closure.debugName).toBe("lambda");
+        expect(closure.debugName).toBe("lambda@<input>:1");
         const restClosure = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (x . rest) x)`));
-        expect(restClosure.debugName).toBe("lambda");
+        expect(restClosure.debugName).toBe("lambda@<input>:1");
+        const named = evaluator.evaluateRaw(evaluator.compileRaw(`(define (named-fn x) x) named-fn`));
+        expect(named.debugName).toBe("named-fn");
 
         const cont = evaluator.evaluateRaw(evaluator.compileRaw(`(call/cc (lambda (k) k))`));
         expect(cont.debugName).toBe("continuation");
@@ -1348,8 +1398,161 @@ describe('Anima', () => {
                     (list result depth max-depth))
             `)).toBe("(done 0 26)");
         });
+
+        // the whole source is one top-level body, so saved-k's continuation includes the (saved-k ...) call itself:
+        // re-entering unconditionally loops forever, so this bounds it with a counter
+        it('correctly does not clobber regs', () => {
+            expect(run(`
+(define saved-k #f)
+(define n 0)
+(define seen '())
+
+(define (test-accumulator)
+  (let ((result (dynamic-wind
+                  (lambda () #f)
+                  (lambda ()
+                    (call/cc (lambda (k)
+                               (set! saved-k k)
+                               "initial-return")))
+                  (lambda ()
+                    999))))
+    (set! seen (cons result seen))))
+
+(test-accumulator)
+(set! n (+ n 1))
+(if (< n 3)
+    (saved-k "re-entered-value")
+    seen)
+            `)).toBe(`("re-entered-value" "re-entered-value" "initial-return")`)
+        })
+    });
+
+    describe('Debugging & tracebacks', () => {
+        const runFile = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src, "t.anima"));
+        const errorOf = (src: string): any => {
+            try {
+                runFile(src);
+            } catch (e) {
+                return e;
+            }
+            throw new Error("expected an error");
+        };
+
+        it("names procedures after their bindings", () => {
+            expect(runFile(`(define (f x) x) f`).debugName).toBe("f");
+            expect(runFile(`(define g (lambda () 1)) g`).debugName).toBe("g");
+            expect(runFile(`(let ((h (lambda () 1))) h)`).debugName).toBe("h");
+            expect(runFile(`(lambda () 1)`).debugName).toBe("lambda@t.anima:1");
+            expect(runFile(`map`).debugName).toBe("map");
+        });
+
+        it("debug-traceback lists the live frames with positions", () => {
+            const tb = runFile(`(define (inner)
+  (list (debug-traceback "here")))
+(define (outer)
+  (car (inner)))
+(car (list (outer)))`);
+            expect(tb).toBe("here\nstack traceback:\n  t.anima:2:9 in inner\n  t.anima:4:8 in outer\n  t.anima:5:12 in top-level");
+        });
+
+        it("debug-frames returns name/file/line/col records and honours level", () => {
+            expect(s.stringify(runFile(`(define (f) (car (debug-frames))) (list (f))`))).toBe(`(#("f" "t.anima" 1 18))`);
+            expect(s.stringify(runFile(`(define (f) (car (debug-frames 1))) (list (f))`))).toBe(`(#("top-level" "t.anima" 1 43))`);
+        });
+
+        it("tail calls drop frames", () => {
+            const tb = runFile(`(define (a) (debug-traceback)) (define (b) (a)) (car (list (b)))`);
+            expect(tb).toBe("stack traceback:\n  t.anima:1:60 in top-level");
+        });
+
+        it("unhandled errors carry a traceback", () => {
+            const err = errorOf(`(define (bad x)
+  (car x))
+(define (go)
+  (+ 1 (bad '())))
+(go)`);
+            expect(err.message).toBe("car: list is too short");
+            expect(err.animaTraceback).toMatch(/^car: list is too short\nstack traceback:\n  t\.anima:\d+:\d+ in bad\n  t\.anima:4:8 in go$/);
+        });
+
+        it("tracebacks work inside exception handlers", () => {
+            const tb = runFile(`(define (bad) (list (raise 'boom)))
+(call/cc (lambda (k)
+  (with-exception-handler
+    (lambda (e) (k (debug-traceback e)))
+    (lambda () (list (bad))))))`);
+            expect(tb).toMatch(/^boom\nstack traceback:\n/);
+            expect(tb).toContain("t.anima:1:21 in bad");
+        });
+
+        it("tracebacks of suspended coroutines", () => {
+            runFile(`(define tb-co (coroutine-create (lambda ()
+  (define (deep) (list (coroutine-yield 1)))
+  (list (deep)))))
+(coroutine-resume tb-co)`);
+            const expected = "stack traceback:\n  t.anima:2:24 in deep\n  t.anima:3:9 in lambda@t.anima:1";
+            expect(runFile(`(debug-traceback tb-co)`)).toBe(expected);
+            expect(evaluator.traceback(runFile(`tb-co`))).toBe(expected);
+            expect(runFile(`(define fresh-co (coroutine-create (lambda () 1))) (debug-traceback fresh-co)`)).toBe("stack traceback:");
+        });
+
+        it("%at overrides positions for transpiled code", () => {
+            const err = errorOf(`(define (lua-fn t)
+  (%at "game.luau" 12 5 (car t)))
+(list (lua-fn '()))`);
+            expect(err.animaTraceback).toContain("game.luau:12:5 in lua-fn");
+            expect(() => runFile(`(%at "x" 1 (car '(1)))`)).toThrow("%at must be in format");
+        });
+
+        it("continuations stay multi-shot after a traceback", () => {
+            expect(runFile(`(define saved #f)
+(define count 0)
+(define (f) (debug-traceback) (call/cc (lambda (k) (set! saved k) 0)))
+(define r (f))
+(set! count (+ count 1))
+(if (< count 3) (saved count) (list r count))`)).toEqual(Cons.list(2, 3));
+        });
     });
 })
+
+describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s", (_mode, vmImpl) => {
+    const evaluator = new Anima(vmImpl);
+    const runFile = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src, "t.anima"));
+    const errorOf = (src: string): any => {
+        try {
+            runFile(src);
+        } catch (e) {
+            return e;
+        }
+        throw new Error("expected an error");
+    };
+
+    it("records recent tail calls, collapsing repeats", () => {
+        const err = errorOf(`(define (loop n) (if (= n 0) (helper n) (loop (- n 1))))
+(define (helper n) (list (explode n)))
+(define (explode n)
+  (car n))
+(define (start) (loop 5))
+(start)`);
+        expect(err.animaTraceback).toBe(
+            "car: expected a pair but got 0\nstack traceback:\n  t.anima:4:3 in explode\n  t.anima:2:26 in helper\n" +
+            "recent tail calls (newest first):\n  helper <- loop x6 <- start"
+        );
+    });
+
+    it("reports the exact failing position without a preceding call", () => {
+        const err = errorOf(`(define (f x)
+  (let ((y (+ x 1)))
+    (list (car y))))
+(list (f 1))`);
+        expect(err.animaTraceback).toContain("t.anima:3:11 in f");
+    });
+
+    it("keeps the prelude out of the tail history", () => {
+        const err = errorOf(`(define (g) (raise 'x)) (list (g))`);
+        expect(err.animaTraceback).toBe("x\nstack traceback:\n  t.anima:1:31 in top-level\nrecent tail calls (newest first):\n  raise");
+    });
+});
 
 describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
     

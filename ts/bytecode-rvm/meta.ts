@@ -16,3 +16,17 @@ export const implAot: AnimaMeta = {
     compiler: () => new Compiler(),
     deepPrint: (bc) => deepPrint(bc as ByteCode)
 };
+
+export const implDebug: AnimaMeta = {
+    id: "rvm-debug",
+    vm: () => new AnimaVM("interp"),
+    compiler: () => new Compiler(true),
+    deepPrint: (bc) => deepPrint(bc as ByteCode)
+};
+
+export const implAotDebug: AnimaMeta = {
+    id: "rvm-aot-debug",
+    vm: () => new AnimaVM("aot"),
+    compiler: () => new Compiler(true),
+    deepPrint: (bc) => deepPrint(bc as ByteCode)
+};

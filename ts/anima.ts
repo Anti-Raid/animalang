@@ -51,6 +51,10 @@ export class Anima {
         this.#vm.closeCoroutine(co)
     }
 
+    public traceback(co: any, msg?: string): string {
+        return this.#vm.traceback(co, msg)
+    }
+
     compileToClosure(s: string, args: any, globals: Table) {
         const bast = new ASP(s, true).parse()
         return this.compileAstToClosure(bast, args, globals)
@@ -63,8 +67,8 @@ export class Anima {
         return res
     }
 
-    compileRaw(s: string) {
-        const ast = new ASP(s, true).parse()
+    compileRaw(s: string, file?: string) {
+        const ast = new ASP(s, true, file).parse()
         return this.compileRawAst(ast)
     }
 

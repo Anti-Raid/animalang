@@ -12,7 +12,10 @@ import {
     SerializableBytecode,
     AbstractClosure,
     OpaqueValue,
-    packValues
+    packValues,
+    ASTStringifier,
+    type SourcePos,
+    formatPos
 } from "../common";
 import { Cons } from "../list";
 import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList } from "../ops";
@@ -81,12 +84,40 @@ export class ByteCode implements AbstractByteCode {
     public directArity: number = -1;
     public directRestArity: number = -1;
 
-    constructor(public constants: any[], public inst: Uint32Array, public numReg: number) {}
+    // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
+    constructor(
+        public constants: any[],
+        public inst: Uint32Array,
+        public numReg: number,
+        public lineTable: Uint32Array = new Uint32Array(0),
+        public files: string[] = [],
+        // compiled in debug mode: records tail calls and exact error positions (never mixed with non-debug code)
+        public debug: boolean = false
+    ) {}
+
+    positionAt(ip: number): SourcePos | null {
+        const table = this.lineTable;
+        let lo = 0, hi = table.length / 4 - 1, found = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (table[mid * 4] <= ip) {
+                found = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if (found === -1) return null;
+        return { file: this.files[table[found * 4 + 1]], line: table[found * 4 + 2], col: table[found * 4 + 3] };
+    }
 
     dump(bs: BS) {
         bs.writeU32Arr(this.inst);
         bs.writeArray(this.constants);
         bs.writeU32(this.numReg);
+        bs.writeU32Arr(this.lineTable);
+        bs.writeArray(this.files);
+        bs.writeValue(this.debug);
     }
 
     static register(bsr: BSReader) {
@@ -94,7 +125,10 @@ export class ByteCode implements AbstractByteCode {
             const inst = bsr.readU32Arr();
             const constants = bsr.readArray();
             const numReg = bsr.readU32();
-            return new ByteCode(constants, inst, numReg);
+            const lineTable = bsr.readU32Arr();
+            const files = bsr.readArray() as string[];
+            const debug = bsr.read() as boolean;
+            return new ByteCode(constants, inst, numReg, lineTable, files, debug);
         });
     }
 }
@@ -110,7 +144,7 @@ export class ClosureTemplate implements SerializableBytecode {
     code: ByteCode;
     upvarLocs: UpVarLoc[]; // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[]) {
+    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null) {
         this.params = params;
         this.remParams = remParams;
         this.code = code;
@@ -122,6 +156,7 @@ export class ClosureTemplate implements SerializableBytecode {
         bs.writeValue(this.remParams);
         bs.writeValue(this.code);
         bs.writeValue(this.upvarLocs);
+        bs.writeValue(this.name);
     }
 
     static register(bsr: BSReader) {
@@ -130,7 +165,8 @@ export class ClosureTemplate implements SerializableBytecode {
             const remParams = bsr.read() as symbol | null;
             const code = bsr.readSerializable<ByteCode>("ByteCode");
             const upvarLocs = bsr.readArray() as UpVarLoc[];
-            return new ClosureTemplate(params, remParams, code, upvarLocs);
+            const name = bsr.read() as string | null;
+            return new ClosureTemplate(params, remParams, code, upvarLocs, name);
         });
     }
 }
@@ -139,17 +175,17 @@ export class ClosureTemplate implements SerializableBytecode {
 export class Closure extends IProcedure implements AbstractClosure {
     public bsid = "Closure";
 
-    constructor(public tmpl: ClosureTemplate, public upvars: any[], debugName: string = "lambda") {
+    constructor(public tmpl: ClosureTemplate, public upvars: any[], debugName: string = tmpl.name ?? "lambda") {
         super(debugName);
     }
 
-    static fromTemplate(tmpl: ClosureTemplate, debugName: string = "lambda") {
+    static fromTemplate(tmpl: ClosureTemplate, debugName?: string) {
         // Allocate enough space for the upvars from outer scopes
         const upvars = new Array(tmpl.upvarLocs.length);
         return new Closure(tmpl, upvars, debugName);
     }
 
-    static create(tmpl: ClosureTemplate, regs: readonly any[], upvars: readonly any[], debugName: string = "lambda") {
+    static create(tmpl: ClosureTemplate, regs: readonly any[], upvars: readonly any[], debugName?: string) {
         const closure = Closure.fromTemplate(tmpl, debugName);
         for (let i = 0; i < tmpl.upvarLocs.length; i++) {
             const loc = tmpl.upvarLocs[i];
@@ -270,6 +306,8 @@ export class ExecutionContext {
     public coroutine: Coroutine | null = null;
     // a throwaway resumer for nested resumes: control coming back here ends the nested driver loop
     public barrier: boolean = false;
+    // recent tail calls, newest last (only recorded by debug code)
+    public tailHistory: { name: string, count: number }[] = [];
 
     constructor(
         public vm: AbstractVM,
@@ -277,7 +315,21 @@ export class ExecutionContext {
     ) {
         this.id = ++ExecutionContext.nextId;
     }
+
+    recordTail(proc: any): void {
+        const name = proc instanceof IProcedure ? proc.debugName ?? "?" : proc instanceof OpaqueValue ? proc.typeName : String(proc);
+        const hist = this.tailHistory;
+        const last = hist[hist.length - 1];
+        if (last !== undefined && last.name === name) {
+            last.count++;
+            return;
+        }
+        hist.push({ name, count: 1 });
+        if (hist.length > TAIL_HISTORY_SIZE) hist.shift();
+    }
 }
+
+const TAIL_HISTORY_SIZE = 16;
 
 export type CoroutineStatus = "suspended" | "running" | "normal" | "dead";
 
@@ -319,6 +371,8 @@ export class Frame {
     public code: ByteCode;
     public upvars: any[];
     public epoch: number;
+    // exact position of the last instruction run, when debug code knows it better than ip
+    public posIp: number = -1;
 
     constructor(
         public closure: Closure,
@@ -611,8 +665,9 @@ export class VMExecutor {
                 if (resumer.ctx.barrier) throw new ReRaise(err.error);
                 return this.handleHostException(resumer.ctx, resumer.frame, new ReRaise(err.error));
             }
-            if (err.error instanceof Error) throw err.error;
-            throw new Error(String(err.error));
+            const out = err.error instanceof Error ? err.error : new Error(String(err.error));
+            if (err.traceback !== undefined && (out as any).animaTraceback === undefined) (out as any).animaTraceback = err.traceback;
+            throw out;
         }
         if (err instanceof ReRaise) {
             if (this.raiseProc !== null && this.raiseProc !== false) {
@@ -764,6 +819,44 @@ export class VMExecutor {
 
 type RuntimeFn = (ctx: ExecutionContext, executor: VMExecutor, regs: readonly any[], start: number, nargs: number) => any;
 
+export type FrameInfo = { name: string, pos: SourcePos | null };
+
+export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] => {
+    const out: FrameInfo[] = [];
+    for (let f = frame, i = 0; f !== null; f = f.parent, i++) {
+        if (i >= level) out.push({ name: f.debugName, pos: f.code.positionAt(Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)) });
+    }
+    return out;
+};
+
+export const formatTraceback = (frames: FrameInfo[], msg?: string, tailHistory: { name: string, count: number }[] = []): string => {
+    const lines = frames.map(f => `\n  ${formatPos(f.pos)} in ${f.name}`).join("");
+    const tails = tailHistory.length === 0 ? "" : "\nrecent tail calls (newest first):\n  " +
+        tailHistory.map(t => t.count > 1 ? `${t.name} x${t.count}` : t.name).reverse().join(" <- ");
+    return `${msg !== undefined ? msg + "\n" : ""}stack traceback:${lines}${tails}`;
+};
+
+// (%debug-frames k args) / (%debug-traceback k args): args is ([coroutine] [msg] [level]), k the caller's continuation
+const debugTarget = (ctx: ExecutionContext, regs: readonly any[], start: number) => {
+    let frame = (regs[start] as VMContinuation).frame;
+    let target = ctx;
+    const args = listToArray(regs[start + 1]);
+    if (args[0] instanceof Coroutine) {
+        const co = args.shift() as Coroutine;
+        target = co.ctx;
+        if (co !== ctx.coroutine) frame = co.frame;
+    }
+    return { frame, args, tailHistory: target.tailHistory };
+};
+
+const tracebackMessage = (msg: any): string | undefined => {
+    if (msg === undefined) return undefined;
+    if (typeof msg === "string") return msg;
+    if (msg instanceof ErrorObject) return msg.error instanceof Error ? msg.error.message : String(msg.error);
+    if (msg instanceof Error) return msg.message;
+    return new ASTStringifier().stringify(msg);
+};
+
 export const RUNTIME: [name: string, fn: RuntimeFn][] = [
     ["coroutine-create", (ctx, executor, regs, start) => executor.coCreate(ctx, regs[start])],
     ["coroutine-status", (ctx, executor, regs, start) => executor.coStatus(regs[start])],
@@ -776,6 +869,17 @@ export const RUNTIME: [name: string, fn: RuntimeFn][] = [
     ["values->list", (ctx, executor, regs, start, nargs) => valuesToList(regs, start, nargs)],
     ["list->values", (ctx, executor, regs, start, nargs) => listToValues(regs, start, nargs)],
     ["apply-args", (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
+    ["debug-frames", (ctx, executor, regs, start) => {
+        const { frame, args } = debugTarget(ctx, regs, start);
+        const level = typeof args[0] === "number" ? args[0] : 0;
+        return Cons.fromArray(frameInfos(frame, level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
+    }],
+    ["debug-traceback", (ctx, executor, regs, start) => {
+        const { frame, args, tailHistory } = debugTarget(ctx, regs, start);
+        const msg = typeof args[0] === "number" ? undefined : args.shift();
+        const level = typeof args[0] === "number" ? args[0] : 0;
+        return formatTraceback(frameInfos(frame, level), tracebackMessage(msg), tailHistory);
+    }],
 ];
 
 export const RUNTIME_IDX = new Map(RUNTIME.map(([name], idx) => [name, idx]));
@@ -891,6 +995,7 @@ export class BytecodeInterpreter {
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
+                        if (isTail && frame.code.debug) ctx.recordTail(proc);
 
                         if (!isTail && proc instanceof BuiltinFunction) {
                             ctx.acc = proc.cb(regs, startReg, nargs);
@@ -935,6 +1040,7 @@ export class BytecodeInterpreter {
                         const coReg = inst[ip++];
                         const listReg = inst[ip++];
                         const isTail = inst[ip++] !== 0;
+                        if (isTail && frame.code.debug) ctx.recordTail(regs[coReg]);
                         frame.ip = ip;
                         return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]));
                     }
@@ -950,12 +1056,14 @@ export class BytecodeInterpreter {
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
+                        if (isTail && frame.code.debug) ctx.recordTail(proc);
                         frame.ip = ip;
                         return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), isTail);
                     }
                     case OpCode.CALLCC: {
                         const procReg = inst[ip++];
                         const isTail = inst[ip++] !== 0;
+                        if (isTail && frame.code.debug) ctx.recordTail(regs[procReg]);
                         frame.ip = ip;
                         return executor.callCC(ctx, regs[procReg], frame, isTail);
                     }
@@ -974,6 +1082,8 @@ export class BytecodeInterpreter {
 
 const JIT_DEPS = {
     IBUILTINS,
+    IProcedure,
+    ErrorObject,
     isTruthy,
     Box,
     MissingVarError,
@@ -994,7 +1104,8 @@ const JIT_DEPS = {
 
 type ProcRef = { reg: number } | { builtin: number };
 
-type AotInst =
+// `at` is the ip of the instruction an op or terminator was decoded from
+type AotInst = { at?: number } & (
     | { k: "LoadConst"; dst: number; idx: number }
     | { k: "LoadInt"; dst: number; value: number }
     | { k: "LoadUpvar"; dst: number; idx: number; unbox: boolean }
@@ -1005,29 +1116,23 @@ type AotInst =
     | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
     | { k: "MoveAcc"; dst: number }
     | { k: "CallBuiltin"; builtin: number; dst: number; start: number; nargs: number; resume: number }
-    | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number };
+    | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number });
 
-type AotTerm =
+type AotTerm = { at?: number } & (
     | { k: "Jump"; target: number }
     | { k: "Branch"; cond: number; then: number; else: number }
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
-    | { k: "TailCallBuiltin"; builtin: number; start: number; nargs: number; ip: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean }
     | { k: "Apply"; proc: ProcRef; isTail: boolean; start: number; nargs: number; resume: number }
     | { k: "CallCC"; proc: number; isTail: boolean; resume: number }
     | { k: "Yield"; val: number; resume: number }
     | { k: "CoResume"; co: number; list: number; isTail: boolean; resume: number }
-    | { k: "Return"; reg: number };
+    | { k: "Return"; reg: number });
 
 type AotBlock = { start: number; insts: AotInst[]; term: AotTerm };
 
 const STRUCTURE_MISMATCH = Symbol("structure mismatch");
-
-const INLINE_BINARY_OPS: Record<string, string> = {
-    "+": "+", "-": "-", "*": "*", "/": "/", "=": "===", "<": "<", "<=": "<=", ">": ">", ">=": ">=",
-};
-
 
 export class AotCompiler {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
@@ -1086,11 +1191,11 @@ export class AotCompiler {
 
     public static generateSource(code: ByteCode, tmpl?: ClosureTemplate): string {
         const blocks = this.buildAot(code, tmpl);
-        const resume = new ResumeEmitter(blocks, code.inst, code.numReg);
+        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug);
         resume.emitFunction();
         let direct = "null";
         if (tmpl !== undefined) {
-            const out = new DirectEmitter(blocks, code.inst, code.numReg);
+            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug);
             out.emitFunction(tmpl.params.length + (tmpl.remParams !== null ? 1 : 0));
             direct = out.toString();
         }
@@ -1143,6 +1248,7 @@ export class AotCompiler {
 
             while (ip < end && term === null) {
                 const opIp = ip;
+                const numInsts = insts.length;
                 const opcode: OpCode = inst[ip++];
                 switch (opcode) {
                     case OpCode.LOADCONST:
@@ -1209,10 +1315,7 @@ export class AotCompiler {
                             term = { k: "Call", proc: procIdx, start, nargs, resume: ip };
                             break;
                         }
-                        if (procIdx >= BUILTINS_START) {
-                            term = { k: "TailCallBuiltin", builtin: procIdx - BUILTINS_START, start, nargs, ip };
-                            break;
-                        }
+                        if (procIdx >= BUILTINS_START) throw new Error("internal error: builtins are never tail called");
                         const numPos = tmpl ? tmpl.params.length : -1;
                         const hasRest = tmpl ? tmpl.remParams !== null : false;
                         const arityFits = tmpl !== undefined && (hasRest ? nargs >= numPos : nargs === numPos);
@@ -1256,6 +1359,8 @@ export class AotCompiler {
                         throw new Error(`Unhandled opcode in JIT: ${opcode}`);
                     }
                 }
+                if (insts.length > numInsts) insts[insts.length - 1].at = opIp;
+                if (term !== null) term.at = opIp;
             }
 
             blocks.push({ start: starts[b], insts, term: term ?? { k: "Jump", target: ip } });
@@ -1331,7 +1436,6 @@ class Liveness {
         switch (term.k) {
             case "Branch": return [term.cond];
             case "Call": case "TailCall": case "MaybeSelfTailCall": return [term.proc, ...windowRegs(term.start, term.nargs)];
-            case "TailCallBuiltin": return windowRegs(term.start, term.nargs);
             case "Apply": return [...("reg" in term.proc ? [term.proc.reg] : []), ...windowRegs(term.start, term.nargs)];
             case "CallCC": return [term.proc];
             case "Yield": return [term.val];
@@ -1412,8 +1516,26 @@ export class CodeEmitter {
 
 // emits one entry point of a compiled function; subclasses decide how registers reach callees, how values come back and how control leaves
 abstract class FunctionEmitter extends CodeEmitter {
-    constructor(protected readonly blocks: AotBlock[], protected readonly inst: Uint32Array, protected readonly numReg: number) {
+    constructor(protected readonly blocks: AotBlock[], protected readonly inst: Uint32Array, protected readonly numReg: number, protected readonly debug: boolean = false) {
         super();
+    }
+
+    // debug code only: statement recording the exact position of the op about to run
+    protected abstract debugPos(ip: number): string;
+
+    protected debugHooks(x: { at?: number }, tailProc?: string): string {
+        if (!this.debug || x.at === undefined) return "";
+        return `${this.debugPos(x.at + 1)}${tailProc !== undefined ? ` ctx.recordTail(${tailProc});` : ""}`;
+    }
+
+    protected tailProcOf(term: AotTerm): string | undefined {
+        switch (term.k) {
+            case "TailCall": case "MaybeSelfTailCall": return `r${term.proc}`;
+            case "Apply": return term.isTail ? this.procExpr(term.proc) : undefined;
+            case "CallCC": return term.isTail ? `r${term.proc}` : undefined;
+            case "CoResume": return term.isTail ? `r${term.co}` : undefined;
+            default: return undefined;
+        }
     }
 
     abstract emitFunction(arity: number): void;
@@ -1482,6 +1604,7 @@ abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected emitInst(inst: AotInst): void {
+        if (this.debug) this.emit(this.debugHooks(inst));
         switch (inst.k) {
             case "LoadConst":
                 return this.emit(`r${inst.dst} = CONSTANTS[${inst.idx}];`);
@@ -1529,11 +1652,14 @@ abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`r${inst.dst} = ${this.accExpr};`);
             case "RtCall":
                 return this.emit(this.#inlineRuntime(inst) ?? `r${inst.dst} = ${this.windowCall(`RUNTIME_FNS[${inst.rt}]`, inst.start, inst.nargs, true)};`);
-            case "CallBuiltin":
-                return this.emit(this.#inlineBuiltin(inst) ?? `
+            case "CallBuiltin": {
+                const inline = this.inlineBuiltin(inst.builtin, inst.start, inst.nargs);
+                if (inline !== null) return this.emit(`r${inst.dst} = ${inline};`);
+                return this.emit(`
                     ${this.recordIp(inst.resume)}
                     r${inst.dst} = ${this.windowCall(`IBUILTINS[${inst.builtin}].cb`, inst.start, inst.nargs)};
                 `);
+            }
             default: {
                 const _: never = inst;
             }
@@ -1552,30 +1678,11 @@ abstract class FunctionEmitter extends CodeEmitter {
         }
     }
 
-    #inlineBuiltin(inst: Extract<AotInst, { k: "CallBuiltin" }>): string | null {
-        const { dst, start, nargs } = inst;
-        const name = Symbol.keyFor(IBUILTINS[inst.builtin].name);
-        const slow = this.windowCall(`IBUILTINS[${inst.builtin}].cb`, start, nargs);
-        const a = `r${start}`, b = `r${start + 1}`;
-        if (name === "list") {
-            let list = "null";
-            for (let i = nargs - 1; i >= 0; i--) list = `new Cons(r${start + i}, ${list})`;
-            return `r${dst} = ${list};`;
-        }
-        if (nargs === 2) {
-            if (name === "cons") return `r${dst} = Cons.pair(${a}, ${b});`;
-            if (name === "eq?") return `r${dst} = ${a} === ${b};`;
-            const op = name === undefined ? undefined : INLINE_BINARY_OPS[name];
-            if (op === undefined) return null;
-            const guard = `typeof ${a} === "number" && typeof ${b} === "number"${name === "/" ? ` && ${b} !== 0` : ""}`;
-            return `r${dst} = ${guard} ? ${a} ${op} ${b} : ${slow};`;
-        }
-        if (nargs === 1) {
-            if (name === "null?") return `r${dst} = ${a} === null;`;
-            if (name === "pair?") return `r${dst} = ${a} instanceof Cons;`;
-            if (name === "car" || name === "cdr") return `r${dst} = ${a} instanceof Cons ? ${a}.${name} : ${slow};`;
-        }
-        return null;
+    // an expression computing a builtin call inline (see InlineFn), or null
+    protected inlineBuiltin(builtin: number, start: number, nargs: number): string | null {
+        const inline = IBUILTINS[builtin].inline;
+        if (inline === undefined) return null;
+        return inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`IBUILTINS[${builtin}].cb`, start, nargs));
     }
 }
 
@@ -1585,13 +1692,17 @@ class ResumeEmitter extends FunctionEmitter {
     protected readonly endOfCode = "return null;";
     readonly #liveness: Liveness;
 
-    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number) {
-        super(blocks, inst, numReg);
+    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false) {
+        super(blocks, inst, numReg, debug);
         this.#liveness = new Liveness(blocks, numReg);
     }
 
     protected recordIp(ip: number): string {
         return `frame.ip = ${ip};`;
+    }
+
+    protected debugPos(ip: number): string {
+        return `frame.posIp = ${ip};`;
     }
 
     protected windowCall(fn: string, start: number, nargs: number, withRuntime: boolean = false): string {
@@ -1647,6 +1758,7 @@ class ResumeEmitter extends FunctionEmitter {
 
     protected emitTerm(term: AotTerm, next: number): void {
         const live = this.#liveness;
+        if (this.debug) this.emit(this.debugHooks(term, this.tailProcOf(term)));
         switch (term.k) {
             case "Jump":
                 return this.emit(this.jump(term.target, next));
@@ -1669,12 +1781,6 @@ class ResumeEmitter extends FunctionEmitter {
                         }
                     }
                     ${this.jump(term.resume, next)}
-                `);
-            case "TailCallBuiltin":
-                return this.emit(`
-                    frame.ip = ${term.ip};
-                    ctx.acc = ${this.windowCall(`IBUILTINS[${term.builtin}].cb`, term.start, term.nargs)};
-                    return executor.setRetVal(ctx, frame.parent, ctx.acc);
                 `);
             case "TailCall":
                 return this.emit(`
@@ -1743,6 +1849,10 @@ class DirectEmitter extends FunctionEmitter {
         return "";
     }
 
+    protected debugPos(ip: number): string {
+        return `dip = ${ip};`;
+    }
+
     protected windowCall(fn: string, start: number, nargs: number, withRuntime: boolean = false): string {
         return `${fn}(${withRuntime ? "ctx, executor, " : ""}[${this.argList(start, nargs)}], 0, ${nargs})`;
     }
@@ -1754,7 +1864,7 @@ class DirectEmitter extends FunctionEmitter {
         this.emit(`
             function(ctx, closure, executor${params}) {
                 const upvars = closure.upvars;
-                let ip = 0, rip = 0, acc;
+                let ip = 0, rip = 0, acc${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 try {
         `);
@@ -1782,7 +1892,11 @@ class DirectEmitter extends FunctionEmitter {
         this.emit(`
                 } catch (e) {
                     const sig = e instanceof Suspend ? e : Suspend.error(e);
-                    if (rip !== -1) sig.push(new Frame(closure, [${allRegs}], rip, null, ctx));
+                    if (rip !== -1) {
+                        const f = new Frame(closure, [${allRegs}], rip, null, ctx);
+                        ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : ""}
+                        sig.push(f);
+                    }
                     throw sig;
                 }
             }
@@ -1791,7 +1905,7 @@ class DirectEmitter extends FunctionEmitter {
 
     // direct-entry code never resumes mid-function, so compiled `if`s (IF c else ... ELSE end, else: ... ENDIF, end:) can be emitted as nested js if/else
     #structuredBody(): string | null {
-        const body = new DirectEmitter(this.blocks, this.inst, this.numReg);
+        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug);
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {
             body.#walk(index, 0, this.inst.length);
@@ -1858,6 +1972,7 @@ class DirectEmitter extends FunctionEmitter {
     }
 
     protected emitTerm(term: AotTerm, next: number): void {
+        if (this.debug) this.emit(this.debugHooks(term, this.tailProcOf(term)));
         switch (term.k) {
             case "Jump":
                 return this.emit(this.jump(term.target, next));
@@ -1886,8 +2001,6 @@ class DirectEmitter extends FunctionEmitter {
                     ${this.jump(term.resume, next)}
                 `);
             }
-            case "TailCallBuiltin":
-                return this.emit(`return ${this.windowCall(`IBUILTINS[${term.builtin}].cb`, term.start, term.nargs)};`);
             case "TailCall":
                 return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs)} }`);
             case "MaybeSelfTailCall":

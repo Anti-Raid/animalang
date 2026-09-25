@@ -72,7 +72,7 @@ export class ErrorObject {
 }
 
 export class UnhandledSchemeError extends Error {
-    constructor(public readonly error: any) {
+    constructor(public readonly error: any, public readonly traceback?: string) {
         super(error instanceof Error ? error.message : String(error));
     }
 }
@@ -92,6 +92,14 @@ export const OP_QUOTE  = Symbol.for("quote");
 export const OP_AND      = Symbol.for("and");
 export const OP_OR       = Symbol.for("or");
 export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
+export const OP_AT = Symbol.for("%at");
+
+export type SourcePos = { file: string, line: number, col: number };
+
+// source positions of forms, set by the reader and by (%at file line col expr), read by the compiler
+export const SOURCE_POS = new WeakMap<object, SourcePos>();
+
+export const formatPos = (pos: SourcePos | null | undefined) => pos ? `${pos.file}:${pos.line}:${pos.col}` : "?";
 
 export const SPECIAL_FORMS = new Set([
     OP_DEFINE, 
@@ -139,6 +147,41 @@ export class ASPParseError extends Error {
     }
 }
 
+const STRING_ESCAPES: Record<string, string> = {
+    'n': "\n", 't': "\t", 'r': "\r", 'b': "\b", 'f': "\f", 'v': "\v", '0': "\0", 'a': "\x07",
+    '"': '"', '\\': '\\', '/': '/',
+}
+
+// raw characters (including control characters like literal newlines and tabs) are kept as-is
+const unescapeString = (body: string): string => {
+    let out = ""
+    for (let i = 0; i < body.length; i++) {
+        const ch = body[i]
+        if (ch !== '\\') {
+            out += ch
+            continue
+        }
+        const esc = body[++i]
+        if (esc === 'u') {
+            const hex = body.slice(i + 1, i + 5)
+            if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`bad \\u escape '\\u${hex}'`)
+            out += String.fromCharCode(parseInt(hex, 16))
+            i += 4
+        } else if (esc === 'x') {
+            const end = body.indexOf(';', i)
+            const hex = end === -1 ? "" : body.slice(i + 1, end)
+            if (!/^[0-9a-fA-F]{1,6}$/.test(hex)) throw new Error(`bad \\x escape, expected \\x<hex>;`)
+            out += String.fromCodePoint(parseInt(hex, 16))
+            i = end
+        } else if (esc !== undefined && esc in STRING_ESCAPES) {
+            out += STRING_ESCAPES[esc]
+        } else {
+            throw new Error(`unknown escape '\\${esc ?? ""}'`)
+        }
+    }
+    return out
+}
+
 const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', '{', '}', ';', '"', "'"])
 const ASP_CLOSING_TOKENS = new Set([')', ']', '}'])
 
@@ -146,10 +189,32 @@ export class ASP {
     #str: string;
     #currPos: number;
     #supportsDottedPairs: boolean = false // only bytecode compiler supports these, AST interpreter does not
-    constructor(str: string, supportsDottedPairs: boolean = false) {
+    #file: string
+    #tokenOffsets: number[] = []
+    constructor(str: string, supportsDottedPairs: boolean = false, file: string = "<input>") {
         this.#str = str
         this.#currPos = 0
         this.#supportsDottedPairs = supportsDottedPairs
+        this.#file = file
+    }
+
+    #lineStarts: number[] | null = null
+
+    #posAt(offset: number): SourcePos {
+        if (this.#lineStarts === null) {
+            this.#lineStarts = [0]
+            for (let i = 0; i < this.#str.length; i++) {
+                if (this.#str.charCodeAt(i) === 10) this.#lineStarts.push(i + 1)
+            }
+        }
+        const starts = this.#lineStarts
+        let lo = 0, hi = starts.length - 1
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1
+            if (starts[mid] <= offset) lo = mid
+            else hi = mid - 1
+        }
+        return { file: this.#file, line: lo + 1, col: offset - starts[lo] + 1 }
     }
 
     /** Look at the current character without moving forward */
@@ -190,28 +255,34 @@ export class ASP {
     /** Tokenize the input into a list of tokens to then parse */
     private tokenize(): string[] {
         const tokens: string[] = [];
+        let start = 0;
+        const push = (tok: string) => {
+            tokens.push(tok);
+            this.#tokenOffsets.push(start);
+        };
 
         while (!this.isEOF()) {
             this.skipTrivia();
             if (this.isEOF()) break;
+            start = this.#currPos;
             const char = this.peek();
 
             // Vectors: #( or #[
             if (char === '#' && (this.#str[this.#currPos + 1] === '(' || this.#str[this.#currPos + 1] === '[')) {
                 this.advance(); // consume '#'
-                tokens.push('#' + this.advance()); // push '#(' or '#['
+                push('#' + this.advance()); // push '#(' or '#['
                 continue;
             }
 
             // Lists & Tables
             if (char === '(' || char === ')' || char === '[' || char === ']' || char === '{' || char === '}') {
-                tokens.push(this.advance());
+                push(this.advance());
                 continue;
             }
 
             // Quote/'reader' has similar behavior to lists
             if (char === "'") {
-                tokens.push(this.advance());
+                push(this.advance());
                 continue;
             }
 
@@ -232,7 +303,7 @@ export class ASP {
                     throw new ASPTokenError(`Unterminated string literal`, this.#currPos, strToken);
                 }
                 
-                tokens.push(strToken);
+                push(strToken);
                 continue;
             }
 
@@ -245,7 +316,7 @@ export class ASP {
             ) {
                 atom += this.advance();
             }
-            tokens.push(atom);
+            push(atom);
         }
 
         return tokens
@@ -262,6 +333,8 @@ export class ASP {
             }
 
             let token = tokens[current];
+
+            const startOffset = this.#tokenOffsets[current];
 
             // Quote
             if (token === "'") {
@@ -330,6 +403,7 @@ export class ASP {
                 for (let i = lst.length - 1; i >= 0; i--) {
                     tail = new Cons(lst[i], tail);
                 }
+                if (tail instanceof Cons) SOURCE_POS.set(tail, this.#posAt(startOffset));
                 return tail;
             }
 
@@ -350,7 +424,9 @@ export class ASP {
                 if (items.length % 2 !== 0) {
                     throw new ASPParseError("table literal requires an even number of key-value expressions", current);
                 }
-                return Cons.list(Symbol.for("table"), ...items);
+                const table = Cons.list(Symbol.for("table"), ...items);
+                if (table !== null) SOURCE_POS.set(table, this.#posAt(startOffset));
+                return table;
             }
 
             // Stray closing brackets are not allowed
@@ -379,12 +455,10 @@ export class ASP {
                 if (!Number.isNaN(num)) return num;
             }
 
-            // Strings must be (un?)escaped
+            // Strings must be unescaped
             if (token.startsWith('"') && token.endsWith('"')) {
                 try {
-                    // HACK: JSON.parse should parse this correctly
-                    const string = JSON.parse(token); 
-                    return string;
+                    return unescapeString(token.slice(1, -1));
                 } catch (e) {
                     throw new ASPParseError(`String parse failed (${e})`, current, token)
                 }
@@ -1132,10 +1206,11 @@ export interface AbstractVM {
     evaluateRaw(code: AbstractByteCode, scope: Table): any,
     evaluateClosure(code: AbstractClosure, scope: Table, args: any[]): any,
     resumeCoroutine(co: any, args: any[]): { done: boolean, value: any, values: any[] },
-    closeCoroutine(co: any): void
+    closeCoroutine(co: any): void,
+    traceback(co: any, msg?: string): string
 }
 export interface AbstractCompiler {
-    compile(trExpr: any): AbstractByteCode
+    compile(trExpr: any, debug?: boolean): AbstractByteCode
 }
 export interface AnimaMeta {
     id: string,

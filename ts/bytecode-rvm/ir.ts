@@ -1,4 +1,4 @@
-import { ConstPool } from "../common";
+import { ConstPool, type SourcePos } from "../common";
 import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, type UpVarLoc } from "./exec";
 
 let nextLabelId = 0;
@@ -85,12 +85,6 @@ export type Node = {
     startReg: number,
     nargs: number
 } | {
-    // A call to a builtin function
-    t: "IBuiltinTail",
-    builtinIdx: number,
-    startReg: number,
-    nargs: number
-} | {
     // reg[destReg] = [reg[srcReg]]
     t: "Box",
     destReg: number,
@@ -123,6 +117,10 @@ export type Node = {
     isTail: boolean,
     destReg?: number
 } | {
+    // marks where the following code came from (goes into the line table, emits nothing)
+    t: "Pos",
+    pos: SourcePos
+} | {
     t: "RtCall",
     rtIdx: number,
     destReg: number,
@@ -131,12 +129,14 @@ export type Node = {
 }
 
 export class IR {
-    constructor() {}
+    constructor(private readonly debug: boolean = false) {}
 
     lower(nodes: Node[], numRegs: number): ByteCode {
         const cpool = new ConstPool()
         const inst: number[] = []
 
+        const lineTable: number[] = []
+        const files: string[] = []
         const jumpIdxs: Map<number, JumpLabel> = new Map()
         const resolvedLabels: Map<JumpLabel, number> = new Map()
         for(let i = 0; i < nodes.length; i++) {
@@ -209,17 +209,13 @@ export class IR {
                     inst.push(OpCode.CALL, node.builtinIdx, node.startReg, node.nargs, 0, OpCode.MOVEACC, node.destReg)
                     break
                 }
-                case "IBuiltinTail": {
-                    inst.push(OpCode.CALL, node.builtinIdx, node.startReg, node.nargs, 1)
-                    break
-                }   
                 case "Return": {
                     inst.push(OpCode.RETURN, node.reg)
                     break
                 }
                 case "NewClosure": {
                     const closureBc = this.lower(node.template.code, node.template.numRegs)
-                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs)
+                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name)
                     if(ct.upvarLocs.length === 0) {
                         // We can just directly push the template as a raw constant in the pool
                         const cidx = cpool.mutPush(Closure.fromTemplate(ct))
@@ -269,6 +265,16 @@ export class IR {
                     inst.push(OpCode.CALLRT, node.rtIdx, node.destReg, node.startReg, node.nargs);
                     break;
                 }
+                case "Pos": {
+                    let fileIdx = files.indexOf(node.pos.file);
+                    if (fileIdx === -1) fileIdx = files.push(node.pos.file) - 1;
+                    const n = lineTable.length;
+                    if (n > 0 && lineTable[n - 4] === inst.length) lineTable.length = n - 4;
+                    const m = lineTable.length;
+                    if (m > 0 && lineTable[m - 3] === fileIdx && lineTable[m - 2] === node.pos.line && lineTable[m - 1] === node.pos.col) break;
+                    lineTable.push(inst.length, fileIdx, node.pos.line, node.pos.col);
+                    break;
+                }
                 default:
                     let _: never = node;
             }
@@ -281,7 +287,7 @@ export class IR {
             inst[jump] = resolvedOffset
         }
 
-        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs)
+        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug)
     }
 }
 
@@ -293,7 +299,7 @@ export class ClosureTemplateIR {
     numRegs: number;
     upvarLocs: UpVarLoc[] // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[]) {
+    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null) {
         this.params = params
         this.remParams = remParams
         this.code = code

@@ -97,6 +97,10 @@ The compiler directly recognizes the following low-level `%` intrinsics:
 - **Forms**: `(%list <arg> ...)`, `(%cons a d)`
 - **Semantics**: Each compiles to a `CALL` of the `list` / `cons` builtin over the register window `[startReg, startReg + nargs)`. `%list` builds a fresh proper list.
 
+### Vector intrinsics
+- **Forms**: `(%vector-ref v k)`, `(%vector-set! v k val)`, `(%vector-length v)`
+- **Semantics**: Direct calls to `vector-ref`, `vector-set!` and `vector-length` are rewritten to these. Each compiles to a `CALL` of the builtin with the same name; the AOT emitter inlines them as a guarded JS array access and falls back to the builtin (and its error messages) when the guard fails.
+
 ### `%handlers` / `%set-handlers!`
 - **Forms**: `(%handlers)`, `(%set-handlers! <lst>)`
 - **Semantics**: Read and replace the current execution context's exception handler stack. Each context, and so each coroutine, has its own stack. Used by the prelude's `raise`, `raise-continuable` and `with-exception-handler`.
@@ -113,9 +117,17 @@ The compiler directly recognizes the following low-level `%` intrinsics:
   - `(%coroutine-close <co>)` runs a suspended coroutine's pending `dynamic-wind` after-thunks (innermost first, inside the coroutine) and marks it `dead`. Closing a dead coroutine does nothing, closing a running one is an error, and yielding during close is an error. The host equivalent is `Anima.coroutineClose(co)`.
   - Yielding from inside a Scheme callback invoked by a host builtin is an error (the callback runs in a separate execution context).
 
+### `%at`
+- **Form**: `(%at <file> <line> <col> <expr>)`
+- **Semantics**: Evaluates `<expr>`, recording `file:line:col` as its source position. For frontends that generate Anima code (e.g. a transpiler) so errors and tracebacks point at the original source. It is removed by the syntax transformer before macros run, so macros never see it. Positions only attach to forms (lists); a wrapped atom keeps the enclosing form's position.
+
+### `%debug-frames` / `%debug-traceback`
+- **Forms**: `(%debug-frames <k> <args>)`, `(%debug-traceback <k> <args>)`, where `<k>` is a continuation and `<args>` is the list `([coroutine] [msg] [level])`
+- **Semantics**: Walk the frames of `<k>` (or of a suspended coroutine) and return a list of `#(name file line col)` records, or a traceback string. Used by the prelude's `debug-frames` and `debug-traceback`.
+
 ### How intrinsics are compiled
-- **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines the common ones by name.
-- **Runtime operations that only need the execution context** (`%coroutine-create`, `%coroutine-status`, `%coroutine-close`, `%handlers`, `%set-handlers!`, `%set-raise-proc`, the wind/unwind steps of `%dynamic-wind`, and internal helpers with no public builtin: `%values->list` and the list/apply conversions behind `%coroutine-yield-list` and `%apply-multi`) compile to `CALLRT idx dst start nargs`, where `idx` indexes the `RUNTIME` table in `exec.ts`.
+- **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines builtins that define an `inline` expression (an `InlineFn` next to the builtin in `ops.ts`/`std.ts`: arithmetic, `eq?`, every predicate, every `c[ad]+r`, `list`, `cons` and the vector intrinsics), keeping a call to the builtin as the fallback so errors are unchanged. Builtins are never tail called: a builtin call in tail position compiles as a call followed by `RETURN`, since it cannot grow the Scheme stack.
+- **Runtime operations that only need the execution context** (`%coroutine-create`, `%coroutine-status`, `%coroutine-close`, `%handlers`, `%set-handlers!`, `%set-raise-proc`, the wind/unwind steps of `%dynamic-wind`, and internal helpers with no public builtin: `%values->list`, `%debug-frames`, `%debug-traceback` and the list/apply conversions behind `%coroutine-yield-list` and `%apply-multi`) compile to `CALLRT idx dst start nargs`, where `idx` indexes the `RUNTIME` table in `exec.ts`.
 - **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `isTail` operand; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
 
 ## Standard Library & Prelude Mappings
@@ -218,6 +230,17 @@ A non-tail resume from direct code instead runs the coroutine in a nested driver
 - `ReRaise` carries an error that escaped a coroutine into its resumer, so the resumer's handlers receive the original raised value.
 - `EscapedError` wraps an error that has already been through `handleHostException`, so enclosing compiled code does not handle it a second time. The driver loop unwraps it.
 - `Suspend.error` is how an error inside direct code reaches the heap frame that can handle it.
+
+## Debugging
+
+- **Names**: a lambda is named after what it is bound to (`define`, `set!`, `let`), else `lambda@file:line`. Exported prelude procedures take their public name.
+- **Source positions**: the reader records the position of every list form, and `%at` overrides it. The syntax transformer carries positions through macro expansion (an expansion inherits its macro call's position). The compiler emits `Pos` IR nodes, which lower into `ByteCode.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
+- **Tracebacks**: `(debug-frames [co] [level])` and `(debug-traceback [co] [msg] [level])` capture the caller's continuation with a tail `call/cc` and walk its frames (direct AOT code rebuilds its frames for this, as it does for any `call/cc`). A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. The host can get a suspended coroutine's traceback with `Anima.traceback(co)`.
+- **Unhandled errors**: the prelude's `raise` builds a traceback before giving up, and it is attached to the JS error as `animaTraceback`. For an error that escaped a coroutine, the coroutine's traceback is kept.
+- **Debug mode** (`implDebug` / `implAotDebug`, i.e. `new Compiler(true)`): the compiled `ByteCode` is flagged `debug`, and interpreter and AOT code for it
+  - record every tail call in the execution context's `tailHistory` (the last 16 callees, repeats collapsed to `name xN`), shown by tracebacks as `recent tail calls`;
+  - track the exact position of the last operation (`frame.posIp`, or `dip` in direct code), so errors inside inlined builtins report the right position.
+  Debug and non-debug code can run side by side (the prelude is always compiled without debug, so it stays out of the tail history), but there is only one set of compiled AOT functions per `ByteCode`.
 
 ## Bytecode serialization
 

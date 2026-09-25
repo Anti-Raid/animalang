@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, OP_BEGIN, OP_IF, OP_LAMBDA, OP_QUOTE, OP_SET, OP_DEFINE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, OP_BEGIN, OP_IF, OP_LAMBDA, OP_QUOTE, OP_SET, OP_DEFINE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -19,6 +19,9 @@ const BUILTIN_INTRINSICS = new Map<symbol, number>([
     ...[...ARITHMETIC, ...PREDICATES, ...CXR_PATHS].map(([name]) => name),
     "list",
     "cons",
+    "vector-ref",
+    "vector-set!",
+    "vector-length",
 ].map(name => [Symbol.for(`%${name}`), IBUILTINS_IDX_MAP.get(Symbol.for(name))!]))
 
 const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: number }>(([
@@ -29,6 +32,8 @@ const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: numb
     ["%coroutine-status", "coroutine-status", 1, 1],
     ["%coroutine-close", "coroutine-close", 1, 1],
     ["%values->list", "values->list", 1, 1],
+    ["%debug-frames", "debug-frames", 2, 2],
+    ["%debug-traceback", "debug-traceback", 2, 2],
 ] as [string, string, number, number][]).map(([form, name, min, max]) => [Symbol.for(form), { idx: RUNTIME_IDX.get(name)!, min, max }]))
 
 interface CmpOpts {
@@ -36,6 +41,8 @@ interface CmpOpts {
     isTail: boolean // whether this is a tail-call or not (for tco)
     nodes: Node[]
     scope: CompilerScope,
+    pos?: SourcePos // position of the enclosing form
+    name?: string // name for a lambda compiled directly as this value
 
     // From pass 1
     ascope: AnalysisScope,
@@ -45,9 +52,9 @@ interface CmpOpts {
 export class Compiler {
     #s = new ASTStringifier()
 
-    constructor() {}
+    constructor(private readonly debug: boolean = false) {}
 
-    compile(trExpr: any) {
+    compile(trExpr: any, debug: boolean = this.debug) {
         // Step 1 is to analyze our variables so we know what to box and what not to box
         let analyzer = new AstAnalysis()
         const ascope = analyzer.analyze(trExpr)
@@ -59,7 +66,7 @@ export class Compiler {
         if (!this.#nodesEndsInRet(nodes)) {
             nodes.push({t: "Return", reg: retReg})
         }
-        const ir = new IR()
+        const ir = new IR(debug)
         return ir.lower(nodes, scope.numRegs)
     }
 
@@ -83,6 +90,19 @@ export class Compiler {
             throw new Error(`bad syntax: illegal use of dotted pair in execution context (consider quoting e.g. '${this.#s.stringify(expr)}')`);
         }
 
+        const pos = SOURCE_POS.get(expr)
+        if (pos !== undefined && pos !== opts.pos) {
+            opts.nodes.push({ t: "Pos", pos })
+            this.#compileForm(expr, { ...opts, pos })
+            if (opts.pos !== undefined) opts.nodes.push({ t: "Pos", pos: opts.pos })
+            return
+        }
+        this.#compileForm(expr, opts)
+    }
+
+    #compileForm(expr: Cons, opts: CmpOpts) {
+        const name = opts.name
+        if (name !== undefined) opts = { ...opts, name: undefined }
         const operator = expr.car;
 
         if (typeof operator === "symbol") {
@@ -103,7 +123,7 @@ export class Compiler {
                     this.#compileSet(expr, opts)
                     return
                 case OP_LAMBDA:
-                    this.#compileLambda(expr, opts)
+                    this.#compileLambda(expr, opts, name)
                     return
                 case OP_DYNAMIC_WIND:
                     this.#compileDynamicWind(expr, opts)
@@ -169,7 +189,7 @@ export class Compiler {
         // intrinsic
         const builtinsIdx = IBUILTINS_IDX_MAP.get(operator)
         if (builtinsIdx !== undefined) {
-            this.#optIntrinsicNormal(expr, BUILTINS_START+builtinsIdx, opts)
+            this.#compileWindowIntrinsic(expr, builtinsIdx, opts)
             return
         }
 
@@ -239,7 +259,7 @@ export class Compiler {
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
-        this.#compile(val, { ...opts, destReg: valReg, isTail: false });
+        this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description });
         opts.nodes.push({t: "SetGlobal", srcReg: valReg, sym})
         opts.scope.freeTemp(valReg)
         if (opts.destReg !== undefined) {
@@ -254,7 +274,7 @@ export class Compiler {
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
-        this.#compile(val, { ...opts, destReg: valReg, isTail: false });
+        this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description });
         const res = this.#setVar(sym, opts, valReg)
         if(res) opts.nodes.push(...res)
         opts.scope.freeTemp(valReg)
@@ -263,7 +283,7 @@ export class Compiler {
         }
     }
 
-    #compileLambda(expr: Cons, opts: CmpOpts) {
+    #compileLambda(expr: Cons, opts: CmpOpts, name?: string) {
         // AnimaTransform ensures lambdas are of correct form
         const lambdaScope = new CompilerScope(opts.scope)
         const ascope = opts.analyzer.scopeMap.get(expr)
@@ -271,6 +291,7 @@ export class Compiler {
 
         const { params, remParams } = unpackLambdaExprArgs(expr, "lambda")
         const lambdaNodes: Node[] = []
+        if (opts.pos !== undefined) lambdaNodes.push({ t: "Pos", pos: opts.pos })
 
         for(let i = 0; i < params.length; i++) {
             const reg = lambdaScope.addLocal(params[i])
@@ -297,17 +318,19 @@ export class Compiler {
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
-        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars);
+        const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
+        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName);
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
     }
 
     #nodesEndsInRet(nodes: Node[]) {
-        if (nodes.length === 0) return false // we need a return if nodes.length === 0
-        const lastNode = nodes[nodes.length-1]
+        let last = nodes.length - 1
+        while (last >= 0 && nodes[last].t === "Pos") last--
+        if (last < 0) return false // we need a return if there is no code
+        const lastNode = nodes[last]
         if (
             lastNode.t === "TailCall" ||
             lastNode.t === "TailApply" ||
-            lastNode.t === "IBuiltinTail" ||
             lastNode.t === "Return" ||
             lastNode.t === "TailCallCC" ||
             (lastNode.t === "CoResume" && lastNode.isTail)
@@ -520,7 +543,7 @@ export class Compiler {
                 const argRegs: number[] = [];
                 for(let i = 0; i < args.length; i++) {
                     const tempReg = opts.scope.allocTemp();
-                    this.#compile(args[i], { ...opts, destReg: tempReg, isTail: false });
+                    this.#compile(args[i], { ...opts, destReg: tempReg, isTail: false, name: typeof params[i] === "symbol" ? params[i].description : undefined });
                     argRegs.push(tempReg);
                 }
 
@@ -549,30 +572,6 @@ export class Compiler {
             }
         }
         return false;
-    }
-
-    /** Optimizes intrinsic/builtin ops */ 
-    #optIntrinsicNormal(expr: Cons, builtinIdx: number, opts: CmpOpts) {
-        // Push args
-        const nargs = expr.cdr === null ? 0 : expr.cdr.length;
-        const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        let curr: any = expr.cdr;
-        let i = 0;
-        while (curr instanceof Cons) {
-            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false });
-            i++;
-            curr = curr.cdr;
-        }
-
-        if (opts.isTail) {
-            opts.nodes.push({t: "IBuiltinTail", startReg, nargs, builtinIdx})
-        } else {
-            const targetReg = opts.destReg === undefined ? opts.scope.allocTemp() : opts.destReg!;
-            opts.nodes.push({t: "IBuiltin", destReg: targetReg, startReg, nargs, builtinIdx})
-            if (opts.destReg === undefined) opts.scope.freeTemp(targetReg);
-        }
-
-        opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
 
     #getVar(varname: symbol, opts: CmpOpts, destReg?: number): Node[] {

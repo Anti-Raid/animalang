@@ -1,6 +1,6 @@
 import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, packValues, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table } from "./common";
 import { Cons } from "./list";
-import { ARITHMETIC, opCons, makeList, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "./ops";
+import { ARITHMETIC, opCons, makeList, CXR_PATHS, CXR_FNS, CXR_INLINES, PREDICATES, PREDICATE_FNS, PREDICATE_INLINES, listInline, consInline, type InlineFn } from "./ops";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
 
 /** 
@@ -15,13 +15,16 @@ export class BuiltinFunction extends IProcedure {
     constructor(
         public name: symbol,
         public cb: (regs: readonly any[], startReg: number, nargs: number) => any,
+        public readonly inline?: InlineFn,
     ) {
         super(name.description || Symbol.keyFor(name));
     }
 }
 
+const vectorIndexOk = (v: string, k: string) => `Array.isArray(${v}) && Number.isInteger(${k}) && ${k} >= 0 && ${k} < ${v}.length`;
+
 export const IBUILTINS: BuiltinFunction[] = [
-    ...ARITHMETIC.map(([name, fn]) => new BuiltinFunction(Symbol.for(name), fn)),
+    ...ARITHMETIC.map(([name, fn, inline]) => new BuiltinFunction(Symbol.for(name), fn, inline)),
     new BuiltinFunction(Symbol.for("values"), (regs, startReg, nargs) => packValues(regs.slice(startReg, startReg + nargs))),
     new BuiltinFunction(Symbol.for("eqv?"), (regs, startReg, nargs) => {
         // DEVIATION: normal scheme requires arity 2, anima extends this to arity >=1
@@ -53,10 +56,10 @@ export const IBUILTINS: BuiltinFunction[] = [
         return res
     }),
     // list builtins
-    new BuiltinFunction(Symbol.for("cons"), opCons),
-    new BuiltinFunction(Symbol.for("list"), makeList),
-    ...CXR_PATHS.map(([name], i) => new BuiltinFunction(Symbol.for(name), CXR_FNS[i])),
-    ...PREDICATES.map(([name], i) => new BuiltinFunction(Symbol.for(name), PREDICATE_FNS[i])),
+    new BuiltinFunction(Symbol.for("cons"), opCons, consInline),
+    new BuiltinFunction(Symbol.for("list"), makeList, listInline),
+    ...CXR_PATHS.map(([name], i) => new BuiltinFunction(Symbol.for(name), CXR_FNS[i], CXR_INLINES[i])),
+    ...PREDICATES.map(([name], i) => new BuiltinFunction(Symbol.for(name), PREDICATE_FNS[i], PREDICATE_INLINES[i])),
     new BuiltinFunction(Symbol.for("last"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("last requires 1 argument");
         const val = regs[startReg];
@@ -125,10 +128,14 @@ export const IBUILTINS: BuiltinFunction[] = [
         return new ErrorObject(regs[startReg]);
     }),
     new BuiltinFunction(Symbol.for("unhandled-error"), (regs, startReg, nargs) => {
-        if (nargs !== 1) throw new Error("unhandled-error requires 1 argument");
+        if (nargs !== 1 && nargs !== 2) throw new Error("unhandled-error requires 1 or 2 arguments");
         const val = regs[startReg];
         const err = val instanceof ErrorObject ? val.error : val;
-        throw new UnhandledSchemeError(err);
+        const traceback = nargs === 2 ? regs[startReg + 1] : undefined;
+        if (err instanceof Error && traceback !== undefined && (err as any).animaTraceback === undefined) {
+            (err as any).animaTraceback = traceback;
+        }
+        throw new UnhandledSchemeError(err, traceback);
     }),
     new BuiltinFunction(Symbol.for("error-message"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("error-message requires 1 argument");
@@ -180,7 +187,7 @@ export const IBUILTINS: BuiltinFunction[] = [
         const vec = regs[startReg];
         if (!Array.isArray(vec)) throw new Error("vector-length requires a vector");
         return vec.length;
-    }),
+    }, ([v], slow) => v === undefined ? null : `(Array.isArray(${v}) ? ${v}.length : ${slow})`),
     new BuiltinFunction(Symbol.for("vector-ref"), (regs, startReg, nargs) => {
         if (nargs !== 2) throw new Error("vector-ref requires 2 arguments (vector-ref vec k)");
         const vec = regs[startReg];
@@ -190,7 +197,7 @@ export const IBUILTINS: BuiltinFunction[] = [
             throw new Error(`vector-ref: index ${k} out of bounds for vector of length ${vec.length}`);
         }
         return vec[k];
-    }),
+    }, (args, slow) => args.length !== 2 ? null : `(${vectorIndexOk(args[0], args[1])} ? ${args[0]}[${args[1]}] : ${slow})`),
     new BuiltinFunction(Symbol.for("vector-set!"), (regs, startReg, nargs) => {
         if (nargs !== 3) throw new Error("vector-set! requires 3 arguments (vector-set! vec k val)");
         const vec = regs[startReg];
@@ -202,7 +209,7 @@ export const IBUILTINS: BuiltinFunction[] = [
         }
         vec[k] = val;
         return undefined;
-    }),
+    }, (args, slow) => args.length !== 3 ? null : `(${vectorIndexOk(args[0], args[1])} ? (${args[0]}[${args[1]}] = ${args[2]}, undefined) : ${slow})`),
     new BuiltinFunction(Symbol.for("vector->list"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("vector->list requires 1 argument");
         const vec = regs[startReg];
@@ -369,6 +376,18 @@ export const IBUILTINS: BuiltinFunction[] = [
         }
         return target;
     }),
+    new BuiltinFunction(Symbol.for("reverse"), (regs, startReg, nargs) => {
+        if (nargs !== 1) throw new Error("reverse requires 1 argument");
+        let lst = regs[startReg];
+        if (lst instanceof Cons && lst.isCyclic()) throw new Error("reverse: circular list");
+        let out: Cons | null = null;
+        while (lst instanceof Cons) {
+            out = new Cons(lst.car, out);
+            lst = lst.cdr;
+        }
+        if (lst !== null) throw new Error("reverse requires a proper list");
+        return out;
+    }),
 ]
 
 export const IBUILTINS_IDX_MAP = new Map<symbol, number>()
@@ -429,6 +448,14 @@ export const STD_PRELUDE = `
     (lambda (before thunk after)
         (%dynamic-wind before thunk after)))
 
+(define $debug-frames
+    (lambda args
+        (%call/cc (lambda (k) (%debug-frames k args)))))
+
+(define $debug-traceback
+    (lambda args
+        (%call/cc (lambda (k) (%debug-traceback k args)))))
+
 (let ((raise-proc #f)
       (with-ex-handler-proc #f)
       (raise-cont-proc #f)
@@ -437,7 +464,7 @@ export const STD_PRELUDE = `
         (lambda (obj)
             (let ((hs (%handlers)))
                 (if (null? hs)
-                    (unhandled-error obj)
+                    (%call/cc (lambda (k) (unhandled-error obj (%debug-traceback k (list obj)))))
                     (begin
                         (%set-handlers! (cdr hs))
                         ((car hs) obj)
@@ -458,7 +485,7 @@ export const STD_PRELUDE = `
         (lambda (obj)
             (let ((hs (%handlers)))
                 (if (null? hs)
-                    (unhandled-error obj)
+                    (%call/cc (lambda (k) (unhandled-error obj (%debug-traceback k (list obj)))))
                     (%dynamic-wind
                         (lambda () (%set-handlers! (cdr hs)))
                         (lambda () ((car hs) obj))
@@ -489,21 +516,27 @@ export class Bootstrapper {
         if (this.#bootstrappedPreludes.has(impl.id)) {
             return this.#bootstrappedPreludes.get(impl.id)!
         }
-        const preludeAst = new ASP(STD_PRELUDE, true).parse()
+        const preludeAst = new ASP(STD_PRELUDE, true, "<prelude>").parse()
         const transformExpr = evaluator.transform(preludeAst)
-        const PRELUDE_BC = cmp.compile(transformExpr)
+        // the prelude is never debug code, so its internals stay out of tracebacks' tail history
+        const PRELUDE_BC = cmp.compile(transformExpr, false)
 
         const privScope = stdPreludeScope()
         vm.evaluateRaw(PRELUDE_BC, privScope)
 
         /* Base scope */
         const publicScope = new Table(); 
+        const named = new Set<IProcedure>()
         for (const [sym, value] of privScope.entries()) {
             const symName = Symbol.keyFor(sym) || sym.description || "%Unknown";
         
             // If the func starts with a $, its public
             if (symName.startsWith("$")) {
                 const publicSym = Symbol.for(symName.replace('$', ''));
+                if (value instanceof IProcedure && !(value instanceof BuiltinFunction) && !named.has(value)) {
+                    value.debugName = publicSym.description
+                    named.add(value)
+                }
                 publicScope.set(publicSym, value);
                 RESERVED_BUILTINS.add(publicSym);
             }

@@ -1,5 +1,5 @@
 import { ASTStringifier, ErrorObject, Table, unpackValues, type AbstractVM } from "../common";
-import { OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs } from "./exec";
+import { OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 
 export {
     CodeEmitter,
@@ -58,17 +58,17 @@ export class AnimaVM implements AbstractVM {
         }
     }
 
+    // stack traceback of a suspended coroutine (empty if it has not started or is dead)
+    public traceback(co: Coroutine, msg?: string): string {
+        if (!(co instanceof Coroutine)) throw new Error("traceback: expected a coroutine");
+        return formatTraceback(frameInfos(co.frame), msg, co.ctx.tailHistory);
+    }
+
     #run(ctx: ExecutionContext, frame: Frame): any {
-        try {
-            if (this.mode === "aot") {
-                AotCompiler.compileAll(frame.code, frame.closure.tmpl);
-                return AotCompiler.run(ctx, frame, this.executor);
-            }
-            return BytecodeInterpreter.run(ctx, frame, this.executor);
-        } catch (err: any) {
-            const active = ctx.currentFrame ?? frame;
-            console.log(`${err.stack}\n\nCurrent Frame [${active.debugName}] IP: ${active.ip}`);
-            throw err;
+        if (this.mode === "aot") {
+            AotCompiler.compileAll(frame.code, frame.closure.tmpl);
+            return AotCompiler.run(ctx, frame, this.executor);
         }
+        return BytecodeInterpreter.run(ctx, frame, this.executor);
     }
 }
