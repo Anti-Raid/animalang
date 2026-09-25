@@ -113,6 +113,8 @@ export class ByteCode implements AbstractByteCode {
     public directFn: DirectFn | null = null;
     public directArity: number = -1;
     public directRestArity: number = -1;
+    // how often a direct call of this function ended in a suspend for call/cc, a continuation or a yield (see resumeSuspend)
+    public controlSuspends: number = 0;
 
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
@@ -437,6 +439,8 @@ const MAX_JS_DEPTH = 1000;
 
 const MAX_NESTED_RESUMES = 16;
 
+const DIRECT_SUSPEND_LIMIT = 8;
+
 const MISSING = Symbol("missing");
 
 class EscapedError {
@@ -449,8 +453,11 @@ type SuspendAction = (ctx: ExecutionContext, executor: VMExecutor, caller: Frame
 export class Suspend {
     innermost: Frame | null = null;
     outermost: Frame | null = null;
+    // the outermost direct function this passed through, i.e. the one heap code called directly
+    entered: Closure | null = null;
 
-    constructor(public readonly action: SuspendAction | null, public readonly error?: any) {}
+    // `control`: suspended for call/cc, invoking a continuation or a yield, rather than for depth or an error
+    constructor(public readonly action: SuspendAction | null, public readonly error?: any, public readonly control: boolean = false) {}
 
     push(frame: Frame) {
         if (this.outermost === null) {
@@ -462,11 +469,11 @@ export class Suspend {
     }
 
     static invoke(proc: any, args: any[]) {
-        return new Suspend((ctx, executor, caller) => executor.invoke(ctx, proc, caller, args, 0, args.length, false));
+        return new Suspend((ctx, executor, caller) => executor.invoke(ctx, proc, caller, args, 0, args.length, false), undefined, proc instanceof VMContinuation);
     }
 
     static callCC(proc: any) {
-        return new Suspend((ctx, executor, caller) => executor.callCC(ctx, proc, caller, false));
+        return new Suspend((ctx, executor, caller) => executor.callCC(ctx, proc, caller, false), undefined, true);
     }
 
     static error(err: any) {
@@ -478,7 +485,7 @@ export class Suspend {
     }
 
     static yield(val: any) {
-        return new Suspend((ctx, executor, caller) => executor.coYield(ctx, caller, val));
+        return new Suspend((ctx, executor, caller) => executor.coYield(ctx, caller, val), undefined, true);
     }
 }
 
@@ -719,6 +726,13 @@ export class VMExecutor {
 
     public resumeSuspend(ctx: ExecutionContext, sig: Suspend): Frame | null {
         const caller = sig.innermost!;
+        // a function whose direct calls keep ending in call/cc, a continuation or a yield pays for rebuilding its frames
+        // every time: after a few times, calls to it go through heap frames, where those need no rebuilding
+        const entered = sig.entered?.tmpl.code;
+        if (sig.control && entered !== undefined && ++entered.controlSuspends === DIRECT_SUSPEND_LIMIT) {
+            entered.directArity = -1;
+            entered.directRestArity = -1;
+        }
         try {
             if (sig.action === null) return this.handleHostException(ctx, caller, sig.error);
             try {
@@ -1988,6 +2002,7 @@ class DirectEmitter extends FunctionEmitter {
         this.emit(`
                 } catch (e) {
                     const sig = e instanceof Suspend ? e : Suspend.error(e);
+                    sig.entered = closure;
                     if (rip !== -1) {
                         const f = new Frame(closure, [${allRegs}], rip, null, ctx);
                         ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : ""}

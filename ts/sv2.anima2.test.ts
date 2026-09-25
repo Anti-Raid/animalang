@@ -1569,6 +1569,28 @@ describe('Anima', () => {
         })
     });
 
+    describe('call/cc-heavy code in AOT', () => {
+        it('stays correct when a function switches from direct calls to heap frames', () => {
+            // after a few call/cc suspends its direct entry is turned off; values before and after must agree
+            expect(run(`(define (make-cc-gen n)
+                          (define return #f)
+                          (define resume-point #f)
+                          (lambda ()
+                            (call/cc (lambda (r)
+                              (set! return r)
+                              (if resume-point
+                                  (resume-point #f)
+                                  (begin
+                                    (let loop ((i 0))
+                                      (if (< i n)
+                                          (begin (call/cc (lambda (k) (set! resume-point k) (return i))) (loop (+ i 1)))
+                                          #f))
+                                    (return 'done)))))))
+                        (define (collect g acc) (let ((v (g))) (if (eq? v 'done) (reverse acc) (collect g (cons v acc)))))
+                        (let ((xs (collect (make-cc-gen 50) '()))) (list (length xs) (car xs) (car (reverse xs)) (apply + xs)))`)).toBe("(50 0 49 1225)")
+        })
+    });
+
     describe('%let', () => {
         // whether a variable is boxed shows up as BOX instructions in the procedure's code
         const boxesIn = (src: string): number => {
