@@ -104,7 +104,8 @@ export const restValues = (vals: any[], count: number): Cons | null => Cons.from
 
 export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecutor) => Frame | null;
 
-export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, ...args: any[]) => any;
+// `depth` counts nested direct calls on the js stack; past MAX_JS_DEPTH calls go through heap frames instead
+export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, ...args: any[]) => any;
 
 export class ByteCode implements AbstractByteCode {
     public bsid = "ByteCode";
@@ -330,7 +331,6 @@ export class ExecutionContext {
     public currentFrame: Frame | null = null;
     public wind: WindPoint | null = null;
     public pendingWind: PendingWindTransition | null = null;
-    public jsDepth: number = 0;
     public handlers: Cons | null = null;
     public coroutine: Coroutine | null = null;
     // a throwaway resumer for nested resumes: control coming back here ends the nested driver loop
@@ -622,14 +622,14 @@ export class VMExecutor {
         return closureRegs;
     }
 
-    public callDirectRest(ctx: ExecutionContext, proc: Closure, args: any[]): any {
+    public callDirectRest(ctx: ExecutionContext, proc: Closure, args: any[], depth: number): any {
         const code = proc.tmpl.code;
         const numPos = code.directRestArity;
         let rest: Cons | null = null;
         for (let i = args.length - 1; i >= numPos; i--) rest = new Cons(args[i], rest);
         args.length = numPos;
         args.push(rest);
-        return code.directFn!(ctx, proc, this, ...args);
+        return code.directFn!(ctx, proc, this, depth, ...args);
     }
 
     // --- continuations and dynamic-wind ---
@@ -1258,7 +1258,7 @@ export class AotCompiler {
         let direct = "null";
         if (tmpl !== undefined) {
             const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug);
-            out.emitFunction(tmpl.params.length + (tmpl.remParams !== null ? 1 : 0));
+            out.emitFunction(tmpl.params.length + (tmpl.remParams !== null ? 1 : 0), tmpl.remParams !== null);
             direct = out.toString();
         }
         return `return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
@@ -1645,6 +1645,9 @@ abstract class FunctionEmitter extends CodeEmitter {
 
     protected abstract readonly endOfCode: string;
 
+    // the check that one more nested direct call is allowed (as `&& ...`)
+    protected abstract readonly depthCheck: string;
+
     protected emitSwitchBody(): void {
         for (let i = 0; i < this.blocks.length; i++) {
             const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.inst.length;
@@ -1675,11 +1678,11 @@ abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected directGuard(proc: string, nargs: string): string {
-        return `${proc} instanceof Closure && ${proc}.tmpl.code.directArity === ${nargs} && ctx.jsDepth < MAX_JS_DEPTH`;
+        return `${proc} instanceof Closure && ${proc}.tmpl.code.directArity === ${nargs}${this.depthCheck}`;
     }
 
     protected restGuard(proc: string, nargs: string): string {
-        return `${proc} instanceof Closure && ${proc}.tmpl.code.directRestArity !== -1 && ${nargs} >= ${proc}.tmpl.code.directRestArity && ctx.jsDepth < MAX_JS_DEPTH`;
+        return `${proc} instanceof Closure && ${proc}.tmpl.code.directRestArity !== -1 && ${nargs} >= ${proc}.tmpl.code.directRestArity${this.depthCheck}`;
     }
 
     protected selfMoves(term: Extract<AotTerm, { k: "MaybeSelfTailCall" }>): string {
@@ -1778,6 +1781,8 @@ abstract class FunctionEmitter extends CodeEmitter {
 class ResumeEmitter extends FunctionEmitter {
     protected readonly accExpr = "ctx.acc";
     protected readonly endOfCode = "return null;";
+    // resume functions run from the driver loop, at the base of the js stack
+    protected readonly depthCheck = "";
     readonly #liveness: Liveness;
 
     constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false) {
@@ -1804,17 +1809,13 @@ class ResumeEmitter extends FunctionEmitter {
 
     #directCall(call: string): string {
         return `
-            const depth = ctx.jsDepth;
-            ctx.jsDepth = depth + 1;
             try {
                 ctx.acc = ${call};
             } catch (e) {
-                ctx.jsDepth = depth;
                 if (!(e instanceof Suspend)) throw e;
                 e.push(frame);
                 return executor.resumeSuspend(ctx, e);
             }
-            ctx.jsDepth = depth;
         `;
     }
 
@@ -1862,9 +1863,9 @@ class ResumeEmitter extends FunctionEmitter {
                         frame.ip = ${term.resume};
                         ${this.#spills(live.spillsFor(term.resume, windowRegs(term.start, term.nargs)))}
                         if (${this.directGuard("proc", `${term.nargs}`)}) {
-                            ${this.#directCall(`proc.tmpl.code.directFn(ctx, proc, executor${term.nargs > 0 ? ", " + this.argList(term.start, term.nargs) : ""})`)}
+                            ${this.#directCall(`proc.tmpl.code.directFn(ctx, proc, executor, 1${term.nargs > 0 ? ", " + this.argList(term.start, term.nargs) : ""})`)}
                         } else if (${this.restGuard("proc", `${term.nargs}`)}) {
-                            ${this.#directCall(`executor.callDirectRest(ctx, proc, [${this.argList(term.start, term.nargs)}])`)}
+                            ${this.#directCall(`executor.callDirectRest(ctx, proc, [${this.argList(term.start, term.nargs)}], 1)`)}
                         } else if (proc instanceof BuiltinFunction) {
                             ctx.acc = proc.cb(regs, ${term.start}, ${term.nargs});
                         } else {
@@ -1934,6 +1935,9 @@ class ResumeEmitter extends FunctionEmitter {
 // the frameless entry used by direct calls: arguments arrive as js arguments and the value is returned
 class DirectEmitter extends FunctionEmitter {
     protected readonly accExpr = "acc";
+    protected readonly depthCheck = " && depth < MAX_JS_DEPTH";
+    // this function's own arity, when a call to its own closure can call it by name (no rest parameter)
+    #selfArity = -1;
     protected readonly endOfCode = "return undefined;";
 
     protected recordIp(): string {
@@ -1948,12 +1952,13 @@ class DirectEmitter extends FunctionEmitter {
         return `${fn}(${withRuntime ? "ctx, executor, " : ""}[${this.argList(start, nargs)}], 0, ${nargs})`;
     }
 
-    emitFunction(arity: number): void {
+    emitFunction(arity: number, hasRest: boolean = false): void {
+        this.#selfArity = hasRest ? -1 : arity;
         const params = Array.from({ length: arity }, (_, i) => `, a${i}`).join("");
         const locals = Array.from({ length: this.numReg }, (_, i) => i < arity ? `r${i} = a${i}` : `r${i}`);
         const allRegs = Array.from({ length: this.numReg }, (_, i) => `r${i}`).join(", ");
         this.emit(`
-            function(ctx, closure, executor${params}) {
+            function direct$(ctx, closure, executor, depth${params}) {
                 const upvars = closure.upvars;
                 let ip = 0, rip = 0, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
@@ -1997,6 +2002,7 @@ class DirectEmitter extends FunctionEmitter {
     // direct-entry code never resumes mid-function, so compiled `if`s (IF c else ... ELSE end, else: ... ENDIF, end:) can be emitted as nested js if/else
     #structuredBody(): string | null {
         const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug);
+        body.#selfArity = this.#selfArity;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {
             body.#walk(index, 0, this.inst.length);
@@ -2079,15 +2085,11 @@ class DirectEmitter extends FunctionEmitter {
         return `
             rip = -1;
             if (${this.directGuard(proc, `${nargs}`)}) {
-                ctx.jsDepth++;
-                const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor${nargs > 0 ? ", " + args : ""});
-                ctx.jsDepth--;
+                const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, depth + 1${nargs > 0 ? ", " + args : ""});
                 return val;
             }
             if (${this.restGuard(proc, `${nargs}`)}) {
-                ctx.jsDepth++;
-                const val = executor.callDirectRest(ctx, ${proc}, [${args}]);
-                ctx.jsDepth--;
+                const val = executor.callDirectRest(ctx, ${proc}, [${args}], depth + 1);
                 return val;
             }
             if (${proc} instanceof BuiltinFunction) return ${proc}.cb([${args}], 0, ${nargs});
@@ -2111,14 +2113,12 @@ class DirectEmitter extends FunctionEmitter {
                     {
                         const proc = r${term.proc};
                         rip = ${term.resume};
-                        if (${this.directGuard("proc", `${term.nargs}`)}) {
-                            ctx.jsDepth++;
-                            acc = proc.tmpl.code.directFn(ctx, proc, executor${term.nargs > 0 ? ", " + args : ""});
-                            ctx.jsDepth--;
+                        ${term.nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
+                            acc = direct$(ctx, proc, executor, depth + 1${term.nargs > 0 ? ", " + args : ""});
+                        } else ` : ""}if (${this.directGuard("proc", `${term.nargs}`)}) {
+                            acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1${term.nargs > 0 ? ", " + args : ""});
                         } else if (${this.restGuard("proc", `${term.nargs}`)}) {
-                            ctx.jsDepth++;
-                            acc = executor.callDirectRest(ctx, proc, [${args}]);
-                            ctx.jsDepth--;
+                            acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1);
                         } else if (proc instanceof BuiltinFunction) {
                             acc = proc.cb([${args}], 0, ${term.nargs});
                         } else {
@@ -2152,14 +2152,10 @@ class DirectEmitter extends FunctionEmitter {
                         if (proc instanceof BuiltinFunction) {
                             ${done} proc.cb(args, 0, args.length);
                         } else if (${this.directGuard("proc", "args.length")}) {
-                            ctx.jsDepth++;
-                            ${term.isTail ? "const val =" : "acc ="} proc.tmpl.code.directFn(ctx, proc, executor, ...args);
-                            ctx.jsDepth--;
+                            ${term.isTail ? "const val =" : "acc ="} proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ...args);
                             ${term.isTail ? "return val;" : ""}
                         } else if (${this.restGuard("proc", "args.length")}) {
-                            ctx.jsDepth++;
-                            ${term.isTail ? "const val =" : "acc ="} executor.callDirectRest(ctx, proc, args);
-                            ctx.jsDepth--;
+                            ${term.isTail ? "const val =" : "acc ="} executor.callDirectRest(ctx, proc, args, depth + 1);
                             ${term.isTail ? "return val;" : ""}
                         } else {
                             throw Suspend.invoke(proc, args);

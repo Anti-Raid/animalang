@@ -195,7 +195,7 @@ This section describes how compiled code runs. The code lives in `exec.ts` (runt
 
 ## Execution contexts
 
-An `ExecutionContext` holds the state of one line of execution: the global environment (`Env`), the accumulator (`acc`), the dynamic-wind stack (`wind`), the exception handler stack (`handlers`), the continuation epoch and the direct-call depth. Every `evaluateRaw`/`evaluateClosure` call gets a new context, and so does every coroutine.
+An `ExecutionContext` holds the state of one line of execution: the global environment (`Env`), the accumulator (`acc`), the dynamic-wind stack (`wind`), the exception handler stack (`handlers`) and the continuation epoch. Every `evaluateRaw`/`evaluateClosure` call gets a new context, and so does every coroutine.
 
 ## Frames and the driver loop
 
@@ -212,7 +212,7 @@ Calls return their value through the context's `acc`. The instruction after a no
 Each compiled function gets two JS functions from the same AOT IR (`AotCompiler.buildAot`: bytecode decoded into blocks, each ending in one terminator):
 
 - **Resume entry** (`resumeFn`): takes a heap `Frame` and continues at `frame.ip` using `switch (ip)`. Registers are JS locals; a liveness analysis decides which ones are loaded on entry and spilled to `frame.regs` before a call that may leave the function. The driver loop uses this entry.
-- **Direct entry** (`directFn`, fixed arity or rest-list variants): takes the arguments as JS arguments and returns the result. It allocates no frame, and is emitted as structured JS (`if`/`else` from `IF`/`ELSE`/`ENDIF`, self tail calls as `continue`). Non-tail calls to compiled closures with a matching arity call their direct entry, up to a depth of `MAX_JS_DEPTH`.
+- **Direct entry** (`directFn`, fixed arity or rest-list variants): takes the arguments as JS arguments and returns the result. It allocates no frame, and is emitted as structured JS (`if`/`else` from `IF`/`ELSE`/`ENDIF`, self tail calls as `continue`). Non-tail calls to compiled closures with a matching arity call their direct entry, up to a depth of `MAX_JS_DEPTH`: every direct entry takes the current depth as an argument (`direct$(ctx, closure, executor, depth, ...args)`) and passes `depth + 1` on, and resume code starts at 1. A call to the function's own closure with its own arity (plain recursion) calls itself by name, skipping the closure and arity checks.
 
 Direct code has no heap frames, so when something needs them (`call/cc`, invoking a continuation, a call that cannot be made directly, a host error, the depth limit, a coroutine switch) it throws a `Suspend`. Each direct function it passes through rebuilds its own `Frame` from its locals at `rip` (the resume point of the call it was making; `rip = -1` marks a tail call, which adds no frame). The heap-mode caller that started the direct chain attaches its frame and performs the pending action (`executor.resumeSuspend`), after which execution continues in resume mode.
 
