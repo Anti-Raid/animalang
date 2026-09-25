@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -38,6 +38,7 @@ const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: numb
     ["%values->list", "values->list", 1, 1],
     ["%debug-frames", "debug-frames", 2, 2],
     ["%debug-traceback", "debug-traceback", 2, 2],
+    ["%first-value", "first-value", 1, 1],
 ] as [string, string, number, number][]).map(([form, name, min, max]) => [Symbol.for(form), { idx: RUNTIME_IDX.get(name)!, min, max }]))
 
 // a %block that %escape can jump to: where its value goes and how its code ends
@@ -140,6 +141,10 @@ export class Compiler {
                     return
                 case CORE_LET:
                     this.#compileLet(expr, opts)
+                    return
+                case CORE_LET_VALUES:
+                case CORE_LET_VALUES_STRICT:
+                    this.#compileLetValues(expr, opts, operator === CORE_LET_VALUES_STRICT)
                     return
                 case CORE_BLOCK:
                     this.#compileBlock(expr, opts)
@@ -346,6 +351,48 @@ export class Compiler {
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
         const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName);
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
+    }
+
+    // (%let-values ((formals expr) ...) body ...): every expr is evaluated and spread into registers (UNPACK), then
+    // all the variables are bound in a block, as in %let
+    #compileLetValues(expr: Cons, opts: CmpOpts, strict: boolean) {
+        const ascope = opts.analyzer.scopeMap.get(expr)
+        if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
+        const clauses = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
+
+        const bound: { sym: symbol, reg: number }[] = []
+        const blocks: { start: number, size: number }[] = []
+        for (const clause of clauses) {
+            const names: symbol[] = []
+            let formals: any = clause.car
+            while (formals instanceof Cons) {
+                names.push(formals.car)
+                formals = formals.cdr
+            }
+            const rest: symbol | null = formals
+            const valReg = opts.scope.allocTemp()
+            this.#compile(clause.cdr.car, { ...opts, destReg: valReg, isTail: false })
+            const size = names.length + (rest !== null ? 1 : 0)
+            const start = opts.scope.regAlloc.allocBlock(size)
+            opts.nodes.push({ t: "Unpack", srcReg: valReg, startReg: start, count: names.length, rest: rest !== null, strict })
+            opts.scope.freeTemp(valReg)
+            names.forEach((sym, i) => bound.push({ sym, reg: start + i }))
+            if (rest !== null) bound.push({ sym: rest, reg: start + names.length })
+            blocks.push({ start, size })
+        }
+
+        opts.scope.enterBlock()
+        const seen = new Set<symbol>()
+        for (const { sym, reg } of bound) {
+            ensureCanBind(sym, seen, "let-values")
+            const inf = ascope.getVarinfo(sym)
+            if (!inf) throw new Error("Could not fetch varinfo")
+            const destReg = opts.scope.addLocal(sym)
+            opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: reg, destReg })
+        }
+        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope })
+        opts.scope.exitBlock()
+        for (const { start, size } of blocks) opts.scope.regAlloc.freeBlock(start, size)
     }
 
     // (%block name body ...): the value of the body, or of an (%escape name value) jumping to its end

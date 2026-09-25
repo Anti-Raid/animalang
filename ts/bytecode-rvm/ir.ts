@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, type UpVarLoc } from "./exec";
+import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, UNPACK_REST, UNPACK_STRICT, type UpVarLoc } from "./exec";
 
 let nextLabelId = 0;
 
@@ -129,6 +129,14 @@ export type Node = {
     t: "EndLoop",
     head: JumpLabel
 } | {
+    // spread the multiple values in srcReg over [startReg, startReg + count), plus a rest list after them
+    t: "Unpack",
+    srcReg: number,
+    startReg: number,
+    count: number,
+    rest: boolean,
+    strict: boolean
+} | {
     // an %escape: jump to the end of a %block
     t: "Jump",
     label: JumpLabel
@@ -201,6 +209,10 @@ export class IR {
                 }
                 case "EndIf": {
                     inst.push(OpCode.ENDIF)
+                    break
+                }
+                case "Unpack": {
+                    inst.push(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
                     break
                 }
                 case "Block":

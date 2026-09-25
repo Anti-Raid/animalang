@@ -1,6 +1,6 @@
 import { AbstractCompiler, AbstractVM, AnimaMeta, ASP, ErrorObject, UnhandledSchemeError, packValues, RESERVED_BUILTINS, IProcedure, isDeepEqual, isTruthy, OP_BEGIN, symGen, Table, Env } from "./common";
 import { Cons } from "./list";
-import { ARITHMETIC, opCons, makeList, CXR_PATHS, CXR_FNS, CXR_INLINES, PREDICATES, PREDICATE_FNS, PREDICATE_INLINES, listInline, consInline, type InlineFn } from "./ops";
+import { ARITHMETIC, opCons, makeList, CXR_PATHS, CXR_FNS, PREDICATES, PREDICATE_FNS } from "./ops";
 import { MacroEvaluator } from "./syntransformer-v1/macro";
 
 /** 
@@ -15,7 +15,6 @@ export class BuiltinFunction extends IProcedure {
     constructor(
         public name: symbol,
         public cb: (regs: readonly any[], startReg: number, nargs: number) => any,
-        public readonly inline?: InlineFn,
     ) {
         super(name.description || Symbol.keyFor(name));
     }
@@ -23,10 +22,8 @@ export class BuiltinFunction extends IProcedure {
 
 const MISSING_KEY = Symbol("missing key");
 
-const vectorIndexOk = (v: string, k: string) => `Array.isArray(${v}) && Number.isInteger(${k}) && ${k} >= 0 && ${k} < ${v}.length`;
-
 export const IBUILTINS: BuiltinFunction[] = [
-    ...ARITHMETIC.map(([name, fn, inline]) => new BuiltinFunction(Symbol.for(name), fn, inline)),
+    ...ARITHMETIC.map(([name, fn]) => new BuiltinFunction(Symbol.for(name), fn)),
     new BuiltinFunction(Symbol.for("values"), (regs, startReg, nargs) => packValues(regs.slice(startReg, startReg + nargs))),
     new BuiltinFunction(Symbol.for("eqv?"), (regs, startReg, nargs) => {
         // DEVIATION: normal scheme requires arity 2, anima extends this to arity >=1
@@ -58,10 +55,10 @@ export const IBUILTINS: BuiltinFunction[] = [
         return res
     }),
     // list builtins
-    new BuiltinFunction(Symbol.for("cons"), opCons, consInline),
-    new BuiltinFunction(Symbol.for("list"), makeList, listInline),
-    ...CXR_PATHS.map(([name], i) => new BuiltinFunction(Symbol.for(name), CXR_FNS[i], CXR_INLINES[i])),
-    ...PREDICATES.map(([name], i) => new BuiltinFunction(Symbol.for(name), PREDICATE_FNS[i], PREDICATE_INLINES[i])),
+    new BuiltinFunction(Symbol.for("cons"), opCons),
+    new BuiltinFunction(Symbol.for("list"), makeList),
+    ...CXR_PATHS.map(([name], i) => new BuiltinFunction(Symbol.for(name), CXR_FNS[i])),
+    ...PREDICATES.map(([name], i) => new BuiltinFunction(Symbol.for(name), PREDICATE_FNS[i])),
     new BuiltinFunction(Symbol.for("last"), (regs, startReg, nargs) => {
         if (nargs != 1) throw new Error("last requires 1 argument");
         const val = regs[startReg];
@@ -189,7 +186,7 @@ export const IBUILTINS: BuiltinFunction[] = [
         const vec = regs[startReg];
         if (!Array.isArray(vec)) throw new Error("vector-length requires a vector");
         return vec.length;
-    }, ([v], slow) => v === undefined ? null : `(Array.isArray(${v}) ? ${v}.length : ${slow})`),
+    }),
     new BuiltinFunction(Symbol.for("vector-ref"), (regs, startReg, nargs) => {
         if (nargs !== 2) throw new Error("vector-ref requires 2 arguments (vector-ref vec k)");
         const vec = regs[startReg];
@@ -199,7 +196,7 @@ export const IBUILTINS: BuiltinFunction[] = [
             throw new Error(`vector-ref: index ${k} out of bounds for vector of length ${vec.length}`);
         }
         return vec[k];
-    }, (args, slow) => args.length !== 2 ? null : `(${vectorIndexOk(args[0], args[1])} ? ${args[0]}[${args[1]}] : ${slow})`),
+    }),
     new BuiltinFunction(Symbol.for("vector-set!"), (regs, startReg, nargs) => {
         if (nargs !== 3) throw new Error("vector-set! requires 3 arguments (vector-set! vec k val)");
         const vec = regs[startReg];
@@ -211,7 +208,7 @@ export const IBUILTINS: BuiltinFunction[] = [
         }
         vec[k] = val;
         return undefined;
-    }, (args, slow) => args.length !== 3 ? null : `(${vectorIndexOk(args[0], args[1])} ? (${args[0]}[${args[1]}] = ${args[2]}, undefined) : ${slow})`),
+    }),
     new BuiltinFunction(Symbol.for("vector->list"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("vector->list requires 1 argument");
         const vec = regs[startReg];
@@ -272,7 +269,7 @@ export const IBUILTINS: BuiltinFunction[] = [
             return regs[startReg + 2];
         }
         throw new Error(`table-ref: key not found: ${String(key)}`);
-    }, ([t, k, ...rest], slow, tmp) => k === undefined || rest.length > 0 ? null : `(${t} instanceof Table && (${tmp} = ${t}.lookup(${k}, MISSING)) !== MISSING ? ${tmp} : ${slow})`),
+    }),
     new BuiltinFunction(Symbol.for("table-is?"), (regs, startReg, nargs) => {
         if (nargs < 3 || nargs > 4) throw new Error("table-is? requires 3 or 4 arguments (table-is? tbl key expected [default])");
         const tbl = regs[startReg];
@@ -292,13 +289,13 @@ export const IBUILTINS: BuiltinFunction[] = [
         if (!(tbl instanceof Table)) throw new Error("table-set! requires a table");
         tbl.set(regs[startReg + 1], regs[startReg + 2]);
         return undefined;
-    }, (args, slow) => args.length !== 3 ? null : `(${args[0]} instanceof Table && !${args[0]}.frozen ? (${args[0]}.set(${args[1]}, ${args[2]}), undefined) : ${slow})`),
+    }),
     new BuiltinFunction(Symbol.for("table-has?"), (regs, startReg, nargs) => {
         if (nargs !== 2) throw new Error("table-has? requires 2 arguments (table-has? tbl key)");
         const tbl = regs[startReg];
         if (!(tbl instanceof Table)) throw new Error("table-has? requires a table");
         return tbl.has(regs[startReg + 1]);
-    }, (args, slow) => args.length !== 2 ? null : `(${args[0]} instanceof Table ? ${args[0]}.has(${args[1]}) : ${slow})`),
+    }),
     new BuiltinFunction(Symbol.for("table-delete!"), (regs, startReg, nargs) => {
         if (nargs !== 2) throw new Error("table-delete! requires 2 arguments (table-delete! tbl key)");
         const tbl = regs[startReg];
@@ -366,7 +363,7 @@ export const IBUILTINS: BuiltinFunction[] = [
         const tbl = regs[startReg];
         if (!(tbl instanceof Table)) throw new Error("table-border requires a table");
         return tbl.border();
-    }, ([t], slow) => t === undefined ? null : `(${t} instanceof Table ? ${t}.border() : ${slow})`),
+    }),
     new BuiltinFunction(Symbol.for("reverse"), (regs, startReg, nargs) => {
         if (nargs !== 1) throw new Error("reverse requires 1 argument");
         let lst = regs[startReg];

@@ -1611,6 +1611,47 @@ describe('Anima', () => {
         })
     });
 
+    describe('%let-values', () => {
+        it('pads missing values with void and drops extras (Lua style)', () => {
+            expect(run(`(%let-values (((a b c) (values 1 2))) (list a b c))`)).toBe("(1 2 <#void>)")
+            expect(run(`(%let-values (((a) (values 1 2 3))) a)`)).toBe("1")
+            expect(run(`(%let-values (((a b) 7)) (list a b))`)).toBe("(7 <#void>)")
+            expect(run(`(%let-values (((a . r) (values 1 2 3)) (all (values))) (list a r all))`)).toBe("(1 (2 3) ())")
+            expect(run(`(%let-values (((a b . r) (values 1))) (list a b r))`)).toBe("(1 <#void> ())")
+        })
+
+        it('is strict for receive, let-values and let*-values (Scheme style)', () => {
+            expect(() => run(`(receive (a b) (values 1) a)`)).toThrow("let-values: expected 2 values but got 1")
+            expect(() => run(`(let-values (((a) (values 1 2))) a)`)).toThrow("let-values: expected 1 value but got 2")
+            expect(() => run(`(let*-values (((a b . r) (values 1))) a)`)).toThrow("let-values: expected at least 2 values but got 1")
+            expect(run(`(%let-values/strict (((a b) (values 1 2))) (+ a b))`)).toBe("3")
+        })
+
+        it('binds in parallel, captures correctly and works across yields and continuations', () => {
+            expect(run(`(let ((a 10)) (%let-values (((a) (values 1)) ((b) (values a))) (list a b)))`)).toBe("(1 10)")
+            expect(run(`(define (pair-fns) (%let-values (((x y) (values 1 2))) (list (lambda () x) (lambda () y)))) (map (lambda (f) (f)) (pair-fns))`)).toBe("(1 2)")
+            expect(run(`(define lv-co (coroutine-create (lambda () (%let-values (((a b) (coroutine-yield 'ready))) (list b a)))))
+                        (list (coroutine-resume lv-co) (coroutine-resume lv-co 1 2))`)).toBe("(ready (2 1))")
+            expect(run(`(define lv-k #f) (define lv-n 0)
+                        (define lv-r (%let-values (((a b) (call/cc (lambda (k) (set! lv-k k) (values 1 2))))) (list a b)))
+                        (set! lv-n (+ lv-n 1))
+                        (if (= lv-n 1) (lv-k 5) (list lv-r lv-n))`)).toBe("((5 <#void>) 2)")
+        })
+
+        it('%first-value truncates multiple values to the first (Lua)', () => {
+            expect(run(`(list (%first-value (values 1 2 3)) (%first-value 5) (%first-value (values)))`)).toBe("(1 5 <#void>)")
+            expect(run(`(define (two) (values 10 20)) (define (fv-sum) (+ (%first-value (two)) 1)) (fv-sum)`)).toBe("11")
+            expect(() => run(`(%first-value)`)).toThrow("%first-value requires 1 arguments")
+        })
+
+        it('compiles without closures', () => {
+            // receive used to build a producer and a consumer lambda; now the procedure has no nested procedures at all
+            const f = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (p) (receive (a b) (p) (+ a b)))`))
+            const nested = f.tmpl.code.constants.filter((c: any) => c instanceof Object && ("tmpl" in c || "upvarLocs" in c))
+            expect(nested).toEqual([])
+        })
+    });
+
     describe('Macro expansion limits', () => {
         it('stops a macro that keeps expanding into itself through a body', () => {
             expect(() => run(`(anima-macro self-ref (list 'lambda '() (list 'self-ref))) (self-ref)`)).toThrow(/nested too deeply|expansion limit/)

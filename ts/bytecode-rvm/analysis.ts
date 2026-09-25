@@ -5,6 +5,8 @@ import {
   CORE_BLOCK,
   CORE_ESCAPE,
   CORE_LET,
+  CORE_LET_VALUES,
+  CORE_LET_VALUES_STRICT,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
@@ -82,6 +84,29 @@ export class AstAnalysis {
                     this.visit(binding.car.cdr.car, scope);
                     letScope.define(binding.car.car);
                     binding = binding.cdr;
+                }
+                this.scopeMap.set(ast, letScope);
+                let curr: any = ast.cdr.cdr;
+                while (curr instanceof Cons) {
+                    this.visit(curr.car, letScope);
+                    curr = curr.cdr;
+                }
+                return;
+            }
+            // (%let-values ((formals expr) ...) body ...): like %let, binding every variable in each formals
+            case CORE_LET_VALUES:
+            case CORE_LET_VALUES_STRICT: {
+                const letScope = new AnalysisScope(scope, false);
+                let clause: any = ast.cdr.car;
+                while (clause instanceof Cons) {
+                    this.visit(clause.car.cdr.car, scope);
+                    let formals: any = clause.car.car;
+                    while (formals instanceof Cons) {
+                        letScope.define(formals.car);
+                        formals = formals.cdr;
+                    }
+                    if (typeof formals === "symbol") letScope.define(formals);
+                    clause = clause.cdr;
                 }
                 this.scopeMap.set(ast, letScope);
                 let curr: any = ast.cdr.cdr;

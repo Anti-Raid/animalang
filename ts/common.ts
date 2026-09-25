@@ -109,6 +109,10 @@ export const CORE_ESCAPE = Symbol.for("%escape");
 export const CORE_LOOP = Symbol.for("%loop");
 // (%let ((x init) ...) body ...): lexical bindings without a lambda
 export const CORE_LET = Symbol.for("%let");
+// (%let-values ((formals expr) ...) body ...) binds each expr's multiple values: missing values are <#void> and extra
+// ones are dropped unless formals has a rest variable (Lua); %let-values/strict raises an error instead (Scheme)
+export const CORE_LET_VALUES = Symbol.for("%let-values");
+export const CORE_LET_VALUES_STRICT = Symbol.for("%let-values/strict");
 export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
@@ -144,6 +148,8 @@ export const SPECIAL_FORMS = new Set([
     CORE_ESCAPE,
     CORE_LOOP,
     CORE_LET,
+    CORE_LET_VALUES,
+    CORE_LET_VALUES_STRICT,
     OP_DEFINE_GLOBAL,
     OP_AT,
 ])

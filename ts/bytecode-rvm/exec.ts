@@ -14,6 +14,8 @@ import {
     AbstractClosure,
     OpaqueValue,
     packValues,
+    unpackValues,
+    MultipleValues,
     ASTStringifier,
     type SourcePos,
     formatPos
@@ -21,6 +23,7 @@ import {
 import { Cons } from "../list";
 import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList } from "../ops";
 import { BuiltinFunction, IBUILTINS } from "../std";
+import { BUILTIN_INLINES, RUNTIME_INLINES } from "./inline";
 
 export const BUILTINS_START = 2**31;
 
@@ -51,6 +54,7 @@ export enum OpCode {
     LOOP,
     ENDLOOP,
     JUMP,
+    UNPACK,
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -80,7 +84,23 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.LOOP]: 2,
     [OpCode.ENDLOOP]: 2,
     [OpCode.JUMP]: 2,
+    [OpCode.UNPACK]: 5,
 };
+
+// UNPACK flags
+export const UNPACK_REST = 1;
+export const UNPACK_STRICT = 2;
+
+// the values of `val` for UNPACK: checks the count when strict; missing values read as undefined (<#void>)
+export const unpackForBinding = (val: any, count: number, flags: number): any[] => {
+    const vals = unpackValues(val);
+    if ((flags & UNPACK_STRICT) !== 0 && ((flags & UNPACK_REST) !== 0 ? vals.length < count : vals.length !== count)) {
+        throw new Error(`let-values: expected ${(flags & UNPACK_REST) !== 0 ? "at least " : ""}${count} value${count === 1 ? "" : "s"} but got ${vals.length}`);
+    }
+    return vals;
+};
+
+export const restValues = (vals: any[], count: number): Cons | null => Cons.fromArray(vals.slice(count));
 
 export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecutor) => Frame | null;
 
@@ -889,6 +909,11 @@ export const RUNTIME: [name: string, fn: RuntimeFn][] = [
         const level = typeof args[0] === "number" ? args[0] : 0;
         return formatTraceback(frameInfos(frame, level), tracebackMessage(msg), tailHistory);
     }],
+    // Lua's truncation of multiple values to one: the first value, or <#void> for none
+    ["first-value", (ctx, executor, regs, start) => {
+        const val = regs[start];
+        return val instanceof MultipleValues ? val.values[0] : val;
+    }],
 ];
 
 export const RUNTIME_IDX = new Map(RUNTIME.map(([name], idx) => [name, idx]));
@@ -977,6 +1002,16 @@ export class BytecodeInterpreter {
                     case OpCode.ENDLOOP:
                     case OpCode.JUMP: {
                         ip = inst[ip];
+                        break;
+                    }
+                    case OpCode.UNPACK: {
+                        const srcReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const count = inst[ip++];
+                        const flags = inst[ip++];
+                        const vals = unpackForBinding(regs[srcReg], count, flags);
+                        for (let i = 0; i < count; i++) regs[startReg + i] = vals[i];
+                        if ((flags & UNPACK_REST) !== 0) regs[startReg + count] = restValues(vals, count);
                         break;
                     }
                     case OpCode.NEWCLOSURE: {
@@ -1102,6 +1137,9 @@ export class BytecodeInterpreter {
 
 const JIT_DEPS = {
     IBUILTINS,
+    MultipleValues,
+    unpackForBinding,
+    restValues,
     IProcedure,
     ErrorObject,
     isTruthy,
@@ -1137,7 +1175,8 @@ type AotInst = { at?: number } & (
     | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
     | { k: "MoveAcc"; dst: number }
     | { k: "CallBuiltin"; builtin: number; dst: number; start: number; nargs: number; resume: number }
-    | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number });
+    | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number }
+    | { k: "Unpack"; src: number; start: number; count: number; flags: number });
 
 type AotTerm = { at?: number } & (
     // `escape` jumps leave a %block early; `loopBack` jumps close a %loop
@@ -1369,6 +1408,9 @@ export class AotCompiler {
                     case OpCode.MOVEACC:
                         insts.push({ k: "MoveAcc", dst: inst[ip++] });
                         break;
+                    case OpCode.UNPACK:
+                        insts.push({ k: "Unpack", src: inst[ip++], start: inst[ip++], count: inst[ip++], flags: inst[ip++] });
+                        break;
                     case OpCode.COYIELD:
                         term = { k: "Yield", val: inst[ip++], resume: ip };
                         break;
@@ -1453,7 +1495,7 @@ class Liveness {
         const written = new Set<number>();
         for (const block of blocks) {
             for (const inst of block.insts) {
-                if ("dst" in inst && inst.k !== "SetBox") written.add(inst.dst);
+                for (const r of Liveness.#instDefs(inst)) written.add(r);
             }
             const term = block.term;
             if (term.k === "MaybeSelfTailCall") {
@@ -1470,8 +1512,15 @@ class Liveness {
             case "SetUpvar": case "SetGlobal": return [inst.src];
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
             case "CallBuiltin": case "RtCall": return windowRegs(inst.start, inst.nargs);
+            case "Unpack": return [inst.src];
             default: return [];
         }
+    }
+
+    // registers an instruction overwrites
+    static #instDefs(inst: AotInst): number[] {
+        if (inst.k === "Unpack") return windowRegs(inst.start, inst.count + ((inst.flags & UNPACK_REST) !== 0 ? 1 : 0));
+        return "dst" in inst && inst.k !== "SetBox" ? [inst.dst] : [];
     }
 
     static #termUses(term: AotTerm): number[] {
@@ -1513,7 +1562,7 @@ class Liveness {
                 for (const r of Liveness.#termUses(block.term)) live.add(r);
                 for (let i = block.insts.length - 1; i >= 0; i--) {
                     const inst = block.insts[i];
-                    if ("dst" in inst && inst.k !== "SetBox") live.delete(inst.dst);
+                    for (const r of Liveness.#instDefs(inst)) live.delete(r);
                     for (const r of Liveness.#instUses(inst)) live.add(r);
                 }
                 const prev = liveIn.get(block.start)!;
@@ -1693,8 +1742,16 @@ abstract class FunctionEmitter extends CodeEmitter {
             }
             case "MoveAcc":
                 return this.emit(`r${inst.dst} = ${this.accExpr};`);
-            case "RtCall":
-                return this.emit(this.#inlineRuntime(inst) ?? `r${inst.dst} = ${this.windowCall(`RUNTIME_FNS[${inst.rt}]`, inst.start, inst.nargs, true)};`);
+            case "Unpack": {
+                const moves = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i} = tmp[${i}];`);
+                if ((inst.flags & UNPACK_REST) !== 0) moves.push(`r${inst.start + inst.count} = restValues(tmp, ${inst.count});`);
+                return this.emit(`tmp = unpackForBinding(r${inst.src}, ${inst.count}, ${inst.flags}); ${moves.join(" ")}`);
+            }
+            case "RtCall": {
+                const slow = this.windowCall(`RUNTIME_FNS[${inst.rt}]`, inst.start, inst.nargs, true);
+                const inline = RUNTIME_INLINES.get(RUNTIME[inst.rt][0])?.(windowRegs(inst.start, inst.nargs).map(r => `r${r}`), slow, "tmp");
+                return this.emit(`r${inst.dst} = ${inline ?? slow};`);
+            }
             case "CallBuiltin": {
                 const inline = this.inlineBuiltin(inst.builtin, inst.start, inst.nargs);
                 if (inline !== null) return this.emit(`r${inst.dst} = ${inline};`);
@@ -1709,21 +1766,9 @@ abstract class FunctionEmitter extends CodeEmitter {
         }
     }
 
-    #inlineRuntime(inst: Extract<AotInst, { k: "RtCall" }>): string | null {
-        const a = `r${inst.start}`, b = `r${inst.start + 1}`, dst = `r${inst.dst}`;
-        switch (RUNTIME[inst.rt][0]) {
-            case "handlers": return `${dst} = ctx.handlers;`;
-            case "set-handlers!": return `ctx.handlers = ${a}; ${dst} = undefined;`;
-            case "set-raise-proc": return `executor.raiseProc = ${a}; ${dst} = undefined;`;
-            case "wind": return `ctx.wind = new WindPoint(ctx.wind, ${a}, ${b}); ${dst} = undefined;`;
-            case "end-wind": return `if (ctx.wind !== null) ctx.wind = ctx.wind.parent; ${dst} = undefined;`;
-            default: return null;
-        }
-    }
-
-    // an expression computing a builtin call inline (see InlineFn), or null
+    // an expression computing a builtin call inline (see inline.ts), or null
     protected inlineBuiltin(builtin: number, start: number, nargs: number): string | null {
-        const inline = IBUILTINS[builtin].inline;
+        const inline = BUILTIN_INLINES.get(Symbol.keyFor(IBUILTINS[builtin].name)!);
         if (inline === undefined) return null;
         return inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`IBUILTINS[${builtin}].cb`, start, nargs), "tmp");
     }

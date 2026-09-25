@@ -14,6 +14,8 @@ import {
     CORE_ESCAPE,
     CORE_LOOP,
     CORE_LET,
+    CORE_LET_VALUES,
+    CORE_LET_VALUES_STRICT,
     AbstractClosure,
     Cons
 } from "../common";
@@ -105,6 +107,13 @@ const lowerBody = (evaluator: MacroEvaluator, rawBody: any, form: string, build:
     return { expanded: build(list(cons(OP_LETREC, cons(fromArray(defines), fromArray(body)))), false), state: TransformState.Recurse };
 };
 
+const valuesClause = (clause: any, form: string): [any, any] => {
+    if (!(clause instanceof Cons) || !(clause.cdr instanceof Cons) || clause.cdr.cdr !== null) {
+        throw new Error(`${form} clause must be of form (formals expr)`);
+    }
+    return [clause.car, clause.cdr.car];
+};
+
 const letBindings = (form: string, bindingsCons: any): [symbol, any][] => {
     if (bindingsCons !== null && !(bindingsCons instanceof Cons)) throw new Error(`${form} bindings must be a list of form ((var expr)...)`);
     return toArray(bindingsCons).map(binding => {
@@ -162,6 +171,26 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             return cons(CORE_LET, cons(fromArray(inits), body));
         });
     });
+
+    for (const core of [CORE_LET_VALUES, CORE_LET_VALUES_STRICT]) {
+        evaluator.registerTransform(core, (evaluator, expr, orig) => {
+            if (!(orig instanceof Cons) || orig.length < 3) throw new Error("let-values must be of form (let-values ((formals expr) ...) body...)");
+            const clauses = toArray(expr.car).map(c => {
+                const [formals, init] = valuesClause(c, "let-values");
+                let f = formals;
+                while (f instanceof Cons) {
+                    if (typeof f.car !== "symbol") throw new Error("let-values formals must be symbols");
+                    f = f.cdr;
+                }
+                if (f !== null && typeof f !== "symbol") throw new Error("let-values formals must be symbols");
+                return [formals, init];
+            });
+            return lowerBody(evaluator, expr.cdr, "let-values", (body, done) => {
+                const transformed = clauses.map(([formals, init]) => list(formals, done ? evaluator.transform(init) : init));
+                return cons(core, cons(fromArray(transformed), body));
+            });
+        });
+    }
 
     // an immediately applied lambda is just a let
     evaluator.setApplicationTransform((evaluator, expr) => {
@@ -500,50 +529,24 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         });
     }
 
-    const callWithValues = (producerExpr: any, formals: any, body: any) =>
-        list(Symbol.for("call-with-values"), list(OP_LAMBDA, null, producerExpr), cons(OP_LAMBDA, cons(formals, body)));
-
-    const valuesClause = (clause: any, form: string): [any, any] => {
-        if (!(clause instanceof Cons) || !(clause.cdr instanceof Cons) || clause.cdr.cdr !== null) {
-            throw new Error(`${form} clause must be of form (formals expr)`);
-        }
-        return [clause.car, clause.cdr.car];
-    };
-
     evaluator.registerTransform(Symbol.for("receive"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length < 4) throw new Error("receive must be of form (receive formals expr body...)");
-        return { expanded: callWithValues(cadr(expr), expr.car, cddr(expr)), state: TransformState.Recurse };
+        return { expanded: cons(CORE_LET_VALUES_STRICT, cons(list(list(expr.car, cadr(expr))), cddr(expr))), state: TransformState.Recurse };
     });
 
+    // receive / let-values / let*-values keep Scheme's strict value counts; use %let-values for Lua-style padding
     evaluator.registerTransform(Symbol.for("let*-values"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error("let*-values must be of form (let*-values (clause...) body...)");
         const clauses = toArray(expr.car);
-        const body = expr.cdr;
-        if (clauses.length === 0) return { expanded: cons(OP_LET, cons(null, body)), state: TransformState.Recurse };
-        const [formals, init] = valuesClause(clauses[0], "let*-values");
-        const rest = cons(Symbol.for("let*-values"), cons(fromArray(clauses.slice(1)), body));
-        return { expanded: callWithValues(init, formals, list(rest)), state: TransformState.Recurse };
+        if (clauses.length === 0) return { expanded: cons(CORE_LET, cons(null, expr.cdr)), state: TransformState.Recurse };
+        let inner: any = expr.cdr;
+        for (let i = clauses.length - 1; i >= 0; i--) inner = list(cons(CORE_LET_VALUES_STRICT, cons(list(clauses[i]), inner)));
+        return { expanded: inner.car, state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(Symbol.for("let-values"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error("let-values must be of form (let-values (clause...) body...)");
-        const renames: any[] = [];
-        const rename = (formals: any): any => {
-            if (formals === null) return null;
-            if (typeof formals === "symbol") {
-                const tmp = Symbol(`lv_${formals.description}`);
-                renames.push(list(formals, tmp));
-                return tmp;
-            }
-            if (formals instanceof Cons) return cons(rename(formals.car), rename(formals.cdr));
-            throw new Error("let-values formals must be symbols");
-        };
-        const clauses = toArray(expr.car).map(c => valuesClause(c, "let-values")).map(([formals, init]) => [rename(formals), init]);
-        let inner: any = cons(OP_LET, cons(fromArray(renames), expr.cdr));
-        for (let i = clauses.length - 1; i >= 0; i--) {
-            inner = callWithValues(clauses[i][1], clauses[i][0], list(inner));
-        }
-        return { expanded: inner, state: TransformState.Recurse };
+        return { expanded: cons(CORE_LET_VALUES_STRICT, expr), state: TransformState.Recurse };
     });
 
     for (const [name] of [...CXR_PATHS, ...PREDICATES, ...ARITHMETIC]) {
