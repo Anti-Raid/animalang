@@ -344,10 +344,12 @@ export class VMExecutor {
         co: any,
         args: any[],
         marks: Marks = resumeTo?.marks ?? null,
-        mframe: number = resumeTo?.mframe ?? 0
+        mframe: number = resumeTo?.mframe ?? 0,
+        raising: boolean = false
     ): Frame | null {
-        if (!(co instanceof Coroutine)) throw hostError(`coroutine-resume: expected a coroutine but got ${String(co)}`);
-        if (co.status !== "suspended") throw hostError(`coroutine-resume: cannot resume a ${co.status} coroutine`);
+        const who = raising ? "coroutine-raise" : "coroutine-resume";
+        if (!(co instanceof Coroutine)) throw hostError(`${who}: expected a coroutine but got ${String(co)}`);
+        if (co.status !== "suspended") throw hostError(`${who}: cannot resume a ${co.status} coroutine`);
 
         co.resumer = { ctx, frame: resumeTo, marks, mframe };
         // a coroutine resuming another keeps its frames where they can be traced while it waits
@@ -358,21 +360,25 @@ export class VMExecutor {
         co.status = "running";
         if (!co.started) {
             co.started = true;
+            // raised into a coroutine that never ran: there is no handler, so it dies with the error
+            if (raising) return this.raise(co.ctx, null, args[0], false);
             return this.invoke(co.ctx, co.proc, null, args, 0, args.length, false);
         }
         const frame = co.frame;
         co.frame = null;
+        // (%coroutine-raise co obj): the pending yield raises obj, under the coroutine's own handlers
+        if (raising) return this.raise(co.ctx, frame, args[0], false);
         co.ctx.acc = packValues(args);
         return frame;
     }
 
     // runs a coroutine to its next yield or return in a nested driver loop and returns the value (used by the host and by direct-mode code)
 
-    public coResumeNested(ctx: ExecutionContext | null, co: any, args: any[]): any {
+    public coResumeNested(ctx: ExecutionContext | null, co: any, args: any[], raising: boolean = false): any {
         const barrier = new ExecutionContext(this.vm, co instanceof Coroutine ? co.ctx.scope : new Env());
         barrier.barrier = true;
         const outer = ctx?.coroutine ?? null;
-        const frame = this.coResume(barrier, null, co, args);
+        const frame = this.coResume(barrier, null, co, args, null, 0, raising);
         if (outer !== null) outer.status = "normal";
         this.nestedResumes++;
         try {

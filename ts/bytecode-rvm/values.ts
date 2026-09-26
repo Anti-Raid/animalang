@@ -320,8 +320,8 @@ export class Suspend {
         return new Suspend(null, err);
     }
 
-    static resume(co: any, args: any[], marks: Marks, mframe: number) {
-        return new Suspend((ctx, executor, caller) => executor.coResume(ctx, caller, co, args, marks, mframe), undefined, true);
+    static resume(co: any, args: any[], marks: Marks, mframe: number, raising: boolean = false) {
+        return new Suspend((ctx, executor, caller) => executor.coResume(ctx, caller, co, args, marks, mframe, raising), undefined, true);
     }
 
     static yield(val: any) {

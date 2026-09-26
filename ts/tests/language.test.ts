@@ -385,6 +385,42 @@ describe('Anima', () => {
             expect(() => evaluator.coroutineResume(failing)).toThrow("nope");
         });
 
+        it('raising into a coroutine', () => {
+            // the pending yield raises, under the coroutine's own handlers, and the coroutine goes on
+            expect(run(`(define rc (coroutine-create (lambda () (coroutine-yield (try (lambda () (coroutine-yield 1)) (lambda (e) (list 'caught e)))) 'end)))
+                        (list (coroutine-resume rc) (coroutine-raise rc 'boom) (coroutine-status rc) (coroutine-resume rc) (coroutine-status rc))`)).toBe("(1 (caught boom) suspended end dead)");
+            // unhandled: the coroutine dies and the error is raised again in the resumer; as with any error a coroutine does
+            // not handle, its dynamic-wind after-thunks do not run
+            expect(run(`(define rlog '())
+                        (define rd (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1) 'never) (lambda () (set! rlog (cons 'after rlog)))))))
+                        (coroutine-resume rd)
+                        (list (try (lambda () (coroutine-raise rd 'bad)) (lambda (e) (list 'out e))) rlog (coroutine-status rd))`)).toBe("((out bad) () dead)");
+            // a coroutine that never ran dies without running
+            expect(run(`(define rn-ran #f) (define rn (coroutine-create (lambda () (set! rn-ran #t))))
+                        (list (try (lambda () (coroutine-raise rn 'early)) (lambda (e) e)) rn-ran (coroutine-status rn))`)).toBe("(early #f dead)");
+            // as a value, in tail position, and from inside another coroutine
+            expect(run(`(define rv (coroutine-create (lambda () (try (lambda () (coroutine-yield 1)) (lambda (e) (* e 2))))))
+                        (define (raise-into co e) (coroutine-raise co e))
+                        (coroutine-resume rv)
+                        (list (raise-into rv 21) (coroutine-status rv))`)).toBe("(42 dead)");
+            expect(run(`(define ri (coroutine-create (lambda () (try (lambda () (coroutine-yield 1)) (lambda (e) (list 'inner e))))))
+                        (define ro (coroutine-create (lambda () (coroutine-resume ri) (list (coroutine-raise ri 'x) (coroutine-status ri)))))
+                        (coroutine-resume ro)`)).toBe("((inner x) dead)");
+            expect(run(`(define rw (coroutine-create (lambda () (try (lambda () (coroutine-yield 1)) (lambda (e) e)))))
+                        (coroutine-resume rw)
+                        (let ((r coroutine-raise)) (r rw 'wrapped))`)).toBe("wrapped");
+            expect(run(`(try (lambda () (let ((c (coroutine-create (lambda () 1)))) (coroutine-resume c) (coroutine-raise c 'x))) (lambda (e) (error-message e)))`)).toBe('"coroutine-raise: cannot resume a dead coroutine"');
+
+            const hostCo = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (let loop ((v (coroutine-yield 0))) (loop (try (lambda () (coroutine-yield v)) (lambda (e) (list 'handled e)))))))`));
+            evaluator.coroutineResume(hostCo);
+            expect(evaluator.coroutineResume(hostCo, 1).value).toBe(1);
+            expect(new ASTStringifier().stringify(evaluator.coroutineRaise(hostCo, Symbol.for("oops")).value)).toBe("(handled oops)");
+            const hostDies = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (coroutine-yield 1)))`));
+            evaluator.coroutineResume(hostDies);
+            expect(() => evaluator.coroutineRaise(hostDies, Symbol.for("fatal"))).toThrow("fatal");
+            expect(hostDies.status).toBe("dead");
+        });
+
         it('multiple values', () => {
             expect(run("(call-with-values (lambda () (values 1 2)) +)")).toBe("3");
             expect(run("(call-with-values (lambda () 5) list)")).toBe("(5)");

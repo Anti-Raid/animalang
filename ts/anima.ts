@@ -84,6 +84,11 @@ export class Anima {
         return this.#vm.resumeCoroutine(co, args)
     }
 
+    // resumes `co` with its pending yield raising `obj` (as a raise inside the coroutine, so its handlers see it)
+    public coroutineRaise(co: any, obj: any): { done: boolean, value: any, values: any[] } {
+        return this.#vm.resumeCoroutine(co, [obj], true)
+    }
+
     public coroutineClose(co: any): void {
         this.#vm.closeCoroutine(co)
     }

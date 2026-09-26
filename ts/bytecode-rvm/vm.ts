@@ -40,9 +40,9 @@ export class AnimaVM {
         return this.#run(ctx, this.executor.newFrame(ctx, code, cargs, null));
     }
 
-    public resumeCoroutine(co: Coroutine, args: any[]): { done: boolean, value: any, values: any[] } {
+    public resumeCoroutine(co: Coroutine, args: any[], raising: boolean = false): { done: boolean, value: any, values: any[] } {
         try {
-            const values = unpackValues(this.executor.coResumeNested(null, co, args));
+            const values = unpackValues(this.executor.coResumeNested(null, co, args, raising));
             return { done: co.status === "dead", value: values[0], values };
         } catch (err) {
             if (!(err instanceof ReRaise)) throw err;

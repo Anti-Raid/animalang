@@ -133,16 +133,18 @@ export class YieldRequest extends ControlRequest {
     }
 }
 
-// (%coroutine-resume co v ...)
+// (%coroutine-resume co v ...), or with `raising`, (%coroutine-raise co obj): args is [obj], raised by the pending yield
 export class ResumeRequest extends ControlRequest {
     co: any = undefined;
     args: any[] = [];
+    raising: boolean = false;
 
     static readonly #reused = new ResumeRequest();
-    static of(co: any, args: any[]): ResumeRequest {
+    static of(co: any, args: any[], raising: boolean = false): ResumeRequest {
         const r = ResumeRequest.#reused;
         r.co = co;
         r.args = args;
+        r.raising = raising;
         return r;
     }
 
@@ -151,15 +153,15 @@ export class ResumeRequest extends ControlRequest {
     }
 
     run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
-        return executor.coResume(ctx, isTail ? frame.parent : frame, this.co, this.args, frame.marks, frame.mframe);
+        return executor.coResume(ctx, isTail ? frame.parent : frame, this.co, this.args, frame.marks, frame.mframe, this.raising);
     }
 
     direct(ctx: ExecutionContext, executor: VMExecutor, closure: Closure, marks: Marks, mframe: number, isTail: boolean): any {
         // inside a coroutine, its frames must stay on the heap, where it can be traced while it waits
         if (isTail || ctx.coroutine !== null || executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > DIRECT_SUSPEND_LIMIT) {
-            throw Suspend.resume(this.co, this.args, marks, mframe);
+            throw Suspend.resume(this.co, this.args, marks, mframe, this.raising);
         }
-        return executor.coResumeNested(ctx, this.co, this.args);
+        return executor.coResumeNested(ctx, this.co, this.args, this.raising);
     }
 }
 
@@ -292,6 +294,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     control("%coroutine-yield-list", [1, 1], (regs, start, nargs) => YieldRequest.of(listToValues(regs, start, nargs)), false);
     control("%coroutine-resume", [1, Infinity], (regs, start, nargs) => ResumeRequest.of(regs[start], copyWindow(regs, start + 1, start + nargs)));
     control("%coroutine-resume-list", [2, 2], (regs, start) => ResumeRequest.of(regs[start], listToArray(regs[start + 1])));
+    control("%coroutine-raise", [2, 2], (regs, start) => ResumeRequest.of(regs[start], [regs[start + 1]], true));
     control("%raise", [1, 2], (regs, start, nargs) => RaiseRequest.of(regs[start], nargs === 2 ? raiseContinuable(regs[start + 1]) : false), false);
     control("%current-stack", [0, 1], (regs, start, nargs) => StackRequest.of(nargs === 1 ? stackSkip(regs[start]) : 0), false);
     // applying a procedure ((%apply proc arg ... lst) and %apply-multi compile to these): (proc arg ... last), where

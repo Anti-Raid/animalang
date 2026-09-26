@@ -402,6 +402,7 @@ export const SCHEME_ALIASES: ReadonlyMap<symbol, SchemeAlias> = new Map([
     alias("coroutine-status", "%coroutine-status", 1, 1),
     alias("coroutine-close", "%coroutine-close", 1, 1),
     alias("coroutine-resume", "%coroutine-resume", 1, Infinity),
+    alias("coroutine-raise", "%coroutine-raise", 2, 2),
     alias("coroutine-yield", "%coroutine-yield", 0, Infinity),
 ]);
 
