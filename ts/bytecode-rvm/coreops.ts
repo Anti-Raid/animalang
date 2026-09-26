@@ -81,6 +81,14 @@ export class HostTail extends ControlRequest {
 
 export const hostTail = (proc: any, ...args: any[]): HostTail => new HostTail(proc, args);
 
+// (proc regs[from] ... regs[from+count-1]): a call of `proc` with part of an intrinsic's argument window, copied with a
+// loop, which on windows this small costs about half of regs.slice plus a spread
+export const hostTailFrom = (proc: any, regs: readonly any[], from: number, count: number): HostTail => {
+    const args = new Array(count);
+    for (let i = 0; i < count; i++) args[i] = regs[from + i];
+    return new HostTail(proc, args);
+};
+
 // (%call/cc proc)
 export class CallCCRequest extends ControlRequest {
     proc: any = undefined;

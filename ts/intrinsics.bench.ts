@@ -1,10 +1,16 @@
 import { bench, describe } from "vitest";
-import { Anima } from "./anima";
-import { createScheme } from "./scheme";
-import { ASTStringifier, IProcedure } from "./common";
-import { impl, implAot, type AnimaOptions } from "./bytecode-rvm/meta";
-import { HostTail, type ByteCode } from "./bytecode-rvm/exec";
-import { dumpFull, readFull } from "./bytecode-rvm/utils";
+import type * as Lib from "./bench-entry";
+// The library as it ships: one bundle, built by `npm run bench` (vite.bench.config.ts). Vitest runs sources module by
+// module, rewriting every use of an import into a property access, which inflates the cost of the VM's cross-module
+// accesses (15-40% on call-heavy workloads) in a way the published bundle does not have
+// (imported by a variable path, so the typecheck never follows it into the generated bundle)
+const BUNDLE = "../.bench/anima.js";
+const bundle = await import(/* @vite-ignore */ BUNDLE);
+
+const { createScheme, impl, implAot, ASTStringifier, IProcedure, hostTailFrom, dumpFull, readFull } = bundle as unknown as typeof Lib;
+type Anima = Lib.Anima;
+type AnimaOptions = Lib.AnimaOptions;
+type ByteCode = Lib.ByteCode;
 
 // --- the only part that follows the intrinsics API as it changes ---
 const makeInstance = (vmImpl: AnimaOptions) => {
@@ -15,13 +21,7 @@ const makeInstance = (vmImpl: AnimaOptions) => {
         inline: ([a, b], slow) => `(typeof ${a} === "number" && typeof ${b} === "number" ? ${a} + ${b} : ${slow})`,
     });
     anima.registerIntrinsic("%bench-add-call", (regs, s) => regs[s] + regs[s + 1], { args: [2, 2], leaf: true });
-    // copies the rest of the window with a loop: regs.slice plus a spread costs about twice as much on windows this small
-    anima.registerIntrinsic("%bench-call-or", (regs, s, n) => {
-        if (!(regs[s] instanceof IProcedure)) return regs[s];
-        const args = new Array(n - 1);
-        for (let i = 1; i < n; i++) args[i - 1] = regs[s + i];
-        return new HostTail(regs[s], args);
-    }, { args: [1, Infinity] });
+    anima.registerIntrinsic("%bench-call-or", (regs, s, n) => regs[s] instanceof IProcedure ? hostTailFrom(regs[s], regs, s + 1, n - 1) : regs[s], { args: [1, Infinity] });
     return anima;
 };
 const loadSetup = (anima: Anima, dumped: Uint32Array) => readFull(dumped, anima.intrinsics);

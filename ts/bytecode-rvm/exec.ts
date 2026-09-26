@@ -7,7 +7,7 @@ export { AotCompiler } from "./aot/compiler";
 export { CodeEmitter } from "./aot/emit";
 export { ByteCode, Closure, ClosureTemplate, createRegs } from "./bytecode";
 export type { DirectFn, ExecutionMode, ResumeFn, UpVarLoc, UsedIntrinsic, VMHost } from "./bytecode";
-export { CORE_COUNT, CORE_INTRINSICS, ControlRequest, HostTail, corePos, hostTail } from "./coreops";
+export { CORE_COUNT, CORE_INTRINSICS, ControlRequest, HostTail, corePos, hostTail, hostTailFrom } from "./coreops";
 export { VMExecutor } from "./executor";
 export { BytecodeInterpreter, OpCode } from "./interpreter";
 export { Box, CatchToken, Coroutine, EscapeContinuation, ExecutionContext, Frame, ReRaise, StackSnapshot, Suspend, VMContinuation, WindPoint, catchHere, computeWindTransition, countControlSuspend, formatTraceback, frameInfos, restValues, tailName, unpackForBinding } from "./values";
