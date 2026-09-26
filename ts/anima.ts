@@ -1,19 +1,24 @@
-import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, Env, OP_LAMBDA, Cons } from "./common"
-import { Bootstrapper } from "./scheme/prelude"
-import { ASP } from "./scheme/reader"
-import { MacroEvaluator } from "./scheme/transformer/macro"
-import { registerCoreSyntax } from "./scheme/transformer/syntax"
+import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, Env, Cons, CORE_LAMBDA } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
-import { isTakenName } from "./bytecode-rvm/core"
+import { isCompilerIntrinsic } from "./bytecode-rvm/core"
 
+// A language on top of the core: reads source into its syntax tree and lowers that to the core forms
+export interface FrontEnd {
+    read(source: string, file?: string): any
+    transform(ast: any): any
+    // a procedure of `params` whose body is `body`, in the front end's syntax
+    lambda(params: any, body: any): any
+}
+
+// A compiler and VM with their intrinsics. On its own it compiles core forms; a front end (see createScheme) adds a
+// language: its syntax, intrinsics and global scope
 export class Anima {
     #vm: AbstractVM
     #comp: AbstractCompiler
-    #scope: Env
+    #scope: Env = new Env()
     #impl: AnimaMeta
-    #bootstrapper: Bootstrapper
-    #evaluator: MacroEvaluator
-    // shared by this instance's compiler, VM and macro evaluator
+    #frontEnd: FrontEnd | null = null
+    // shared by this instance's compiler and VM (and its front end's)
     readonly #intrinsics: Intrinsics
 
     get scope(): Env {
@@ -32,17 +37,22 @@ export class Anima {
         return this.#intrinsics
     }
 
-    constructor(impl: AnimaMeta, maxSteps?: number) {
+    get impl(): AnimaMeta {
+        return this.#impl
+    }
+
+    constructor(impl: AnimaMeta, readonly maxSteps: number = 0) {
         this.#impl = impl
-        this.#intrinsics = new Intrinsics(isTakenName)
-        this.#vm = impl.vm(maxSteps || 0, this.#intrinsics)
+        this.#intrinsics = new Intrinsics(isCompilerIntrinsic)
+        this.#vm = impl.vm(maxSteps, this.#intrinsics)
         this.#comp = impl.compiler(this.#intrinsics)
-        this.#evaluator = new MacroEvaluator(impl, maxSteps || 0, this.#intrinsics)
-        registerCoreSyntax(this.#evaluator)
-        this.#evaluator.init(new Bootstrapper().setupPublicScope(impl, this.#evaluator.expandcmp, this.#evaluator.expandvm, this.#evaluator, this.#intrinsics))
-        this.#bootstrapper = new Bootstrapper()
-        const publicScope = this.#bootstrapper.setupPublicScope(impl, this.#comp, this.#vm, this.#evaluator, this.#intrinsics)
-        this.#scope = publicScope.chained()
+    }
+
+    // gives the instance a language: `scope` is where its code runs
+    attachFrontEnd(frontEnd: FrontEnd, scope: Env): void {
+        if (this.#frontEnd !== null) throw new Error("this instance already has a front end")
+        this.#frontEnd = frontEnd
+        this.#scope = scope
     }
 
     // makes (name arg ...) call `fn` in code compiled from now on; names start with '%'
@@ -77,28 +87,30 @@ export class Anima {
     }
 
     compileToClosure(s: string, args: any, globals: Env) {
-        const bast = new ASP(s, true).parse()
-        return this.compileAstToClosure(bast, args, globals)
+        return this.compileAstToClosure(this.#requireFrontEnd().read(s), args, globals)
     }
 
     compileAstToClosure(bast: any, args: any, globals: Env): AbstractClosure {
-        const ast = Cons.list(OP_LAMBDA, args, bast)
+        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : Cons.list(CORE_LAMBDA, args, bast)
         const bc = this.compileRawAst(ast)
-        const res = this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
-        return res
+        return this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
     }
 
     compileRaw(s: string, file?: string) {
-        const ast = new ASP(s, true, file).parse()
-        return this.compileRawAst(ast)
+        return this.compileRawAst(this.#requireFrontEnd().read(s, file))
     }
 
+    // the front end's syntax tree, or core forms if there is no front end
     compileRawAst(ast: any) {
-        let trExpr = this.#evaluator.transform(ast)
-        return this.#comp.compile(trExpr)
+        return this.#comp.compile(this.#frontEnd !== null ? this.#frontEnd.transform(ast) : ast)
     }
 
     deepPrint(bc: AbstractByteCode) {
         this.#impl.deepPrint(bc)
+    }
+
+    #requireFrontEnd(): FrontEnd {
+        if (this.#frontEnd === null) throw new Error("this instance has no front end to read source with (see createScheme)")
+        return this.#frontEnd
     }
 }

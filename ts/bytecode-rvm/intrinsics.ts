@@ -42,6 +42,9 @@ export class Intrinsics {
     readonly deps: unknown[] = []
     readonly #bySym = new Map<symbol, number>()
     #frozen = false
+    // names code compiled with this table cannot bind, besides the intrinsics: a front end's keywords ("special form")
+    // and the procedures it provides ("builtin")
+    readonly reserved = new Map<symbol, "special form" | "builtin">()
 
     constructor(private readonly taken: (sym: symbol) => boolean = () => false) {}
 

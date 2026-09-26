@@ -2,10 +2,9 @@ import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
-import { IBUILTINS_IDX_MAP } from "../scheme/builtins";
-import { BUILTINS_START, rtIdx } from "./exec";
-import { BUILTIN_INTRINSICS, CORE_OPS, isCompilerIntrinsic, isTakenName } from "./core";
-import { Intrinsics } from "./intrinsics";
+import { arityMessage, rtIdx } from "./exec";
+import { CORE_OPS, isCompilerIntrinsic } from "./core";
+import { Intrinsics, type Intrinsic } from "./intrinsics";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
@@ -48,7 +47,7 @@ interface CmpOpts {
 export class Compiler {
     #s = new ASTStringifier()
 
-    constructor(readonly intrinsics: Intrinsics = new Intrinsics(isTakenName), private readonly debug: boolean = false) {}
+    constructor(readonly intrinsics: Intrinsics = new Intrinsics(isCompilerIntrinsic), private readonly debug: boolean = false) {}
 
     compile(trExpr: any, debug: boolean = this.debug) {
         // Step 1 is to analyze our variables so we know what to box and what not to box
@@ -170,12 +169,12 @@ export class Compiler {
                             opts.nodes.push({ t: "CoYield", valReg: start, destReg: dest })
                             return
                         }
-                        this.#withBuiltinResult(opts, "values", start, nargs, valReg => opts.nodes.push({ t: "CoYield", valReg, destReg: dest }))
+                        this.#withRtResult(opts, "%values", start, nargs, valReg => opts.nodes.push({ t: "CoYield", valReg, destReg: dest }))
                     })
                     return
                 case OP_CO_RESUME:
                     this.#compileRuntimeOp(expr, opts, 1, Infinity, (start, nargs, dest) => {
-                        this.#withBuiltinResult(opts, "list", start + 1, nargs - 1, listReg => {
+                        this.#withRtResult(opts, "%list", start + 1, nargs - 1, listReg => {
                             opts.nodes.push({ t: "CoResume", coReg: start, listReg, isTail: opts.isTail, destReg: dest })
                         })
                     })
@@ -221,19 +220,6 @@ export class Compiler {
                 })
                 return
             }
-
-            const builtinIdx = BUILTIN_INTRINSICS.get(operator)
-            if (builtinIdx !== undefined) {
-                this.#compileWindowIntrinsic(expr, builtinIdx, opts)
-                return
-            }
-        }
-
-        // intrinsic
-        const builtinsIdx = IBUILTINS_IDX_MAP.get(operator)
-        if (builtinsIdx !== undefined) {
-            this.#compileWindowIntrinsic(expr, builtinsIdx, opts)
-            return
         }
 
         this.#compileNormalCall(expr, opts)
@@ -598,10 +584,7 @@ export class Compiler {
 
     #compileRuntimeOp(expr: Cons, opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {
         const nargs = expr.cdr === null ? 0 : expr.cdr.length
-        if (nargs < minArgs || nargs > maxArgs) {
-            const expected = minArgs === maxArgs ? `${minArgs}` : maxArgs === Infinity ? `at least ${minArgs}` : `${minArgs} to ${maxArgs}`
-            throw new Error(`${String(expr.car.description)} requires ${expected} arguments, got ${nargs}`)
-        }
+        if (nargs < minArgs || nargs > maxArgs) throw new Error(arityMessage(String(expr.car.description), minArgs, maxArgs, nargs))
         const startReg = opts.scope.regAlloc.allocBlock(nargs)
         let curr: any = expr.cdr
         let i = 0
@@ -614,9 +597,9 @@ export class Compiler {
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
 
-    #withBuiltinResult(opts: CmpOpts, builtin: string, startReg: number, nargs: number, use: (reg: number) => void) {
+    #withRtResult(opts: CmpOpts, op: string, startReg: number, nargs: number, use: (reg: number) => void) {
         const reg = opts.scope.allocTemp()
-        opts.nodes.push({ t: "IBuiltin", builtinIdx: BUILTINS_START + IBUILTINS_IDX_MAP.get(Symbol.for(builtin))!, destReg: reg, startReg, nargs })
+        opts.nodes.push({ t: "RtCall", rtIdx: rtIdx(op), destReg: reg, startReg, nargs })
         use(reg)
         opts.scope.freeTemp(reg)
     }
@@ -627,44 +610,23 @@ export class Compiler {
         if (dest === undefined) opts.scope.freeTemp(destReg)
     }
 
-    #compileWindowIntrinsic(expr: Cons, builtinIdx: number, opts: CmpOpts) {
-        const nargs = expr.cdr === null ? 0 : expr.cdr.length
-        const startReg = opts.scope.regAlloc.allocBlock(nargs)
-        let curr: any = expr.cdr
-        let i = 0
-        while (curr instanceof Cons) {
-            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false })
-            i++
-            curr = curr.cdr
-        }
-
-        const destReg = opts.destReg ?? opts.scope.allocTemp()
-        opts.nodes.push({ t: "IBuiltin", builtinIdx: BUILTINS_START + builtinIdx, destReg, startReg, nargs })
-        if (opts.destReg === undefined) opts.scope.freeTemp(destReg)
-        opts.scope.regAlloc.freeBlock(startReg, nargs)
-    }
-
     #isIntrinsic(sym: symbol): boolean {
-        return isCompilerIntrinsic(sym) || BUILTIN_INTRINSICS.has(sym) || this.intrinsics.get(sym) !== undefined
+        return isCompilerIntrinsic(sym) || this.intrinsics.get(sym) !== undefined
     }
 
-    // a call of an intrinsic's name always calls the intrinsic, so the name cannot be a variable too
+    // a call of an intrinsic's name always calls the intrinsic, so the name cannot be a variable too; nor can the names
+    // the front end reserved
     #ensureNotIntrinsic(sym: any, syntaxCtx: string) {
-        if (typeof sym === "symbol" && this.#isIntrinsic(sym)) throw new Error(`${syntaxCtx}: cannot bind ${String(sym.description)}, which is an intrinsic`)
+        if (typeof sym !== "symbol") return
+        const reserved = this.intrinsics.reserved.get(sym)
+        if (reserved === "special form") throw new Error(`${String(sym)}: bad syntax`)
+        if (reserved === "builtin") throw new Error(`${syntaxCtx}: cannot bind builtin ${Symbol.keyFor(sym)}`)
+        if (this.#isIntrinsic(sym)) throw new Error(`${syntaxCtx}: cannot bind ${String(sym.description)}, which is an intrinsic`)
     }
 
     #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
         if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
             throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
-        }
-        if (typeof procExpr === "symbol") {
-            const resolved = opts.scope.resolve(procExpr);
-            if (resolved.type === "Global") {
-                const builtinsIdx = IBUILTINS_IDX_MAP.get(procExpr);
-                if (builtinsIdx !== undefined) {
-                    return { procReg: BUILTINS_START + builtinsIdx, isTemp: false };
-                }
-            }
         }
         const procReg = opts.scope.allocTemp();
         this.#compile(procExpr, { ...opts, destReg: procReg, isTail: false });
@@ -677,6 +639,11 @@ export class Compiler {
         }
         const procExpr = expr.cdr.car;
         const argsExprList = expr.cdr.cdr;
+        const intrinsic = typeof procExpr === "symbol" ? this.intrinsics.get(procExpr) : undefined;
+        if (intrinsic !== undefined) {
+            this.#compileApplyIntrinsic(intrinsic, argsExprList, opts);
+            return;
+        }
         const { procReg, isTemp } = this.#resolveProcReg(procExpr, opts);
 
         const nargs = argsExprList === null ? 0 : argsExprList.length;
@@ -693,6 +660,22 @@ export class Compiler {
 
         opts.scope.regAlloc.freeBlock(startReg, nargs);
         if (isTemp) opts.scope.freeTemp(procReg);
+    }
+
+    // (%apply %intrinsic arg ... lst): the argument count is only known at run time, so APPLYINT checks it there
+    #compileApplyIntrinsic(intrinsic: Intrinsic, argsExprList: any, opts: CmpOpts) {
+        if (!intrinsic.leaf) throw new Error(`%apply: ${intrinsic.name} is not a leaf intrinsic, so it cannot be applied`);
+        const nargs = argsExprList === null ? 0 : argsExprList.length;
+        const startReg = opts.scope.regAlloc.allocBlock(nargs);
+        let curr: any = argsExprList;
+        let i = 0;
+        while (curr instanceof Cons) {
+            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false });
+            i++;
+            curr = curr.cdr;
+        }
+        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntApply", pos: intrinsic.pos, destReg, startReg, nargs }));
+        opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
     #compileApplyMulti(expr: Cons, opts: CmpOpts) {

@@ -1,10 +1,6 @@
 import {
-    OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, 
-    OP_SET, OP_LETREC, OP_LETSTAR, ensureCanBind,
-    OP_AND,
-    OP_OR,
+    ensureCanBind,
     OP_DEFINE_GLOBAL,
-    OP_QUOTE,
     CORE_IF,
     CORE_LAMBDA,
     CORE_QUOTE,
@@ -26,7 +22,9 @@ import {
     Cons
 } from "../../common";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
-import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../../ops";
+import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
+import { SCHEME_ALIASES } from "../intrinsics";
+import { CORE_OPS } from "../../bytecode-rvm/core";
 
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
@@ -746,9 +744,15 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(CORE_LET_VALUES_STRICT, expr), state: TransformState.Recurse };
     });
 
-    for (const [name] of [...CXR_PATHS, ...PREDICATES, ...ARITHMETIC]) {
-        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
-            return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
+    // (name arg ...) of a builtin calls its intrinsic directly when the argument count fits; otherwise it stays an
+    // ordinary call of the prelude's procedure, which reports the wrong count when (and if) it runs
+    for (const [name, target] of SCHEME_ALIASES) {
+        evaluator.registerTransform(name, (evaluator, expr, orig) => {
+            const range = evaluator.intrinsics.get(target) ?? CORE_OPS.get(target);
+            if (range === undefined) throw new Error(`internal error: ${String(target.description)} is not an intrinsic`);
+            const nargs = expr === null ? 0 : expr instanceof Cons && !expr.isImproper() ? expr.length : -1;
+            const fits = nargs >= range.min && nargs <= range.max;
+            return { expanded: fits ? cons(target, expr) : orig, state: TransformState.DoChildren };
         });
     }
 };

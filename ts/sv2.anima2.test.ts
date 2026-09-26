@@ -3,9 +3,9 @@ import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, 
 import { ASPParseError } from './scheme/reader';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from './list';
-import { BuiltinFunction } from './scheme/builtins';
+import { createScheme } from './scheme';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
-import { BUILTINS_START, INSTRUCTION_LENGTHS } from './bytecode-rvm/exec';
+import { INSTRUCTION_LENGTHS, rtIdx } from './bytecode-rvm/exec';
 import { Anima } from './anima';
 import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
@@ -13,7 +13,7 @@ import { hostTail } from './bytecode-rvm/exec';
 import { IProcedure } from './common';
 import { hostError } from './errors';
 import { CORE_FORMS, CORE_OPS } from './bytecode-rvm/core';
-import { readFileSync } from 'fs';
+import { readdirSync, readFileSync } from 'fs';
 
 // intrinsics belong to an instance, so every instance that uses these registers them
 const registerTestIntrinsics = (anima: Anima) => {
@@ -33,7 +33,7 @@ describe('Anima', () => {
     let s = new ASTStringifier()
     // every test starts from a fresh instance, so none depends on what ran before it
     beforeEach(() => {
-        evaluator = new Anima(vmImpl)
+        evaluator = createScheme(vmImpl)
         registerTestIntrinsics(evaluator)
         bcCache = {}
         evaluator.scope.set(Symbol.for("port"), 8080)
@@ -205,7 +205,7 @@ describe('Anima', () => {
             expect(run("(map car '((1) (2)))")).toBe("(1 2)");
             expect(() => run("(car '())")).toThrow("car: list is too short");
             expect(() => run("(cdr 5)")).toThrow("cdr: expected a pair but got 5");
-            expect(() => run("(cons 1)")).toThrow("cons requires 2 arguments");
+            expect(() => run("(cons 1)")).toThrow("cons: expected exactly 2 args, got 1");
             expect(run("(cadr '(1 2 3))")).toBe("2");
             expect(run("(cddr '(1 2 3))")).toBe("(3)");
             expect(run("(caar '((1) 2))")).toBe("1");
@@ -214,7 +214,7 @@ describe('Anima', () => {
             expect(run("(map cadr '((1 2) (3 4)))")).toBe("(2 4)");
             expect(() => run("(cadr '(1))")).toThrow("cadr: list is too short");
             expect(() => run("(cadr 5)")).toThrow("cadr: expected a pair but got 5");
-            expect(() => run("(cadr 1 2)")).toThrow("cadr requires 1 argument");
+            expect(() => run("(cadr 1 2)")).toThrow("cadr: expected exactly 1 args, got 2");
             expect(() => run("(lambda (cddr) 1)")).toThrow("cannot bind builtin cddr");
             expect(run("(first '(1 2 3))")).toBe("1");
             expect(run("(second '(1 2 3))")).toBe("2");
@@ -227,14 +227,14 @@ describe('Anima', () => {
             expect(run("(map null? '(() 1))")).toBe("(#t #f)");
             expect(() => run("(even? 1.5)")).toThrow("even? requires an integer");
             expect(() => run("(table-empty? 1)")).toThrow("table-empty? requires a table");
-            expect(() => run("(zero? 1 2)")).toThrow("zero? requires 1 argument");
-            expect(() => run("(let ((f pair?)) (f))")).toThrow("pair? requires 1 argument");
+            expect(() => run("(zero? 1 2)")).toThrow("zero?: expected exactly 1 args, got 2");
+            expect(() => run("(let ((f pair?)) (f))")).toThrow("pair?: expected exactly 1 args, got 0");
             expect(() => run("(let ((f third)) (f '(1 2)))")).toThrow("third: list is too short");
             expect(run("(let ((f <)) (f 1 2))")).toBe("#t");
             expect(() => run("(+ 1 \"a\")")).toThrow("+ requires numbers, but received string");
-            expect(() => run("(-)")).toThrow("- requires at least 1 argument");
+            expect(() => run("(-)")).toThrow("%- requires at least 1 arguments, got 0");
             expect(() => run("(< \"a\")")).toThrow("< requires numbers, but received string");
-            expect(() => run("(modulo 1 2 3)")).toThrow("modulo requires 2 arguments");
+            expect(() => run("(modulo 1 2 3)")).toThrow("modulo: expected exactly 2 args, got 3");
             expect(() => run("(/ 1 0)")).toThrow("division by zero");
         });
 
@@ -324,8 +324,9 @@ describe('Anima', () => {
             expect(run(`(try (lambda () (coroutine-yield 1)) (lambda (e) (error-message e)))`)).toBe('"coroutine-yield: not inside a coroutine (or across a host call boundary)"');
             expect(run(`(map (lambda (co) (coroutine-resume co)) (list (coroutine-create (lambda () 'a)) (coroutine-create (lambda () 'b))))`)).toBe("(a b)");
 
-            evaluator.scope.set(Symbol.for("host-call"), new BuiltinFunction(Symbol.for("host-call"), (regs, start) => evaluator.evaluateClosure(regs[start], [])));
-            expect(run(`(try (lambda () (coroutine-resume (coroutine-create (lambda () (host-call (lambda () (coroutine-yield 1)))))))
+            // a host function that runs Scheme code itself (not through a tail request) is a boundary a yield cannot cross
+            evaluator.registerIntrinsic("%host-call", (regs, start) => evaluator.evaluateClosure(regs[start], []), { args: [1, 1] });
+            expect(run(`(try (lambda () (coroutine-resume (coroutine-create (lambda () (%host-call (lambda () (coroutine-yield 1)))))))
                              (lambda (e) (error-message e)))`)).toBe('"coroutine-yield: not inside a coroutine (or across a host call boundary)"');
         });
 
@@ -874,7 +875,7 @@ describe('Anima', () => {
         })
 
         it('keeps intrinsics per instance, and code keeps the ones it was compiled with', () => {
-            const other = new Anima(vmImpl)
+            const other = createScheme(vmImpl)
             expect(() => other.evaluateRaw(other.compileRaw(`(%test-add 1 2)`))).toThrow()
             other.registerIntrinsic("%test-add", (regs, s) => regs[s] * regs[s + 1], { args: [2, 2], leaf: true })
             expect(s.stringify(other.evaluateRaw(other.compileRaw(`(%test-add 3 4)`)))).toBe("12")
@@ -889,9 +890,31 @@ describe('Anima', () => {
             expect(() => run(`(%test-add %test-add 1)`)).toThrow()
         })
 
+        it('compiles builtin calls to intrinsics, and passes builtins as the prelude procedures', () => {
+            const bc = evaluator.compileRaw(`(car (cons 1 2))`) as ByteCode
+            expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%car", "%cons"])
+            expect(run(`(car (cons 1 2))`)).toBe("1")
+            expect(run(`(list (procedure? car) (map car '((1) (2))) (apply + '(1 2 3)) (apply list 1 '(2)) (apply values '(4)))`)).toBe("(#t (1 2) 6 (1 2) 4)")
+            // a call with the wrong count stays an ordinary call, so it compiles, and fails only if it runs
+            expect(run(`(if #f (car) 'fine)`)).toBe("fine")
+            expect(() => run(`(apply car '(1 2))`)).toThrow("car: expected exactly 1 args, got 2")
+            expect(() => run(`(apply vector-append '(1))`)).toThrow("vector-append requires all arguments to be vectors")
+            expect(() => run(`(apply table-ref '(1))`)).toThrow("%table-ref requires 2 to 3 arguments, got 1")
+            // the builtins' intrinsics are at the same positions in every instance
+            expect(createScheme(vmImpl).intrinsics.byName("%car")!.pos).toBe(evaluator.intrinsics.byName("%car")!.pos)
+        })
+
+        it('has no language without a front end', () => {
+            const bare = new Anima(vmImpl)
+            expect(bare.intrinsics.byName("%car")).toBeUndefined()
+            expect(() => bare.compileRaw(`(+ 1 2)`)).toThrow("no front end")
+            const ifForm = Cons.list(Symbol.for("%if"), false, 1, Cons.list(Symbol.for("%list"), 2, 3))
+            expect(s.stringify(bare.evaluateRaw(bare.compileRawAst(ifForm)))).toBe("(2 3)")
+        })
+
         it('gives inline templates their deps', () => {
             class Point { constructor(readonly x: number) {} }
-            const other = new Anima(vmImpl)
+            const other = createScheme(vmImpl)
             other.registerIntrinsic("%test-px", (regs, s) => regs[s].x, {
                 args: [1, 1], leaf: true, deps: { Point },
                 inline: ([p], slow, _tmp, d) => `(${p} instanceof ${d.Point} ? ${p}.x : ${slow})`,
@@ -2218,7 +2241,7 @@ describe('Anima', () => {
 
 describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s", (_mode, vmImpl) => {
     let evaluator: Anima;
-    beforeEach(() => { evaluator = new Anima(vmImpl) });
+    beforeEach(() => { evaluator = createScheme(vmImpl) });
     const runFile = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src, "t.anima"));
     const errorOf = (src: string): any => {
         try {
@@ -2347,7 +2370,7 @@ describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
 
 describe('Vectors (using JS Arrays)', () => {
     let evaluator: Anima;
-    beforeEach(() => { evaluator = new Anima(vmImpl) });
+    beforeEach(() => { evaluator = createScheme(vmImpl) });
     let s = new ASTStringifier();
 
     const run = (expr: string) => {
@@ -2463,7 +2486,7 @@ describe('Vectors (using JS Arrays)', () => {
 
 describe('Tables (using Table class)', () => {
     let evaluator: Anima;
-    beforeEach(() => { evaluator = new Anima(vmImpl) });
+    beforeEach(() => { evaluator = createScheme(vmImpl) });
     let s = new ASTStringifier();
 
     const run = (expr: string) => {
@@ -2730,7 +2753,7 @@ describe('Tables (using Table class)', () => {
 describe('Floats, Infinities & NaNs', () => {
     let evaluator: Anima;
     beforeEach(() => {
-        evaluator = new Anima(vmImpl)
+        evaluator = createScheme(vmImpl)
         registerTestIntrinsics(evaluator)
     });
     let s = new ASTStringifier();
@@ -2907,12 +2930,11 @@ describe('Floats, Infinities & NaNs', () => {
         // ByteCode serialization containing floats and infinities
         const bc = evaluator.compileRaw('(+ 3.14 2.71 +inf.0)');
         const bcBs = new BS();
-        ByteCode.register(new BSReader(new Uint32Array(0)));
         bcBs.writeSerializable(bc as ByteCode);
 
         const dumped = bcBs.finalize();
         const bcReader = new BSReader(dumped);
-        ByteCode.register(bcReader);
+        ByteCode.register(bcReader, evaluator.intrinsics);
         const deserializedBc = bcReader.read() as ByteCode;
 
         expect(deserializedBc instanceof ByteCode).toBe(true);
@@ -2924,7 +2946,7 @@ describe('Floats, Infinities & NaNs', () => {
         bcFloatBs.writeSerializable(bcFloat as ByteCode);
         const floatDumped = bcFloatBs.finalize();
         const floatReader = new BSReader(floatDumped);
-        ByteCode.register(floatReader);
+        ByteCode.register(floatReader, evaluator.intrinsics);
         const deserializedFloatBc = floatReader.read() as ByteCode;
         expect(s.stringify(evaluator.evaluateRaw(deserializedFloatBc))).toBe("3.75");
 
@@ -2938,7 +2960,7 @@ describe('Floats, Infinities & NaNs', () => {
             const listBs = new BS();
             listBs.writeSerializable(evaluator.compileRaw(src) as ByteCode);
             const listReader = new BSReader(listBs.finalize());
-            ByteCode.register(listReader);
+            ByteCode.register(listReader, evaluator.intrinsics);
             expect(s.stringify(evaluator.evaluateRaw(listReader.read() as ByteCode))).toBe(expected);
         }
 
@@ -2965,7 +2987,7 @@ describe('Floats, Infinities & NaNs', () => {
         expect(s.stringify(evaluator.evaluateRaw(readFull(dumped, evaluator.intrinsics) as ByteCode))).toBe("(3 4)");
 
         // the same intrinsics at other positions: operands are remapped by name
-        const other = new Anima(vmImpl);
+        const other = createScheme(vmImpl);
         other.registerIntrinsic("%test-first", (regs, s) => regs[s], { args: [1, 1], leaf: true });
         registerTestIntrinsics(other);
         expect(other.intrinsics.byName("%test-add")!.pos).not.toBe(evaluator.intrinsics.byName("%test-add")!.pos);
@@ -2974,13 +2996,13 @@ describe('Floats, Infinities & NaNs', () => {
         // the original still runs with its own positions
         expect(s.stringify(evaluator.evaluateRaw(bc))).toBe("(3 4)");
 
-        expect(() => readFull(dumped, new Anima(vmImpl).intrinsics)).toThrow("'%test-add', which is not registered");
+        expect(() => readFull(dumped, createScheme(vmImpl).intrinsics)).toThrow("'%test-add', which is not registered");
         expect(() => readFull(dumped)).toThrow("needs an intrinsics table");
     });
 
     it("refuses to load code whose intrinsics changed from leaf to not a leaf, or back", () => {
         const leafCode = dumpFull(evaluator.compileRaw("(%test-add 1 2)") as ByteCode);
-        const other = new Anima(vmImpl);
+        const other = createScheme(vmImpl);
         other.registerIntrinsic("%test-add", (regs, s) => regs[s] + regs[s + 1], { args: [2, 2] });
         expect(() => readFull(leafCode, other.intrinsics)).toThrow("compiled with '%test-add' as a leaf, but it is registered as not a leaf");
         const nonLeafCode = dumpFull(other.compileRaw("(%test-add 1 2)") as ByteCode);
@@ -2992,12 +3014,12 @@ describe('Floats, Infinities & NaNs', () => {
 
 describe("JIT Compiler Runtime Compilation & Execution", () => {
     const animaScope = () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         return anima.scope;
     };
 
     it("compiles functions AOT and executes natively", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const code = anima.compileRaw(`
             (define (double x) (+ x x))
             double
@@ -3014,7 +3036,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
     });
 
     it("executes straight-line native opcodes completely natively in AOT", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const code = anima.compileRaw(`(lambda (x) x)`);
         const idClosure = anima.evaluateRaw(code);
         const fnCode = idClosure.tmpl.code as ByteCode;
@@ -3026,7 +3048,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
     });
 
     it("loads negative and non-integer literals through LOADCONST", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const bc = anima.compileRaw("(+ -42 -0.5 4294967296)") as ByteCode;
         expect(bc.constants).toEqual(expect.arrayContaining([-42, -0.5, 4294967296]));
         expect(anima.evaluateRaw(bc)).toBe(4294967253.5);
@@ -3079,13 +3101,12 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Function with straight-line ops followed by an unhandled opcode:
         // 0: LOADU32 r1, 50
         // 3: LOADU32 r2, 60
-        // 6: CALL builtin(+), start=r1, nargs=2; MOVEACC r0
-        // 13: RETURN r0
-        const plusSym = Symbol.for("+");
+        // 6: CALLRT %list, dest=r0, start=r1, nargs=2
+        // 11: RETURN r0
         const inst = new Uint32Array([
             OpCode.LOADU32, 1, 50,
             OpCode.LOADU32, 2, 60,
-            OpCode.CALL, BUILTINS_START, 1, 2, 0, OpCode.MOVEACC, 0,
+            OpCode.CALLRT, rtIdx("%list"), 0, 1, 2,
             OpCode.RETURN, 0
         ]);
         const bc = new ByteCode([], inst, 4);
@@ -3098,11 +3119,11 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Evaluating this will run native code for LOADU32 r1, 50 and LOADU32 r2, 60,
         // then hit deopt(6) at CALL, drop to interpreter, and execute CALL and RETURN!
         const res = vm.evaluateRaw(bc, animaScope());
-        expect(res).toBe(110);
+        expect(new ASTStringifier().stringify(res)).toBe("(50 60)");
     });
 
     it("executes IF, ELSE, ENDIF control flow completely natively in AOT", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const code = anima.compileRaw(`
             (define (my-branch c a b)
                 (if c a b))
@@ -3119,7 +3140,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
     });
 
     it("executes nested IF, ELSE, ENDIF completely natively in AOT", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const code = anima.compileRaw(`
             (define (classify a b)
                 (if a
@@ -3138,7 +3159,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
     });
 
     it("executes tail CALL recursively in JIT without stack overflow", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const code = anima.compileRaw(`
             (define (sum-loop n acc)
                 (if (= n 0)
@@ -3156,7 +3177,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
     });
 
     it("executes non-tail CALL to user closures natively in AOT", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const code = anima.compileRaw(`
             (define (square x) (* x x))
             (define (sum-of-squares a b)
@@ -3173,7 +3194,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
     });
 
     it("executes CALL with call/cc in AOT mode", () => {
-        const anima = new Anima(implAot);
+        const anima = createScheme(implAot);
         const code = anima.compileRaw(`
             (define (test-callcc x)
                 (+ x (call/cc (lambda (k) (+ 10 (k 5))))))
@@ -3231,5 +3252,11 @@ describe("Compiler intrinsics", () => {
         const readme = readFileSync(new URL("./bytecode-rvm/README.md", import.meta.url), "utf8");
         const documented = (name: string) => new RegExp("[`(]" + name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&") + "[`\\s)]").test(readme);
         expect([...CORE_FORMS.keys(), ...CORE_OPS.keys()].map(sym => Symbol.keyFor(sym)!).filter(name => !documented(name))).toEqual([]);
+    });
+
+    it("belong to a compiler that knows nothing of the Scheme front end", () => {
+        const dir = new URL("./bytecode-rvm/", import.meta.url);
+        const mentions = readdirSync(dir).filter(file => /scheme/i.test(readFileSync(new URL(file, dir), "utf8")));
+        expect(mentions).toEqual([]);
     });
 });

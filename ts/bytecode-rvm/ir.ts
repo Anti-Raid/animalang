@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, rtIdx, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, rtIdx, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 
 let nextLabelId = 0;
@@ -78,13 +78,6 @@ export type Node = {
     t: "NewClosure",
     destReg: number,
     template: ClosureTemplateIR
-} | {
-    // A call to a builtin function
-    t: "IBuiltin",
-    builtinIdx: number,
-    destReg: number,
-    startReg: number,
-    nargs: number
 } | {
     // reg[destReg] = [reg[srcReg]]
     t: "Box",
@@ -172,6 +165,13 @@ export type Node = {
     nargs: number,
     isTail: boolean,
     destReg?: number
+} | {
+    // (%apply %intrinsic arg ... lst) of a leaf intrinsic (APPLYINT)
+    t: "IntApply",
+    pos: number,
+    destReg: number,
+    startReg: number,
+    nargs: number
 } | {
     // a leaf intrinsic (CALLINT)
     t: "IntCall",
@@ -286,6 +286,9 @@ export class IR {
                 case "IntCall":
                     inst.push(OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
+                case "IntApply":
+                    inst.push(OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
+                    break
                 case "CurrentStack":
                     inst.push(OpCode.CURSTACK, node.skip)
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
@@ -319,10 +322,6 @@ export class IR {
                 }
                 case "TailApply": {
                     inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, 1)
-                    break
-                }
-                case "IBuiltin": {
-                    inst.push(OpCode.CALL, node.builtinIdx, node.startReg, node.nargs, 0, OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "Return": {

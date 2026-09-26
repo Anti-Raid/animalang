@@ -1,7 +1,7 @@
-import { AbstractByteCode, AbstractCompiler, AbstractVM, AnimaMeta, RESERVED_BUILTINS, IProcedure, Env } from "../common";
+import { AbstractByteCode, AbstractCompiler, AbstractVM, IProcedure, Env } from "../common";
 import type { Intrinsics } from "../bytecode-rvm/intrinsics";
-import { BuiltinFunction, IBUILTINS } from "./builtins";
 import { ASP } from "./reader";
+import { BUILTIN_WRAPPERS } from "./intrinsics";
 import type { MacroEvaluator } from "./transformer/macro";
 
 export const stdPreludeScope = () => new Env()
@@ -95,55 +95,37 @@ export const STD_PRELUDE = `
 
 // compiled once per implementation; each VM runs its own copy, with its own adaptive state, whose AOT code is built from
 // source generated once
-const PRELUDE_CODE = new Map<string, AbstractByteCode>()
+// compiled once, for every implementation (the prelude is never debug code, and AOT code is built from bytecode later, per
+// VM), and kept unbound so the cache holds no instance's intrinsics; each instance runs its own copy, bound by name
+let PRELUDE_CODE: AbstractByteCode | null = null
 
-export class Bootstrapper {
-    #bootstrappedPreludes: Map<string, Env> = new Map()
-
-    /** Set up the public scope for the given vm and compiler instance */
-    setupPublicScope(impl: AnimaMeta, cmp: AbstractCompiler, vm: AbstractVM, evaluator: MacroEvaluator, intrinsics: Intrinsics) {
-        if (this.#bootstrappedPreludes.has(impl.id)) {
-            return this.#bootstrappedPreludes.get(impl.id)!
-        }
-        let PRELUDE_BC = PRELUDE_CODE.get(impl.id)
-        if (PRELUDE_BC === undefined) {
-            const preludeAst = new ASP(STD_PRELUDE, true, "<prelude>").parse()
-            // the prelude is never debug code, so its internals stay out of tracebacks' tail history
-            const compiled = cmp.compile(evaluator.transform(preludeAst), false)
-            // kept unbound, so the cache holds no instance's intrinsics
-            PRELUDE_BC = compiled.fresh?.(new Map(), null) ?? compiled
-            PRELUDE_CODE.set(impl.id, PRELUDE_BC)
-        }
-
-        const privScope = stdPreludeScope()
-        vm.evaluateRaw(PRELUDE_BC.fresh?.(new Map(), intrinsics) ?? PRELUDE_BC, privScope)
-
-        /* Base scope */
-        const publicScope = new Env();
-        const named = new Set<IProcedure>()
-        for (const [sym, value] of privScope.ownEntries()) {
-            const symName = Symbol.keyFor(sym) || sym.description || "%Unknown";
-        
-            // If the func starts with a $, its public
-            if (symName.startsWith("$")) {
-                const publicSym = Symbol.for(symName.replace('$', ''));
-                if (value instanceof IProcedure && !(value instanceof BuiltinFunction) && !named.has(value)) {
-                    value.debugName = publicSym.description
-                    named.add(value)
-                }
-                publicScope.set(publicSym, value);
-                RESERVED_BUILTINS.add(publicSym);
-            }
-        }
-
-        // finally, export the builtins
-        for(const builtin of IBUILTINS) {
-            publicScope.set(builtin.name, builtin)
-        }
-
-        publicScope.frozen = true;
-
-        this.#bootstrappedPreludes.set(impl.id, publicScope)
-        return publicScope
+// Runs the prelude with `vm` and returns the scope of its $ exports (under their public names), which the instance's
+// code cannot rebind
+export const loadPrelude = (cmp: AbstractCompiler, vm: AbstractVM, evaluator: MacroEvaluator, intrinsics: Intrinsics): Env => {
+    if (PRELUDE_CODE === null) {
+        const preludeAst = new ASP(`${BUILTIN_WRAPPERS}\n${STD_PRELUDE}`, true, "<prelude>").parse()
+        const compiled = cmp.compile(evaluator.transform(preludeAst), false)
+        PRELUDE_CODE = compiled.fresh?.(new Map(), null) ?? compiled
     }
+
+    const privScope = stdPreludeScope()
+    vm.evaluateRaw(PRELUDE_CODE.fresh?.(new Map(), intrinsics) ?? PRELUDE_CODE, privScope)
+
+    const publicScope = new Env();
+    const named = new Set<IProcedure>()
+    for (const [sym, value] of privScope.ownEntries()) {
+        const symName = Symbol.keyFor(sym) || sym.description || "%Unknown";
+        // If the func starts with a $, its public
+        if (symName.startsWith("$")) {
+            const publicSym = Symbol.for(symName.replace('$', ''));
+            if (value instanceof IProcedure && !named.has(value)) {
+                value.debugName = publicSym.description
+                named.add(value)
+            }
+            publicScope.set(publicSym, value);
+            intrinsics.reserved.set(publicSym, "builtin");
+        }
+    }
+    publicScope.frozen = true;
+    return publicScope
 }

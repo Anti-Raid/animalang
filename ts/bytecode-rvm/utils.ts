@@ -1,6 +1,5 @@
 import { BS, BSReader, type SerializableBytecode } from "../common"
-import { IBUILTINS } from "../scheme/builtins"
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
+import { ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
 import type { Intrinsics } from "./intrinsics"
 
 const intrinsicName = (code: ByteCode, pos: number): string => code.intrinsics.find(used => used.pos === pos)?.name ?? `#${pos}`
@@ -117,7 +116,7 @@ const stringifyInst = (inst: ByteCode): string[] => {
             case OpCode.CALL:
             case OpCode.APPLY: {
                 const proc = inst.inst[idx + 1];
-                const procStr = (proc < BUILTINS_START) ? `r${proc}` : `builtin(${String(IBUILTINS[proc-BUILTINS_START].name)})`;
+                const procStr = `r${proc}`;
                 line += `${padOp(OpCode[opcode])} ${procStr}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${inst.inst[idx + 4] ? ", tail" : ""}`;
                 idx += 5;
                 break;
@@ -203,7 +202,8 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 break;
 
             case OpCode.CALLINT:
-                line += `${padOp("CALLINT")} ${intrinsicName(inst, inst.inst[idx + 1])}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
+            case OpCode.APPLYINT:
+                line += `${padOp(inst.inst[idx] === OpCode.CALLINT ? "CALLINT" : "APPLYINT")} ${intrinsicName(inst, inst.inst[idx + 1])}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
                 idx += 5;
                 break;
 

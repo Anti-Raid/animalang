@@ -1,7 +1,7 @@
 import {
     ErrorObject,
     MissingVarError,
-    UnhandledSchemeError,
+    UnhandledError,
     isTruthy,
     Table,
     Env,
@@ -21,14 +21,12 @@ import {
     formatPos
 } from "../common";
 import { Cons } from "../list";
-import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList } from "../ops";
-import { BuiltinFunction, IBUILTINS } from "../scheme/builtins";
+import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList, makeList } from "./lists";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markOwn, markSet, markValues, recordTailMark, TAIL_TRAIL, type Marks, type TailTrail } from "../marks";
-import { BUILTIN_INLINES, RUNTIME_INLINES } from "./inline";
+import { RUNTIME_INLINES } from "./inline";
 import { hostError } from "../errors";
 import type { Intrinsics, Intrinsic } from "./intrinsics";
 
-export const BUILTINS_START = 2**31;
 
 // Operands are u32s; reg[x] = register x, constant = a constant-pool index, ip = an instruction index.
 // Non-tail CALL/APPLY/CALLCC/CORESUME/COYIELD leave their result in the accumulator, read by a following MOVEACC.
@@ -42,7 +40,7 @@ export enum OpCode {
     IF,          // cond elseIp        jump to elseIp if reg[cond] is false
     ELSE,        // endIp              end of the then branch: jump past the else branch
     ENDIF,       //                    marks the end of an if (for structured AOT code)
-    CALL,        // proc start n tail  call reg[proc] (or builtin proc - BUILTINS_START) on reg[start .. start+n)
+    CALL,        // proc start n tail  call reg[proc] on reg[start .. start+n)
     RETURN,      // src                return reg[src] from the function
     NEWCLOSURE,  // dst constant       reg[dst] = closure of the template constants[constant], capturing its upvars
     BOX,         // dst src            reg[dst] = new box holding reg[src]
@@ -72,6 +70,7 @@ export enum OpCode {
     CALLHOST,    // pos start n tail   call the non-leaf intrinsic at pos in the code's table on reg[start .. start+n); a
                  //                    HostTail result is called in its place
     CALLINT,     // pos dst start n    reg[dst] = the leaf intrinsic at pos in the code's table applied to reg[start .. start+n)
+    APPLYINT,    // pos dst start n    like CALLINT, with the last argument a list spread into the arguments (count checked here)
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -112,6 +111,7 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.CURSTACK]: 2,
     [OpCode.CALLHOST]: 5,
     [OpCode.CALLINT]: 5,
+    [OpCode.APPLYINT]: 5,
 };
 
 // UNPACK flags
@@ -175,11 +175,13 @@ export class ByteCode implements AbstractByteCode {
 
     // Makes the operands positions in `table`, by name: an error if an intrinsic is missing or its leaf flag differs from
     // the one the code was compiled for (either way). Rewrites the instructions (copying them if other code runs them)
-    // only when a position moves
+    // only when a position moves. Binding to null leaves the code unbound (a cached copy): it runs once bound again
     bind(table: Intrinsics | null): void {
-        if (this.intrinsics.length === 0) return;
-        if (table === null) throw new Error("bytecode that uses intrinsics needs an intrinsics table to run with");
-        if (table === this.table) return;
+        if (this.intrinsics.length === 0 || table === this.table) return;
+        if (table === null) {
+            this.table = null;
+            return;
+        }
         const moved = new Map<number, number>();
         const bound = this.intrinsics.map(used => {
             const entry = table.byName(used.name);
@@ -193,7 +195,8 @@ export class ByteCode implements AbstractByteCode {
         if (moved.size > 0) {
             const inst = SHARED_INSTS.has(this.inst) ? this.inst.slice() : this.inst;
             for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) {
-                if (inst[ip] === OpCode.CALLINT || inst[ip] === OpCode.CALLHOST) inst[ip + 1] = moved.get(inst[ip + 1]) ?? inst[ip + 1];
+                const op = inst[ip];
+                if (op === OpCode.CALLINT || op === OpCode.CALLHOST || op === OpCode.APPLYINT) inst[ip + 1] = moved.get(inst[ip + 1]) ?? inst[ip + 1];
             }
             this.inst = inst;
         }
@@ -266,6 +269,7 @@ export class ByteCode implements AbstractByteCode {
             const flat = bsr.readArray();
             const intrinsics: UsedIntrinsic[] = [];
             for (let i = 0; i < flat.length; i += 3) intrinsics.push({ pos: flat[i], name: flat[i + 1], leaf: flat[i + 2] });
+            if (intrinsics.length > 0 && table === null) throw new Error("bytecode that uses intrinsics needs an intrinsics table to load");
             const code = new ByteCode(constants, inst, numReg, lineTable, files, debug, null, intrinsics);
             code.bind(table);
             return code;
@@ -357,9 +361,7 @@ export const createRegs = (numRegs: number) => {
 };
 
 
-export const resolveProc = (regs: readonly any[], procIdx: number): any => {
-    return procIdx < BUILTINS_START ? regs[procIdx] : IBUILTINS[procIdx - BUILTINS_START];
-};
+
 
 
 export class Box {
@@ -718,13 +720,8 @@ export class VMExecutor {
     ): Frame | null {
         const returnTo = (isTail && callerFrame !== null) ? callerFrame.parent : callerFrame;
 
-        if (proc instanceof BuiltinFunction) {
-            ctx.acc = proc.cb(callerArgs, startReg, nargs);
-            return this.setRetVal(ctx, returnTo, ctx.acc);
-        }
-
         if (proc instanceof Closure) {
-            const pregs = this.createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
+            const pregs = this.createClosureArg(proc, nargs, callerArgs, startReg);
             if (marks !== undefined) return this.newFrame(ctx, proc, pregs, returnTo, marks, mframe);
             if (isTail && callerFrame !== null && !callerFrame.isShared(ctx)) {
                 return this.reset(callerFrame, proc, pregs);
@@ -814,15 +811,16 @@ export class VMExecutor {
         return frame;
     }
 
-    public createClosureArg(template: ClosureTemplate, nargs: number, args: any[], startOffset: number): any[] {
+    public createClosureArg(closure: Closure, nargs: number, args: any[], startOffset: number): any[] {
+        const template = closure.tmpl;
         const arity = template.params.length;
         if (template.remParams !== null) {
             if (nargs < arity) {
-                throw hostError(`expected at least ${arity} args, got ${nargs}`);
+                throw hostError(`${closure.debugName}: expected at least ${arity} args, got ${nargs}`);
             }
         } else {
             if (nargs !== arity) {
-                throw hostError(`expected exactly ${arity} args, got ${nargs}`);
+                throw hostError(`${closure.debugName}: expected exactly ${arity} args, got ${nargs}`);
             }
         }
 
@@ -878,7 +876,7 @@ export class VMExecutor {
     // calls `proc` with `tok` as the innermost exception handler; its value, or a Caught, is returned to `frame`
     public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, tok: CatchToken): Frame | null {
         const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Cons(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
-        if (proc instanceof Closure) return this.newFrame(ctx, proc, this.createClosureArg(proc.tmpl, 0, [], 0), frame, marks, frame.mframe + 1);
+        if (proc instanceof Closure) return this.newFrame(ctx, proc, this.createClosureArg(proc, 0, [], 0), frame, marks, frame.mframe + 1);
         try {
             return this.invoke(ctx, proc, frame, [], 0, 0, false);
         } catch (err) {
@@ -912,13 +910,8 @@ export class VMExecutor {
                     ctx.wind = action.nextWind;
                 }
 
-                if (action.thunk instanceof BuiltinFunction) {
-                    ctx.acc = action.thunk.cb([], 0, 0);
-                    continue;
-                }
-
                 if (action.thunk instanceof Closure) {
-                    const pregs = this.createClosureArg(action.thunk.tmpl, 0, [], 0);
+                    const pregs = this.createClosureArg(action.thunk, 0, [], 0);
                     return this.newFrame(ctx, action.thunk, pregs, null);
                 }
 
@@ -939,7 +932,7 @@ export class VMExecutor {
     // `marks`/`mframe`: where the error happened, when that is not `frame` (a tail call that left no frame)
     public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any, marks?: Marks, mframe: number = 0): Frame | null {
         if (err instanceof EscapedError) throw err;
-        if (err instanceof UnhandledSchemeError) {
+        if (err instanceof UnhandledError) {
             const co = ctx.coroutine;
             if (co !== null && co.closing) throw err;
             if (co !== null && co.status === "running") {
@@ -983,7 +976,7 @@ export class VMExecutor {
         const traceback = formatTraceback(frameInfos(frame), tracebackMessage(obj));
         const err = obj instanceof ErrorObject ? obj.error : obj;
         if (err instanceof Error && (err as any).animaTraceback === undefined) (err as any).animaTraceback = traceback;
-        return this.handleHostException(ctx, frame, new UnhandledSchemeError(err, traceback));
+        return this.handleHostException(ctx, frame, new UnhandledError(err, traceback));
     }
 
     public resumeSuspend(ctx: ExecutionContext, sig: Suspend): Frame | null {
@@ -1005,7 +998,7 @@ export class VMExecutor {
     // --- coroutines ---
 
     public coCreate(ctx: ExecutionContext, proc: any): Coroutine {
-        if (!(proc instanceof Closure || proc instanceof BuiltinFunction)) {
+        if (!(proc instanceof Closure)) {
             throw hostError(`coroutine-create: expected a procedure but got ${String(proc)}`);
         }
         return new Coroutine(proc, ctx.vm, ctx.scope);
@@ -1095,7 +1088,7 @@ export class VMExecutor {
             const frame = this.advanceWindTransition(cctx);
             if (frame !== null) this.#runLoop(cctx, frame);
         } catch (err) {
-            throw new ReRaise(err instanceof UnhandledSchemeError ? err.error : err);
+            throw new ReRaise(err instanceof UnhandledError ? err.error : err);
         } finally {
             cctx.pendingWind = null;
             co.closing = false;
@@ -1209,9 +1202,11 @@ export const RUNTIME: readonly RuntimeOp[] = Object.freeze(([
         const vals = regs[start + 1];
         return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
     }],
+    ["%list", [0, Infinity], true, (ctx, executor, regs, start, nargs) => makeList(regs, start, nargs)],
+    ["%values", [0, Infinity], true, (ctx, executor, regs, start, nargs) => packValues(regs.slice(start, start + nargs))],
     ["%values->list", [1, 1], true, (ctx, executor, regs, start, nargs) => valuesToList(regs, start, nargs)],
     ["%list->values", [1, 1], true, (ctx, executor, regs, start, nargs) => listToValues(regs, start, nargs)],
-    ["%apply-args", [1, Infinity], true, (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
+    ["%apply-args", [1, 1], true, (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
     ["%debug-frames", [2, 2], true, (ctx, executor, regs, start) => {
         const { frames, args } = debugTarget(ctx, regs, start);
         const level = typeof args[0] === "number" ? args[0] : 0;
@@ -1249,6 +1244,17 @@ export class HostTail {
 }
 
 export const hostTail = (proc: any, ...args: any[]): HostTail => new HostTail(proc, args);
+
+// an intrinsic's argument count checked at run time (for APPLYINT, whose count the compiler cannot know)
+export const arityMessage = (name: string, min: number, max: number, nargs: number): string => {
+    const expected = min === max ? `${min}` : max === Infinity ? `at least ${min}` : `${min} to ${max}`;
+    return `${name} requires ${expected} arguments, got ${nargs}`;
+};
+
+const applyIntrinsic = (fn: (regs: any[], start: number, nargs: number) => any, name: string, min: number, max: number, args: any[]): any => {
+    if (args.length < min || args.length > max) throw hostError(arityMessage(name, min, max, args.length));
+    return fn(args, 0, args.length);
+};
 
 const RUNTIME_FNS: readonly RuntimeFn[] = RUNTIME.map(({ fn }) => fn);
 
@@ -1400,16 +1406,11 @@ export class BytecodeInterpreter {
                         return executor.setRetVal(ctx, frame.parent, ctx.acc);
                     }
                     case OpCode.CALL: {
-                        const proc = resolveProc(regs, inst[ip++]);
+                        const proc = regs[inst[ip++]];
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
                         if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(proc));
-
-                        if (!isTail && proc instanceof BuiltinFunction) {
-                            ctx.acc = proc.cb(regs, startReg, nargs);
-                            break;
-                        }
 
                         // self tail call: rebind the params in place and jump back to the start
                         if (isTail && proc === frame.closure && !frame.isShared(ctx)) {
@@ -1467,8 +1468,15 @@ export class BytecodeInterpreter {
                         regs[destReg] = fn(regs, startReg, inst[ip++]);
                         break;
                     }
+                    case OpCode.APPLYINT: {
+                        const entry = frame.code.table!.entries[inst[ip++]];
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, windowApplyArgs(regs, startReg, inst[ip++]));
+                        break;
+                    }
                     case OpCode.APPLY: {
-                        const proc = resolveProc(regs, inst[ip++]);
+                        const proc = regs[inst[ip++]];
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
@@ -1536,7 +1544,6 @@ export class BytecodeInterpreter {
 }
 
 const JIT_DEPS = {
-    IBUILTINS,
     markSet,
     recordTailMark,
     tailName,
@@ -1550,7 +1557,6 @@ const JIT_DEPS = {
     Box,
     MissingVarError,
     Closure,
-    BuiltinFunction,
     WindPoint,
     windowApplyArgs,
     RUNTIME_FNS,
@@ -1568,14 +1574,13 @@ const JIT_DEPS = {
     StackSnapshot,
     frameInfos,
     HostTail,
+    applyIntrinsic,
     CatchToken,
     Caught,
     catchHere,
     markFirst,
     EXCEPTION_HANDLERS,
 };
-
-type ProcRef = { reg: number } | { builtin: number };
 
 // `at` is the ip of the instruction an op or terminator was decoded from
 type AotInst = { at?: number } & (
@@ -1588,9 +1593,8 @@ type AotInst = { at?: number } & (
     | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }
     | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
     | { k: "MoveAcc"; dst: number }
-    | { k: "CallBuiltin"; builtin: number; dst: number; start: number; nargs: number; resume: number }
     | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number }
-    | { k: "IntCall"; pos: number; dst: number; start: number; nargs: number }
+    | { k: "IntCall" | "IntApply"; pos: number; dst: number; start: number; nargs: number }
     | { k: "Unpack"; src: number; start: number; count: number; flags: number }
     | { k: "SetMark"; key: number; val: number }
     | { k: "MarkSave" | "MarkRestore"; reg: number }
@@ -1604,7 +1608,7 @@ type AotTerm = { at?: number } & (
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean }
-    | { k: "Apply"; proc: ProcRef; isTail: boolean; start: number; nargs: number; resume: number }
+    | { k: "Apply"; proc: number; isTail: boolean; start: number; nargs: number; resume: number }
     | { k: "CallCC"; proc: number; isTail: boolean; resume: number }
     | { k: "CallEC"; proc: number; tok: number; resume: number }
     | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
@@ -1761,7 +1765,7 @@ export class AotCompiler {
                     blocks.add(nextIp);
                     break;
                 case OpCode.CALL:
-                    if (inst[nextIp - 1] === 0 && inst[ip + 1] < BUILTINS_START) blocks.add(nextIp);
+                    if (inst[nextIp - 1] === 0) blocks.add(nextIp);
                     break;
                 case OpCode.APPLY:
                 case OpCode.CALLCC:
@@ -1857,18 +1861,10 @@ export class AotCompiler {
                         const start = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
-                        if (!isTail && procIdx >= BUILTINS_START) {
-                            if (inst[ip] !== OpCode.MOVEACC) throw new Error("internal error: builtin CALL must be followed by MOVEACC");
-                            const dst = inst[ip + 1];
-                            ip += 2;
-                            insts.push({ k: "CallBuiltin", builtin: procIdx - BUILTINS_START, dst, start, nargs, resume: ip });
-                            break;
-                        }
                         if (!isTail) {
                             term = { k: "Call", proc: procIdx, start, nargs, resume: ip };
                             break;
                         }
-                        if (procIdx >= BUILTINS_START) throw new Error("internal error: builtins are never tail called");
                         const numPos = tmpl ? tmpl.params.length : -1;
                         const hasRest = tmpl ? tmpl.remParams !== null : false;
                         const arityFits = tmpl !== undefined && (hasRest ? nargs >= numPos : nargs === numPos);
@@ -1910,11 +1906,14 @@ export class AotCompiler {
                     case OpCode.CALLINT:
                         insts.push({ k: "IntCall", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
+                    case OpCode.APPLYINT:
+                        insts.push({ k: "IntApply", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                        break;
                     case OpCode.APPLY: {
                         const procIdx = inst[ip++];
                         const start = inst[ip++];
                         const nargs = inst[ip++];
-                        term = { k: "Apply", proc: this.procRef(procIdx), isTail: inst[ip++] !== 0, start, nargs, resume: ip };
+                        term = { k: "Apply", proc: procIdx, isTail: inst[ip++] !== 0, start, nargs, resume: ip };
                         break;
                     }
                     case OpCode.CALLCC: {
@@ -1964,10 +1963,6 @@ export class AotCompiler {
         }
 
         return blocks;
-    }
-
-    private static procRef(procIdx: number): ProcRef {
-        return procIdx >= BUILTINS_START ? { builtin: procIdx - BUILTINS_START } : { reg: procIdx };
     }
 }
 
@@ -2027,7 +2022,7 @@ class Liveness {
             case "SetBox": return [inst.dst, inst.src];
             case "SetUpvar": case "SetGlobal": return [inst.src];
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
-            case "CallBuiltin": case "RtCall": case "IntCall": return windowRegs(inst.start, inst.nargs);
+            case "RtCall": case "IntCall": case "IntApply": return windowRegs(inst.start, inst.nargs);
             case "Unpack": return [inst.src];
             case "SetMark": return [inst.key, inst.val];
             case "MarkRestore": return [inst.reg, inst.reg + 1];
@@ -2046,7 +2041,7 @@ class Liveness {
         switch (term.k) {
             case "Branch": return [term.cond];
             case "Call": case "TailCall": case "MaybeSelfTailCall": return [term.proc, ...windowRegs(term.start, term.nargs)];
-            case "Apply": return [...("reg" in term.proc ? [term.proc.reg] : []), ...windowRegs(term.start, term.nargs)];
+            case "Apply": return [term.proc, ...windowRegs(term.start, term.nargs)];
             case "CallCC": return [term.proc];
             case "CallEC": return [term.proc];
             case "CallCatch": return term.pre === NO_REG ? [term.proc] : [term.proc, term.pre];
@@ -2166,7 +2161,7 @@ abstract class FunctionEmitter extends CodeEmitter {
     protected tailProcOf(term: AotTerm): string | undefined {
         switch (term.k) {
             case "TailCall": case "MaybeSelfTailCall": return `r${term.proc}`;
-            case "Apply": return term.isTail ? this.procExpr(term.proc) : undefined;
+            case "Apply": return term.isTail ? `r${term.proc}` : undefined;
             case "CallCC": return term.isTail ? `r${term.proc}` : undefined;
             case "CoResume": return term.isTail ? `r${term.co}` : undefined;
             default: return undefined;
@@ -2220,9 +2215,6 @@ abstract class FunctionEmitter extends CodeEmitter {
         return `ip = isTruthy(r${term.cond}) ? ${term.then} : ${term.else}; continue top;`;
     }
 
-    protected procExpr(proc: ProcRef): string {
-        return "reg" in proc ? `r${proc.reg}` : `IBUILTINS[${proc.builtin}]`;
-    }
 
     protected directGuard(proc: string, nargs: string): string {
         return `${proc} instanceof Closure && ${proc}.tmpl.code.directArity === ${nargs}${this.depthCheck}`;
@@ -2312,13 +2304,9 @@ abstract class FunctionEmitter extends CodeEmitter {
             }
             case "IntCall":
                 return this.emit(`r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)};`);
-            case "CallBuiltin": {
-                const inline = this.inlineBuiltin(inst.builtin, inst.start, inst.nargs);
-                if (inline !== null) return this.emit(`r${inst.dst} = ${inline};`);
-                return this.emit(`
-                    ${this.recordIp(inst.resume)}
-                    r${inst.dst} = ${this.windowCall(`IBUILTINS[${inst.builtin}].cb`, inst.start, inst.nargs)};
-                `);
+            case "IntApply": {
+                const entry = this.table!.entries[inst.pos];
+                return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, windowApplyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}));`);
             }
             default: {
                 const _: never = inst;
@@ -2335,12 +2323,6 @@ abstract class FunctionEmitter extends CodeEmitter {
         return entry.inline(windowRegs(start, nargs).map(r => `r${r}`), direct, "tmp", inlineDeps(entry)) ?? direct;
     }
 
-    // an expression computing a builtin call inline (see inline.ts), or null
-    protected inlineBuiltin(builtin: number, start: number, nargs: number): string | null {
-        const inline = BUILTIN_INLINES.get(Symbol.keyFor(IBUILTINS[builtin].name)!);
-        if (inline === undefined) return null;
-        return inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`IBUILTINS[${builtin}].cb`, start, nargs), "tmp", {});
-    }
 }
 
 // the frame-based entry the driver loop uses: registers live in locals and are spilled to frame.regs whenever control may leave
@@ -2493,8 +2475,6 @@ class ResumeEmitter extends FunctionEmitter {
                             ${this.#directCall(`proc.tmpl.code.directFn(ctx, proc, executor, 1, frame.marks, frame.mframe + 1${term.nargs > 0 ? ", " + this.argList(term.start, term.nargs) : ""})`)}
                         } else if (${this.restGuard("proc", `${term.nargs}`)}) {
                             ${this.#directCall(`executor.callDirectRest(ctx, proc, [${this.argList(term.start, term.nargs)}], 1, frame.marks, frame.mframe + 1)`)}
-                        } else if (proc instanceof BuiltinFunction) {
-                            ctx.acc = proc.cb(regs, ${term.start}, ${term.nargs});
                         } else {
                             return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, false);
                         }
@@ -2574,7 +2554,7 @@ class ResumeEmitter extends FunctionEmitter {
                 return this.emit(`
                     frame.ip = ${term.resume};
                     ${this.#spills(term.isTail ? window : live.spillsFor(term.resume, window))}
-                    return executor.apply(ctx, ${this.procExpr(term.proc)}, frame, windowApplyArgs(regs, ${term.start}, ${term.nargs}), ${term.isTail});
+                    return executor.apply(ctx, r${term.proc}, frame, windowApplyArgs(regs, ${term.start}, ${term.nargs}), ${term.isTail});
                 `);
             }
             case "CallCC":
@@ -2790,7 +2770,6 @@ class DirectEmitter extends FunctionEmitter {
                 const val = executor.callDirectRest(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
                 return val;
             }
-            if (${proc} instanceof BuiltinFunction) return ${proc}.cb([${args}], 0, ${nargs});
             throw Suspend.invoke(${proc}, [${args}]);
         `;
     }
@@ -2800,9 +2779,7 @@ class DirectEmitter extends FunctionEmitter {
         const done = isTail ? "return" : "acc =";
         const frameArg = isTail ? "mframe" : "mframe + 1";
         return `
-            if (proc instanceof BuiltinFunction) {
-                ${done} proc.cb(args, 0, args.length);
-            } else if (${this.directGuard("proc", "args.length")}) {
+            if (${this.directGuard("proc", "args.length")}) {
                 ${done} executor.callDirect(ctx, proc, args, depth + 1, marks, ${frameArg});
             } else if (${this.restGuard("proc", "args.length")}) {
                 ${done} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${frameArg});
@@ -2824,8 +2801,6 @@ class DirectEmitter extends FunctionEmitter {
                     acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
                 } else if (${this.restGuard("proc", `${nargs}`)}) {
                     acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
-                } else if (proc instanceof BuiltinFunction) {
-                    acc = proc.cb([${args}], 0, ${nargs});
                 } else {
                     throw Suspend.invoke(proc, [${args}]);
                 }
@@ -2917,7 +2892,7 @@ class DirectEmitter extends FunctionEmitter {
             case "Apply": {
                 return this.emit(`
                     {
-                        const proc = ${this.procExpr(term.proc)};
+                        const proc = r${term.proc};
                         const args = windowApplyArgs([${this.argList(term.start, term.nargs)}], 0, ${term.nargs});
                         rip = ${term.isTail ? -1 : term.resume};
                         ${this.#callArray(term.isTail)}

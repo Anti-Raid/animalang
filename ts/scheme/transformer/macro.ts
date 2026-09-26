@@ -1,4 +1,5 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Env, OP_QUOTE, CORE_QUOTE, OP_AT, SOURCE_POS } from "../../common"
+import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Env, CORE_QUOTE, SOURCE_POS } from "../../common"
+import { OP_QUOTE, OP_AT } from "../symbols"
 import type { Intrinsics } from "../../bytecode-rvm/intrinsics";
 
 export enum TransformState {

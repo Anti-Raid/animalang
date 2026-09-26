@@ -19,9 +19,8 @@ import {
   Cons,
 } from "../common";
 import { AnalysisScope, VariableMetadata } from "./scope";
-import { BUILTIN_INTRINSICS, CORE_FORMS, CORE_OPS } from "./core";
+import { CORE_FORMS, CORE_OPS } from "./core";
 import type { Intrinsics } from "./intrinsics";
-import { IBUILTINS_IDX_MAP } from "../scheme/builtins";
 
 // Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
 export class AstAnalysis {
@@ -190,16 +189,12 @@ class CallLiveness {
     // whether calling this operator never calls back into the VM, where a continuation of the current frame could be captured
     #isLeaf(op: any, scope: AnalysisScope): boolean {
         if (typeof op !== "symbol") return false;
-        const core = CORE_FORMS.get(op) ?? CORE_OPS.get(op) ?? this.intrinsics.get(op);
-        if (core !== undefined) return core.leaf;
-        if (BUILTIN_INTRINSICS.has(op)) return true;
-        // builtins cannot be shadowed and never call back into the VM
-        return IBUILTINS_IDX_MAP.has(op) && scope.getVarinfo(op) === null;
+        return (CORE_FORMS.get(op) ?? CORE_OPS.get(op) ?? this.intrinsics.get(op))?.leaf ?? false;
     }
 
     // intrinsics' operands are expressions, but the operator is not evaluated
     #isIntrinsic(op: any): boolean {
-        return typeof op === "symbol" && (CORE_FORMS.has(op) || CORE_OPS.has(op) || BUILTIN_INTRINSICS.has(op) || this.intrinsics.get(op) !== undefined);
+        return typeof op === "symbol" && (CORE_FORMS.has(op) || CORE_OPS.has(op) || this.intrinsics.get(op) !== undefined);
     }
 
     // the variables bound by a %let / %let-values, as they are known in its own scope

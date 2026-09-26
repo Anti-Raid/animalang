@@ -84,27 +84,13 @@ export class ErrorObject {
     constructor(public error: any) {}
 }
 
-export class UnhandledSchemeError extends Error {
+export class UnhandledError extends Error {
     constructor(public readonly error: any, public readonly traceback?: string) {
         super(error instanceof Error ? error.message : String(error));
     }
 }
 
 // Special Forms
-export const OP_DEFINE = Symbol.for("define");
-export const OP_SET    = Symbol.for("set!")
-export const OP_BEGIN     = Symbol.for("begin");
-export const OP_LAMBDA = Symbol.for("lambda");
-export const OP_LET    = Symbol.for("let");
-export const OP_LETSTAR = Symbol.for("let*")
-export const OP_LETREC = Symbol.for("letrec")
-export const OP_IF     = Symbol.for("if");
-export const OP_COND   = Symbol.for("cond");
-export const OP_ELSE   = Symbol.for("else"); // part of cond but not a special form
-export const OP_QUOTE  = Symbol.for("quote");
-export const OP_AND      = Symbol.for("and");
-export const OP_OR       = Symbol.for("or");
-export const OP_AT = Symbol.for("%at");
 
 // the core language: the only special forms the compiler accepts (besides the other % intrinsics);
 // the syntax transformer lowers all surface syntax to these
@@ -120,7 +106,7 @@ export const CORE_LOOP = Symbol.for("%loop");
 // (%let ((x init) ...) body ...): lexical bindings without a lambda
 export const CORE_LET = Symbol.for("%let");
 // (%let-values ((formals expr) ...) body ...) binds each expr's multiple values: missing values are <#void> and extra
-// ones are dropped unless formals has a rest variable (Lua); %let-values/strict raises an error instead (Scheme)
+// ones are dropped unless formals has a rest variable (Lua); %let-values/strict raises an error instead
 export const CORE_LET_VALUES = Symbol.for("%let-values");
 export const CORE_LET_VALUES_STRICT = Symbol.for("%let-values/strict");
 // (%with-mark key value body): body runs with a continuation mark; (%current-marks): the current continuation's marks
@@ -138,23 +124,8 @@ export const SOURCE_POS = new WeakMap<object, SourcePos>();
 
 export const formatPos = (pos: SourcePos | null | undefined) => pos ? `${pos.file}:${pos.line}:${pos.col}` : "?";
 
+// the core forms: they cannot be bound (a front end reserves its own keywords through its intrinsics table)
 export const SPECIAL_FORMS = new Set([
-    OP_DEFINE, 
-    OP_SET,
-    OP_BEGIN,
-    OP_LAMBDA, 
-    OP_LET,
-    OP_LETSTAR,
-    OP_LETREC,
-    OP_IF,
-    OP_COND,
-    OP_ELSE,
-    OP_QUOTE,
-    OP_AND,
-    OP_OR,
-    Symbol.for("receive"),
-    Symbol.for("let-values"),
-    Symbol.for("let*-values"),
     CORE_IF,
     CORE_LAMBDA,
     CORE_QUOTE,
@@ -172,13 +143,7 @@ export const SPECIAL_FORMS = new Set([
     OP_CURRENT_STACK,
     OP_RAISE,
     OP_DEFINE_GLOBAL,
-    OP_AT,
 ])
-
-export const RESERVED_BUILTINS = new Set([
-    "+", "-", "*", "/", "modulo", "remainder", "=", "eq?", "<", "<=", ">", ">=", "list", "cons", "car", "cdr", "null?", "pair?",
-    "apply", "call/cc", "call-with-current-continuation", "dynamic-wind",
-].map(name => Symbol.for(name)))
 
 // Marker class that all procs should extend from
 export class MultipleValues {
@@ -308,10 +273,6 @@ export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxC
 
     if (SPECIAL_FORMS.has(param)) {
         throw new Error(`${String(param)}: bad syntax`)
-    }
-
-    if (RESERVED_BUILTINS.has(param)) {
-        throw new Error(`${syntaxCtx}: cannot bind builtin ${Symbol.keyFor(param)}`)
     }
 }
 

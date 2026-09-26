@@ -1,5 +1,6 @@
 import { bench, describe } from "vitest";
 import { Anima } from "./anima";
+import { createScheme } from "./scheme";
 import type { AbstractByteCode, AnimaMeta } from "./common";
 import { ASTStringifier, IProcedure } from "./common";
 import { impl, implAot } from "./bytecode-rvm/meta";
@@ -8,7 +9,7 @@ import { dumpFull, readFull } from "./bytecode-rvm/utils";
 
 // --- the only part that follows the intrinsics API as it changes ---
 const makeInstance = (vmImpl: AnimaMeta) => {
-    const anima = new Anima(vmImpl);
+    const anima = createScheme(vmImpl);
     anima.registerIntrinsic("%bench-add", (regs, s) => regs[s] + regs[s + 1], {
         args: [2, 2],
         leaf: true,
@@ -135,7 +136,7 @@ for (const { mode, vmImpl, anima } of prepared) {
     describe(`${mode}: startup, compile, load`, () => {
         const compiled = anima.compileRaw(SETUP) as ByteCode;
         const dumped = dumpFull(compiled);
-        bench("new instance", () => { new Anima(vmImpl); }, OPTS);
+        bench("new instance", () => { createScheme(vmImpl); }, OPTS);
         bench("compile setup program", () => { anima.compileRaw(SETUP); }, OPTS);
         bench("dump + load setup program", () => { loadSetup(anima, dumpFull(compiled)); }, OPTS);
         bench("load setup program", () => { loadSetup(anima, dumped); }, OPTS);
