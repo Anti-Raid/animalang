@@ -19,7 +19,7 @@
   "scripts": {
     "test": "vitest",
     "test:run": "vitest run",
-    "test:dist": "vite build --logLevel warn && vitest run --config vitest.dist.config.ts",
+    "test:dist": "vite build --logLevel warn && tsc --noEmit -p dist-test && vitest run --config vitest.dist.config.ts",
     "bench": "vite build --config vite.bench.config.ts --logLevel warn && vitest bench --run",
     "build": "vite build",
     "prepare": "npm run build"

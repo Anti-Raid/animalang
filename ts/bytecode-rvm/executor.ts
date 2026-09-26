@@ -342,8 +342,10 @@ export class VMExecutor {
     // --- coroutines ---
 
     public coCreate(ctx: ExecutionContext, proc: any, fin: any = null): Coroutine {
+        // the body runs as the coroutine's first frame, so it must be Anima code: a closure (builtins used as values are
+        // closures too), not a continuation
         if (!(proc instanceof Closure)) {
-            throw hostError(`coroutine-create: expected a procedure but got ${String(proc)}`);
+            throw hostError(`coroutine-create: expected a closure but got ${String(proc)}`);
         }
         if (fin !== null && !(fin instanceof IProcedure)) {
             throw hostError(`coroutine-create: expected a finally procedure but got ${String(fin)}`);

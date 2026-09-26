@@ -130,7 +130,9 @@ export class ByteCode implements SerializableBytecode {
         copy.bind(table);
         copy.constants = this.constants.map(c => {
             if (c instanceof ClosureTemplate) return c.withCode(c.code.fresh(copies, table));
-            // a closure with no upvars (made once, when compiled) is shared by the copies, unless it must be bound
+            // a closure with no upvars (made once, when compiled) is shared by the copies, unless it must be bound. Its code's
+            // adaptive counters and compiled functions are then shared too: deliberately, as they only choose how the same
+            // code runs, and a copy per instance would compile every prelude function for each one (see the README)
             if (c instanceof Closure && !c.tmpl.code.runsWith(table)) {
                 return Closure.fromTemplate(c.tmpl.withCode(c.tmpl.code.fresh(copies, table)), c.debugName);
             }

@@ -433,6 +433,18 @@ describe('Anima', () => {
             expect(run("host-unwound")).toBe("#t");
         });
 
+        it('coroutine-create takes a closure as its body', () => {
+            // builtins used as values are closures (their prelude wrappers)
+            expect(run(`(coroutine-resume (coroutine-create car) '(1 2))`)).toBe("1");
+            expect(run(`(coroutine-resume (coroutine-create (lambda args (length args))) 1 2 3)`)).toBe("3");
+            const message = (body: string) => run(`(try (lambda () (coroutine-create ${body})) (lambda (e) (error-message e)))`);
+            expect(message("5")).toBe('"coroutine-create: expected a closure but got 5"');
+            expect(message("'sym")).toMatch(/^"coroutine-create: expected a closure but got /);
+            // a continuation is a procedure, but not Anima code a coroutine can start in
+            expect(message("(call/cc (lambda (k) k))")).toMatch(/^"coroutine-create: expected a closure but got /);
+            expect(message("(call/ec (lambda (k) k))")).toMatch(/^"coroutine-create: expected a closure but got /);
+        });
+
         it('coroutine-create with a finally thunk', () => {
             run(`(define fin-log '()) (define (fin-co tag body) (coroutine-create body (lambda () (set! fin-log (cons tag fin-log)))))`);
             // runs once the body is left for good: a return (after which its values are the resume's), not a yield

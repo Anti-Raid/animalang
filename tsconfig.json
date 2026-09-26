@@ -12,5 +12,5 @@
 		"moduleResolution": "bundler",
     "noEmit": true
 	},
-	"exclude": ["node_modules", "dist", ".bench"]
+	"exclude": ["node_modules", "dist", ".bench", "dist-test"]
 }
