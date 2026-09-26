@@ -1,5 +1,6 @@
 import { ConstPool, type SourcePos } from "../common";
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, RUNTIME, RUNTIME_IDX, UNPACK_REST, UNPACK_STRICT, type UpVarLoc } from "./exec";
+import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, rtIdx, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import type { Intrinsics } from "./intrinsics";
 
 let nextLabelId = 0;
 
@@ -164,13 +165,20 @@ export type Node = {
     t: "CurrentMarks",
     destReg: number
 } | {
-    // a host intrinsic that may return a tail request (CALLHOST)
+    // an intrinsic that is not a leaf: may return a tail request (CALLHOST)
     t: "HostCall",
-    rtIdx: number,
+    pos: number,
     startReg: number,
     nargs: number,
     isTail: boolean,
     destReg?: number
+} | {
+    // a leaf intrinsic (CALLINT)
+    t: "IntCall",
+    pos: number,
+    destReg: number,
+    startReg: number,
+    nargs: number
 } | {
     t: "CurrentStack",
     skip: number,
@@ -192,7 +200,7 @@ export type Node = {
 }
 
 export class IR {
-    constructor(private readonly debug: boolean = false) {}
+    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false) {}
 
     lower(nodes: Node[], numRegs: number): ByteCode {
         const cpool = new ConstPool()
@@ -201,12 +209,14 @@ export class IR {
         const lineTable: number[] = []
         const files: string[] = []
         const jumpIdxs: Map<number, JumpLabel> = new Map()
-        // the runtime operations used, by name (the bytecode's metadata); CALLRT operands index this
-        const runtime: string[] = []
-        const rtSlot = (idx: number): number => {
-            const name = RUNTIME[idx][0]
-            const slot = runtime.indexOf(name)
-            return slot !== -1 ? slot : runtime.push(name) - 1
+        // the intrinsics used (the bytecode's metadata), by position
+        const used = new Map<number, UsedIntrinsic>()
+        const use = (pos: number): number => {
+            if (!used.has(pos)) {
+                const entry = this.table.entries[pos]
+                used.set(pos, { pos, name: entry.name, leaf: entry.leaf })
+            }
+            return pos
         }
         const resolvedLabels: Map<JumpLabel, number> = new Map()
         for(let i = 0; i < nodes.length; i++) {
@@ -270,8 +280,11 @@ export class IR {
                     inst.push(OpCode.CURMARKS, node.destReg)
                     break
                 case "HostCall":
-                    inst.push(OpCode.CALLHOST, rtSlot(node.rtIdx), node.startReg, node.nargs, node.isTail ? 1 : 0)
+                    inst.push(OpCode.CALLHOST, use(node.pos), node.startReg, node.nargs, node.isTail ? 1 : 0)
                     if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                    break
+                case "IntCall":
+                    inst.push(OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "CurrentStack":
                     inst.push(OpCode.CURSTACK, node.skip)
@@ -364,7 +377,7 @@ export class IR {
                     if (node.t === "CallEC") inst.push(OpCode.CALLEC, node.procReg, node.tokReg);
                     else inst.push(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    inst.push(OpCode.CALLRT, rtSlot(RUNTIME_IDX.get("end-escape")!), node.tokReg, node.tokReg, 1);
+                    inst.push(OpCode.CALLRT, rtIdx("%end-escape"), node.tokReg, node.tokReg, 1);
                     break;
                 }
                 case "CoYield": {
@@ -378,7 +391,7 @@ export class IR {
                     break;
                 }
                 case "RtCall": {
-                    inst.push(OpCode.CALLRT, rtSlot(node.rtIdx), node.destReg, node.startReg, node.nargs);
+                    inst.push(OpCode.CALLRT, node.rtIdx, node.destReg, node.startReg, node.nargs);
                     break;
                 }
                 case "Pos": {
@@ -403,7 +416,7 @@ export class IR {
             inst[jump] = resolvedOffset
         }
 
-        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, runtime)
+        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
     }
 }
 

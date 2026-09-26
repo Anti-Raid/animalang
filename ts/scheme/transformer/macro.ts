@@ -1,5 +1,5 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Env, OP_QUOTE, CORE_QUOTE, OP_AT, SOURCE_POS } from "../common"
-import { Bootstrapper } from "../std";
+import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Env, OP_QUOTE, CORE_QUOTE, OP_AT, SOURCE_POS } from "../../common"
+import type { Intrinsics } from "../../bytecode-rvm/intrinsics";
 
 export enum TransformState {
     Recurse, // check the new expr as if it was a new expr
@@ -22,23 +22,22 @@ const TOO_DEEP = "program is nested too deeply to expand (or a macro keeps expan
 export class MacroEvaluator {
     readonly meta: AnimaMeta
     readonly #transformers: Map<symbol, Transform>
-    readonly #bootstrapper: Bootstrapper
 
     scope: Env
     readonly expandcmp: AbstractCompiler
     readonly expandvm: AbstractVM;
 
-    constructor(meta: AnimaMeta, maxSteps: number) {
+    // macros run with the same intrinsics as the code they expand
+    constructor(meta: AnimaMeta, maxSteps: number, readonly intrinsics: Intrinsics) {
         this.meta = meta
-        this.expandcmp = meta.compiler()
-        this.expandvm = meta.vm(maxSteps)
+        this.expandcmp = meta.compiler(intrinsics)
+        this.expandvm = meta.vm(maxSteps, intrinsics)
         this.#transformers = new Map<symbol, Transform>()
-        this.#bootstrapper = new Bootstrapper()
         this.scope = new Env()
     }
 
-    init() {
-        const publicScope = this.#bootstrapper.setupPublicScope(this.meta, this.expandcmp, this.expandvm, this)
+    // macros run in a scope chained to `publicScope` (the prelude's exports, set up with this evaluator's compiler and VM)
+    init(publicScope: Env) {
         this.scope = publicScope.chained()
     }
 

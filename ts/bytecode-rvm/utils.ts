@@ -1,6 +1,9 @@
 import { BS, BSReader, type SerializableBytecode } from "../common"
-import { IBUILTINS } from "../std"
+import { IBUILTINS } from "../scheme/builtins"
 import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
+import type { Intrinsics } from "./intrinsics"
+
+const intrinsicName = (code: ByteCode, pos: number): string => code.intrinsics.find(used => used.pos === pos)?.name ?? `#${pos}`
 
 const constToString = (s: any): string => {
     if (s === null) {
@@ -190,12 +193,17 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 break;
 
             case OpCode.CALLHOST:
-                line += `${padOp("CALLHOST")} ${inst.runtime[inst.inst[idx + 1]]}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${inst.inst[idx + 4] ? ", tail" : ""}`;
+                line += `${padOp("CALLHOST")} ${intrinsicName(inst, inst.inst[idx + 1])}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${inst.inst[idx + 4] ? ", tail" : ""}`;
                 idx += 5;
                 break;
 
             case OpCode.CALLRT:
-                line += `${padOp("CALLRT")} ${inst.runtime[inst.inst[idx + 1]]}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
+                line += `${padOp("CALLRT")} ${RUNTIME[inst.inst[idx + 1]].name}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
+                idx += 5;
+                break;
+
+            case OpCode.CALLINT:
+                line += `${padOp("CALLINT")} ${intrinsicName(inst, inst.inst[idx + 1])}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
                 idx += 5;
                 break;
 
@@ -224,7 +232,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 18
+export const BYTECODE_VERSION = 19
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()
@@ -237,7 +245,8 @@ export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     return out
 }
 
-export const readFull = (b: Uint32Array): SerializableBytecode => {
+// the code is bound to `intrinsics` by name: an error if it uses one that is missing or registered differently (see ByteCode.bind)
+export const readFull = (b: Uint32Array, intrinsics: Intrinsics | null = null): SerializableBytecode => {
     if (b.length < 2 || b[0] !== BYTECODE_MAGIC) {
         throw new Error("not anima bytecode (missing header)")
     }
@@ -245,7 +254,7 @@ export const readFull = (b: Uint32Array): SerializableBytecode => {
         throw new Error(`bytecode version ${b[1]} is not supported (expected ${BYTECODE_VERSION}), recompile from source`)
     }
     const bsr = new BSReader(b.subarray(2))
-    ByteCode.register(bsr)
+    ByteCode.register(bsr, intrinsics)
     ClosureTemplate.register(bsr)
     Closure.register(bsr)
     return bsr.readSerializable()

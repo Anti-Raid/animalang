@@ -24,9 +24,9 @@ import {
     SOURCE_POS,
     AbstractClosure,
     Cons
-} from "../common";
+} from "../../common";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
-import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops";
+import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../../ops";
 
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);

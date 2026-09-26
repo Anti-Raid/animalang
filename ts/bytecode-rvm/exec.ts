@@ -22,10 +22,11 @@ import {
 } from "../common";
 import { Cons } from "../list";
 import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList } from "../ops";
-import { BuiltinFunction, IBUILTINS } from "../std";
+import { BuiltinFunction, IBUILTINS } from "../scheme/builtins";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markOwn, markSet, markValues, recordTailMark, TAIL_TRAIL, type Marks, type TailTrail } from "../marks";
 import { BUILTIN_INLINES, RUNTIME_INLINES } from "./inline";
 import { hostError } from "../errors";
+import type { Intrinsics, Intrinsic } from "./intrinsics";
 
 export const BUILTINS_START = 2**31;
 
@@ -68,7 +69,9 @@ export enum OpCode {
                  //                    (reg[pre], unless pre is NO_REG, runs on the error before unwinding)
     RAISE,       // obj continuable    deliver reg[obj] to the innermost exception handler
     CURSTACK,    // skip               a snapshot of the current stack, minus its innermost skip frames
-    CALLHOST,    // rt start n tail    call host intrinsic runtime[rt] on reg[start .. start+n); a HostTail result is called in its place
+    CALLHOST,    // pos start n tail   call the non-leaf intrinsic at pos in the code's table on reg[start .. start+n); a
+                 //                    HostTail result is called in its place
+    CALLINT,     // pos dst start n    reg[dst] = the leaf intrinsic at pos in the code's table applied to reg[start .. start+n)
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -108,6 +111,7 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.RAISE]: 3,
     [OpCode.CURSTACK]: 2,
     [OpCode.CALLHOST]: 5,
+    [OpCode.CALLINT]: 5,
 };
 
 // UNPACK flags
@@ -131,6 +135,9 @@ export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecuto
 // the continuation's mark list and `mframe` the logical frame the function runs in (a tail call keeps its caller's)
 export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, ...args: any[]) => any;
 
+// an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
+export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };
+
 // instruction arrays that several ByteCode copies run (see ByteCode.fresh)
 const SHARED_INSTS = new WeakSet<Uint32Array>();
 
@@ -151,10 +158,6 @@ export class ByteCode implements AbstractByteCode {
     // chains in constant space without unwinding the js stack
     public tailSuspends: number = 0;
 
-    // the runtime operations CALLRT operands refer to, as indices into `runtime`, resolved by name to the operations
-    // registered now
-    readonly rt: number[];
-
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
         public constants: any[],
@@ -164,25 +167,64 @@ export class ByteCode implements AbstractByteCode {
         public files: string[] = [],
         // compiled in debug mode: records tail calls and exact error positions (never mixed with non-debug code)
         public debug: boolean = false,
-        // metadata: the names of the runtime operations the code uses
-        public readonly runtime: string[] = []
-    ) {
-        this.rt = runtime.map(name => {
-            const idx = RUNTIME_IDX.get(name);
-            if (idx === undefined) throw new Error(`bytecode uses the runtime operation '${name}', which is not registered`);
-            return idx;
+        // the intrinsics CALLINT/CALLHOST operands are positions in; null when `intrinsics` is empty (or before loading binds it)
+        public table: Intrinsics | null = null,
+        // metadata: the intrinsics the code uses, by name (for binding to another table, serialization and disassembly)
+        public intrinsics: readonly UsedIntrinsic[] = []
+    ) {}
+
+    // Makes the operands positions in `table`, by name: an error if an intrinsic is missing or its leaf flag differs from
+    // the one the code was compiled for (either way). Rewrites the instructions (copying them if other code runs them)
+    // only when a position moves
+    bind(table: Intrinsics | null): void {
+        if (this.intrinsics.length === 0) return;
+        if (table === null) throw new Error("bytecode that uses intrinsics needs an intrinsics table to run with");
+        if (table === this.table) return;
+        const moved = new Map<number, number>();
+        const bound = this.intrinsics.map(used => {
+            const entry = table.byName(used.name);
+            if (entry === undefined) throw new Error(`bytecode uses the intrinsic '${used.name}', which is not registered`);
+            if (entry.leaf !== used.leaf) {
+                throw new Error(`bytecode was compiled with '${used.name}' as ${used.leaf ? "a leaf" : "not a leaf"}, but it is registered as ${entry.leaf ? "a leaf" : "not a leaf"}`);
+            }
+            if (entry.pos !== used.pos) moved.set(used.pos, entry.pos);
+            return { pos: entry.pos, name: used.name, leaf: used.leaf };
         });
+        if (moved.size > 0) {
+            const inst = SHARED_INSTS.has(this.inst) ? this.inst.slice() : this.inst;
+            for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) {
+                if (inst[ip] === OpCode.CALLINT || inst[ip] === OpCode.CALLHOST) inst[ip + 1] = moved.get(inst[ip + 1]) ?? inst[ip + 1];
+            }
+            this.inst = inst;
+        }
+        this.intrinsics = bound;
+        this.table = table;
     }
 
-    fresh(copies: Map<ByteCode, ByteCode> = new Map()): ByteCode {
+    // whether this code or any code it contains uses intrinsics
+    #usesIntrinsics: boolean | null = null;
+    get usesIntrinsics(): boolean {
+        return this.#usesIntrinsics ??= this.intrinsics.length > 0 || this.constants.some(c =>
+            (c instanceof ClosureTemplate && c.code.usesIntrinsics) || (c instanceof Closure && c.tmpl.code.usesIntrinsics));
+    }
+
+    // a copy with its own runtime state, bound to `table`; copies share instructions unless binding moves positions
+    fresh(copies: Map<ByteCode, ByteCode> = new Map(), table: Intrinsics | null = this.table): ByteCode {
         const known = copies.get(this);
         if (known !== undefined) return known;
-        const copy = new ByteCode([], this.inst, this.numReg, this.lineTable, this.files, this.debug, this.runtime);
+        const copy = new ByteCode([], this.inst, this.numReg, this.lineTable, this.files, this.debug, this.table, this.intrinsics);
         copies.set(this, copy);
         SHARED_INSTS.add(this.inst);
-        copy.constants = this.constants.map(c => c instanceof ClosureTemplate
-            ? new ClosureTemplate(c.params, c.remParams, c.code.fresh(copies), c.upvarLocs, c.name)
-            : c);
+        copy.bind(table);
+        copy.constants = this.constants.map(c => {
+            if (c instanceof ClosureTemplate) return new ClosureTemplate(c.params, c.remParams, c.code.fresh(copies, table), c.upvarLocs, c.name);
+            // a closure with no upvars (made once, when compiled) is shared by the copies, unless it must be bound
+            if (c instanceof Closure && c.tmpl.code.usesIntrinsics && c.tmpl.code.table !== table) {
+                const tmpl = c.tmpl;
+                return Closure.fromTemplate(new ClosureTemplate(tmpl.params, tmpl.remParams, tmpl.code.fresh(copies, table), tmpl.upvarLocs, tmpl.name), c.debugName);
+            }
+            return c;
+        });
         return copy;
     }
 
@@ -209,10 +251,11 @@ export class ByteCode implements AbstractByteCode {
         bs.writeU32Arr(this.lineTable);
         bs.writeArray(this.files);
         bs.writeValue(this.debug);
-        bs.writeArray(this.runtime);
+        bs.writeArray(this.intrinsics.flatMap(({ pos, name, leaf }) => [pos, name, leaf]));
     }
 
-    static register(bsr: BSReader) {
+    // loaded code is bound to `table`, by name
+    static register(bsr: BSReader, table: Intrinsics | null = null) {
         bsr.registerFactory("ByteCode", (bsr) => {
             const inst = bsr.readU32Arr();
             const constants = bsr.readArray();
@@ -220,8 +263,12 @@ export class ByteCode implements AbstractByteCode {
             const lineTable = bsr.readU32Arr();
             const files = bsr.readArray() as string[];
             const debug = bsr.read() as boolean;
-            const runtime = bsr.readArray() as string[];
-            return new ByteCode(constants, inst, numReg, lineTable, files, debug, runtime);
+            const flat = bsr.readArray();
+            const intrinsics: UsedIntrinsic[] = [];
+            for (let i = 0; i < flat.length; i += 3) intrinsics.push({ pos: flat[i], name: flat[i + 1], leaf: flat[i + 2] });
+            const code = new ByteCode(constants, inst, numReg, lineTable, files, debug, null, intrinsics);
+            code.bind(table);
+            return code;
         });
     }
 }
@@ -476,19 +523,19 @@ export class EscapeContinuation extends IProcedure {
 // register 0 with what a pre-unwind handler returned
 let helpers: { handlerReturned: Closure, escapeWith: Closure } | null = null;
 const raiseHelpers = () => helpers ??= {
-    handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [], [
+    handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [
         OpCode.LOADCONST, 0, 0,
         OpCode.RAISE, 0, 0,
         OpCode.RETURN, 0,
     ]),
-    escapeWith: helperClosure(3, [], ["make-caught"], [
+    escapeWith: helperClosure(3, [], [
         OpCode.MOVEACC, 1,
-        OpCode.CALLRT, 0, 2, 1, 1,
+        OpCode.CALLRT, rtIdx("%make-caught"), 2, 1, 1,
         OpCode.CALL, 0, 2, 1, 1,
     ]),
 };
-const helperClosure = (numReg: number, constants: any[], runtime: string[], inst: number[]): Closure =>
-    new Closure(new ClosureTemplate([], null, new ByteCode(constants, new Uint32Array(inst), numReg, undefined, undefined, false, runtime), [], "raise"), [], "raise");
+const helperClosure = (numReg: number, constants: any[], inst: number[]): Closure =>
+    new Closure(new ClosureTemplate([], null, new ByteCode(constants, new Uint32Array(inst), numReg), [], "raise"), [], "raise");
 
 // the handler a %catch installs: raising to it escapes to the %catch with the error wrapped in a Caught
 export class CatchToken extends EscapeContinuation {
@@ -1142,67 +1189,68 @@ const markSetArg = (who: string, set: any): Marks => {
     return set.marks;
 };
 
-export const RUNTIME: [name: string, fn: RuntimeFn][] = [
-    ["coroutine-create", (ctx, executor, regs, start) => executor.coCreate(ctx, regs[start])],
-    ["coroutine-status", (ctx, executor, regs, start) => executor.coStatus(regs[start])],
-    ["coroutine-close", (ctx, executor, regs, start) => { executor.coClose(ctx, regs[start]); }],
-    ["wind", (ctx, executor, regs, start) => { ctx.wind = new WindPoint(ctx.wind, regs[start], regs[start + 1]); }],
-    ["end-wind", (ctx) => { if (ctx.wind !== null) ctx.wind = ctx.wind.parent; }],
-    ["end-escape", () => undefined],
-    ["caught?", (ctx, executor, regs, start) => regs[start] instanceof Caught],
-    ["caught-value", (ctx, executor, regs, start) => regs[start].error],
-    ["make-caught", (ctx, executor, regs, start) => new Caught(regs[start])],
-    ["handler-key", () => EXCEPTION_HANDLERS],
-    ["values-cons", (ctx, executor, regs, start) => {
+// A compiler intrinsic that is a runtime operation: CALLRT runs RUNTIME[idx], with a fixed index. `leaf`: never calls back
+// into the VM (so no continuation can be captured while it runs)
+export type RuntimeOp = { name: string, args: [min: number, max: number], leaf: boolean, fn: RuntimeFn };
+
+export const RUNTIME: readonly RuntimeOp[] = Object.freeze(([
+    ["%coroutine-create", [1, 1], true, (ctx, executor, regs, start) => executor.coCreate(ctx, regs[start])],
+    ["%coroutine-status", [1, 1], true, (ctx, executor, regs, start) => executor.coStatus(regs[start])],
+    // closing a coroutine runs its dynamic-wind after-thunks
+    ["%coroutine-close", [1, 1], false, (ctx, executor, regs, start) => { executor.coClose(ctx, regs[start]); }],
+    ["%wind", [2, 2], true, (ctx, executor, regs, start) => { ctx.wind = new WindPoint(ctx.wind, regs[start], regs[start + 1]); }],
+    ["%end-wind", [0, 0], true, (ctx) => { if (ctx.wind !== null) ctx.wind = ctx.wind.parent; }],
+    ["%end-escape", [1, 1], true, () => undefined],
+    ["%caught?", [1, 1], true, (ctx, executor, regs, start) => regs[start] instanceof Caught],
+    ["%caught-value", [1, 1], true, (ctx, executor, regs, start) => regs[start].error],
+    ["%make-caught", [1, 1], true, (ctx, executor, regs, start) => new Caught(regs[start])],
+    ["%handler-key", [0, 0], true, () => EXCEPTION_HANDLERS],
+    ["%values-cons", [2, 2], true, (ctx, executor, regs, start) => {
         const vals = regs[start + 1];
         return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
     }],
-    ["values->list", (ctx, executor, regs, start, nargs) => valuesToList(regs, start, nargs)],
-    ["list->values", (ctx, executor, regs, start, nargs) => listToValues(regs, start, nargs)],
-    ["apply-args", (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
-    ["debug-frames", (ctx, executor, regs, start) => {
+    ["%values->list", [1, 1], true, (ctx, executor, regs, start, nargs) => valuesToList(regs, start, nargs)],
+    ["%list->values", [1, 1], true, (ctx, executor, regs, start, nargs) => listToValues(regs, start, nargs)],
+    ["%apply-args", [1, Infinity], true, (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
+    ["%debug-frames", [2, 2], true, (ctx, executor, regs, start) => {
         const { frames, args } = debugTarget(ctx, regs, start);
         const level = typeof args[0] === "number" ? args[0] : 0;
         return Cons.fromArray(frames.slice(level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
     }],
-    ["debug-traceback", (ctx, executor, regs, start) => {
+    ["%debug-traceback", [2, 2], true, (ctx, executor, regs, start) => {
         const { frames, args } = debugTarget(ctx, regs, start);
         const msg = typeof args[0] === "number" ? undefined : args.shift();
         const level = typeof args[0] === "number" ? args[0] : 0;
         return formatTraceback(frames.slice(level), tracebackMessage(msg));
     }],
     // Lua's truncation of multiple values to one: the first value, or <#void> for none
-    ["first-value", (ctx, executor, regs, start) => {
+    ["%first-value", [1, 1], true, (ctx, executor, regs, start) => {
         const val = regs[start];
         return val instanceof MultipleValues ? val.values[0] : val;
     }],
     // (%marks-first set key none) / (%marks->list set key): continuation-mark-set-first / ->list
-    ["marks-first", (ctx, executor, regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2])],
-    ["marks->list", (ctx, executor, regs, start) => Cons.fromArray(markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1]))],
-];
+    ["%marks-first", [3, 3], true, (ctx, executor, regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2])],
+    ["%marks->list", [2, 2], true, (ctx, executor, regs, start) => Cons.fromArray(markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1]))],
+] as [string, [number, number], boolean, RuntimeFn][]).map(([name, args, leaf, fn]) => Object.freeze({ name, args, leaf, fn })));
 
-export const RUNTIME_IDX = new Map(RUNTIME.map(([name], idx) => [name, idx]));
+export const RUNTIME_IDX: ReadonlyMap<string, number> = new Map(RUNTIME.map(({ name }, idx) => [name, idx]));
 
-// A host intrinsic that is not a leaf may return this instead of a value: the value is then (proc args ...), called as
-// Scheme code (so it can yield, capture continuations and raise)
+// the index of a runtime operation the compiler or the VM emits itself
+export const rtIdx = (name: string): number => {
+    const idx = RUNTIME_IDX.get(name);
+    if (idx === undefined) throw new Error(`internal error: no runtime operation '${name}'`);
+    return idx;
+};
+
+// A host intrinsic that is not a leaf may return this instead of a value: the value is then (proc args ...), made as an
+// ordinary call (so it can yield, capture continuations and raise)
 export class HostTail {
     constructor(readonly proc: any, readonly args: any[]) {}
 }
 
 export const hostTail = (proc: any, ...args: any[]): HostTail => new HostTail(proc, args);
 
-// the functions of host intrinsics, by runtime index, called directly by AOT code
-export const HOST_FNS: (((...args: any[]) => any) | undefined)[] = [];
-
-export const addRuntimeOp = (name: string, fn: RuntimeFn): number => {
-    if (RUNTIME_IDX.has(name)) throw new Error(`the runtime operation '${name}' is already registered`);
-    const idx = RUNTIME.push([name, fn]) - 1;
-    RUNTIME_FNS.push(fn);
-    RUNTIME_IDX.set(name, idx);
-    return idx;
-};
-
-const RUNTIME_FNS = RUNTIME.map(([, fn]) => fn);
+const RUNTIME_FNS: readonly RuntimeFn[] = RUNTIME.map(({ fn }) => fn);
 
 export class BytecodeInterpreter {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
@@ -1406,10 +1454,17 @@ export class BytecodeInterpreter {
                         return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]), frame.marks, frame.mframe);
                     }
                     case OpCode.CALLRT: {
-                        const fn = RUNTIME_FNS[frame.code.rt[inst[ip++]]];
+                        const fn = RUNTIME_FNS[inst[ip++]];
                         const destReg = inst[ip++];
                         const startReg = inst[ip++];
                         regs[destReg] = fn(ctx, executor, regs, startReg, inst[ip++]);
+                        break;
+                    }
+                    case OpCode.CALLINT: {
+                        const fn = frame.code.table!.fns[inst[ip++]];
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = fn(regs, startReg, inst[ip++]);
                         break;
                     }
                     case OpCode.APPLY: {
@@ -1456,12 +1511,12 @@ export class BytecodeInterpreter {
                         break;
                     }
                     case OpCode.CALLHOST: {
-                        const fn = RUNTIME_FNS[frame.code.rt[inst[ip++]]];
+                        const fn = frame.code.table!.fns[inst[ip++]];
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
                         frame.ip = ip;
-                        const res = fn(ctx, executor, regs, startReg, nargs);
+                        const res = fn(regs, startReg, nargs);
                         if (res instanceof HostTail) return executor.invoke(ctx, res.proc, frame, res.args, 0, res.args.length, isTail);
                         ctx.acc = res;
                         if (isTail) return executor.setRetVal(ctx, frame.parent, res);
@@ -1512,7 +1567,6 @@ const JIT_DEPS = {
     countControlSuspend,
     StackSnapshot,
     frameInfos,
-    HOST_FNS,
     HostTail,
     CatchToken,
     Caught,
@@ -1536,6 +1590,7 @@ type AotInst = { at?: number } & (
     | { k: "MoveAcc"; dst: number }
     | { k: "CallBuiltin"; builtin: number; dst: number; start: number; nargs: number; resume: number }
     | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number }
+    | { k: "IntCall"; pos: number; dst: number; start: number; nargs: number }
     | { k: "Unpack"; src: number; start: number; count: number; flags: number }
     | { k: "SetMark"; key: number; val: number }
     | { k: "MarkSave" | "MarkRestore"; reg: number }
@@ -1555,7 +1610,7 @@ type AotTerm = { at?: number } & (
     | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
     | { k: "Raise"; obj: number; continuable: boolean; resume: number }
     | { k: "CurStack"; skip: number; resume: number }
-    | { k: "HostCall"; rt: number; start: number; nargs: number; isTail: boolean; resume: number }
+    | { k: "HostCall"; pos: number; start: number; nargs: number; isTail: boolean; resume: number }
     | { k: "Yield"; val: number; resume: number }
     | { k: "CoResume"; co: number; list: number; isTail: boolean; resume: number }
     | { k: "Return"; reg: number });
@@ -1624,33 +1679,48 @@ export class AotCompiler {
         return resume;
     }
 
-    // generated source of shared instruction arrays: copies of a ByteCode (ByteCode.fresh) only build their own functions
+    // generated source of shared instruction arrays: copies of a ByteCode (ByteCode.fresh) only build their own functions.
+    // Source that calls intrinsics depends on their table (positions, inline templates), so it is cached per table
     static readonly #sources = new WeakMap<Uint32Array, string>();
+    static readonly #tableSources = new WeakMap<Intrinsics, WeakMap<Uint32Array, string>>();
+
+    static #sourceCache(code: ByteCode): WeakMap<Uint32Array, string> {
+        if (code.intrinsics.length === 0) return this.#sources;
+        let cache = this.#tableSources.get(code.table!);
+        if (cache === undefined) this.#tableSources.set(code.table!, cache = new WeakMap());
+        return cache;
+    }
 
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        let source = this.#sources.get(code.inst);
+        const cache = this.#sourceCache(code);
+        let source = cache.get(code.inst);
         if (source === undefined) {
             source = this.generateSource(code, tmpl);
-            if (SHARED_INSTS.has(code.inst)) this.#sources.set(code.inst, source);
+            if (SHARED_INSTS.has(code.inst)) cache.set(code.inst, source);
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
-        const factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", source);
-        return factory(...Object.values(JIT_DEPS), code.constants, globalCache);
+        const factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "RT", "DEPS", source);
+        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 
     public static generateSource(code: ByteCode, tmpl?: ClosureTemplate): string {
+        if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
         const blocks = this.buildAot(code, tmpl);
-        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug);
+        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug, code.table);
         resume.emitFunction();
         let direct = "null";
         if (tmpl !== undefined) {
-            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug);
+            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug, code.table);
             out.emitFunction(tmpl.params.length + (tmpl.remParams !== null ? 1 : 0), tmpl.remParams !== null);
             direct = out.toString();
         }
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
-        return `${caches}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
+        // positions never change once registered, so each intrinsic's function and deps are read once, into locals
+        const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
+        const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
+        const deps = [...new Set(used.flatMap(entry => Object.values(entry.deps)))].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
+        return `${caches}${fns}${deps}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
     }
 
     static #globalLoads(code: ByteCode): number[] {
@@ -1835,7 +1905,10 @@ export class AotCompiler {
                         break;
                     }
                     case OpCode.CALLRT:
-                        insts.push({ k: "RtCall", rt: code.rt[inst[ip++]], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                        insts.push({ k: "RtCall", rt: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                        break;
+                    case OpCode.CALLINT:
+                        insts.push({ k: "IntCall", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.APPLY: {
                         const procIdx = inst[ip++];
@@ -1869,10 +1942,10 @@ export class AotCompiler {
                         term = { k: "CurStack", skip: inst[ip++], resume: ip };
                         break;
                     case OpCode.CALLHOST: {
-                        const rt = code.rt[inst[ip++]];
+                        const pos = inst[ip++];
                         const start = inst[ip++];
                         const nargs = inst[ip++];
-                        term = { k: "HostCall", rt, start, nargs, isTail: inst[ip++] !== 0, resume: ip };
+                        term = { k: "HostCall", pos, start, nargs, isTail: inst[ip++] !== 0, resume: ip };
                         break;
                     }
                     case OpCode.RETURN:
@@ -1954,7 +2027,7 @@ class Liveness {
             case "SetBox": return [inst.dst, inst.src];
             case "SetUpvar": case "SetGlobal": return [inst.src];
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
-            case "CallBuiltin": case "RtCall": return windowRegs(inst.start, inst.nargs);
+            case "CallBuiltin": case "RtCall": case "IntCall": return windowRegs(inst.start, inst.nargs);
             case "Unpack": return [inst.src];
             case "SetMark": return [inst.key, inst.val];
             case "MarkRestore": return [inst.reg, inst.reg + 1];
@@ -2061,8 +2134,24 @@ export class CodeEmitter {
 }
 
 // emits one entry point of a compiled function; subclasses decide how registers reach callees, how values come back and how control leaves
+// the `d` an intrinsic's inline template gets: the local names of its deps, where a name it did not declare is an error
+const inlineDeps = (entry: Intrinsic): Readonly<Record<string, string>> => new Proxy(entry.deps, {
+    get(target, key) {
+        if (typeof key !== "string") return undefined;
+        if (!Object.hasOwn(target, key)) throw new Error(`the inline template of '${entry.name}' uses '${key}', which is not in its deps`);
+        return target[key];
+    },
+});
+
 abstract class FunctionEmitter extends CodeEmitter {
-    constructor(protected readonly blocks: AotBlock[], protected readonly inst: Uint32Array, protected readonly numReg: number, protected readonly debug: boolean = false) {
+    constructor(
+        protected readonly blocks: AotBlock[],
+        protected readonly inst: Uint32Array,
+        protected readonly numReg: number,
+        protected readonly debug: boolean = false,
+        // the table the code is bound to: its intrinsics are the hoisted locals I<pos>, their deps D<slot>
+        protected readonly table: Intrinsics | null = null
+    ) {
         super();
     }
 
@@ -2218,9 +2307,11 @@ abstract class FunctionEmitter extends CodeEmitter {
             }
             case "RtCall": {
                 const slow = this.windowCall(`RUNTIME_FNS[${inst.rt}]`, inst.start, inst.nargs, true);
-                const inline = RUNTIME_INLINES.get(RUNTIME[inst.rt][0])?.(windowRegs(inst.start, inst.nargs).map(r => `r${r}`), slow, "tmp");
+                const inline = RUNTIME_INLINES.get(RUNTIME[inst.rt].name)?.(windowRegs(inst.start, inst.nargs).map(r => `r${r}`), slow, "tmp", {});
                 return this.emit(`r${inst.dst} = ${inline ?? slow};`);
             }
+            case "IntCall":
+                return this.emit(`r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)};`);
             case "CallBuiltin": {
                 const inline = this.inlineBuiltin(inst.builtin, inst.start, inst.nargs);
                 if (inline !== null) return this.emit(`r${inst.dst} = ${inline};`);
@@ -2235,18 +2326,20 @@ abstract class FunctionEmitter extends CodeEmitter {
         }
     }
 
-    // an expression calling a host intrinsic: its inline template, whose fallback is a direct call of its function
-    protected hostCall(rt: number, start: number, nargs: number): string {
-        const args = windowRegs(start, nargs).map(r => `r${r}`);
-        const direct = `HOST_FNS[${rt}](${args.join(", ")})`;
-        return RUNTIME_INLINES.get(RUNTIME[rt][0])?.(args, direct, "tmp") ?? direct;
+    // an expression calling the intrinsic at `pos`: its inline template, whose fallback is a call of its function (the
+    // hoisted local I<pos>) over the register window
+    protected intrinsicCall(pos: number, start: number, nargs: number): string {
+        const entry = this.table!.entries[pos];
+        const direct = this.windowCall(`I${pos}`, start, nargs);
+        if (entry.inline === undefined) return direct;
+        return entry.inline(windowRegs(start, nargs).map(r => `r${r}`), direct, "tmp", inlineDeps(entry)) ?? direct;
     }
 
     // an expression computing a builtin call inline (see inline.ts), or null
     protected inlineBuiltin(builtin: number, start: number, nargs: number): string | null {
         const inline = BUILTIN_INLINES.get(Symbol.keyFor(IBUILTINS[builtin].name)!);
         if (inline === undefined) return null;
-        return inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`IBUILTINS[${builtin}].cb`, start, nargs), "tmp");
+        return inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`IBUILTINS[${builtin}].cb`, start, nargs), "tmp", {});
     }
 }
 
@@ -2260,8 +2353,8 @@ class ResumeEmitter extends FunctionEmitter {
     protected readonly mframeVar = "frame.mframe";
     readonly #liveness: Liveness;
 
-    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false) {
-        super(blocks, inst, numReg, debug);
+    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false, table: Intrinsics | null = null) {
+        super(blocks, inst, numReg, debug, table);
         this.#liveness = new Liveness(blocks, numReg);
     }
     // follows jumps through empty blocks (left by loops and blocks) to where control really goes, saving dispatches
@@ -2439,7 +2532,7 @@ class ResumeEmitter extends FunctionEmitter {
                 return this.emit(`
                     frame.ip = ${term.resume};
                     {
-                        const res = ${this.hostCall(term.rt, term.start, term.nargs)};
+                        const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
                         if (res instanceof HostTail) {
                             ${term.isTail ? "" : this.#spills(live.spillsFor(term.resume))}
                             return executor.invoke(ctx, res.proc, frame, res.args, 0, res.args.length, ${term.isTail});
@@ -2591,7 +2684,7 @@ class DirectEmitter extends FunctionEmitter {
 
     // direct-entry code never resumes mid-function, so compiled `if`s (IF c else ... ELSE end, else: ... ENDIF, end:) can be emitted as nested js if/else
     #structuredBody(): string | null {
-        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug);
+        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug, this.table);
         body.#selfArity = this.#selfArity;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {
@@ -2797,7 +2890,7 @@ class DirectEmitter extends FunctionEmitter {
                 return this.emit(`
                     {
                         rip = ${term.isTail ? -1 : term.resume};
-                        const res = ${this.hostCall(term.rt, term.start, term.nargs)};
+                        const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
                         if (res instanceof HostTail) {
                             const proc = res.proc, args = res.args;
                             ${this.#callArray(term.isTail)}

@@ -2,9 +2,10 @@ import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
-import { IBUILTINS_IDX_MAP } from "../std";
-import { BUILTINS_START, OpCode, RUNTIME_IDX } from "./exec";
-import { BUILTIN_INTRINSICS, HOST_CALLING, RUNTIME_INTRINSICS } from "./intrinsics";
+import { IBUILTINS_IDX_MAP } from "../scheme/builtins";
+import { BUILTINS_START, rtIdx } from "./exec";
+import { BUILTIN_INTRINSICS, CORE_OPS, isCompilerIntrinsic, isTakenName } from "./core";
+import { Intrinsics } from "./intrinsics";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
@@ -47,11 +48,11 @@ interface CmpOpts {
 export class Compiler {
     #s = new ASTStringifier()
 
-    constructor(private readonly debug: boolean = false) {}
+    constructor(readonly intrinsics: Intrinsics = new Intrinsics(isTakenName), private readonly debug: boolean = false) {}
 
     compile(trExpr: any, debug: boolean = this.debug) {
         // Step 1 is to analyze our variables so we know what to box and what not to box
-        let analyzer = new AstAnalysis()
+        let analyzer = new AstAnalysis(this.intrinsics)
         const ascope = analyzer.analyze(trExpr)
 
         const scope = new CompilerScope(null)
@@ -61,7 +62,7 @@ export class Compiler {
         if (!this.#nodesEndsInRet(nodes)) {
             nodes.push({t: "Return", reg: retReg})
         }
-        const ir = new IR(debug)
+        const ir = new IR(this.intrinsics, debug)
         return ir.lower(nodes, scope.numRegs)
     }
 
@@ -187,7 +188,7 @@ export class Compiler {
                 case OP_CO_YIELD_LIST:
                     this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
                         this.#withDest(opts, undefined, valReg => {
-                            opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("list->values")!, destReg: valReg, startReg: start, nargs })
+                            opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%list->values"), destReg: valReg, startReg: start, nargs })
                             opts.nodes.push({ t: "CoYield", valReg, destReg: dest })
                         })
                     })
@@ -200,16 +201,23 @@ export class Compiler {
                     return
             }
 
-            const runtime = RUNTIME_INTRINSICS.get(operator)
-            if (runtime !== undefined && HOST_CALLING.has(operator)) {
-                this.#compileRuntimeOp(expr, opts, runtime.min, runtime.max, (start, nargs, dest) => {
-                    opts.nodes.push({ t: "HostCall", rtIdx: runtime.idx, startReg: start, nargs, isTail: opts.isTail, destReg: dest })
+            const op = CORE_OPS.get(operator)
+            if (op !== undefined) {
+                this.#compileRuntimeOp(expr, opts, op.min, op.max, (start, nargs, dest) => {
+                    this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "RtCall", rtIdx: op.idx, destReg, startReg: start, nargs }))
                 })
                 return
             }
-            if (runtime !== undefined) {
-                this.#compileRuntimeOp(expr, opts, runtime.min, runtime.max, (start, nargs, dest) => {
-                    this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "RtCall", rtIdx: runtime.idx, destReg, startReg: start, nargs }))
+            const intrinsic = this.intrinsics.get(operator)
+            if (intrinsic !== undefined && intrinsic.leaf) {
+                this.#compileRuntimeOp(expr, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                    this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "IntCall", pos: intrinsic.pos, destReg, startReg: start, nargs }))
+                })
+                return
+            }
+            if (intrinsic !== undefined) {
+                this.#compileRuntimeOp(expr, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                    opts.nodes.push({ t: "HostCall", pos: intrinsic.pos, startReg: start, nargs, isTail: opts.isTail, destReg: dest })
                 })
                 return
             }
@@ -291,6 +299,7 @@ export class Compiler {
         const sym = expr.cdr.car;
         const val = expr.cdr.cdr.car;
         if (typeof sym !== "symbol") throw new Error("internal error: complex defines should be transformed by AnimaTransform prior to reaching here")
+        this.#ensureNotIntrinsic(sym, "define")
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
@@ -305,6 +314,7 @@ export class Compiler {
     #compileSet(expr: Cons, opts: CmpOpts) {
         // AnimaTransform ensures sets are of correct form
         const sym = expr.cdr.car;
+        this.#ensureNotIntrinsic(sym, "set!")
         const val = expr.cdr.cdr.car;
 
         // We need to compile the second arg first and leave it on a temp reg
@@ -325,6 +335,8 @@ export class Compiler {
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
 
         const { params, remParams } = unpackLambdaExprArgs(expr, "lambda")
+        for (const p of params) this.#ensureNotIntrinsic(p, "lambda")
+        this.#ensureNotIntrinsic(remParams, "lambda")
         const lambdaNodes: Node[] = []
         if (opts.pos !== undefined) lambdaNodes.push({ t: "Pos", pos: opts.pos })
 
@@ -390,6 +402,7 @@ export class Compiler {
         const seen = new Set<symbol>()
         for (const { sym, reg } of bound) {
             ensureCanBind(sym, seen, "let-values")
+            this.#ensureNotIntrinsic(sym, "let-values")
             const inf = ascope.getVarinfo(sym)
             if (!inf) throw new Error("Could not fetch varinfo")
             const destReg = opts.scope.addLocal(sym)
@@ -495,9 +508,9 @@ export class Compiler {
         this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: afterProcReg, isTail: false });
 
         opts.nodes.push({ t: "Call", procReg: beforeProcReg, startReg: 0, nargs: 0 });
-        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("wind")!, destReg, startReg: beforeProcReg, nargs: 2 }));
+        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%wind"), destReg, startReg: beforeProcReg, nargs: 2 }));
         opts.nodes.push({ t: "Call", procReg: thunkProcReg, destReg: opts.destReg, startReg: 0, nargs: 0 });
-        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("end-wind")!, destReg, startReg: 0, nargs: 0 }));
+        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%end-wind"), destReg, startReg: 0, nargs: 0 }));
         opts.nodes.push({ t: "Call", procReg: afterProcReg, startReg: 0, nargs: 0 });
 
         opts.scope.regAlloc.freeBlock(block, 3);
@@ -562,7 +575,7 @@ export class Compiler {
         opts.scope.freeTemp(procReg);
 
         const condReg = opts.scope.allocTemp();
-        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("caught?")!, destReg: condReg, startReg: resReg, nargs: 1 });
+        opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%caught?"), destReg: condReg, startReg: resReg, nargs: 1 });
         const elseLabel = new JumpLabel();
         const endLabel = new JumpLabel();
         opts.nodes.push({ t: "If", reg: condReg, elseLabel });
@@ -570,7 +583,7 @@ export class Compiler {
 
         const call = opts.scope.regAlloc.allocBlock(2);
         this.#compile(expr.cdr.cdr.car, { ...opts, destReg: call, isTail: false });
-        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("caught-value")!, destReg: call + 1, startReg: resReg, nargs: 1 });
+        opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%caught-value"), destReg: call + 1, startReg: resReg, nargs: 1 });
         if (opts.isTail) opts.nodes.push({ t: "TailCall", procReg: call, startReg: call + 1, nargs: 1 });
         else opts.nodes.push({ t: "Call", procReg: call, destReg: opts.destReg, startReg: call + 1, nargs: 1 });
         opts.scope.regAlloc.freeBlock(call, 2);
@@ -631,8 +644,17 @@ export class Compiler {
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
 
+    #isIntrinsic(sym: symbol): boolean {
+        return isCompilerIntrinsic(sym) || BUILTIN_INTRINSICS.has(sym) || this.intrinsics.get(sym) !== undefined
+    }
+
+    // a call of an intrinsic's name always calls the intrinsic, so the name cannot be a variable too
+    #ensureNotIntrinsic(sym: any, syntaxCtx: string) {
+        if (typeof sym === "symbol" && this.#isIntrinsic(sym)) throw new Error(`${syntaxCtx}: cannot bind ${String(sym.description)}, which is an intrinsic`)
+    }
+
     #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
-        if (BUILTIN_INTRINSICS.has(procExpr) || RUNTIME_INTRINSICS.has(procExpr)) {
+        if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
             throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
         }
         if (typeof procExpr === "symbol") {
@@ -684,7 +706,7 @@ export class Compiler {
 
         const listReg = opts.scope.allocTemp();
         this.#compile(lstExpr, { ...opts, destReg: listReg, isTail: false });
-        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("apply-args")!, destReg: listReg, startReg: listReg, nargs: 1 });
+        opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%apply-args"), destReg: listReg, startReg: listReg, nargs: 1 });
         this.#emitApplyNode(opts, procReg, listReg, 1);
 
         opts.scope.freeTemp(listReg);
@@ -742,6 +764,7 @@ export class Compiler {
         for (let i = 0; i < bindings.length; i++) {
             const sym = bindings[i].car
             ensureCanBind(sym, seen, "let")
+            this.#ensureNotIntrinsic(sym, "let")
             const inf = ascope.getVarinfo(sym)
             if (!inf) throw new Error("Could not fetch varinfo")
             const destReg = opts.scope.addLocal(sym)

@@ -2,7 +2,7 @@
 
 This document specifies the core language the compiler accepts, the compiler intrinsics, and how surface syntax and the standard prelude map onto them.
 
-The compiler only understands `%` forms. Every special form users write (`if`, `lambda`, `let`, `cond`, `define`, ...) is surface syntax that the syntax transformer (`syntransformer-v1`) validates and lowers to the core forms below; anything else in the compiler's input is a variable reference, a literal or a call. Frontends such as transpilers can emit core forms directly. All surface and core form names are reserved and cannot be bound.
+The compiler only understands `%` forms. Every special form users write (`if`, `lambda`, `let`, `cond`, `define`, ...) is surface syntax that the syntax transformer (`scheme/transformer`) validates and lowers to the core forms below; anything else in the compiler's input is a variable reference, a literal or a call. Frontends such as transpilers can emit core forms directly. All surface and core form names are reserved and cannot be bound.
 
 ## Core Language
 
@@ -97,7 +97,7 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Form**: `(%apply-multi <proc> <lst>)`
 - **Semantics**:
   - Runtime-list variant of `%apply`: the elements of `<lst>` are the arguments, with the last element spliced in the same way (e.g. `$apply` passes its rest parameter here).
-  - Compiles as `(%apply <proc> <flattened>)`, where the `apply-args` runtime operation (`CALLRT`) first splices the last element of `<lst>` into a flat argument list.
+  - Compiles as `(%apply <proc> <flattened>)`, where the `%apply-args` runtime operation (`CALLRT`) first splices the last element of `<lst>` into a flat argument list.
 
 ### Arithmetic intrinsics
 - **Forms**: `(%+ <arg> ...)`, `%-`, `%*`, `%/`, `%modulo`, `%remainder`, `%=`, `%eq?`, `%<`, `%<=`, `%>`, `%>=`
@@ -163,15 +163,36 @@ Besides the core forms, the compiler directly recognizes the following low-level
     (define $debug-traceback (lambda args (%debug-traceback (%current-stack 1) args)))
     ```
 
+### Runtime operations
+Compiler intrinsics that compile to `CALLRT` (a fixed index into `RUNTIME` in `exec.ts`). The compiler emits several of them itself when lowering other forms, but every one can also be written directly; each has a fixed argument count and a `leaf` flag (see host intrinsics):
+
+| Form | Arguments | Leaf | What it does |
+|---|---|---|---|
+| `%coroutine-create`, `%coroutine-status` | 1 | yes | make a coroutine from a procedure / its status |
+| `%coroutine-close` | 1 | no | close a coroutine, running its pending dynamic-wind after-thunks |
+| `%wind`, `%end-wind` | 2 (before, after), 0 | yes | push / pop a wind point: the steps `%dynamic-wind` lowers to. They must be balanced |
+| `%end-escape` | 1 | yes | ends the extent of an escape continuation or catch token (`%call/ec`, `%catch`) |
+| `%caught?`, `%caught-value`, `%make-caught` | 1 | yes | test / unwrap / make the value a `%catch` produces when its thunk raised |
+| `%handler-key` | 0 | yes | the continuation-mark key the exception handlers live under |
+| `%values-cons` | 2 | yes | prepend a value to multiple values |
+| `%values->list`, `%list->values` | 1 | yes | convert between multiple values and a list |
+| `%apply-args` | 1 or more | yes | the arguments of an apply: the leading ones, then the elements of the last (a list) |
+| `%first-value` | 1 | yes | see above |
+| `%marks-first`, `%marks->list` | 3, 2 | yes | `continuation-mark-set-first` / `continuation-mark-set->list` |
+| `%debug-frames`, `%debug-traceback` | 2 | yes | see above |
+
 ### Host intrinsics
-- **Registering**: `registerHostIntrinsic(name, fn, { args, leaf, inline })` (exported from the package) makes `(name arg ...)` a compiler intrinsic calling the JS function `fn` with the arguments. `name` must start with `%`, becomes reserved, and cannot be registered twice; the registry is process-wide, and code using a name must be compiled after it is registered. `args` is `[min, max]`, checked at compile time; `inline` is an AOT template like the builtin inlines (see `inline.ts`), whose fallback is a direct call of `fn`.
-- **Tail requests**: unless it is a `leaf`, a host intrinsic may return `hostTail(proc, arg ...)` instead of a value; the value is then `(proc arg ...)`, made as an ordinary Scheme call (a tail call if the intrinsic was in tail position), so it can yield, capture continuations and raise. This is how host libraries (userdata, Luau tables and their metamethods) call back into Scheme code. Such intrinsics compile to `CALLHOST rt start nargs tail` and count as calls for the boxing analysis.
-- **Leaves** (`leaf: true`) never call back into Scheme: they compile to a plain `CALLRT` and are not calls for the boxing analysis. "Leaf" does not mean pure: a leaf may have side effects.
-- Errors a host intrinsic throws are host errors (see the exception model); `hostError` in `errors.ts` makes one without the cost of a JS stack trace.
+- **Registering**: `anima.registerIntrinsic(name, fn, { args, leaf, inline, deps })` makes `(name arg ...)` an intrinsic of that instance: its compiler, VM and macro expander share one `Intrinsics` table, and nothing about it is global. `name` must start with `%`, and cannot be a compiler intrinsic, a builtin or an intrinsic already registered. A name only means the intrinsic in code compiled after it is registered. `anima.freeze()` stops further registrations; compiling and loading are unaffected.
+- **Calling convention**: `fn(regs, start, nargs)` reads its arguments from `regs[start .. start+nargs)`. It must not write to `regs` or keep it: in the interpreter it is the caller's live register file. `args` is `[min, max]`, checked at compile time.
+- **Inlining**: `inline(args, slow, tmp, d)` is an AOT template: given the argument expressions (plain variables, so they may be repeated), the direct call `slow`, a scratch variable `tmp` and `d`, it returns a JS expression, or null to make the direct call. `deps` names the values the template needs (`deps: { Table }`); the template refers to them as `${d.Table}`, which generated code reads from a local set up once per function. Using a name that is not in `deps` is an error when the code is generated.
+- **Tail requests**: unless it is a `leaf`, an intrinsic may return `hostTail(proc, arg ...)` (or `new HostTail(proc, args)`) instead of a value; the value is then `(proc arg ...)`, made as an ordinary call (a tail call if the intrinsic was in tail position), so it can yield, capture continuations and raise. This is how host libraries (userdata, Luau tables and their metamethods) call back into the VM. Such intrinsics compile to `CALLHOST pos start nargs tail` and count as calls for the boxing analysis. To pass on the rest of the window, copy it with a loop: `regs.slice` with a spread costs about twice as much on windows this small.
+- **Leaves** (`leaf: true`) never call back into the VM: they compile to `CALLINT pos dst start nargs` and are not calls for the boxing analysis. "Leaf" does not mean pure: a leaf may have side effects.
+- Errors an intrinsic throws are host errors (see the exception model); `hostError` in `errors.ts` makes one without the cost of a JS stack trace.
 
 ### How intrinsics are compiled
 - **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines builtins that have an entry in `BUILTIN_INLINES` (`inline.ts`, the AOT-only table of `InlineFn`s by builtin name; `CALLRT` operations use `RUNTIME_INLINES` there the same way: arithmetic, `eq?`, every predicate, every `c[ad]+r`, `list`, `cons`, and the table and vector intrinsics), keeping a call to the builtin as the fallback so errors are unchanged. Builtins are never tail called: a builtin call in tail position compiles as a call followed by `RETURN`, since it cannot grow the Scheme stack.
-- **Runtime operations that only need the execution context** (`%coroutine-create`, `%coroutine-status`, `%coroutine-close`, the wind/unwind steps of `%dynamic-wind`, and internal helpers with no public builtin: `%values->list`, `%first-value`, `%marks-first`, `%marks->list`, `%handler-key`, `%values-cons`, `%debug-frames`, `%debug-traceback` and the list/apply conversions behind `%coroutine-yield-list` and `%apply-multi`) compile to `CALLRT idx dst start nargs`, where `idx` indexes the `RUNTIME` table in `exec.ts`.
+- **Runtime operations** (see above) compile to `CALLRT idx dst start nargs`, where `idx` is a fixed index into the `RUNTIME` table in `exec.ts`.
+- **Registered intrinsics** compile to `CALLINT pos dst start nargs` (leaves) or `CALLHOST pos start nargs tail`, where `pos` is the intrinsic's position in the table the code is compiled against. The interpreter calls `code.table.fns[pos](regs, start, nargs)`; AOT code reads each function it uses into a local once, and calls it over the register window or inlines its template.
 - **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `isTail` operand; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
 
 ## Standard Library & Prelude Mappings
@@ -232,7 +253,7 @@ This section describes how compiled code runs. The code lives in `exec.ts` (runt
 
 ## Pipeline
 
-1. The syntax transformer (`syntransformer-v1`) expands macros and rewrites calls to builtins into `%` intrinsic forms.
+1. The syntax transformer (`scheme/transformer`) expands macros and rewrites calls to builtins into `%` intrinsic forms.
 2. `analysis.ts` works out which variables live in `Box`es: those captured (used from inside a nested `%lambda`; a `%let` is not a boundary), and those assigned with `set!` that are live across a call, i.e. read after a call that may run Scheme code before being assigned again. A continuation captured during such a call restores the frame's registers when re-entered, so only then would a register copy differ from a shared location. A second, backward liveness pass over the core forms (with a fixed point for `%loop`, and `%escape` flowing to its block's continuation) finds them; calls of builtins and of runtime intrinsics that never run Scheme code do not count.
 3. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers, and `IR.lower` turns those into a `ByteCode` (a `Uint32Array` of instructions plus a constant pool).
 4. The bytecode runs either in the interpreter (`BytecodeInterpreter`) or, in `"aot"` mode, is compiled to JS functions (`AotCompiler`).
@@ -301,4 +322,8 @@ The library follows Racket: `with-continuation-mark`, `current-continuation-mark
 
 ## Bytecode serialization
 
-`dumpFull`/`readFull` (`utils.ts`) prefix the serialized bytecode with a magic word and `BYTECODE_VERSION`. Each `ByteCode` carries a metadata section, `runtime`: the names of the runtime operations and host intrinsics its `CALLRT`/`CALLHOST` operands index. When a `ByteCode` is made (compiled or loaded), the names are resolved against the operations registered then, so serialized bytecode does not depend on registration order, a missing host intrinsic fails with a clear error at load time, and the disassembler shows names. Bump the version whenever opcodes, builtin indices or the serialized layout change.
+`dumpFull`/`readFull` (`utils.ts`) prefix the serialized bytecode with a magic word and `BYTECODE_VERSION`. Bump the version whenever opcodes, builtin indices or the serialized layout change.
+
+Each `ByteCode` refers to the `Intrinsics` table it was compiled against (`table`, null when it uses no intrinsics), and records the intrinsics it uses in its metadata (`intrinsics`: position, name, and whether it was compiled as a leaf). `CALLINT`/`CALLHOST` operands are positions in that table, so code always calls the intrinsics it was compiled with, whichever instance runs it.
+
+Binding (`ByteCode.bind`) moves code to another table by name: `readFull(buf, anima.intrinsics)` binds everything it loads, and `fresh(copies, intrinsics)` binds a copy. It is an error if an intrinsic is not registered in the new table, or is registered as a leaf when the code was compiled for a non-leaf, or the other way round (the boxing analysis depends on it). Instructions are rewritten (copied first if other code shares them) only when a position differs. Loading code that uses intrinsics without a table is an error. The disassembler shows intrinsics by name.

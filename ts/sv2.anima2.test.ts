@@ -1,26 +1,30 @@
 // Made w/ lots of help from gemini cli
-import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, Env, ASPParseError, BS, BSReader } from './common';
+import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, Env, BS, BSReader } from './common';
+import { ASPParseError } from './scheme/reader';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from './list';
-import { BuiltinFunction } from './std';
+import { BuiltinFunction } from './scheme/builtins';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
 import { BUILTINS_START, INSTRUCTION_LENGTHS } from './bytecode-rvm/exec';
 import { Anima } from './anima';
 import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
-import { registerHostIntrinsic } from './bytecode-rvm/intrinsics';
 import { hostTail } from './bytecode-rvm/exec';
 import { IProcedure } from './common';
 import { hostError } from './errors';
+import { CORE_FORMS, CORE_OPS } from './bytecode-rvm/core';
+import { readFileSync } from 'fs';
 
-// host intrinsics are process-wide, so the ones under test are registered once
-registerHostIntrinsic("%test-add", (a: any, b: any) => a + b, {
-    args: [2, 2],
-    leaf: true,
-    inline: ([a, b], slow) => `(typeof ${a} === "number" && typeof ${b} === "number" ? ${a} + ${b} : ${slow})`,
-});
-registerHostIntrinsic("%test-call-or", (f: any, ...args: any[]) => f instanceof IProcedure ? hostTail(f, ...args) : f, { args: [1, Infinity] });
-registerHostIntrinsic("%test-fail", (msg: string) => { throw hostError(msg) }, { args: [1, 1], leaf: true });
+// intrinsics belong to an instance, so every instance that uses these registers them
+const registerTestIntrinsics = (anima: Anima) => {
+    anima.registerIntrinsic("%test-add", (regs, s) => regs[s] + regs[s + 1], {
+        args: [2, 2],
+        leaf: true,
+        inline: ([a, b], slow) => `(typeof ${a} === "number" && typeof ${b} === "number" ? ${a} + ${b} : ${slow})`,
+    });
+    anima.registerIntrinsic("%test-call-or", (regs, s, n) => regs[s] instanceof IProcedure ? hostTail(regs[s], ...regs.slice(s + 1, s + n)) : regs[s], { args: [1, Infinity] });
+    anima.registerIntrinsic("%test-fail", (regs, s) => { throw hostError(regs[s]) }, { args: [1, 1], leaf: true });
+};
 
 describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
 let bcCache: Record<string, AbstractByteCode> = {}
@@ -30,6 +34,7 @@ describe('Anima', () => {
     // every test starts from a fresh instance, so none depends on what ran before it
     beforeEach(() => {
         evaluator = new Anima(vmImpl)
+        registerTestIntrinsics(evaluator)
         bcCache = {}
         evaluator.scope.set(Symbol.for("port"), 8080)
         evaluator.scope.set(Symbol.for("protocol"), "tcp")
@@ -853,6 +858,52 @@ describe('Anima', () => {
                         (if (< ht-n 3) (ht-k ht-n) (list ht-r ht-n))`)).toBe("(102 3)")
             expect(run(`(try (lambda () (%test-fail "boom")) (lambda (e) (error-message e)))`)).toBe('"boom"')
             expect(run(`(try (lambda () (%test-call-or (lambda () (raise 'inner)))) (lambda (e) e))`)).toBe("inner")
+        })
+
+        it('checks registrations, and freezing stops them but not compiling', () => {
+            expect(() => evaluator.registerIntrinsic("no-percent", () => 1)).toThrow("start with '%'")
+            expect(() => evaluator.registerIntrinsic("%test-add", () => 1)).toThrow("already defined")
+            expect(() => evaluator.registerIntrinsic("%marks-first", () => 1)).toThrow("already defined")
+            expect(() => evaluator.registerIntrinsic("%wind", () => 1)).toThrow("already defined")
+            expect(() => evaluator.registerIntrinsic("%car", () => 1)).toThrow("already defined")
+            expect(() => evaluator.registerIntrinsic("%test-range", () => 1, { args: [2, 1] })).toThrow("bad argument count range")
+            expect(evaluator.freeze()).toBe(evaluator)
+            expect(evaluator.intrinsics.frozen).toBe(true)
+            expect(() => evaluator.registerIntrinsic("%test-late", () => 1)).toThrow("frozen")
+            expect(run(`(%test-add 40 2)`)).toBe("42")
+        })
+
+        it('keeps intrinsics per instance, and code keeps the ones it was compiled with', () => {
+            const other = new Anima(vmImpl)
+            expect(() => other.evaluateRaw(other.compileRaw(`(%test-add 1 2)`))).toThrow()
+            other.registerIntrinsic("%test-add", (regs, s) => regs[s] * regs[s + 1], { args: [2, 2], leaf: true })
+            expect(s.stringify(other.evaluateRaw(other.compileRaw(`(%test-add 3 4)`)))).toBe("12")
+            expect(run(`(%test-add 3 4)`)).toBe("7")
+            const mul = other.evaluateRaw(other.compileRaw(`(lambda (a b) (%test-add a b))`))
+            expect(s.stringify(evaluator.evaluateClosure(mul, [3, 4]))).toBe("12")
+        })
+
+        it('does not let intrinsics be bound as variables', () => {
+            expect(() => run(`(lambda (%test-add) 1)`)).toThrow("which is an intrinsic")
+            expect(() => run(`(let ((%marks-first 1)) 1)`)).toThrow("which is an intrinsic")
+            expect(() => run(`(%test-add %test-add 1)`)).toThrow()
+        })
+
+        it('gives inline templates their deps', () => {
+            class Point { constructor(readonly x: number) {} }
+            const other = new Anima(vmImpl)
+            other.registerIntrinsic("%test-px", (regs, s) => regs[s].x, {
+                args: [1, 1], leaf: true, deps: { Point },
+                inline: ([p], slow, _tmp, d) => `(${p} instanceof ${d.Point} ? ${p}.x : ${slow})`,
+            })
+            other.scope.set(Symbol.for("pt"), new Point(5))
+            expect(s.stringify(other.evaluateRaw(other.compileRaw(`(define (px p) (%test-px p)) (px pt)`)))).toBe("5")
+            other.registerIntrinsic("%test-bad-dep", (regs, s) => regs[s], {
+                args: [1, 1], leaf: true, inline: ([a], _slow, _tmp, d) => `(${d.Missing}, ${a})`,
+            })
+            const bad = other.compileRaw(`(%test-bad-dep 1)`)
+            if (_mode === "aot") expect(() => other.evaluateRaw(bad)).toThrow("uses 'Missing', which is not in its deps")
+            else expect(s.stringify(other.evaluateRaw(bad))).toBe("1")
         })
     });
 
@@ -2678,7 +2729,10 @@ describe('Tables (using Table class)', () => {
 
 describe('Floats, Infinities & NaNs', () => {
     let evaluator: Anima;
-    beforeEach(() => { evaluator = new Anima(vmImpl) });
+    beforeEach(() => {
+        evaluator = new Anima(vmImpl)
+        registerTestIntrinsics(evaluator)
+    });
     let s = new ASTStringifier();
 
     const run = (expr: string) => {
@@ -2904,20 +2958,33 @@ describe('Floats, Infinities & NaNs', () => {
         expect(() => readFull(full.subarray(2))).toThrow("not anima bytecode");
     });
 
-    it("serializes host intrinsics by name", () => {
+    it("serializes intrinsics by name and binds them to the loading table", () => {
         const bc = evaluator.compileRaw("(list (%test-add 1 2) (%test-call-or (lambda (x) x) 4))") as ByteCode;
-        expect(bc.runtime).toContain("%test-add");
-        expect(bc.runtime).toContain("%test-call-or");
-        expect(s.stringify(evaluator.evaluateRaw(readFull(dumpFull(bc)) as ByteCode))).toBe("(3 4)");
-        const unknown = evaluator.compileRaw("(%test-add 1 2)") as ByteCode;
-        unknown.runtime[unknown.runtime.indexOf("%test-add")] = "%not-registered";
-        expect(() => readFull(dumpFull(unknown))).toThrow("'%not-registered', which is not registered");
+        expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%test-add", "%test-call-or"]);
+        const dumped = dumpFull(bc);
+        expect(s.stringify(evaluator.evaluateRaw(readFull(dumped, evaluator.intrinsics) as ByteCode))).toBe("(3 4)");
+
+        // the same intrinsics at other positions: operands are remapped by name
+        const other = new Anima(vmImpl);
+        other.registerIntrinsic("%test-first", (regs, s) => regs[s], { args: [1, 1], leaf: true });
+        registerTestIntrinsics(other);
+        expect(other.intrinsics.byName("%test-add")!.pos).not.toBe(evaluator.intrinsics.byName("%test-add")!.pos);
+        expect(s.stringify(other.evaluateRaw(readFull(dumped, other.intrinsics) as ByteCode))).toBe("(3 4)");
+        expect(s.stringify(other.evaluateRaw((bc as ByteCode).fresh(new Map(), other.intrinsics)))).toBe("(3 4)");
+        // the original still runs with its own positions
+        expect(s.stringify(evaluator.evaluateRaw(bc))).toBe("(3 4)");
+
+        expect(() => readFull(dumped, new Anima(vmImpl).intrinsics)).toThrow("'%test-add', which is not registered");
+        expect(() => readFull(dumped)).toThrow("needs an intrinsics table");
     });
 
-    it("rejects bad host intrinsic registrations", () => {
-        expect(() => registerHostIntrinsic("no-percent", () => 1)).toThrow("start with '%'");
-        expect(() => registerHostIntrinsic("%test-add", () => 1)).toThrow("already defined");
-        expect(() => registerHostIntrinsic("%marks-first", () => 1)).toThrow("already defined");
+    it("refuses to load code whose intrinsics changed from leaf to not a leaf, or back", () => {
+        const leafCode = dumpFull(evaluator.compileRaw("(%test-add 1 2)") as ByteCode);
+        const other = new Anima(vmImpl);
+        other.registerIntrinsic("%test-add", (regs, s) => regs[s] + regs[s + 1], { args: [2, 2] });
+        expect(() => readFull(leafCode, other.intrinsics)).toThrow("compiled with '%test-add' as a leaf, but it is registered as not a leaf");
+        const nonLeafCode = dumpFull(other.compileRaw("(%test-add 1 2)") as ByteCode);
+        expect(() => readFull(nonLeafCode, evaluator.intrinsics)).toThrow("compiled with '%test-add' as not a leaf, but it is registered as a leaf");
     });
 });
 
@@ -3158,3 +3225,11 @@ const TEST_PROG = `
 
 export const TEST_PROG_BC = new AnimaCompiler().compileExpr(new ASP(TEST_PROG).parse(), false, false)
 */
+
+describe("Compiler intrinsics", () => {
+    it("are all documented in the compiler's README", () => {
+        const readme = readFileSync(new URL("./bytecode-rvm/README.md", import.meta.url), "utf8");
+        const documented = (name: string) => new RegExp("[`(]" + name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&") + "[`\\s)]").test(readme);
+        expect([...CORE_FORMS.keys(), ...CORE_OPS.keys()].map(sym => Symbol.keyFor(sym)!).filter(name => !documented(name))).toEqual([]);
+    });
+});

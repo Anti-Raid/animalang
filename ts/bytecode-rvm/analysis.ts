@@ -19,18 +19,21 @@ import {
   Cons,
 } from "../common";
 import { AnalysisScope, VariableMetadata } from "./scope";
-import { BUILTIN_INTRINSICS, RUNTIME_INTRINSICS, RUNTIME_INTRINSICS_CALLING_SCHEME } from "./intrinsics";
-import { IBUILTINS_IDX_MAP } from "../std";
+import { BUILTIN_INTRINSICS, CORE_FORMS, CORE_OPS } from "./core";
+import type { Intrinsics } from "./intrinsics";
+import { IBUILTINS_IDX_MAP } from "../scheme/builtins";
 
 // Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
 export class AstAnalysis {
     scopeMap = new WeakMap<object, AnalysisScope>();
-    
+
+    constructor(private readonly intrinsics: Intrinsics) {}
+
     analyze(ast: any) {
         const baseScope = new AnalysisScope(null);
         if (ast instanceof Cons) this.scopeMap.set(ast, baseScope);
         this.visit(ast, baseScope);
-        new CallLiveness(this.scopeMap).expr(ast, baseScope, new Set(), new Map());
+        new CallLiveness(this.scopeMap, this.intrinsics).expr(ast, baseScope, new Set(), new Map());
         return baseScope;
     }
 
@@ -162,12 +165,6 @@ const union = (a: Live, b: Live): Live => {
     return out;
 };
 
-// % forms whose operands are expressions and which may call Scheme code (and so capture a continuation)
-const CALLING_INTRINSICS = new Set([
-    "%call/cc", "%call/ec", "%raise", "%apply", "%apply-multi", "%dynamic-wind",
-    "%coroutine-yield", "%coroutine-yield-list", "%coroutine-resume", "%coroutine-resume-list",
-].map(name => Symbol.for(name)));
-
 // Second pass: backward liveness of the variables that are assigned but not captured, marking those that are live
 // after a call (see VariableMetadata.isBoxed). `expr` returns the variables live before `ast` given those live after
 // it (`out`); `blocks` gives what is live after each %block an %escape can reach.
@@ -176,7 +173,7 @@ class CallLiveness {
     // live sets only grow, so starting from the previous result reaches the same fixed point in about one pass
     readonly #loopHeads = new Map<object, Live>();
 
-    constructor(private readonly scopeMap: WeakMap<object, AnalysisScope>) {}
+    constructor(private readonly scopeMap: WeakMap<object, AnalysisScope>, private readonly intrinsics: Intrinsics) {}
 
     #candidate(scope: AnalysisScope, sym: symbol): VariableMetadata | null {
         const meta = scope.getVarinfo(sym);
@@ -190,18 +187,19 @@ class CallLiveness {
         return live;
     }
 
-    // whether calling this operator may run Scheme code, where a continuation of the current frame can be captured
-    #callsScheme(op: any, scope: AnalysisScope): boolean {
-        if (typeof op !== "symbol") return true;
-        if (BUILTIN_INTRINSICS.has(op)) return false;
-        if (RUNTIME_INTRINSICS.has(op)) return RUNTIME_INTRINSICS_CALLING_SCHEME.has(op);
-        if (CALLING_INTRINSICS.has(op)) return true;
-        // builtins cannot be shadowed and never call Scheme code
-        return !(IBUILTINS_IDX_MAP.has(op) && scope.getVarinfo(op) === null);
+    // whether calling this operator never calls back into the VM, where a continuation of the current frame could be captured
+    #isLeaf(op: any, scope: AnalysisScope): boolean {
+        if (typeof op !== "symbol") return false;
+        const core = CORE_FORMS.get(op) ?? CORE_OPS.get(op) ?? this.intrinsics.get(op);
+        if (core !== undefined) return core.leaf;
+        if (BUILTIN_INTRINSICS.has(op)) return true;
+        // builtins cannot be shadowed and never call back into the VM
+        return IBUILTINS_IDX_MAP.has(op) && scope.getVarinfo(op) === null;
     }
 
+    // intrinsics' operands are expressions, but the operator is not evaluated
     #isIntrinsic(op: any): boolean {
-        return typeof op === "symbol" && (BUILTIN_INTRINSICS.has(op) || RUNTIME_INTRINSICS.has(op) || CALLING_INTRINSICS.has(op));
+        return typeof op === "symbol" && (CORE_FORMS.has(op) || CORE_OPS.has(op) || BUILTIN_INTRINSICS.has(op) || this.intrinsics.get(op) !== undefined);
     }
 
     // the variables bound by a %let / %let-values, as they are known in its own scope
@@ -297,9 +295,9 @@ class CallLiveness {
             }
         }
 
-        // a call (or intrinsic): operands are evaluated first, then the call runs; anything live after a call that may run
-        // Scheme code could be read after re-entering a continuation captured during it
-        if (this.#callsScheme(op, scope)) {
+        // a call (or intrinsic): operands are evaluated first, then the call runs; anything live after a call that is not a
+        // leaf could be read after re-entering a continuation captured during it
+        if (!this.#isLeaf(op, scope)) {
             for (const meta of out) meta.liveAcrossCall = true;
         }
         const operands = this.#isIntrinsic(op) ? (ast.cdr instanceof Cons ? ast.cdr.toArray() : []) : ast.toArray();

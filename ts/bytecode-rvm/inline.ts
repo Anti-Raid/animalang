@@ -1,10 +1,9 @@
 import { CXR_PATHS } from "../ops";
+import type { InlineFn } from "./intrinsics";
 
-// AOT inlining: given the js expressions of the arguments and of a call to the operation itself (the fallback, which
-// reports errors), returns a js expression computing the result, or null to always make the call. `tmp` names a
-// scratch variable the expression may assign. Expressions may use the names in exec.ts's JIT_DEPS (Cons, Table,
-// MISSING, MultipleValues, ...) and, for runtime operations, `ctx` and `executor`.
-export type InlineFn = (args: string[], slow: string, tmp: string) => string | null;
+// AOT inlining (see InlineFn). The templates here may also use the names in exec.ts's JIT_DEPS (Cons, Table, MISSING,
+// MultipleValues, ...) and, for runtime operations, `ctx` and `executor`.
+export type { InlineFn };
 
 const allNumbers = (args: string[]) => args.map(a => `typeof ${a} === "number"`).join(" && ");
 
@@ -95,13 +94,13 @@ export const BUILTIN_INLINES = new Map<string, InlineFn>([
 
 // runtime operations (CALLRT), by name
 export const RUNTIME_INLINES = new Map<string, InlineFn>([
-    ["wind", ([before, after]) => `(ctx.wind = new WindPoint(ctx.wind, ${before}, ${after}), undefined)`],
-    ["end-wind", () => `(ctx.wind !== null && (ctx.wind = ctx.wind.parent), undefined)`],
-    ["end-escape", () => `undefined`],
-    ["caught?", unaryInline(v => `${v} instanceof Caught`)],
-    ["caught-value", unaryInline(v => `${v}.error`)],
-    ["make-caught", unaryInline(v => `new Caught(${v})`)],
-    ["handler-key", () => `EXCEPTION_HANDLERS`],
-    ["values-cons", ([x, v]) => `(${v} instanceof MultipleValues ? new MultipleValues([${x}, ...${v}.values]) : new MultipleValues([${x}, ${v}]))`],
-    ["first-value", unaryInline(v => `(${v} instanceof MultipleValues ? ${v}.values[0] : ${v})`)],
+    ["%wind", ([before, after]) => `(ctx.wind = new WindPoint(ctx.wind, ${before}, ${after}), undefined)`],
+    ["%end-wind", () => `(ctx.wind !== null && (ctx.wind = ctx.wind.parent), undefined)`],
+    ["%end-escape", () => `undefined`],
+    ["%caught?", unaryInline(v => `${v} instanceof Caught`)],
+    ["%caught-value", unaryInline(v => `${v}.error`)],
+    ["%make-caught", unaryInline(v => `new Caught(${v})`)],
+    ["%handler-key", () => `EXCEPTION_HANDLERS`],
+    ["%values-cons", ([x, v]) => `(${v} instanceof MultipleValues ? new MultipleValues([${x}, ...${v}.values]) : new MultipleValues([${x}, ${v}]))`],
+    ["%first-value", unaryInline(v => `(${v} instanceof MultipleValues ? ${v}.values[0] : ${v})`)],
 ]);
