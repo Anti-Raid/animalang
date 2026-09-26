@@ -153,13 +153,22 @@ export class MacroEvaluator {
         }
     }
 
+    // transforms every element of a list (and an improper tail), one element at a time rather than one js frame each
     #mapTransform(list: any, depth: number): any {
-        if (list instanceof Cons) {
-            const out = new Cons(this.#transform(list.car, depth), this.#mapTransform(list.cdr, depth));
-            const pos = SOURCE_POS.get(list);
-            if (pos !== undefined) SOURCE_POS.set(out, pos);
-            return out;
+        const cells: Cons[] = [];
+        const items: any[] = [];
+        let curr: any = list;
+        while (curr instanceof Cons) {
+            cells.push(curr);
+            items.push(this.#transform(curr.car, depth));
+            curr = curr.cdr;
         }
-        return list;
+        let out: any = curr;
+        for (let i = cells.length - 1; i >= 0; i--) {
+            out = new Cons(items[i], out);
+            const pos = SOURCE_POS.get(cells[i]);
+            if (pos !== undefined) SOURCE_POS.set(out, pos);
+        }
+        return out;
     }
 }

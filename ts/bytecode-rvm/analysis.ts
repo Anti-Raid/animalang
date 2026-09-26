@@ -219,9 +219,14 @@ class CallLiveness {
                 if (lambdaScope !== undefined) this.#seq(ast.cdr.cdr, lambdaScope, new Set(), new Map());
                 return out;
             }
+            // (%if c1 e1 c2 e2 ... [else]): each ci runs after the ones before it, then its branch or the rest of the chain
             case CORE_IF: {
-                const [cond, then, otherwise] = ast.cdr.toArray();
-                return this.expr(cond, scope, union(this.expr(then, scope, out, blocks), this.expr(otherwise, scope, out, blocks)), blocks);
+                const args = ast.cdr.toArray();
+                let live = args.length % 2 === 1 ? this.expr(args[args.length - 1], scope, out, blocks) : out;
+                for (let i = args.length - (args.length % 2 === 1 ? 3 : 2); i >= 0; i -= 2) {
+                    live = this.expr(args[i], scope, union(this.expr(args[i + 1], scope, out, blocks), live), blocks);
+                }
+                return live;
             }
             case CORE_BEGIN:
                 return this.#seq(ast.cdr, scope, out, blocks);

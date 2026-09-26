@@ -44,6 +44,11 @@ export type Node = {
     reg: number,
     elseLabel: JumpLabel,
 } | {
+    // the next condition of an %if chain (like If, but continuing the chain an If started)
+    t: "ElseIf",
+    reg: number,
+    elseLabel: JumpLabel,
+} | {
     t: "Else",
     endLabel: JumpLabel,
 } | {
@@ -255,6 +260,11 @@ export class IR {
                 }
                 case "If": {
                     const jidx = inst.push(OpCode.IF, node.reg, -1) - 1
+                    jumpIdxs.set(jidx, node.elseLabel)
+                    break
+                }
+                case "ElseIf": {
+                    const jidx = inst.push(OpCode.ELSEIF, node.reg, -1) - 1
                     jumpIdxs.set(jidx, node.elseLabel)
                     break
                 }

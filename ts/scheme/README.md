@@ -24,6 +24,7 @@ Each surface form lowers to a core form:
 |---|---|
 | `begin` | `(%begin <expr> ...)` |
 | `if` (exactly 3 arguments) | `(%if <cond> <then> <else>)` |
+| `cond` | one flat `(%if <c1> <e1> <c2> <e2> ... [<else>])`, however many clauses |
 | `quote`, `'datum` | `(%quote <datum>)` |
 | `lambda` | `(%lambda <params> <body> ...)` |
 | `let`, `let*` (nested), `letrec` (void inits then `%set!`), and any immediately applied lambda `((lambda (p ...) body) arg ...)` | `(%let ((<symbol> <init>) ...) <body> ...)` |

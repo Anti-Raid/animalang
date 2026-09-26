@@ -99,7 +99,8 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 continue
 
             case OpCode.IF:
-                line += `${padOp("IF")} r${inst.inst[idx + 1]}, else=#${inst.inst[idx + 2]}`;
+            case OpCode.ELSEIF:
+                line += `${padOp(inst.inst[idx] === OpCode.IF ? "IF" : "ELSEIF")} r${inst.inst[idx + 1]}, else=#${inst.inst[idx + 2]}`;
                 idx += 3;
                 break;
 
@@ -232,7 +233,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 19
+export const BYTECODE_VERSION = 20
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

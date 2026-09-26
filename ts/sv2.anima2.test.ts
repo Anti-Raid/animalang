@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from './list';
 import { createScheme } from './scheme';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
-import { INSTRUCTION_LENGTHS, rtIdx } from './bytecode-rvm/exec';
+import { Closure, INSTRUCTION_LENGTHS, rtIdx } from './bytecode-rvm/exec';
 import { Anima } from './anima';
 import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
@@ -93,7 +93,8 @@ describe('Anima', () => {
             expect(run(`((%lambda (x) (define y (+ x 1)) (* y 2)) 4)`)).toBe("10")
             expect(run(`(define cf-v 1) (%set! cf-v (%quote (a b))) cf-v`)).toBe("(a b)")
             expect(() => run(`(if 1 2)`)).toThrow("if condition must be in format")
-            expect(() => run(`(%if 1 2)`)).toThrow("if condition must be in format")
+            expect(() => run(`(%if 1)`)).toThrow("%if requires at least a condition and a branch")
+            expect(run(`(list (%if 1 2) (void? (%if #f 2)))`)).toBe("(2 #t)")
             expect(() => run(`(quote 1 2)`)).toThrow("quote must be in format")
             expect(() => run(`(define %if 1)`)).toThrow()
             expect(() => run(`(lambda (%lambda) 1)`)).toThrow()
@@ -888,6 +889,24 @@ describe('Anima', () => {
             expect(() => run(`(lambda (%test-add) 1)`)).toThrow("which is an intrinsic")
             expect(() => run(`(let ((%marks-first 1)) 1)`)).toThrow("which is an intrinsic")
             expect(() => run(`(%test-add %test-add 1)`)).toThrow()
+        })
+
+        it('runs %if chains (c1 e1 c2 e2 ... [else]) as one flat IF ... ELSEIF ... ENDIF', () => {
+            expect(run(`(list (%if #f 1 #t 2 3) (%if #f 1 #f 2 3) (void? (%if #f 1 #f 2)) (%if 'a 1 #t 2))`)).toBe("(2 3 #t 1)")
+            // conditions run in order, and stop at the first true one
+            expect(run(`(define ch-log '()) (define (ch-t x) (set! ch-log (cons x ch-log)) (= x 2))
+                        (list (%if (ch-t 1) 'a (ch-t 2) 'b (ch-t 3) 'c 'd) ch-log)`)).toBe("(b (2 1))")
+            // branches keep tail position, and a variable assigned in them is seen after
+            expect(run(`(define (ch-count n) (cond ((= n 0) 'done) ((< n 0) 'neg) (else (ch-count (- n 1))))) (ch-count 100000)`)).toBe("done")
+            expect(run(`(define (ch-set x) (let ((r 0)) (%if (= x 1) (set! r 'one) (= x 2) (set! r 'two) (set! r 'many)) r)) (list (ch-set 1) (ch-set 2) (ch-set 7))`)).toBe("(one two many)")
+            const bc = evaluator.compileRaw(`(define (ch-f x) (cond ((= x 1) 'a) ((= x 2) 'b) (else 'c)))`) as ByteCode
+            const fn: ByteCode = bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code
+            const ops: OpCode[] = []
+            for (let ip = 0; ip < fn.inst.length; ip += INSTRUCTION_LENGTHS[fn.inst[ip] as OpCode]) ops.push(fn.inst[ip])
+            expect(ops.filter(op => op === OpCode.IF || op === OpCode.ELSEIF || op === OpCode.ENDIF)).toEqual([OpCode.IF, OpCode.ELSEIF, OpCode.ENDIF])
+            // however many clauses, in both modes
+            const clauses = Array.from({ length: 1000 }, (_, i) => `((= x ${i}) ${i})`).join(" ")
+            expect(run(`(define (ch-big x) (cond ${clauses} (else -1))) (list (ch-big 0) (ch-big 999) (ch-big 1000))`)).toBe("(0 999 -1)")
         })
 
         it('compiles builtin calls to intrinsics, and passes builtins as the prelude procedures', () => {

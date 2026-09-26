@@ -71,6 +71,7 @@ export enum OpCode {
                  //                    HostTail result is called in its place
     CALLINT,     // pos dst start n    reg[dst] = the leaf intrinsic at pos in the code's table applied to reg[start .. start+n)
     APPLYINT,    // pos dst start n    like CALLINT, with the last argument a list spread into the arguments (count checked here)
+    ELSEIF,      // cond elseIp        like IF, for a later condition of the same chain (IF ... ELSE end; ELSEIF ... ELSE end; ... ENDIF)
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -112,6 +113,7 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.CALLHOST]: 5,
     [OpCode.CALLINT]: 5,
     [OpCode.APPLYINT]: 5,
+    [OpCode.ELSEIF]: 3,
 };
 
 // UNPACK flags
@@ -1316,7 +1318,8 @@ export class BytecodeInterpreter {
                         ctx.scope.set(constants[inst[ip++]], regs[srcReg]);
                         break;
                     }
-                    case OpCode.IF: {
+                    case OpCode.IF:
+                    case OpCode.ELSEIF: {
                         const condReg = inst[ip++];
                         const elseOffset = inst[ip++];
                         if (!isTruthy(regs[condReg])) {
@@ -1604,7 +1607,7 @@ type AotTerm = { at?: number } & (
     // `escape` jumps leave a %block early; `loopBack` jumps close a %loop
     | { k: "Jump"; target: number; escape?: boolean; loopBack?: boolean }
     | { k: "Block" | "Loop"; body: number; end: number }
-    | { k: "Branch"; cond: number; then: number; else: number }
+    | { k: "Branch"; cond: number; then: number; else: number; elseif: boolean }
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean }
@@ -1744,6 +1747,7 @@ export class AotCompiler {
 
             switch (opcode) {
                 case OpCode.IF:
+                case OpCode.ELSEIF:
                     blocks.add(nextIp);
                     blocks.add(inst[ip + 2]);
                     break;
@@ -1832,10 +1836,11 @@ export class AotCompiler {
                         insts.push({ k: "NewClosure", dst, tmpl: tmplIdx, captures: (code.constants[tmplIdx] as ClosureTemplate).upvarLocs });
                         break;
                     }
-                    case OpCode.IF: {
+                    case OpCode.IF:
+                    case OpCode.ELSEIF: {
                         const cond = inst[ip++];
                         const elseIp = inst[ip++];
-                        term = { k: "Branch", cond, then: ip, else: elseIp };
+                        term = { k: "Branch", cond, then: ip, else: elseIp, elseif: opcode === OpCode.ELSEIF };
                         break;
                     }
                     case OpCode.ELSE:
@@ -2682,6 +2687,21 @@ class DirectEmitter extends FunctionEmitter {
     // MAX_STRUCTURED_NESTING the direct entry falls back to switch dispatch
     #nesting = 0;
 
+    // the labels of the if chains being walked, by the ip of their end
+    readonly #chains = new Map<number, string>();
+
+    // whether the else branch of the if ending at endIp starts an ELSEIF of the same chain (whose then branch ends with
+    // ELSE endIp; a nested if's chain has its own end)
+    #hasElseIf(elseIp: number, endIp: number): boolean {
+        const inst = this.inst;
+        for (let ip = elseIp; ip < endIp - 1; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) {
+            if (inst[ip] !== OpCode.ELSEIF) continue;
+            const target = inst[ip + 2];
+            if (inst[target - 2] === OpCode.ELSE && inst[target - 1] === endIp) return true;
+        }
+        return false;
+    }
+
     #walk(index: Map<number, number>, from: number, stop: number): void {
         const { blocks, inst } = this;
         let i = index.get(from);
@@ -2707,11 +2727,35 @@ class DirectEmitter extends FunctionEmitter {
                 if (term.then !== next || inst[elseIp - 2] !== OpCode.ELSE) throw STRUCTURE_MISMATCH;
                 const endIp = inst[elseIp - 1];
                 if (inst[endIp - 1] !== OpCode.ENDIF) throw STRUCTURE_MISMATCH;
-                this.emit(`if (isTruthy(r${term.cond})) {`);
-                this.#walk(index, term.then, elseIp - 2);
-                this.emit(`} else {`);
-                this.#walk(index, elseIp, endIp - 1);
-                this.emit(`}`);
+                // a later clause of the chain being walked: a sibling of the first, leaving the chain's block when taken
+                if (term.elseif) {
+                    const chain = this.#chains.get(endIp);
+                    if (chain === undefined) throw STRUCTURE_MISMATCH;
+                    this.emit(`if (isTruthy(r${term.cond})) {`);
+                    this.#walk(index, term.then, elseIp - 2);
+                    this.emit(`break ${chain}; }`);
+                    i = index.get(elseIp);
+                    if (i === undefined) throw STRUCTURE_MISMATCH;
+                    continue;
+                }
+                if (this.#hasElseIf(elseIp, endIp)) {
+                    // a chain is flat: C: { if (c1) { e1; break C; } <c2> if (c2) { e2; break C; } ... else }
+                    const chain = `C${block.start}`;
+                    this.#chains.set(endIp, chain);
+                    this.emit(`${chain}: {`);
+                    this.emit(`if (isTruthy(r${term.cond})) {`);
+                    this.#walk(index, term.then, elseIp - 2);
+                    this.emit(`break ${chain}; }`);
+                    this.#walk(index, elseIp, endIp - 1);
+                    this.emit(`}`);
+                    this.#chains.delete(endIp);
+                } else {
+                    this.emit(`if (isTruthy(r${term.cond})) {`);
+                    this.#walk(index, term.then, elseIp - 2);
+                    this.emit(`} else {`);
+                    this.#walk(index, elseIp, endIp - 1);
+                    this.emit(`}`);
+                }
                 if (endIp >= stop) return;
                 i = index.get(endIp);
                 if (i === undefined) throw STRUCTURE_MISMATCH;

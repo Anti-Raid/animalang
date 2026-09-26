@@ -174,8 +174,10 @@ const namedLetAsLoop = (evaluator: MacroEvaluator, name: symbol, params: symbol[
                 if (binds(e.cdr.car) || !mentions(e.cdr.cdr)) return e;
                 throw NOT_A_LOOP;
             case CORE_IF: {
-                const [cond, then, otherwise] = e.toArray().slice(1);
-                return keepPos(list(CORE_IF, rw(cond, false, blocks), rw(then, tail, blocks), rw(otherwise, tail, blocks)), e);
+                // conditions are values, branches (and the final else) are in the %if's tail position
+                const args = e.toArray().slice(1);
+                const isBranch = (i: number) => i % 2 === 1 || i === args.length - 1;
+                return keepPos(cons(CORE_IF, fromArray(args.map((a, i) => rw(a, tail && isBranch(i), blocks)))), e);
             }
             case CORE_BEGIN:
                 return keepPos(cons(CORE_BEGIN, seq(e.cdr, tail, blocks)), e);
@@ -242,11 +244,15 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         evaluator.registerTransform(core, lowerTo(core, validate, state));
     };
 
-    coreForm(OP_IF, CORE_IF, orig => {
+    evaluator.registerTransform(OP_IF, lowerTo(CORE_IF, orig => {
         if (orig.length !== 4) {
             throw new Error(`if condition must be in format ["if", condition, true_expr, false_expr] but only have ${orig.length - 1} arguments`);
         }
-    });
+    }));
+    // (%if c1 e1 c2 e2 ... [else]), e.g. from a transpiler's if/elseif/else
+    evaluator.registerTransform(CORE_IF, lowerTo(CORE_IF, orig => {
+        if (orig.length < 3) throw new Error(`%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else])`);
+    }));
     coreForm(OP_BEGIN, CORE_BEGIN, () => {});
     // quoted data is never transformed
     coreForm(OP_QUOTE, CORE_QUOTE, orig => {
@@ -356,25 +362,24 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     evaluator.registerTransform(OP_COND, (evaluator, expr, orig) => {
         if (expr === null) return { expanded: undefined, state: TransformState.ReturnImm };
 
+        // one flat (%if c1 e1 c2 e2 ... [else]), however many clauses
         const clauses = toArray(expr);
-        let result: any = undefined; 
-        for (let i = clauses.length - 1; i >= 0; i--) {
+        const args: any[] = [];
+        for (let i = 0; i < clauses.length; i++) {
             const clause = clauses[i];
             if (!(clause instanceof Cons) || !(clause.cdr instanceof Cons)) {
                 throw new Error(`cond clause must be a list of at least 2 elements: (condition expr...)`);
             }
-
-            const condition = clause.car;
-            const resultExpr = wrapMulti(clause.cdr);
-
-            if (condition === OP_ELSE) {
+            if (clause.car === OP_ELSE) {
                 if (i !== clauses.length - 1) throw new Error("else must be the final clause in a cond statement");
-                result = resultExpr;
+                args.push(wrapMulti(clause.cdr));
             } else {
-                result = list(OP_IF, condition, resultExpr, result);
+                args.push(clause.car, wrapMulti(clause.cdr));
             }
         }
-        return { expanded: result, state: TransformState.Recurse };
+        // a cond of only an else clause is just its body
+        if (args.length === 1) return { expanded: args[0], state: TransformState.Recurse };
+        return { expanded: cons(CORE_IF, fromArray(args)), state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(OP_LET, (evaluator, expr, orig) => {        

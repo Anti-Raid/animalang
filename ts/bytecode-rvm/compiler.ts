@@ -243,33 +243,27 @@ export class Compiler {
     }
 
     // compiles both if calls as well as code that is converted into if calls
+    // (%if c1 e1 c2 e2 ... [else]): the first ei whose ci is true, else `else` (or <#void>). One chain whatever the number
+    // of clauses: IF c1 L1; e1; ELSE end; L1: <c2>; ELSEIF c2 L2; e2; ELSE end; L2: ...; else; ENDIF; end:
     #compileIfCall(expr: Cons, opts: CmpOpts) {
-        if (expr.length !== 4) {
-            throw new Error(`if condition must be in format ["if", condition, true_expr, false_expr] but only have ${expr.length-1} arguments`)
+        const args = expr.cdr instanceof Cons ? expr.cdr.toArray() : []
+        if (args.length < 2) {
+            throw new Error(`%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else]), but got ${args.length} arguments`)
         }
-
-        const cond = expr.cdr.car;
-        const thenExpr = expr.cdr.cdr.car;
-        const elseExpr = expr.cdr.cdr.cdr.car;
-
-        // We need to compile the first arg first and leave it to a temp reg
-        const condReg = opts.scope.allocTemp()
-        this.#compile(cond, { ...opts, destReg: condReg, isTail: false })
-        // we place the bytecode as <jumpiffalse [false code]><true code><jump [|]><false code>|
-        const falseLabel = new JumpLabel()
         const endLabel = new JumpLabel()
-        opts.nodes.push({t: "If", reg: condReg, elseLabel: falseLabel})
-        opts.scope.freeTemp(condReg) // we can free the reg here
-        // Place true code
-        this.#compile(thenExpr, opts)
-        // Place else separator
-        opts.nodes.push({t: "Else", endLabel})
-        // Place false code as well as jump to start of false code
-        opts.nodes.push({t:"Label", label: falseLabel})
-        this.#compile(elseExpr, opts)
-        // Place EndIf and end label
-        opts.nodes.push({t: "EndIf"})
-        opts.nodes.push({t: "Label", label: endLabel})
+        for (let i = 0; i + 1 < args.length; i += 2) {
+            const condReg = opts.scope.allocTemp()
+            this.#compile(args[i], { ...opts, destReg: condReg, isTail: false })
+            const nextLabel = new JumpLabel()
+            opts.nodes.push({ t: i === 0 ? "If" : "ElseIf", reg: condReg, elseLabel: nextLabel })
+            opts.scope.freeTemp(condReg)
+            this.#compile(args[i + 1], opts)
+            opts.nodes.push({ t: "Else", endLabel })
+            opts.nodes.push({ t: "Label", label: nextLabel })
+        }
+        this.#compile(args.length % 2 === 1 ? args[args.length - 1] : undefined, opts)
+        opts.nodes.push({ t: "EndIf" })
+        opts.nodes.push({ t: "Label", label: endLabel })
     }
 
     #compileQuote(expr: Cons, opts: CmpOpts) {
