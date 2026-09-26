@@ -38,6 +38,8 @@ export class ByteCode implements SerializableBytecode {
     // how often direct code of this function resumed a coroutine in a nested driver loop: past a few, it suspends to heap
     // frames instead, where resuming is a cheap switch inside one loop
     public nestedResumes: number = 0;
+    // the VM's own helper code (see helperClosure), left out of tracebacks and frame lists
+    public internal: boolean = false;
     // how often a tail call from this function's heap code into a direct entry came back as a Suspend (e.g. a long chain
     // of tail calls reaching the depth limit): past a few, its heap code tail calls through heap frames, which run such
     // chains in constant space without unwinding the js stack

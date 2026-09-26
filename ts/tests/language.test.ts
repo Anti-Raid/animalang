@@ -433,6 +433,25 @@ describe('Anima', () => {
             expect(run("host-unwound")).toBe("#t");
         });
 
+        it('coroutine-create with a finally thunk', () => {
+            run(`(define fin-log '()) (define (fin-co tag body) (coroutine-create body (lambda () (set! fin-log (cons tag fin-log)))))`);
+            // runs once the body is left for good: a return (after which its values are the resume's), not a yield
+            expect(run(`(define fc1 (fin-co 'returned (lambda (x) (coroutine-yield x) (values 1 2))))
+                        (list (coroutine-resume fc1 'a) fin-log (call-with-values (lambda () (coroutine-resume fc1)) list) fin-log (coroutine-status fc1))`)).toBe("(a () (1 2) (returned) dead)");
+            // an error, raised by the coroutine or into it, and a close
+            expect(run(`(define fc2 (fin-co 'errored (lambda () (coroutine-yield 1) (raise 'x)))) (coroutine-resume fc2)
+                        (list (try (lambda () (coroutine-resume fc2)) (lambda (e) e)) (car fin-log))`)).toBe("(x errored)");
+            expect(run(`(define fc3 (fin-co 'raised-in (lambda () (coroutine-yield 1)))) (coroutine-resume fc3)
+                        (list (try (lambda () (coroutine-raise fc3 'y)) (lambda (e) e)) (car fin-log))`)).toBe("(y raised-in)");
+            expect(run(`(define fc4 (fin-co 'closed (lambda () (coroutine-yield 1)))) (coroutine-resume fc4) (coroutine-close fc4) (car fin-log)`)).toBe("closed");
+            // not for a coroutine that never started
+            expect(run(`(define fc5 (fin-co 'never (lambda () 1))) (coroutine-close fc5) (car fin-log)`)).toBe("closed");
+            // as a value, and out of tracebacks
+            expect(run(`(let ((f coroutine-create)) (list (coroutine-resume (f (lambda () 'v) (lambda () (set! fin-log (cons 'as-value fin-log))))) (car fin-log)))`)).toBe("(v as-value)");
+            expect(run(`(coroutine-resume (fin-co 'tb (lambda () (debug-traceback))))`)).not.toContain("coroutine-finally");
+            expect(run(`(try (lambda () (coroutine-create (lambda () 1) 5)) (lambda (e) (error-message e)))`)).toBe('"coroutine-create: expected a finally procedure but got 5"');
+        });
+
         it('multiple values', () => {
             expect(run("(call-with-values (lambda () (values 1 2)) +)")).toBe("3");
             expect(run("(call-with-values (lambda () 5) list)")).toBe("(5)");

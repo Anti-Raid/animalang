@@ -398,7 +398,7 @@ export const SCHEME_ALIASES: ReadonlyMap<symbol, SchemeAlias> = new Map([
     alias("dynamic-wind", "%dynamic-wind", 3, 3),
     alias("raise", "%raise", 1, 1),
     alias("apply", "%apply", 2, Infinity),
-    alias("coroutine-create", "%coroutine-create", 1, 1),
+    alias("coroutine-create", "%coroutine-create", 1, 2, true),
     alias("coroutine-status", "%coroutine-status", 1, 1),
     alias("coroutine-close", "%coroutine-close", 1, 1),
     alias("coroutine-resume", "%coroutine-resume", 1, Infinity),

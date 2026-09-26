@@ -126,7 +126,8 @@ export class Coroutine extends OpaqueValue {
     public resumer: { ctx: ExecutionContext, frame: Frame | null, marks: Marks, mframe: number } | null = null;
     public readonly ctx: ExecutionContext;
 
-    constructor(public readonly proc: any, vm: VMHost, scope: Env) {
+    // `fin`: a thunk run when the coroutine is left for good (it returns, dies with an error or is closed), once started
+    constructor(public readonly proc: any, vm: VMHost, scope: Env, public readonly fin: any = null) {
         super();
         this.ctx = new ExecutionContext(vm, scope);
         this.ctx.coroutine = this;
@@ -345,8 +346,9 @@ export class StackSnapshot extends OpaqueValue {
 
 export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] => {
     const out: FrameInfo[] = [];
-    for (let f = frame, i = 0; f !== null; f = f.parent, i++) {
-        if (i >= level) out.push({
+    for (let f = frame, i = 0; f !== null; f = f.parent) {
+        if (f.code.internal) continue;
+        if (i++ >= level) out.push({
             name: f.debugName,
             pos: f.code.positionAt(Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)),
             tails: markOwn(f.marks, f.mframe, TAIL_TRAIL, null),

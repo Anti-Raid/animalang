@@ -234,7 +234,8 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     const deps = { Cons, MultipleValues, WindPoint, Caught, EXCEPTION_HANDLERS };
     const core = (name: string, args: [number, number], fn: IntrinsicFn, options: Omit<IntrinsicOptions, "args" | "deps"> = {}) =>
         table.register(name, fn, { args, leaf: true, ...options, deps: options.inline === undefined ? undefined : deps });
-    core("%coroutine-create", [1, 1], (regs, start, nargs, ctx, executor) => executor.coCreate(ctx, regs[start]), { context: true });
+    // (%coroutine-create proc [finally]): finally is a thunk run when the coroutine, once started, is left for good
+    core("%coroutine-create", [1, 2], (regs, start, nargs, ctx, executor) => executor.coCreate(ctx, regs[start], nargs === 2 ? regs[start + 1] : null), { context: true });
     core("%coroutine-status", [1, 1], (regs, start, nargs, ctx, executor) => executor.coStatus(regs[start]), { context: true });
     // closing a coroutine runs its dynamic-wind after-thunks
     core("%coroutine-close", [1, 1], (regs, start, nargs, ctx, executor) => { executor.coClose(ctx, regs[start]); }, { context: true, leaf: false });

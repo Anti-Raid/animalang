@@ -1,6 +1,6 @@
 // VMExecutor: calls, returns, continuations, dynamic-wind, exception delivery and coroutines, and the driver loop that
 // runs heap frames through the interpreter or AOT code
-import { Env, ErrorObject, UnhandledError, packValues } from "../common";
+import { Env, ErrorObject, IProcedure, UnhandledError, packValues } from "../common";
 import { hostError } from "../errors";
 import { Cons } from "../list";
 import { Caught, EXCEPTION_HANDLERS, markFirst, markSet } from "../marks";
@@ -12,13 +12,14 @@ import type { VMHost } from "./bytecode";
 import { CORE_INTRINSICS, corePos, tracebackMessage } from "./coreops";
 import { BytecodeInterpreter, OpCode } from "./interpreter";
 import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
-import { CatchToken, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, ReRaise, VMContinuation, caughtValue, computeWindTransition, countControlSuspend, formatTraceback, frameInfos } from "./values";
-import type { Suspend, WindPoint } from "./values";
+import { CatchToken, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, ReRaise, VMContinuation, WindPoint, caughtValue, computeWindTransition, countControlSuspend, formatTraceback, frameInfos } from "./values";
+import type { Suspend } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
-// register 0 with what a pre-unwind handler returned
-export let helpers: { handlerReturned: Closure, escapeWith: Closure } | null = null;
+// register 0 with what a pre-unwind handler returned. `coroutineFinally` is under the procedure of a coroutine with a
+// finally thunk (in its register 1): it leaves the thunk's wind and calls it, then returns the procedure's value
+export let helpers: { handlerReturned: Closure, escapeWith: Closure, coroutineFinally: Closure } | null = null;
 export const raiseHelpers = () => helpers ??= {
     handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [
         OpCode.LOADCONST, 0, 0,
@@ -30,13 +31,20 @@ export const raiseHelpers = () => helpers ??= {
         OpCode.CALLINT, corePos("%make-caught"), 2, 1, 1,
         OpCode.CALL, 0, 2, 1, 1,
     ]),
+    coroutineFinally: helperClosure(3, [], [
+        OpCode.MOVEACC, 0,
+        OpCode.CALLCTX, corePos("%end-wind"), 2, 0, 0,
+        OpCode.CALL, 1, 0, 0, 0,
+        OpCode.RETURN, 0,
+    ], "coroutine-finally"),
 };
-export const helperClosure = (numReg: number, constants: any[], inst: number[]): Closure => {
+export const helperClosure = (numReg: number, constants: any[], inst: number[], name: string = "raise"): Closure => {
     const positions = new Set<number>();
     for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip]]) for (const off of INTRINSIC_OPERANDS[inst[ip]]) positions.add(inst[ip + off]);
     const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
     const code = new ByteCode(constants, new Uint32Array(inst), numReg, undefined, undefined, false, CORE_INTRINSICS, used);
-    return new Closure(new ClosureTemplate([], null, code, [], "raise"), [], "raise");
+    code.internal = true;
+    return new Closure(new ClosureTemplate([], null, code, [], name), [], name);
 };
 
 export class VMExecutor {
@@ -333,11 +341,14 @@ export class VMExecutor {
 
     // --- coroutines ---
 
-    public coCreate(ctx: ExecutionContext, proc: any): Coroutine {
+    public coCreate(ctx: ExecutionContext, proc: any, fin: any = null): Coroutine {
         if (!(proc instanceof Closure)) {
             throw hostError(`coroutine-create: expected a procedure but got ${String(proc)}`);
         }
-        return new Coroutine(proc, ctx.vm, ctx.scope);
+        if (fin !== null && !(fin instanceof IProcedure)) {
+            throw hostError(`coroutine-create: expected a finally procedure but got ${String(fin)}`);
+        }
+        return new Coroutine(proc, ctx.vm, ctx.scope, fin);
     }
 
     public coStatus(co: any): symbol {
@@ -369,7 +380,14 @@ export class VMExecutor {
             co.started = true;
             // raised into a coroutine that never ran: there is no handler, so it dies with the error
             if (raising) return this.raise(co.ctx, null, args[0], false);
-            return this.invoke(co.ctx, co.proc, null, args, 0, args.length, false);
+            let bottom: Frame | null = null;
+            // the procedure runs as the body of a dynamic-wind whose after thunk is `fin`, returning through the frame
+            // that leaves it and calls it (so an error or close runs it too, as the coroutine's pending after thunk)
+            if (co.fin !== null) {
+                co.ctx.wind = new WindPoint(null, null, co.fin);
+                bottom = new Frame(raiseHelpers().coroutineFinally, [undefined, co.fin, undefined], 0, null, co.ctx);
+            }
+            return this.invoke(co.ctx, co.proc, bottom, args, 0, args.length, false);
         }
         const frame = co.frame;
         co.frame = null;
