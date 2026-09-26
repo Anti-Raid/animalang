@@ -794,8 +794,11 @@ describe('Anima', () => {
             // shadowed by a local of the same name: that one is a list, spread as a list
             expect(run(`(define (nf-shadow . xs) (let ((xs (list 5 6))) (%apply %+ xs))) (nf-shadow 1)`)).toBe("11")
             expect(run(`(define (nf-inner . xs) (let ((xs (list 5 6))) (%apply %+ xs)) (%apply %* xs)) (nf-inner 2 3)`)).toBe("6")
-            const bc = evaluator.compileRaw(`(define (nf-t . xs) (%apply %+ xs) xs)`) as ByteCode
-            expect(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.restArray).toBe(false)
+            // read as a value, captured by a nested lambda, or reassigned: the closure keeps the list path
+            for (const src of [`(define (nf-t . xs) (%apply %+ xs) xs)`, `(define (nf-t . xs) (lambda () (%apply %+ xs)))`, `(define (nf-t . xs) (set! xs (cdr xs)) (%apply %+ xs))`]) {
+                const bc = evaluator.compileRaw(src) as ByteCode
+                expect(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.restArray).toBe(false)
+            }
         });
     });
 
