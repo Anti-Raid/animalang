@@ -252,14 +252,20 @@ export class ASP {
                     }
 
                     if (this.#supportsDottedPairs && tokens[current] === '.') {
+                        if (lst.length === 0) {
+                            throw new ASPParseError(`Syntax error: '.' must follow at least one expression`, current);
+                        }
                         current++; // consume .
                         if (tokens[current] === expectedClose) {
-                            throw new Error(`Syntax error: trailing '.' is not allowed`);
+                            throw new ASPParseError(`Syntax error: trailing '.' is not allowed`, current);
                         }
                         // Parse rest and make sure its the final guy
                         rest = walk();
+                        if (current >= tokens.length || (tokens[current] !== expectedClose && ASP_CLOSING_TOKENS.has(tokens[current]))) {
+                            throw new ASPParseError(`Mismatched or missing closing bracket for '${token}'`, current);
+                        }
                         if (tokens[current] !== expectedClose) {
-                            throw new Error(`Syntax error: multiple expressions after '.' is not allowed`);
+                            throw new ASPParseError(`Syntax error: multiple expressions after '.' is not allowed`, current, tokens[current]);
                         }
                         current++;
                         isDotted = true;

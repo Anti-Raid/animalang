@@ -2570,6 +2570,21 @@ describe('Tables (using Table class)', () => {
         expect(() => evaluator.compileRaw('(list 1 2 }')).toThrow(ASPParseError);
     });
 
+    it('throws on malformed dotted pairs', () => {
+        expect(() => evaluator.compileRaw("'(. 1)")).toThrow(ASPParseError);
+        expect(() => evaluator.compileRaw("'(. 1)")).toThrow("'.' must follow at least one expression");
+        expect(() => evaluator.compileRaw("'(a .)")).toThrow(ASPParseError);
+        expect(() => evaluator.compileRaw("'(a .)")).toThrow("trailing '.' is not allowed");
+        expect(() => evaluator.compileRaw("'(a . b c)")).toThrow(ASPParseError);
+        expect(() => evaluator.compileRaw("'(a . b c)")).toThrow("multiple expressions after '.' is not allowed");
+        expect(() => evaluator.compileRaw("'(a . b")).toThrow("missing closing bracket for '('");
+        expect(() => evaluator.compileRaw("'(a . b]")).toThrow("Mismatched or missing closing bracket for '('");
+        const err = (() => { try { evaluator.compileRaw("'(a . b c)") } catch (e) { return e } })() as ASPParseError;
+        expect(err.pos).toBeTypeOf("number");
+        expect(err.curtok).toBe("c");
+        expect(s.stringify(evaluator.evaluateRaw(evaluator.compileRaw("'(a . b)")))).toBe("(a . b)");
+    });
+
     it('tests table? predicate', () => {
         expect(run("(table? {})")).toBe("#t");
         expect(run('(table? (table "a" 1))')).toBe("#t");
