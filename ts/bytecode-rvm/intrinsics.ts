@@ -46,7 +46,15 @@ export class Intrinsics {
     // and the procedures it provides ("builtin")
     readonly reserved = new Map<symbol, "special form" | "builtin">()
 
-    constructor(private readonly taken: (sym: symbol) => boolean = () => false) {}
+    // `base`: a table to start from (its entries at the same positions, and its reserved names)
+    constructor(private readonly taken: (sym: symbol) => boolean = () => false, base?: Intrinsics) {
+        if (base === undefined) return
+        this.entries.push(...base.entries)
+        this.fns.push(...base.fns)
+        this.deps.push(...base.deps)
+        for (const [sym, pos] of base.#bySym) this.#bySym.set(sym, pos)
+        for (const [sym, kind] of base.reserved) this.reserved.set(sym, kind)
+    }
 
     get frozen(): boolean {
         return this.#frozen

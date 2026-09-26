@@ -213,6 +213,29 @@ export class ByteCode implements AbstractByteCode {
             (c instanceof ClosureTemplate && c.code.usesIntrinsics) || (c instanceof Closure && c.tmpl.code.usesIntrinsics));
     }
 
+    // whether this code (and all it contains) would call the same thing through `table` as through its own: every
+    // intrinsic it uses is there at the same position, with the same function, template and deps
+    runsWith(table: Intrinsics | null): boolean {
+        if (table === this.table || !this.usesIntrinsics) return true;
+        const own = this.table;
+        if (table === null || own === null) return false;
+        for (const { pos } of this.intrinsics) {
+            const mine: Intrinsic = own.entries[pos];
+            const theirs: Intrinsic | undefined = table.entries[pos];
+            // a table copied from this code's (or from the same base) holds the very same entry
+            if (theirs !== mine) {
+                if (theirs === undefined || theirs.name !== mine.name || theirs.fn !== mine.fn || theirs.leaf !== mine.leaf || theirs.inline !== mine.inline) return false;
+                for (const dep in mine.deps) if (theirs.deps[dep] !== mine.deps[dep]) return false;
+                for (const dep in theirs.deps) if (!(dep in mine.deps)) return false;
+            }
+            for (const dep in mine.deps) {
+                const slot = +mine.deps[dep].substring(1);
+                if (table.deps[slot] !== own.deps[slot]) return false;
+            }
+        }
+        return this.constants.every(c => !(c instanceof ClosureTemplate || c instanceof Closure) || (c instanceof Closure ? c.tmpl.code : c.code).runsWith(table));
+    }
+
     // a copy with its own runtime state, bound to `table`; copies share instructions unless binding moves positions
     fresh(copies: Map<ByteCode, ByteCode> = new Map(), table: Intrinsics | null = this.table): ByteCode {
         const known = copies.get(this);
@@ -224,7 +247,7 @@ export class ByteCode implements AbstractByteCode {
         copy.constants = this.constants.map(c => {
             if (c instanceof ClosureTemplate) return new ClosureTemplate(c.params, c.remParams, c.code.fresh(copies, table), c.upvarLocs, c.name);
             // a closure with no upvars (made once, when compiled) is shared by the copies, unless it must be bound
-            if (c instanceof Closure && c.tmpl.code.usesIntrinsics && c.tmpl.code.table !== table) {
+            if (c instanceof Closure && !c.tmpl.code.runsWith(table)) {
                 const tmpl = c.tmpl;
                 return Closure.fromTemplate(new ClosureTemplate(tmpl.params, tmpl.remParams, tmpl.code.fresh(copies, table), tmpl.upvarLocs, tmpl.name), c.debugName);
             }
@@ -1628,6 +1651,9 @@ const STRUCTURE_MISMATCH = Symbol("structure mismatch");
 
 const MAX_STRUCTURED_NESTING = 250;
 
+// what generated source depends on in an intrinsic it calls (not its function, so a cached source keeps none alive)
+type SourceUse = Pick<Intrinsic, "pos" | "inline" | "deps">;
+
 export class AotCompiler {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
         let frame: Frame | null = initialFrame;
@@ -1686,39 +1712,48 @@ export class AotCompiler {
         return resume;
     }
 
-    // generated source of shared instruction arrays: copies of a ByteCode (ByteCode.fresh) only build their own functions.
-    // Source that calls intrinsics depends on their table (positions, inline templates), so it is cached per table
-    static readonly #sources = new WeakMap<Uint32Array, string>();
-    static readonly #tableSources = new WeakMap<Intrinsics, WeakMap<Uint32Array, string>>();
+    // the compiled source of shared instruction arrays: copies of a ByteCode (ByteCode.fresh) only build their own functions.
+    // Source that calls intrinsics also depends on what they generate: their positions, inline templates and deps' locals.
+    // Instances that register the same intrinsics the same way (e.g. from the same front end) share it
+    static readonly #sources = new WeakMap<Uint32Array, { uses: readonly SourceUse[], factory: Function }[]>();
 
-    static #sourceCache(code: ByteCode): WeakMap<Uint32Array, string> {
-        if (code.intrinsics.length === 0) return this.#sources;
-        let cache = this.#tableSources.get(code.table!);
-        if (cache === undefined) this.#tableSources.set(code.table!, cache = new WeakMap());
-        return cache;
+    static #sameUses(a: readonly SourceUse[], b: readonly SourceUse[]): boolean {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            const x = a[i], y = b[i];
+            if (x.pos !== y.pos || x.inline !== y.inline) return false;
+            const dx = Object.entries(x.deps), dy = y.deps;
+            if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
+        }
+        return true;
     }
 
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        const cache = this.#sourceCache(code);
-        let source = cache.get(code.inst);
-        if (source === undefined) {
-            source = this.generateSource(code, tmpl);
-            if (SHARED_INSTS.has(code.inst)) cache.set(code.inst, source);
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps } = code.table!.entries[pos]; return { pos, inline, deps }; });
+        let variants = this.#sources.get(code.inst);
+        let factory = variants?.find(v => this.#sameUses(v.uses, uses))?.factory;
+        if (factory === undefined) {
+            // parsing the source is most of the cost, so copies share the factory and only call it for their own functions
+            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl));
+            if (SHARED_INSTS.has(code.inst)) {
+                if (variants === undefined) this.#sources.set(code.inst, variants = []);
+                variants.push({ uses, factory });
+            }
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
-        const factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "RT", "DEPS", source);
         return factory(...Object.values(JIT_DEPS), code.constants, globalCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 
     public static generateSource(code: ByteCode, tmpl?: ClosureTemplate): string {
         if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
         const blocks = this.buildAot(code, tmpl);
-        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug, code.table);
+        const usedDeps = new Set<string>();
+        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps);
         resume.emitFunction();
         let direct = "null";
         if (tmpl !== undefined) {
-            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug, code.table);
+            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps);
             out.emitFunction(tmpl.params.length + (tmpl.remParams !== null ? 1 : 0), tmpl.remParams !== null);
             direct = out.toString();
         }
@@ -1726,7 +1761,7 @@ export class AotCompiler {
         // positions never change once registered, so each intrinsic's function and deps are read once, into locals
         const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
         const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
-        const deps = [...new Set(used.flatMap(entry => Object.values(entry.deps)))].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
+        const deps = [...usedDeps].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
         return `${caches}${fns}${deps}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
     }
 
@@ -2135,10 +2170,13 @@ export class CodeEmitter {
 
 // emits one entry point of a compiled function; subclasses decide how registers reach callees, how values come back and how control leaves
 // the `d` an intrinsic's inline template gets: the local names of its deps, where a name it did not declare is an error
-const inlineDeps = (entry: Intrinsic): Readonly<Record<string, string>> => new Proxy(entry.deps, {
+// the `d` an intrinsic's inline template gets: the local names of its deps (recorded in `used`, as only those are set up),
+// where a name it did not declare is an error
+const inlineDeps = (entry: Intrinsic, used: Set<string>): Readonly<Record<string, string>> => new Proxy(entry.deps, {
     get(target, key) {
         if (typeof key !== "string") return undefined;
         if (!Object.hasOwn(target, key)) throw new Error(`the inline template of '${entry.name}' uses '${key}', which is not in its deps`);
+        used.add(target[key]);
         return target[key];
     },
 });
@@ -2150,7 +2188,9 @@ abstract class FunctionEmitter extends CodeEmitter {
         protected readonly numReg: number,
         protected readonly debug: boolean = false,
         // the table the code is bound to: its intrinsics are the hoisted locals I<pos>, their deps D<slot>
-        protected readonly table: Intrinsics | null = null
+        protected readonly table: Intrinsics | null = null,
+        // the deps' locals the inline templates used (shared by the emitters of one function)
+        readonly usedDeps: Set<string> = new Set()
     ) {
         super();
     }
@@ -2319,13 +2359,15 @@ abstract class FunctionEmitter extends CodeEmitter {
         }
     }
 
-    // an expression calling the intrinsic at `pos`: its inline template, whose fallback is a call of its function (the
-    // hoisted local I<pos>) over the register window
+    // an expression calling the intrinsic at `pos`: its inline template, whose fallback is a call of its function over the
+    // register window. A call that is the fast path goes through the hoisted local I<pos>, which V8 may inline; a template's
+    // fallback goes through RT[pos], so V8 does not inline the function into the cold path (which slows the hot one)
     protected intrinsicCall(pos: number, start: number, nargs: number): string {
         const entry = this.table!.entries[pos];
         const direct = this.windowCall(`I${pos}`, start, nargs);
         if (entry.inline === undefined) return direct;
-        return entry.inline(windowRegs(start, nargs).map(r => `r${r}`), direct, "tmp", inlineDeps(entry)) ?? direct;
+        const inlined = entry.inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`RT[${pos}]`, start, nargs), "tmp", inlineDeps(entry, this.usedDeps));
+        return inlined ?? direct;
     }
 
 }
@@ -2340,8 +2382,8 @@ class ResumeEmitter extends FunctionEmitter {
     protected readonly mframeVar = "frame.mframe";
     readonly #liveness: Liveness;
 
-    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false, table: Intrinsics | null = null) {
-        super(blocks, inst, numReg, debug, table);
+    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false, table: Intrinsics | null = null, usedDeps: Set<string> = new Set()) {
+        super(blocks, inst, numReg, debug, table, usedDeps);
         this.#liveness = new Liveness(blocks, numReg);
     }
     // follows jumps through empty blocks (left by loops and blocks) to where control really goes, saving dispatches
@@ -2669,7 +2711,7 @@ class DirectEmitter extends FunctionEmitter {
 
     // direct-entry code never resumes mid-function, so compiled `if`s (IF c else ... ELSE end, else: ... ENDIF, end:) can be emitted as nested js if/else
     #structuredBody(): string | null {
-        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug, this.table);
+        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug, this.table, this.usedDeps);
         body.#selfArity = this.#selfArity;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {

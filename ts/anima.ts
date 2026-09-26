@@ -41,9 +41,10 @@ export class Anima {
         return this.#impl
     }
 
-    constructor(impl: AnimaMeta, readonly maxSteps: number = 0) {
+    // `base`: intrinsics (and reserved names) to start with, e.g. a front end's
+    constructor(impl: AnimaMeta, readonly maxSteps: number = 0, base?: Intrinsics) {
         this.#impl = impl
-        this.#intrinsics = new Intrinsics(isCompilerIntrinsic)
+        this.#intrinsics = new Intrinsics(isCompilerIntrinsic, base)
         this.#vm = impl.vm(maxSteps, this.#intrinsics)
         this.#comp = impl.compiler(this.#intrinsics)
     }

@@ -2,6 +2,7 @@ import { AbstractByteCode, AbstractCompiler, AbstractVM, IProcedure, Env } from 
 import type { Intrinsics } from "../bytecode-rvm/intrinsics";
 import { ASP } from "./reader";
 import { BUILTIN_WRAPPERS } from "./intrinsics";
+import { schemeBase } from "./base";
 import type { MacroEvaluator } from "./transformer/macro";
 
 export const stdPreludeScope = () => new Env()
@@ -96,7 +97,8 @@ export const STD_PRELUDE = `
 // compiled once per implementation; each VM runs its own copy, with its own adaptive state, whose AOT code is built from
 // source generated once
 // compiled once, for every implementation (the prelude is never debug code, and AOT code is built from bytecode later, per
-// VM), and kept unbound so the cache holds no instance's intrinsics; each instance runs its own copy, bound by name
+// VM), and bound to the frozen Scheme base table, so the cache holds no instance's intrinsics; each instance runs its own
+// copy, bound by name, sharing the closures that call the same intrinsics through its table (every builtin's wrapper)
 let PRELUDE_CODE: AbstractByteCode | null = null
 
 // Runs the prelude with `vm` and returns the scope of its $ exports (under their public names), which the instance's
@@ -105,7 +107,7 @@ export const loadPrelude = (cmp: AbstractCompiler, vm: AbstractVM, evaluator: Ma
     if (PRELUDE_CODE === null) {
         const preludeAst = new ASP(`${BUILTIN_WRAPPERS}\n${STD_PRELUDE}`, true, "<prelude>").parse()
         const compiled = cmp.compile(evaluator.transform(preludeAst), false)
-        PRELUDE_CODE = compiled.fresh?.(new Map(), null) ?? compiled
+        PRELUDE_CODE = compiled.fresh?.(new Map(), schemeBase()) ?? compiled
     }
 
     const privScope = stdPreludeScope()
