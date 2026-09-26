@@ -2,19 +2,20 @@ import { Cons } from "./list";
 import { ErrorObject, IProcedure, packValues, unpackValues } from "./common";
 import { Table } from "./table";
 import { ContinuationMarkSet } from "./marks";
+import { hostError } from "./errors";
 
 const numAt = (name: string, regs: readonly any[], i: number): number => {
     const val = regs[i];
-    if (typeof val !== "number") throw new Error(`${name} requires numbers, but received ${typeof val}`);
+    if (typeof val !== "number") throw hostError(`${name} requires numbers, but received ${typeof val}`);
     return val;
 };
 
 const divisorArgs = (name: string, regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 2) throw new Error(`${name} requires 2 arguments`);
+    if (nargs !== 2) throw hostError(`${name} requires 2 arguments`);
     const a = regs[start];
     const b = regs[start + 1];
-    if (typeof a !== "number" || typeof b !== "number") throw new Error(`${name}: requires numbers, but received ${typeof a}/${typeof b}`);
-    if (b === 0) throw new Error(`${name}: division by zero`);
+    if (typeof a !== "number" || typeof b !== "number") throw hostError(`${name}: requires numbers, but received ${typeof a}/${typeof b}`);
+    if (b === 0) throw hostError(`${name}: division by zero`);
 };
 
 export const opAdd = (regs: readonly any[], start: number, nargs: number) => {
@@ -31,7 +32,7 @@ export const opMul = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opSub = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error("- requires at least 1 argument");
+    if (nargs === 0) throw hostError("- requires at least 1 argument");
     let acc = numAt("-", regs, start);
     if (nargs === 1) return -acc;
     for (let i = start + 1; i < start + nargs; i++) acc -= numAt("-", regs, i);
@@ -39,15 +40,15 @@ export const opSub = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opDiv = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error("/ requires at least 1 argument");
+    if (nargs === 0) throw hostError("/ requires at least 1 argument");
     let acc = numAt("/", regs, start);
     if (nargs === 1) {
-        if (acc === 0) throw new Error("division by zero");
+        if (acc === 0) throw hostError("division by zero");
         return 1 / acc;
     }
     for (let i = start + 1; i < start + nargs; i++) {
         const val = numAt("/", regs, i);
-        if (val === 0) throw new Error("division by zero");
+        if (val === 0) throw hostError("division by zero");
         acc /= val;
     }
     return acc;
@@ -65,7 +66,7 @@ export const opRem = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opNumEq = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error("= requires at least 1 argument");
+    if (nargs === 0) throw hostError("= requires at least 1 argument");
     const first = numAt("=", regs, start);
     for (let i = start + 1; i < start + nargs; i++) {
         if (numAt("=", regs, i) !== first) return false;
@@ -74,7 +75,7 @@ export const opNumEq = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opEq = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error("eq? requires at least 1 argument");
+    if (nargs === 0) throw hostError("eq? requires at least 1 argument");
     const first = regs[start];
     for (let i = start + 1; i < start + nargs; i++) {
         if (regs[i] !== first) return false;
@@ -83,7 +84,7 @@ export const opEq = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opLt = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error("< requires at least 1 argument");
+    if (nargs === 0) throw hostError("< requires at least 1 argument");
     let prev = numAt("<", regs, start);
     for (let i = start + 1; i < start + nargs; i++) {
         const val = numAt("<", regs, i);
@@ -94,7 +95,7 @@ export const opLt = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opLe = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error("<= requires at least 1 argument");
+    if (nargs === 0) throw hostError("<= requires at least 1 argument");
     let prev = numAt("<=", regs, start);
     for (let i = start + 1; i < start + nargs; i++) {
         const val = numAt("<=", regs, i);
@@ -105,7 +106,7 @@ export const opLe = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opGt = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error("> requires at least 1 argument");
+    if (nargs === 0) throw hostError("> requires at least 1 argument");
     let prev = numAt(">", regs, start);
     for (let i = start + 1; i < start + nargs; i++) {
         const val = numAt(">", regs, i);
@@ -116,7 +117,7 @@ export const opGt = (regs: readonly any[], start: number, nargs: number) => {
 };
 
 export const opGe = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs === 0) throw new Error(">= requires at least 1 argument");
+    if (nargs === 0) throw hostError(">= requires at least 1 argument");
     let prev = numAt(">=", regs, start);
     for (let i = start + 1; i < start + nargs; i++) {
         const val = numAt(">=", regs, i);
@@ -150,12 +151,12 @@ export const makeList = (regs: readonly any[], start: number, nargs: number) => 
 };
 
 export const valuesToList = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 1) throw new Error("%values->list requires 1 argument");
+    if (nargs !== 1) throw hostError("%values->list requires 1 argument");
     return Cons.fromArray(unpackValues(regs[start]));
 };
 
 export const opCons = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 2) throw new Error("cons requires 2 arguments [cons a d]");
+    if (nargs !== 2) throw hostError("cons requires 2 arguments [cons a d]");
     return Cons.pair(regs[start], regs[start + 1]);
 };
 
@@ -172,11 +173,11 @@ export const CXR_PATHS: [name: string, path: string][] = [
 
 export const makeCxr = (name: string, path: string) => {
     return (regs: readonly any[], start: number, nargs: number) => {
-        if (nargs !== 1) throw new Error(`${name} requires 1 argument`);
+        if (nargs !== 1) throw hostError(`${name} requires 1 argument`);
         let val = regs[start];
         for (let i = path.length - 1; i >= 0; i--) {
             if (!(val instanceof Cons)) {
-                throw new Error(val === null ? `${name}: list is too short` : `${name}: expected a pair but got ${val}`);
+                throw hostError(val === null ? `${name}: list is too short` : `${name}: expected a pair but got ${val}`);
             }
             val = path[i] === "a" ? val.car : val.cdr;
         }
@@ -187,12 +188,12 @@ export const makeCxr = (name: string, path: string) => {
 export const CXR_FNS = CXR_PATHS.map(([name, path]) => makeCxr(name, path));
 
 const requireInteger = (name: string, val: any): number => {
-    if (typeof val !== "number" || !Number.isInteger(val)) throw new Error(`${name} requires an integer`);
+    if (typeof val !== "number" || !Number.isInteger(val)) throw hostError(`${name} requires an integer`);
     return val;
 };
 
 const requireTable = (name: string, val: any): Table => {
-    if (!(val instanceof Table)) throw new Error(`${name} requires a table`);
+    if (!(val instanceof Table)) throw hostError(`${name} requires a table`);
     return val;
 };
 
@@ -220,7 +221,7 @@ export const PREDICATES: [name: string, test: (val: any) => boolean][] = [
     ["table?", val => val instanceof Table],
     ["empty?", val => val === null || (Array.isArray(val) && val.length === 0) || (typeof val === "string" && val.length === 0) || (val instanceof Table && val.size === 0)],
     ["vector-empty?", val => {
-        if (!Array.isArray(val)) throw new Error("vector-empty? requires a vector");
+        if (!Array.isArray(val)) throw hostError("vector-empty? requires a vector");
         return val.length === 0;
     }],
     ["table-empty?", val => requireTable("table-empty?", val).size === 0],
@@ -229,7 +230,7 @@ export const PREDICATES: [name: string, test: (val: any) => boolean][] = [
 ];
 
 export const PREDICATE_FNS = PREDICATES.map(([name, test]) => (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 1) throw new Error(`${name} requires 1 argument`);
+    if (nargs !== 1) throw hostError(`${name} requires 1 argument`);
     return test(regs[start]);
 });
 
@@ -240,7 +241,7 @@ const spliceLast = (args: any[]): any[] => {
     if (finalArg instanceof Cons) {
         for (const v of finalArg) args.push(v);
     } else if (finalArg !== null) {
-        throw new Error(`apply: last argument must be a list but got ${String(finalArg)}`);
+        throw hostError(`apply: last argument must be a list but got ${String(finalArg)}`);
     }
     return args;
 };
@@ -250,12 +251,12 @@ export const windowApplyArgs = (regs: readonly any[], startReg: number, nargs: n
 };
 
 export const applyArgsList = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 1) throw new Error("%apply-args requires 1 argument");
+    if (nargs !== 1) throw hostError("%apply-args requires 1 argument");
     const lst = regs[start];
     return Cons.fromArray(spliceLast(lst === null ? [] : [...lst]));
 };
 
 export const listToValues = (regs: readonly any[], start: number, nargs: number) => {
-    if (nargs !== 1) throw new Error("%list->values requires 1 argument");
+    if (nargs !== 1) throw hostError("%list->values requires 1 argument");
     return packValues(listToArray(regs[start]));
 };

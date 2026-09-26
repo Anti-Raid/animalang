@@ -1,3 +1,5 @@
+import { hostError } from "./errors";
+
 // a global environment: a map of global bindings chained to a parent environment (e.g. user globals over the builtins)
 export class Env {
     #map: Map<symbol, any> = new Map();
@@ -56,14 +58,14 @@ export class Env {
     }
 
     set(key: symbol, val: any): this {
-        if (this.#frozen) throw new Error("Cannot modify a frozen environment");
+        if (this.#frozen) throw hostError("Cannot modify a frozen environment");
         this.#map.set(key, val);
         if (this.#watched) Env.globalsVersion++;
         return this;
     }
 
     delete(key: symbol): boolean {
-        if (this.#frozen) throw new Error("Cannot modify a frozen environment");
+        if (this.#frozen) throw hostError("Cannot modify a frozen environment");
         if (this.#watched) Env.globalsVersion++;
         return this.#map.delete(key);
     }

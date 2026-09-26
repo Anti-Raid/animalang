@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, CORE_CURRENT_MARKS, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_RAISE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -8,6 +8,7 @@ import { BUILTIN_INTRINSICS, RUNTIME_INTRINSICS } from "./intrinsics";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
+const OP_CALLEC = Symbol.for("%call/ec");
 const OP_CO_YIELD = Symbol.for("%coroutine-yield");
 const OP_CO_YIELD_LIST = Symbol.for("%coroutine-yield-list");
 const OP_CO_RESUME = Symbol.for("%coroutine-resume");
@@ -135,7 +136,7 @@ export class Compiler {
                 case CORE_WITH_MARK:
                     this.#compileWithMark(expr, opts)
                     return
-                case CORE_CURRENT_MARKS:
+                case OP_CURRENT_MARKS:
                     if (opts.destReg !== undefined) opts.nodes.push({ t: "CurrentMarks", destReg: opts.destReg })
                     return
                 case OP_DYNAMIC_WIND:
@@ -143,6 +144,15 @@ export class Compiler {
                     return
                 case OP_CALLCC:
                     this.#compileCallCC(expr, opts)
+                    return
+                case OP_CALLEC:
+                    this.#compileCallEC(expr, opts)
+                    return
+                case CORE_CATCH:
+                    this.#compileCatch(expr, opts)
+                    return
+                case OP_RAISE:
+                    this.#compileRaise(expr, opts)
                     return
                 case OP_DEFINE_GLOBAL:
                     this.#compileDefine(expr, opts)
@@ -492,6 +502,72 @@ export class Compiler {
             opts.nodes.push({ t: "CallCC", destReg: opts.destReg, procReg });
         }
         opts.scope.freeTemp(procReg);
+    }
+
+    // always a non-tail call: the escape continuation is deactivated when it returns
+    #compileCallEC(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 2) {
+            throw new Error(`%call/ec requires 1 argument, got ${expr.length - 1}`);
+        }
+        const procReg = opts.scope.allocTemp();
+        const tokReg = opts.scope.allocTemp();
+        this.#compile(expr.cdr.car, { ...opts, destReg: procReg, isTail: false });
+        opts.nodes.push({ t: "CallEC", procReg, tokReg, destReg: opts.destReg });
+        opts.scope.freeTemp(tokReg);
+        opts.scope.freeTemp(procReg);
+    }
+
+    // (%raise obj [continuable]): continuable must be a literal
+    #compileRaise(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 2 && expr.length !== 3) {
+            throw new Error(`%raise requires 1 or 2 arguments (obj, continuable), got ${expr.length - 1}`);
+        }
+        const flag = expr.length === 3 ? expr.cdr.cdr.car : false;
+        if (typeof flag !== "boolean") throw new Error("%raise: continuable must be #t or #f");
+        const objReg = opts.scope.allocTemp();
+        this.#compile(expr.cdr.car, { ...opts, destReg: objReg, isTail: false });
+        opts.nodes.push({ t: "Raise", objReg, continuable: flag, destReg: opts.destReg });
+        opts.scope.freeTemp(objReg);
+    }
+
+    // (%catch thunk handler [pre]): CALLCATCH gives the value of (thunk), or a Caught when it raised, after which the
+    // handler expression is evaluated and called with the error (in tail position if the %catch is); pre is evaluated
+    // first, and runs on the error before unwinding
+    #compileCatch(expr: Cons, opts: CmpOpts) {
+        if (expr.length !== 3 && expr.length !== 4) {
+            throw new Error(`%catch requires 2 or 3 arguments (thunk, handler, pre), got ${expr.length - 1}`);
+        }
+        const procReg = opts.scope.allocTemp();
+        const tokReg = opts.scope.allocTemp();
+        const resReg = opts.scope.allocTemp();
+        const preReg = expr.length === 4 ? opts.scope.allocTemp() : undefined;
+        this.#compile(expr.cdr.car, { ...opts, destReg: procReg, isTail: false });
+        if (preReg !== undefined) this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: preReg, isTail: false });
+        opts.nodes.push({ t: "CallCatch", procReg, tokReg, preReg, destReg: resReg });
+        if (preReg !== undefined) opts.scope.freeTemp(preReg);
+        opts.scope.freeTemp(tokReg);
+        opts.scope.freeTemp(procReg);
+
+        const condReg = opts.scope.allocTemp();
+        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("caught?")!, destReg: condReg, startReg: resReg, nargs: 1 });
+        const elseLabel = new JumpLabel();
+        const endLabel = new JumpLabel();
+        opts.nodes.push({ t: "If", reg: condReg, elseLabel });
+        opts.scope.freeTemp(condReg);
+
+        const call = opts.scope.regAlloc.allocBlock(2);
+        this.#compile(expr.cdr.cdr.car, { ...opts, destReg: call, isTail: false });
+        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("caught-value")!, destReg: call + 1, startReg: resReg, nargs: 1 });
+        if (opts.isTail) opts.nodes.push({ t: "TailCall", procReg: call, startReg: call + 1, nargs: 1 });
+        else opts.nodes.push({ t: "Call", procReg: call, destReg: opts.destReg, startReg: call + 1, nargs: 1 });
+        opts.scope.regAlloc.freeBlock(call, 2);
+
+        opts.nodes.push({ t: "Else", endLabel });
+        opts.nodes.push({ t: "Label", label: elseLabel });
+        if (opts.destReg !== undefined) opts.nodes.push({ t: "Move", destReg: opts.destReg, srcReg: resReg });
+        opts.nodes.push({ t: "EndIf" });
+        opts.nodes.push({ t: "Label", label: endLabel });
+        opts.scope.freeTemp(resReg);
     }
 
     #compileRuntimeOp(expr: Cons, opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {

@@ -23,8 +23,9 @@ import {
 import { Cons } from "../list";
 import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList } from "../ops";
 import { BuiltinFunction, IBUILTINS } from "../std";
-import { ContinuationMarkSet, markFirst, markOwn, markSet, markValues, recordTailMark, TAIL_TRAIL, type Marks, type TailTrail } from "../marks";
+import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markOwn, markSet, markValues, recordTailMark, TAIL_TRAIL, type Marks, type TailTrail } from "../marks";
 import { BUILTIN_INLINES, RUNTIME_INLINES } from "./inline";
+import { hostError } from "../errors";
 
 export const BUILTINS_START = 2**31;
 
@@ -62,6 +63,10 @@ export enum OpCode {
     MARKSAVE,    // dst                reg[dst], reg[dst+1] = current marks and logical frame, then start a new logical frame
     MARKRESTORE, // src                marks and logical frame = reg[src], reg[src+1]
     CURMARKS,    // dst                reg[dst] = the current continuation marks, as a mark set
+    CALLEC,      // proc tok           reg[tok] = a new escape continuation; call reg[proc] with it
+    CALLCATCH,   // proc tok pre       reg[tok] = a new catch token; call reg[proc] with it as the innermost exception handler
+                 //                    (reg[pre], unless pre is NO_REG, runs on the error before unwinding)
+    RAISE,       // obj continuable    deliver reg[obj] to the innermost exception handler
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -96,6 +101,9 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.MARKSAVE]: 2,
     [OpCode.MARKRESTORE]: 2,
     [OpCode.CURMARKS]: 2,
+    [OpCode.CALLEC]: 3,
+    [OpCode.CALLCATCH]: 4,
+    [OpCode.RAISE]: 3,
 };
 
 // UNPACK flags
@@ -106,7 +114,7 @@ export const UNPACK_STRICT = 2;
 export const unpackForBinding = (val: any, count: number, flags: number): any[] => {
     const vals = unpackValues(val);
     if ((flags & UNPACK_STRICT) !== 0 && ((flags & UNPACK_REST) !== 0 ? vals.length < count : vals.length !== count)) {
-        throw new Error(`let-values: expected ${(flags & UNPACK_REST) !== 0 ? "at least " : ""}${count} value${count === 1 ? "" : "s"} but got ${vals.length}`);
+        throw hostError(`let-values: expected ${(flags & UNPACK_REST) !== 0 ? "at least " : ""}${count} value${count === 1 ? "" : "s"} but got ${vals.length}`);
     }
     return vals;
 };
@@ -118,6 +126,9 @@ export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecuto
 // `depth` counts nested direct calls on the js stack; past MAX_JS_DEPTH calls go through heap frames instead. `marks` is
 // the continuation's mark list and `mframe` the logical frame the function runs in (a tail call keeps its caller's)
 export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, ...args: any[]) => any;
+
+// instruction arrays that several ByteCode copies run (see ByteCode.fresh)
+const SHARED_INSTS = new WeakSet<Uint32Array>();
 
 export class ByteCode implements AbstractByteCode {
     public bsid = "ByteCode";
@@ -146,6 +157,18 @@ export class ByteCode implements AbstractByteCode {
         // compiled in debug mode: records tail calls and exact error positions (never mixed with non-debug code)
         public debug: boolean = false
     ) {}
+
+    fresh(copies: Map<ByteCode, ByteCode> = new Map()): ByteCode {
+        const known = copies.get(this);
+        if (known !== undefined) return known;
+        const copy = new ByteCode([], this.inst, this.numReg, this.lineTable, this.files, this.debug);
+        copies.set(this, copy);
+        SHARED_INSTS.add(this.inst);
+        copy.constants = this.constants.map(c => c instanceof ClosureTemplate
+            ? new ClosureTemplate(c.params, c.remParams, c.code.fresh(copies), c.upvarLocs, c.name)
+            : c);
+        return copy;
+    }
 
     positionAt(ip: number): SourcePos | null {
         const table = this.lineTable;
@@ -352,7 +375,6 @@ export class ExecutionContext {
     public epoch: number = 0;
     public wind: WindPoint | null = null;
     public pendingWind: PendingWindTransition | null = null;
-    public handlers: Cons | null = null;
     public coroutine: Coroutine | null = null;
     // a throwaway resumer for nested resumes: control coming back here ends the nested driver loop
     public barrier: boolean = false;
@@ -376,7 +398,8 @@ export class Coroutine extends OpaqueValue {
     public started: boolean = false;
     public closing: boolean = false;
     public frame: Frame | null = null;
-    public resumer: { ctx: ExecutionContext, frame: Frame | null } | null = null;
+    // `marks`/`mframe`: those of the code that resumed it (a tail resume's frame is gone), where its errors are raised again
+    public resumer: { ctx: ExecutionContext, frame: Frame | null, marks: Marks, mframe: number } | null = null;
     public readonly ctx: ExecutionContext;
 
     constructor(public readonly proc: any, vm: AbstractVM, scope: Env) {
@@ -392,7 +415,7 @@ export class Coroutine extends OpaqueValue {
 
 // an error that escaped a coroutine, raised again in the resumer as-is
 export class ReRaise {
-    constructor(public readonly value: any) {}
+    constructor(public readonly value: any, public readonly marks: Marks | undefined = undefined, public readonly mframe: number = 0) {}
 }
 
 export class VMContinuation extends IProcedure {
@@ -404,6 +427,79 @@ export class VMContinuation extends IProcedure {
         super("continuation");
     }
 }
+
+// a function whose direct calls keep ending in a control transfer (call/cc, a continuation, a yield, an escape) or an
+// error pays for it every time: after DIRECT_SUSPEND_LIMIT of them, calls to it use heap frames, where those are cheap
+export const countControlSuspend = (code: ByteCode): void => {
+    if (++code.controlSuspends === DIRECT_SUSPEND_LIMIT) {
+        code.directArity = -1;
+        code.directRestArity = -1;
+    }
+};
+
+// an escape-only continuation (call/ec), usable until its %call/ec returns. The %call/ec's frame is the one of `code`
+// holding this in register `reg` (cleared when it returns); a direct-mode %call/ec catches escapes to it itself
+export class EscapeContinuation extends IProcedure {
+    constructor(public readonly ctxId: number, public readonly wind: WindPoint | null, public readonly code: ByteCode, public readonly reg: number) {
+        super("escape continuation");
+    }
+
+    // the frame to return to, found among `from` and its callers; copies made by call/cc hold it too
+    target(from: Frame | null): Frame | null {
+        for (let f = from; f !== null; f = f.parent) {
+            if (f.code === this.code && f.regs[this.reg] === this) return f;
+        }
+        return null;
+    }
+}
+
+// Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
+// non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
+// register 0 with what a pre-unwind handler returned
+let helpers: { handlerReturned: Closure, escapeWith: Closure } | null = null;
+const raiseHelpers = () => helpers ??= {
+    handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [
+        OpCode.LOADCONST, 0, 0,
+        OpCode.RAISE, 0, 0,
+        OpCode.RETURN, 0,
+    ]),
+    escapeWith: helperClosure(3, [], [
+        OpCode.MOVEACC, 1,
+        OpCode.CALLRT, RUNTIME_IDX.get("make-caught")!, 2, 1, 1,
+        OpCode.CALL, 0, 2, 1, 1,
+    ]),
+};
+const helperClosure = (numReg: number, constants: any[], inst: number[]): Closure =>
+    new Closure(new ClosureTemplate([], null, new ByteCode(constants, new Uint32Array(inst), numReg), [], "raise"), [], "raise");
+
+// the handler a %catch installs: raising to it escapes to the %catch with the error wrapped in a Caught
+export class CatchToken extends EscapeContinuation {
+    constructor(ctxId: number, wind: WindPoint | null, code: ByteCode, reg: number, public readonly pre: any = null) {
+        super(ctxId, wind, code, reg);
+    }
+}
+
+export const NO_REG = 0xFFFFFFFF;
+
+// the value of a caught error, as handlers see it
+const caughtValue = (err: any): any =>
+    err instanceof ReRaise ? (err.value instanceof Error ? new ErrorObject(err.value) : err.value) : err instanceof ErrorObject ? err : new ErrorObject(err);
+
+// what a direct-mode %catch whose token is `tok` takes from an exception passing through it, or null to let it go on:
+// its own escapes, and errors whose innermost handler is `tok` (so nothing else would see them) and which leave no
+// dynamic-wind to unwind
+export const catchHere = (e: any, tok: CatchToken, ctx: ExecutionContext): any => {
+    if (ctx.wind !== tok.wind) return null;
+    if (e instanceof Suspend && e.escape === tok) return e.escapeVal;
+    // a pre-unwind handler has to run first, in heap code
+    if (tok.pre !== null) return null;
+    if (!(e instanceof Suspend)) return e instanceof EscapedError ? null : new Caught(caughtValue(e));
+    if (e.action !== null) return null;
+    const marks = e.marks !== undefined ? e.marks : e.innermost !== null ? e.innermost.marks : undefined;
+    if (marks === undefined) return null;
+    const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
+    return handlers instanceof Cons && handlers.car === tok ? new Caught(caughtValue(e.error)) : null;
+};
 
 export class Frame {
     public code: ByteCode;
@@ -457,7 +553,7 @@ class EscapedError {
     constructor(public readonly error: any) {}
 }
 
-type SuspendAction = (ctx: ExecutionContext, executor: VMExecutor, caller: Frame) => Frame | null;
+type SuspendAction = (ctx: ExecutionContext, executor: VMExecutor, caller: Frame, sig: Suspend) => Frame | null;
 
 // thrown out of direct-entry code when heap frames are needed; each direct frame on the way out rebuilds itself
 export class Suspend {
@@ -465,6 +561,12 @@ export class Suspend {
     outermost: Frame | null = null;
     // the outermost direct function this passed through, i.e. the one heap code called directly
     entered: Closure | null = null;
+    // set when invoking an escape continuation, so a direct-mode %call/ec on the way out can take the value itself
+    escape: EscapeContinuation | null = null;
+    escapeVal: any = undefined;
+    // the marks where it was thrown, when that was a tail call (which rebuilds no frame): errors are raised with them
+    marks: Marks | undefined = undefined;
+    mframe: number = 0;
 
     // `control`: suspended for call/cc, invoking a continuation, a yield or a coroutine resume, rather than for depth or an error
     constructor(public readonly action: SuspendAction | null, public readonly error?: any, public readonly control: boolean = false) {}
@@ -479,19 +581,37 @@ export class Suspend {
     }
 
     static invoke(proc: any, args: any[]) {
-        return new Suspend((ctx, executor, caller) => executor.invoke(ctx, proc, caller, args, 0, args.length, false), undefined, proc instanceof VMContinuation);
+        const escape = proc instanceof EscapeContinuation;
+        const sig = new Suspend((ctx, executor, caller, sig) => executor.invoke(ctx, proc, caller, args, 0, args.length, false, sig.marks, sig.mframe), undefined, escape || proc instanceof VMContinuation);
+        if (escape && args.length === 1) {
+            sig.escape = proc;
+            sig.escapeVal = args[0];
+        }
+        return sig;
+    }
+
+    // raising from direct code: an escape when the innermost handler is a plain catch token (which a direct %catch
+    // further out can take), else delivered from heap frames
+    static raise(obj: any, continuable: boolean, marks: Marks) {
+        const sig = new Suspend((ctx, executor, caller) => executor.raise(ctx, caller, obj, continuable), undefined, true);
+        const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
+        if (handlers instanceof Cons && handlers.car instanceof CatchToken && handlers.car.pre === null) {
+            sig.escape = handlers.car;
+            sig.escapeVal = new Caught(obj);
+        }
+        return sig;
     }
 
     static callCC(proc: any) {
-        return new Suspend((ctx, executor, caller) => executor.callCC(ctx, proc, caller, false), undefined, true);
+        return new Suspend((ctx, executor, caller, sig) => executor.callCC(ctx, proc, caller, false, sig.marks, sig.mframe), undefined, true);
     }
 
     static error(err: any) {
         return new Suspend(null, err);
     }
 
-    static resume(co: any, args: any[]) {
-        return new Suspend((ctx, executor, caller) => executor.coResume(ctx, caller, co, args), undefined, true);
+    static resume(co: any, args: any[], marks: Marks, mframe: number) {
+        return new Suspend((ctx, executor, caller) => executor.coResume(ctx, caller, co, args, marks, mframe), undefined, true);
     }
 
     static yield(val: any) {
@@ -500,7 +620,6 @@ export class Suspend {
 }
 
 export class VMExecutor {
-    public raiseProc: any | null = null;
     public nestedResumes: number = 0;
 
     constructor(public vm: AbstractVM) {}
@@ -521,7 +640,10 @@ export class VMExecutor {
         callerArgs: any[],
         startReg: number,
         nargs: number,
-        isTail: boolean
+        isTail: boolean,
+        // for a tail call made by direct code that left no frame: the marks and logical frame the callee continues
+        marks?: Marks,
+        mframe: number = 0
     ): Frame | null {
         const returnTo = (isTail && callerFrame !== null) ? callerFrame.parent : callerFrame;
 
@@ -532,6 +654,7 @@ export class VMExecutor {
 
         if (proc instanceof Closure) {
             const pregs = this.createClosureArg(proc.tmpl, nargs, callerArgs, startReg);
+            if (marks !== undefined) return this.newFrame(ctx, proc, pregs, returnTo, marks, mframe);
             if (isTail && callerFrame !== null && !callerFrame.isShared(ctx)) {
                 return this.reset(callerFrame, proc, pregs);
             }
@@ -542,29 +665,39 @@ export class VMExecutor {
 
         if (proc instanceof VMContinuation) {
             if (proc.ctxId !== ctx.id) {
-                throw new Error("Cannot invoke a continuation across execution/FFI boundary");
+                throw hostError("Cannot invoke a continuation across execution/FFI boundary");
             }
-            if (nargs !== 1) throw new Error(`continuation expected exactly 1 argument, but received ${nargs}`);
+            if (nargs !== 1) throw hostError(`continuation expected exactly 1 argument, but received ${nargs}`);
 
-            const targetVal = callerArgs[startReg];
-            if (ctx.wind === proc.wind) {
-                ctx.acc = targetVal;
-                return this.setRetVal(ctx, proc.frame, targetVal);
-            }
-            const actions = computeWindTransition(ctx.wind, proc.wind);
-
-            ctx.pendingWind = {
-                actions,
-                actionIdx: 0,
-                targetFrame: proc.frame,
-                targetVal,
-                targetWind: proc.wind,
-            };
-
-            return this.advanceWindTransition(ctx);
+            return this.#jumpTo(ctx, proc.frame, proc.wind, callerArgs[startReg]);
         }
 
-        throw new Error(`Attempted to call a non-procedure: ${String(proc)}`);
+        if (proc instanceof EscapeContinuation) {
+            if (proc.ctxId !== ctx.id) {
+                throw hostError("Cannot invoke an escape continuation across execution/FFI boundary");
+            }
+            if (nargs !== 1) throw hostError(`escape continuation expected exactly 1 argument, but received ${nargs}`);
+            const target = proc.target(callerFrame);
+            if (target === null) throw hostError("escape continuation invoked outside of its dynamic extent");
+            return this.#jumpTo(ctx, target, proc.wind, callerArgs[startReg]);
+        }
+
+        throw hostError(`Attempted to call a non-procedure: ${String(proc)}`);
+    }
+
+    #jumpTo(ctx: ExecutionContext, frame: Frame | null, wind: WindPoint | null, val: any): Frame | null {
+        if (ctx.wind === wind) {
+            ctx.acc = val;
+            return this.setRetVal(ctx, frame, val);
+        }
+        ctx.pendingWind = {
+            actions: computeWindTransition(ctx.wind, wind),
+            actionIdx: 0,
+            targetFrame: frame,
+            targetVal: val,
+            targetWind: wind,
+        };
+        return this.advanceWindTransition(ctx);
     }
 
     public apply(ctx: ExecutionContext, proc: any, frame: Frame, args: any[], isTail: boolean): Frame | null {
@@ -614,11 +747,11 @@ export class VMExecutor {
         const arity = template.params.length;
         if (template.remParams !== null) {
             if (nargs < arity) {
-                throw new Error(`expected at least ${arity} args, got ${nargs}`);
+                throw hostError(`expected at least ${arity} args, got ${nargs}`);
             }
         } else {
             if (nargs !== arity) {
-                throw new Error(`expected exactly ${arity} args, got ${nargs}`);
+                throw hostError(`expected exactly ${arity} args, got ${nargs}`);
             }
         }
 
@@ -649,11 +782,24 @@ export class VMExecutor {
 
     // --- continuations and dynamic-wind ---
 
-    public callCC(ctx: ExecutionContext, proc: any, frame: Frame, isTail: boolean): Frame | null {
+    // calls `proc` with `tok` as the innermost exception handler; its value, or a Caught, is returned to `frame`
+    public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, tok: CatchToken): Frame | null {
+        const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Cons(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
+        if (proc instanceof Closure) return this.newFrame(ctx, proc, this.createClosureArg(proc.tmpl, 0, [], 0), frame, marks, frame.mframe + 1);
+        try {
+            return this.invoke(ctx, proc, frame, [], 0, 0, false);
+        } catch (err) {
+            if (err instanceof EscapedError) throw err;
+            ctx.acc = new Caught(caughtValue(err));
+            return frame;
+        }
+    }
+
+    public callCC(ctx: ExecutionContext, proc: any, frame: Frame, isTail: boolean, marks?: Marks, mframe?: number): Frame | null {
         const target = isTail ? frame.parent : frame;
         target?.share(ctx);
         const k = new VMContinuation(target, ctx.id, ctx.wind);
-        return this.invoke(ctx, proc, frame, [k], 0, 1, isTail);
+        return this.invoke(ctx, proc, frame, [k], 0, 1, isTail, marks, mframe);
     }
 
     public advanceWindTransition(ctx: ExecutionContext): Frame | null {
@@ -683,7 +829,7 @@ export class VMExecutor {
                     return this.newFrame(ctx, action.thunk, pregs, null);
                 }
 
-                throw new Error(`Attempted to call a non-procedure in dynamic-wind: ${String(action.thunk)}`);
+                throw hostError(`Attempted to call a non-procedure in dynamic-wind: ${String(action.thunk)}`);
             }
 
             ctx.pendingWind = null;
@@ -697,7 +843,8 @@ export class VMExecutor {
 
     // --- errors ---
 
-    public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any): Frame | null {
+    // `marks`/`mframe`: where the error happened, when that is not `frame` (a tail call that left no frame)
+    public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any, marks?: Marks, mframe: number = 0): Frame | null {
         if (err instanceof EscapedError) throw err;
         if (err instanceof UnhandledSchemeError) {
             const co = ctx.coroutine;
@@ -707,46 +854,55 @@ export class VMExecutor {
                 co.frame = null;
                 const resumer = this.#detachResumer(co);
                 if (resumer.ctx.barrier) throw new ReRaise(err.error);
-                return this.handleHostException(resumer.ctx, resumer.frame, new ReRaise(err.error));
+                return this.handleHostException(resumer.ctx, resumer.frame, new ReRaise(err.error, resumer.marks, resumer.mframe));
             }
             const out = err.error instanceof Error ? err.error : new Error(String(err.error));
             if (err.traceback !== undefined && (out as any).animaTraceback === undefined) (out as any).animaTraceback = err.traceback;
             throw out;
         }
-        if (err instanceof ReRaise) {
-            if (this.raiseProc !== null && this.raiseProc !== false) {
-                const val = err.value instanceof Error ? new ErrorObject(err.value) : err.value;
-                return this.invoke(ctx, this.raiseProc, frame, [val], 0, 1, false);
+        if (err instanceof ReRaise && err.marks !== undefined) return this.raise(ctx, frame, caughtValue(err), false, err.marks, err.mframe);
+        return this.raise(ctx, frame, caughtValue(err), false, marks, mframe);
+    }
+
+    // Delivers `obj` to the innermost exception handler seen from `frame` (or `marks`, where a tail call left no frame):
+    // a catch token is escaped to (after its pre-unwind handler, if any); a handler procedure is called with the outer
+    // handlers installed, and if it returns, that is the value of a continuable raise, else a secondary error for them
+    public raise(ctx: ExecutionContext, frame: Frame | null, obj: any, continuable: boolean, marks: Marks = frame?.marks ?? null, mframe: number = frame?.mframe ?? 0): Frame | null {
+        const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
+        if (!(handlers instanceof Cons)) return this.#unhandled(ctx, frame, obj);
+        const handler = handlers.car;
+        const outer = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, handlers.cdr);
+        if (handler instanceof CatchToken) {
+            if (handler.pre !== null) {
+                const escape = new Frame(raiseHelpers().escapeWith, [handler, undefined, undefined], 0, frame, ctx, outer, mframe + 1);
+                return this.invoke(ctx, handler.pre, escape, [obj], 0, 1, false);
             }
-            const val = err.value instanceof ErrorObject ? err.value.error : err.value;
-            throw val instanceof Error ? val : new Error(String(val));
+            const target = handler.target(frame);
+            if (target === null) throw hostError("catch invoked outside of its dynamic extent");
+            return this.#jumpTo(ctx, target, handler.wind, new Caught(obj));
         }
-        if (this.raiseProc !== null && this.raiseProc !== false) {
-            const errObj = (err instanceof ErrorObject)
-                ? err
-                : new ErrorObject(err);
-            return this.invoke(ctx, this.raiseProc, frame, [errObj], 0, 1, false);
-        }
-        if (err instanceof Error) throw err;
-        if (err instanceof ErrorObject) throw new Error(err.error);
-        throw new Error(String(err));
+        if (continuable) return this.invoke(ctx, handler, frame, [obj], 0, 1, false, outer, mframe + 1);
+        const returned = new Frame(raiseHelpers().handlerReturned, [undefined], 0, frame, ctx, outer, mframe + 1);
+        return this.invoke(ctx, handler, returned, [obj], 0, 1, false);
+    }
+
+    #unhandled(ctx: ExecutionContext, frame: Frame | null, obj: any): Frame | null {
+        const traceback = formatTraceback(frameInfos(frame), tracebackMessage(obj));
+        const err = obj instanceof ErrorObject ? obj.error : obj;
+        if (err instanceof Error && (err as any).animaTraceback === undefined) (err as any).animaTraceback = traceback;
+        return this.handleHostException(ctx, frame, new UnhandledSchemeError(err, traceback));
     }
 
     public resumeSuspend(ctx: ExecutionContext, sig: Suspend): Frame | null {
         const caller = sig.innermost!;
-        // a function whose direct calls keep ending in call/cc, a continuation or a yield pays for rebuilding its frames
-        // every time: after a few times, calls to it go through heap frames, where those need no rebuilding
         const entered = sig.entered?.tmpl.code;
-        if (sig.control && entered !== undefined && ++entered.controlSuspends === DIRECT_SUSPEND_LIMIT) {
-            entered.directArity = -1;
-            entered.directRestArity = -1;
-        }
+        if ((sig.control || sig.action === null) && entered !== undefined) countControlSuspend(entered);
         try {
-            if (sig.action === null) return this.handleHostException(ctx, caller, sig.error);
+            if (sig.action === null) return this.handleHostException(ctx, caller, sig.error, sig.marks, sig.mframe);
             try {
-                return sig.action(ctx, this, caller);
+                return sig.action(ctx, this, caller, sig);
             } catch (err) {
-                return this.handleHostException(ctx, caller, err);
+                return this.handleHostException(ctx, caller, err, sig.marks, sig.mframe);
             }
         } catch (err) {
             throw err instanceof EscapedError ? err : new EscapedError(err);
@@ -757,21 +913,28 @@ export class VMExecutor {
 
     public coCreate(ctx: ExecutionContext, proc: any): Coroutine {
         if (!(proc instanceof Closure || proc instanceof BuiltinFunction)) {
-            throw new Error(`coroutine-create: expected a procedure but got ${String(proc)}`);
+            throw hostError(`coroutine-create: expected a procedure but got ${String(proc)}`);
         }
         return new Coroutine(proc, ctx.vm, ctx.scope);
     }
 
     public coStatus(co: any): symbol {
-        if (!(co instanceof Coroutine)) throw new Error(`coroutine-status: expected a coroutine but got ${String(co)}`);
+        if (!(co instanceof Coroutine)) throw hostError(`coroutine-status: expected a coroutine but got ${String(co)}`);
         return Symbol.for(co.status);
     }
 
-    public coResume(ctx: ExecutionContext, resumeTo: Frame | null, co: any, args: any[]): Frame | null {
-        if (!(co instanceof Coroutine)) throw new Error(`coroutine-resume: expected a coroutine but got ${String(co)}`);
-        if (co.status !== "suspended") throw new Error(`coroutine-resume: cannot resume a ${co.status} coroutine`);
+    public coResume(
+        ctx: ExecutionContext,
+        resumeTo: Frame | null,
+        co: any,
+        args: any[],
+        marks: Marks = resumeTo?.marks ?? null,
+        mframe: number = resumeTo?.mframe ?? 0
+    ): Frame | null {
+        if (!(co instanceof Coroutine)) throw hostError(`coroutine-resume: expected a coroutine but got ${String(co)}`);
+        if (co.status !== "suspended") throw hostError(`coroutine-resume: cannot resume a ${co.status} coroutine`);
 
-        co.resumer = { ctx, frame: resumeTo };
+        co.resumer = { ctx, frame: resumeTo, marks, mframe };
         if (ctx.coroutine !== null) ctx.coroutine.status = "normal";
         co.status = "running";
         if (!co.started) {
@@ -804,8 +967,8 @@ export class VMExecutor {
 
     public coYield(ctx: ExecutionContext, frame: Frame, val: any): Frame | null {
         const co = ctx.coroutine;
-        if (co === null) throw new Error("coroutine-yield: not inside a coroutine (or across a host call boundary)");
-        if (co.closing) throw new Error("coroutine-yield: cannot yield while a coroutine is closing");
+        if (co === null) throw hostError("coroutine-yield: not inside a coroutine (or across a host call boundary)");
+        if (co.closing) throw hostError("coroutine-yield: cannot yield while a coroutine is closing");
         co.frame = frame;
         co.status = "suspended";
         return this.#returnToResumer(co, val);
@@ -814,9 +977,9 @@ export class VMExecutor {
     // starts or continues a coroutine inside the current driver loop; `resumeTo` is where its yields and final value go
 
     public coClose(ctx: ExecutionContext | null, co: any): void {
-        if (!(co instanceof Coroutine)) throw new Error(`coroutine-close: expected a coroutine but got ${String(co)}`);
+        if (!(co instanceof Coroutine)) throw hostError(`coroutine-close: expected a coroutine but got ${String(co)}`);
         if (co.status === "dead") return;
-        if (co.status !== "suspended") throw new Error(`coroutine-close: cannot close a ${co.status} coroutine`);
+        if (co.status !== "suspended") throw hostError(`coroutine-close: cannot close a ${co.status} coroutine`);
 
         const cctx = co.ctx;
         co.frame = null;
@@ -849,7 +1012,7 @@ export class VMExecutor {
         return this.setRetVal(resumer.ctx, resumer.frame, val);
     }
 
-    #detachResumer(co: Coroutine): { ctx: ExecutionContext, frame: Frame | null } {
+    #detachResumer(co: Coroutine): NonNullable<Coroutine["resumer"]> {
         const resumer = co.resumer!;
         co.resumer = null;
         if (resumer.ctx.coroutine !== null) resumer.ctx.coroutine.status = "running";
@@ -913,7 +1076,7 @@ const tracebackMessage = (msg: any): string | undefined => {
 };
 
 const markSetArg = (who: string, set: any): Marks => {
-    if (!(set instanceof ContinuationMarkSet)) throw new Error(`${who}: expected a continuation mark set`);
+    if (!(set instanceof ContinuationMarkSet)) throw hostError(`${who}: expected a continuation mark set`);
     return set.marks;
 };
 
@@ -921,11 +1084,17 @@ export const RUNTIME: [name: string, fn: RuntimeFn][] = [
     ["coroutine-create", (ctx, executor, regs, start) => executor.coCreate(ctx, regs[start])],
     ["coroutine-status", (ctx, executor, regs, start) => executor.coStatus(regs[start])],
     ["coroutine-close", (ctx, executor, regs, start) => { executor.coClose(ctx, regs[start]); }],
-    ["handlers", (ctx) => ctx.handlers],
-    ["set-handlers!", (ctx, executor, regs, start) => { ctx.handlers = regs[start]; }],
-    ["set-raise-proc", (ctx, executor, regs, start) => { executor.raiseProc = regs[start]; }],
     ["wind", (ctx, executor, regs, start) => { ctx.wind = new WindPoint(ctx.wind, regs[start], regs[start + 1]); }],
     ["end-wind", (ctx) => { if (ctx.wind !== null) ctx.wind = ctx.wind.parent; }],
+    ["end-escape", () => undefined],
+    ["caught?", (ctx, executor, regs, start) => regs[start] instanceof Caught],
+    ["caught-value", (ctx, executor, regs, start) => regs[start].error],
+    ["make-caught", (ctx, executor, regs, start) => new Caught(regs[start])],
+    ["handler-key", () => EXCEPTION_HANDLERS],
+    ["values-cons", (ctx, executor, regs, start) => {
+        const vals = regs[start + 1];
+        return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
+    }],
     ["values->list", (ctx, executor, regs, start, nargs) => valuesToList(regs, start, nargs)],
     ["list->values", (ctx, executor, regs, start, nargs) => listToValues(regs, start, nargs)],
     ["apply-args", (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
@@ -1153,7 +1322,7 @@ export class BytecodeInterpreter {
                         const isTail = inst[ip++] !== 0;
                         if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(regs[coReg]));
                         frame.ip = ip;
-                        return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]));
+                        return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]), frame.marks, frame.mframe);
                     }
                     case OpCode.CALLRT: {
                         const fn = RUNTIME_FNS[inst[ip++]];
@@ -1177,6 +1346,27 @@ export class BytecodeInterpreter {
                         if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(regs[procReg]));
                         frame.ip = ip;
                         return executor.callCC(ctx, regs[procReg], frame, isTail);
+                    }
+                    case OpCode.CALLEC: {
+                        const procReg = inst[ip++];
+                        const tokReg = inst[ip++];
+                        regs[tokReg] = new EscapeContinuation(ctx.id, ctx.wind, frame.code, tokReg);
+                        frame.ip = ip;
+                        return executor.invoke(ctx, regs[procReg], frame, regs, tokReg, 1, false);
+                    }
+                    case OpCode.CALLCATCH: {
+                        const procReg = inst[ip++];
+                        const tokReg = inst[ip++];
+                        const preReg = inst[ip++];
+                        const tok = regs[tokReg] = new CatchToken(ctx.id, ctx.wind, frame.code, tokReg, preReg === NO_REG ? null : regs[preReg]);
+                        frame.ip = ip;
+                        return executor.callCatch(ctx, regs[procReg], frame, tok);
+                    }
+                    case OpCode.RAISE: {
+                        const objReg = inst[ip++];
+                        const continuable = inst[ip++] !== 0;
+                        frame.ip = ip;
+                        return executor.raise(ctx, frame, regs[objReg], continuable);
                     }
                     default: {
                         const _: never = opcode;
@@ -1219,6 +1409,13 @@ const JIT_DEPS = {
     Env,
     Frame,
     Suspend,
+    EscapeContinuation,
+    countControlSuspend,
+    CatchToken,
+    Caught,
+    catchHere,
+    markFirst,
+    EXCEPTION_HANDLERS,
 };
 
 type ProcRef = { reg: number } | { builtin: number };
@@ -1251,6 +1448,9 @@ type AotTerm = { at?: number } & (
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean }
     | { k: "Apply"; proc: ProcRef; isTail: boolean; start: number; nargs: number; resume: number }
     | { k: "CallCC"; proc: number; isTail: boolean; resume: number }
+    | { k: "CallEC"; proc: number; tok: number; resume: number }
+    | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
+    | { k: "Raise"; obj: number; continuable: boolean; resume: number }
     | { k: "Yield"; val: number; resume: number }
     | { k: "CoResume"; co: number; list: number; isTail: boolean; resume: number }
     | { k: "Return"; reg: number });
@@ -1267,13 +1467,11 @@ export class AotCompiler {
 
         // one try around the loop: any error ends the run
         try {
+            if (frame.ip === 0 && frame.code.directArity === 0 && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
             while (frame !== null) {
                 const frameCtx: ExecutionContext = frame.ctx;
                 frame = executor.enter(frameCtx, frame);
-                const resumeFn = frame.code.resumeFn;
-                if (resumeFn === null) {
-                    throw new Error(`AOT mode encountered uncompiled code in frame: ${frame.debugName}`);
-                }
+                const resumeFn = frame.code.resumeFn ?? this.compile(frame.code, frame.closure.tmpl);
                 frame = resumeFn(frameCtx, frame, executor);
             }
         } catch (err) {
@@ -1281,6 +1479,20 @@ export class AotCompiler {
         }
 
         return ctx.acc;
+    }
+
+    // a fresh zero-argument frame (top-level code) runs through its direct entry, falling back to heap frames on a Suspend
+    static #runDirect(frame: Frame, executor: VMExecutor): Frame | null {
+        const ctx = frame.ctx;
+        let val;
+        try {
+            val = frame.code.directFn!(ctx, frame.closure, executor, 1, frame.marks, frame.mframe);
+        } catch (e) {
+            if (!(e instanceof Suspend)) throw e;
+            if (frame.parent !== null) e.push(frame.parent);
+            return executor.resumeSuspend(ctx, e);
+        }
+        return executor.setRetVal(ctx, frame.parent, val);
     }
 
     public static compileAll(code: ByteCode, tmpl?: ClosureTemplate): void {
@@ -1307,12 +1519,17 @@ export class AotCompiler {
         return resume;
     }
 
+    // generated source of shared instruction arrays: copies of a ByteCode (ByteCode.fresh) only build their own functions
+    static readonly #sources = new WeakMap<Uint32Array, string>();
+
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        const source = this.generateSource(code, tmpl);
-        const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
-        for (let ip = 0; ip < code.inst.length; ip += INSTRUCTION_LENGTHS[code.inst[ip] as OpCode]) {
-            if (code.inst[ip] === OpCode.LOADGLOBAL) globalCache[ip] = { scope: null, version: -1, value: undefined };
+        let source = this.#sources.get(code.inst);
+        if (source === undefined) {
+            source = this.generateSource(code, tmpl);
+            if (SHARED_INSTS.has(code.inst)) this.#sources.set(code.inst, source);
         }
+        const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
+        for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
         const factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", source);
         return factory(...Object.values(JIT_DEPS), code.constants, globalCache);
     }
@@ -1327,7 +1544,16 @@ export class AotCompiler {
             out.emitFunction(tmpl.params.length + (tmpl.remParams !== null ? 1 : 0), tmpl.remParams !== null);
             direct = out.toString();
         }
-        return `return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
+        const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
+        return `${caches}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
+    }
+
+    static #globalLoads(code: ByteCode): number[] {
+        const ips: number[] = [];
+        for (let ip = 0; ip < code.inst.length; ip += INSTRUCTION_LENGTHS[code.inst[ip] as OpCode]) {
+            if (code.inst[ip] === OpCode.LOADGLOBAL) ips.push(ip);
+        }
+        return ips;
     }
 
     public static findBasicBlocks(inst: Uint32Array): number[] {
@@ -1353,6 +1579,9 @@ export class AotCompiler {
                     blocks.add(inst[ip + 1]);
                     break;
                 case OpCode.COYIELD:
+                case OpCode.CALLEC:
+                case OpCode.CALLCATCH:
+                case OpCode.RAISE:
                     blocks.add(nextIp);
                     break;
                 case OpCode.CALL:
@@ -1513,6 +1742,22 @@ export class AotCompiler {
                         term = { k: "CallCC", proc, isTail: inst[ip++] !== 0, resume: ip };
                         break;
                     }
+                    case OpCode.CALLEC: {
+                        const proc = inst[ip++];
+                        term = { k: "CallEC", proc, tok: inst[ip++], resume: ip };
+                        break;
+                    }
+                    case OpCode.CALLCATCH: {
+                        const proc = inst[ip++];
+                        const tok = inst[ip++];
+                        term = { k: "CallCatch", proc, tok, pre: inst[ip++], resume: ip };
+                        break;
+                    }
+                    case OpCode.RAISE: {
+                        const obj = inst[ip++];
+                        term = { k: "Raise", obj, continuable: inst[ip++] !== 0, resume: ip };
+                        break;
+                    }
                     case OpCode.RETURN:
                         term = { k: "Return", reg: inst[ip++] };
                         break;
@@ -1565,7 +1810,7 @@ class Liveness {
 
     static #resumePoint(term: AotTerm): number | null {
         switch (term.k) {
-            case "Call": case "Apply": case "CallCC": case "Yield": case "CoResume": return term.resume;
+            case "Call": case "Apply": case "CallCC": case "CallEC": case "CallCatch": case "Raise": case "Yield": case "CoResume": return term.resume;
             default: return null;
         }
     }
@@ -1580,6 +1825,7 @@ class Liveness {
             if (term.k === "MaybeSelfTailCall") {
                 for (let i = 0; i < term.numPos + (term.hasRest ? 1 : 0); i++) written.add(i);
             }
+            if (term.k === "CallEC" || term.k === "CallCatch") written.add(term.tok);
         }
         return [...written].filter(r => r < numReg).sort((a, b) => a - b);
     }
@@ -1611,6 +1857,9 @@ class Liveness {
             case "Call": case "TailCall": case "MaybeSelfTailCall": return [term.proc, ...windowRegs(term.start, term.nargs)];
             case "Apply": return [...("reg" in term.proc ? [term.proc.reg] : []), ...windowRegs(term.start, term.nargs)];
             case "CallCC": return [term.proc];
+            case "CallEC": return [term.proc];
+            case "CallCatch": return term.pre === NO_REG ? [term.proc] : [term.proc, term.pre];
+            case "Raise": return [term.obj];
             case "Yield": return [term.val];
             case "CoResume": return [term.co, term.list];
             case "Return": return [term.reg];
@@ -1623,7 +1872,7 @@ class Liveness {
             case "Jump": return [term.target];
             case "Block": case "Loop": return [term.body];
             case "Branch": return [term.then, term.else];
-            case "Call": case "Yield": return [term.resume];
+            case "Call": case "CallEC": case "CallCatch": case "Raise": case "Yield": return [term.resume];
             case "Apply": case "CallCC": case "CoResume": return term.isTail ? [] : [term.resume];
             case "MaybeSelfTailCall": return [0];
             default: return [];
@@ -1802,7 +2051,7 @@ abstract class FunctionEmitter extends CodeEmitter {
             case "LoadGlobal":
                 return this.emit(`
                     {
-                        const cache = GLOBAL_CACHE[${inst.ip}];
+                        const cache = GC${inst.ip};
                         if (cache.scope === ctx.scope && cache.version === Env.globalsVersion) {
                             r${inst.dst} = cache.value;
                         } else {
@@ -1889,7 +2138,6 @@ class ResumeEmitter extends FunctionEmitter {
         super(blocks, inst, numReg, debug);
         this.#liveness = new Liveness(blocks, numReg);
     }
-
     // follows jumps through empty blocks (left by loops and blocks) to where control really goes, saving dispatches
     #thread(target: number): number {
         if (this.debug) return target;
@@ -2034,6 +2282,27 @@ class ResumeEmitter extends FunctionEmitter {
                     }
                     ${this.jump(term.resume, next)}
                 `);
+            // the receiver gets a heap frame, so escapes from its body are jumps rather than js exceptions
+            case "CallEC":
+                return this.emit(`
+                    r${term.tok} = new EscapeContinuation(ctx.id, ctx.wind, frame.code, ${term.tok});
+                    frame.ip = ${term.resume};
+                    ${this.#spills(live.spillsFor(term.resume, [term.tok]))}
+                    return executor.invoke(ctx, r${term.proc}, frame, [r${term.tok}], 0, 1, false);
+                `);
+            case "CallCatch":
+                return this.emit(`
+                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, frame.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}`});
+                    frame.ip = ${term.resume};
+                    ${this.#spills(live.spillsFor(term.resume, [term.tok]))}
+                    return executor.callCatch(ctx, r${term.proc}, frame, r${term.tok});
+                `);
+            case "Raise":
+                return this.emit(`
+                    frame.ip = ${term.resume};
+                    ${this.#spills(live.spillsFor(term.resume))}
+                    return executor.raise(ctx, frame, r${term.obj}, ${term.continuable});
+                `);
             case "TailCall":
                 return this.emit(`
                     {
@@ -2085,7 +2354,7 @@ class ResumeEmitter extends FunctionEmitter {
                 return this.emit(`
                     frame.ip = ${term.resume};
                     ${term.isTail ? "" : this.#spills(live.spillsFor(term.resume))}
-                    return executor.coResume(ctx, ${term.isTail ? "frame.parent" : "frame"}, r${term.co}, listToArray(r${term.list}));
+                    return executor.coResume(ctx, ${term.isTail ? "frame.parent" : "frame"}, r${term.co}, listToArray(r${term.list}), frame.marks, frame.mframe);
                 `);
             case "Return":
                 return this.emit(`
@@ -2158,7 +2427,12 @@ class DirectEmitter extends FunctionEmitter {
                 } catch (e) {
                     const sig = e instanceof Suspend ? e : Suspend.error(e);
                     sig.entered = closure;
-                    if (rip !== -1) {
+                    if (rip === -1) {
+                        if (sig.innermost === null && sig.marks === undefined) {
+                            sig.marks = marks;
+                            sig.mframe = mframe;
+                        }
+                    } else {
                         const f = new Frame(closure, [${allRegs}], rip, null, ctx, marks, mframe);
                         ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : ""}
                         sig.push(f);
@@ -2282,6 +2556,27 @@ class DirectEmitter extends FunctionEmitter {
         `;
     }
 
+    #call(procReg: number, start: number, nargs: number, resume: number, marksExpr: string = "marks"): string {
+        const args = this.argList(start, nargs);
+        return `
+            {
+                const proc = r${procReg};
+                rip = ${resume};
+                ${nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
+                    acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
+                } else ` : ""}if (${this.directGuard("proc", `${nargs}`)}) {
+                    acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
+                } else if (${this.restGuard("proc", `${nargs}`)}) {
+                    acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
+                } else if (proc instanceof BuiltinFunction) {
+                    acc = proc.cb([${args}], 0, ${nargs});
+                } else {
+                    throw Suspend.invoke(proc, [${args}]);
+                }
+            }
+        `;
+    }
+
     protected emitTerm(term: AotTerm, next: number): void {
         if (this.debug) this.emit(this.debugHooks(term, this.tailProcOf(term)));
         switch (term.k) {
@@ -2292,27 +2587,44 @@ class DirectEmitter extends FunctionEmitter {
             case "Block":
             case "Loop":
                 return this.emit(this.jump(term.body, next));
-            case "Call": {
-                const args = this.argList(term.start, term.nargs);
+            case "Call":
                 return this.emit(`
-                    {
-                        const proc = r${term.proc};
-                        rip = ${term.resume};
-                        ${term.nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
-                            acc = direct$(ctx, proc, executor, depth + 1, marks, mframe + 1${term.nargs > 0 ? ", " + args : ""});
-                        } else ` : ""}if (${this.directGuard("proc", `${term.nargs}`)}) {
-                            acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, marks, mframe + 1${term.nargs > 0 ? ", " + args : ""});
-                        } else if (${this.restGuard("proc", `${term.nargs}`)}) {
-                            acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1, marks, mframe + 1);
-                        } else if (proc instanceof BuiltinFunction) {
-                            acc = proc.cb([${args}], 0, ${term.nargs});
-                        } else {
-                            throw Suspend.invoke(proc, [${args}]);
-                        }
+                    ${this.#call(term.proc, term.start, term.nargs, term.resume)}
+                    ${this.jump(term.resume, next)}
+                `);
+            case "CallEC":
+                // escapes that need no unwinding end here; others go on out and find this frame once it is rebuilt
+                return this.emit(`
+                    r${term.tok} = new EscapeContinuation(ctx.id, ctx.wind, closure.tmpl.code, ${term.tok});
+                    try {
+                        ${this.#call(term.proc, term.tok, 1, term.resume)}
+                    } catch (e) {
+                        const own = e instanceof Suspend && e.escape === r${term.tok};
+                        if (own) countControlSuspend(closure.tmpl.code);
+                        if (!own || ctx.wind !== r${term.tok}.wind) throw e;
+                        acc = e.escapeVal;
                     }
                     ${this.jump(term.resume, next)}
                 `);
-            }
+            case "CallCatch":
+                return this.emit(`
+                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, closure.tmpl.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}`});
+                    try {
+                        const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Cons(r${term.tok}, markFirst(marks, EXCEPTION_HANDLERS, null)));
+                        ${this.#call(term.proc, 0, 0, term.resume, "handlers")}
+                    } catch (e) {
+                        const caught = catchHere(e, r${term.tok}, ctx);
+                        if (caught === null) throw e;
+                        countControlSuspend(closure.tmpl.code);
+                        acc = caught;
+                    }
+                    ${this.jump(term.resume, next)}
+                `);
+            case "Raise":
+                return this.emit(`
+                    rip = ${term.resume};
+                    throw Suspend.raise(r${term.obj}, ${term.continuable}, marks);
+                `);
             case "TailCall":
                 return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs)} }`);
             case "MaybeSelfTailCall":
@@ -2363,12 +2675,12 @@ class DirectEmitter extends FunctionEmitter {
                 if (term.isTail) {
                     return this.emit(`
                         rip = -1;
-                        throw Suspend.resume(r${term.co}, listToArray(r${term.list}));
+                        throw Suspend.resume(r${term.co}, listToArray(r${term.list}), marks, mframe);
                     `);
                 }
                 return this.emit(`
                     rip = ${term.resume};
-                    if (executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > ${DIRECT_SUSPEND_LIMIT}) throw Suspend.resume(r${term.co}, listToArray(r${term.list}));
+                    if (executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > ${DIRECT_SUSPEND_LIMIT}) throw Suspend.resume(r${term.co}, listToArray(r${term.list}), marks, mframe);
                     acc = executor.coResumeNested(ctx, r${term.co}, listToArray(r${term.list}));
                     ${this.jump(term.resume, next)}
                 `);

@@ -11,7 +11,8 @@ import {
   CORE_BEGIN,
   CORE_LOOP,
   CORE_WITH_MARK,
-  CORE_CURRENT_MARKS,
+  CORE_CATCH,
+  OP_CURRENT_MARKS,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
@@ -162,7 +163,7 @@ const union = (a: Live, b: Live): Live => {
 
 // % forms whose operands are expressions and which may call Scheme code (and so capture a continuation)
 const CALLING_INTRINSICS = new Set([
-    "%call/cc", "%apply", "%apply-multi", "%dynamic-wind",
+    "%call/cc", "%call/ec", "%raise", "%apply", "%apply-multi", "%dynamic-wind",
     "%coroutine-yield", "%coroutine-yield-list", "%coroutine-resume", "%coroutine-resume-list",
 ].map(name => Symbol.for(name)));
 
@@ -272,8 +273,15 @@ class CallLiveness {
                 const [key, value, body] = ast.cdr.toArray();
                 return this.expr(key, scope, this.expr(value, scope, this.expr(body, scope, out, blocks), blocks), blocks);
             }
-            case CORE_CURRENT_MARKS:
+            case OP_CURRENT_MARKS:
                 return out;
+            // (thunk) is called; only if it raised is the handler evaluated and called
+            case CORE_CATCH: {
+                const [thunk, handler, pre] = ast.cdr.toArray();
+                const after = union(out, this.expr(handler, scope, out, blocks));
+                for (const meta of after) meta.liveAcrossCall = true;
+                return this.expr(thunk, scope, pre === undefined ? after : this.expr(pre, scope, after, blocks), blocks);
+            }
             case CORE_LOOP: {
                 // the end of the body flows back to its start: iterate until the live set at the start is stable
                 let head: Live = this.#loopHeads.get(ast) ?? new Set();

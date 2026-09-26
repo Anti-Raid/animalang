@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, OpCode, UNPACK_REST, UNPACK_STRICT, type UpVarLoc } from "./exec";
+import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, RUNTIME_IDX, UNPACK_REST, UNPACK_STRICT, type UpVarLoc } from "./exec";
 
 let nextLabelId = 0;
 
@@ -106,6 +106,17 @@ export type Node = {
 } | {
     t: "TailCallCC",
     procReg: number
+} | {
+    t: "CallEC" | "CallCatch",
+    procReg: number,
+    tokReg: number,
+    preReg?: number,
+    destReg?: number
+} | {
+    t: "Raise",
+    objReg: number,
+    continuable: boolean,
+    destReg?: number
 } | {
     t: "CoYield",
     valReg: number,
@@ -314,6 +325,19 @@ export class IR {
                 }
                 case "TailCallCC": {
                     inst.push(OpCode.CALLCC, node.procReg, 1);
+                    break;
+                }
+                case "Raise": {
+                    inst.push(OpCode.RAISE, node.objReg, node.continuable ? 1 : 0);
+                    if (node.continuable && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    break;
+                }
+                case "CallEC":
+                case "CallCatch": {
+                    if (node.t === "CallEC") inst.push(OpCode.CALLEC, node.procReg, node.tokReg);
+                    else inst.push(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    inst.push(OpCode.CALLRT, RUNTIME_IDX.get("end-escape")!, node.tokReg, node.tokReg, 1);
                     break;
                 }
                 case "CoYield": {

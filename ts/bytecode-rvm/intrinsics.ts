@@ -18,9 +18,6 @@ export const BUILTIN_INTRINSICS = new Map<symbol, number>([
 
 // % forms that are runtime operations (CALLRT)
 export const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, max: number }>(([
-    ["%set-raise-proc", "set-raise-proc", 1, 1],
-    ["%handlers", "handlers", 0, 0],
-    ["%set-handlers!", "set-handlers!", 1, 1],
     ["%coroutine-create", "coroutine-create", 1, 1],
     ["%coroutine-status", "coroutine-status", 1, 1],
     ["%coroutine-close", "coroutine-close", 1, 1],
@@ -30,6 +27,8 @@ export const RUNTIME_INTRINSICS = new Map<symbol, { idx: number, min: number, ma
     ["%first-value", "first-value", 1, 1],
     ["%marks-first", "marks-first", 3, 3],
     ["%marks->list", "marks->list", 2, 2],
+    ["%handler-key", "handler-key", 0, 0],
+    ["%values-cons", "values-cons", 2, 2],
 ] as [string, string, number, number][]).map(([form, name, min, max]) => [Symbol.for(form), { idx: RUNTIME_IDX.get(name)!, min, max }]))
 
 // runtime intrinsics that may run Scheme code (closing a coroutine runs its dynamic-wind after-thunks)

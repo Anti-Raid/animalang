@@ -14,6 +14,8 @@ The compiler only understands `%` forms. Every special form users write (`if`, `
 
 ### Core Forms
 
+A core form binds variables or does not evaluate its operands the usual way. Primitives that evaluate their operands normally, even ones that transfer control or read implicit state (`%call/cc`, `%raise`, `%current-marks`), are intrinsics.
+
 | Core form | Surface syntax | Semantics |
 |---|---|---|
 | `(%begin <expr> ...)` | `begin` | Evaluates the expressions in order; the last one gives the value and keeps tail position. `(%begin)` is `undefined`. |
@@ -25,7 +27,7 @@ The compiler only understands `%` forms. Every special form users write (`if`, `
 | `(%let-values/strict ((<formals> <expr>) ...) <body> ...)` | `receive`, `let-values`, `let*-values` (nested) | The same, but a wrong number of values is an error (Scheme semantics). The two differ only in a flag on `UNPACK`. |
 | `(%set! <symbol> <expr>)` | `set!` | Updates the binding of `<symbol>` according to lexical scoping. |
 | `(%with-mark <key> <value> <body>)` | `with-continuation-mark` | Evaluates `<body>` with the continuation mark `<key>` = `<value>`. In tail position the mark goes on the current frame, replacing its value for `<key>` (so a tail-recursive loop keeps one mark); otherwise `<body>` runs as a new frame and the mark is gone once it returns (or escapes). |
-| `(%current-marks)` | `current-continuation-marks` | The current continuation's marks, as a continuation mark set. |
+| `(%catch <thunk> <handler> [<pre>])` | `try`, `try-catch`, `pcall`, Luau `pcall`/`xpcall` | The value(s) of `(<thunk>)`; if an error reaches it, `(<pre> err)` runs first if given (still inside the raise, with the outer handlers), then everything unwinds to the `%catch` (running `dynamic-wind` after thunks), and `<handler>` is evaluated and called with `pre`'s result, or else the error, in tail position if the `%catch` is. `<handler>` is evaluated only when an error is caught, so a literal lambda costs nothing otherwise; `<pre>` is evaluated before `<thunk>` is called. |
 | `(%define-global <symbol> <expr>)` | `define` at top level (after `(define (f ...) ...)` becomes a lambda) | Binds `<symbol>` in the global scope. |
 | `(%block <name> <body> ...)` | none yet | Evaluates the body; its value is the last expression's, or the value of an `%escape` to `<name>`. Keeps tail position. |
 | `(%escape <name> [<expr>])` | none yet | Leaves the innermost enclosing `%block` called `<name>` with `<expr>` (default `<#void>`), computed as that block's value (in its tail position if the block is in tail position). |
@@ -67,9 +69,18 @@ Besides the core forms, the compiler directly recognizes the following low-level
   - In non-tail position: Captures the current continuation and passes it as a single argument to `<proc>`.
   - In tail position: Replaces the current frame with the caller's continuation and tail-calls `<proc>`.
 
-### `%set-raise-proc`
-- **Form**: `(%set-raise-proc <proc>)`
-- **Semantics**: Registers `<proc>` as the runtime exception raising procedure on the execution context. When host exceptions or runtime errors occur, the VM delegates to this procedure to trigger Scheme-level exception handling.
+### `%call/ec`
+- **Form**: `(%call/ec <proc>)`
+- **Semantics**: Calls `<proc>` with an escape continuation `k`. Calling `(k v)` while `<proc>` is still running makes the `%call/ec` return `v`, running `dynamic-wind` after thunks on the way out; marks are restored as with any return. Calling `k` after the `%call/ec` has returned or been escaped past is an error, as is calling it from another coroutine; an extent re-entered through a full continuation is live again. Always compiled as a non-tail call (`CALLEC`, then `%end-escape` deactivates `k`).
+- Cheaper than `%call/cc` because it never needs heap frames: in direct code the call runs inside a JS `try/catch`, and an escape that has no `dynamic-wind` to unwind is caught right there. Escapes that do unwind, or that come from heap code, rebuild the frames and jump like a continuation, to the nearest frame on the caller chain that still holds `k` in the `%call/ec`'s register (the register is cleared when it returns, so a `k` whose extent has ended finds no frame; copies of the frame made by `call/cc` hold `k` too, so escapes out of a re-entered extent work). JS exceptions are slow (hundreds of ns), so a function whose `%call/ec` keeps being escaped from switches to heap frames after `DIRECT_SUSPEND_LIMIT` escapes, where the receiver gets a heap frame and escapes are plain jumps.
+
+### `%raise`
+- **Form**: `(%raise <obj> [<continuable>])`, from `raise`, `raise-continuable`, `error` and Luau's `error()`
+- **Semantics**: Delivers `<obj>` to the innermost exception handler (see the exception model below). `<continuable>` is a literal `#t` or `#f` (default `#f`).
+
+### `%current-marks`
+- **Form**: `(%current-marks)`, from `current-continuation-marks`
+- **Semantics**: The current continuation's marks, as a continuation mark set.
 
 ### `%apply`
 - **Form**: `(%apply <proc> <arg> ... <lst>)`
@@ -102,9 +113,16 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Forms**: `(%vector-ref v k)`, `(%vector-set! v k val)`, `(%vector-length v)`
 - **Semantics**: Direct calls to `vector-ref`, `vector-set!` and `vector-length` are rewritten to these. Each compiles to a `CALL` of the builtin with the same name; the AOT emitter inlines them as a guarded JS array access and falls back to the builtin (and its error messages) when the guard fails.
 
-### `%handlers` / `%set-handlers!`
-- **Forms**: `(%handlers)`, `(%set-handlers! <lst>)`
-- **Semantics**: Read and replace the current execution context's exception handler stack. Each context, and so each coroutine, has its own stack. Used by the prelude's `raise`, `raise-continuable` and `with-exception-handler`.
+### The exception model
+- **One handler list.** The handlers in effect are a continuation mark under the key `(%handler-key)` returns: a list, innermost first, whose entries are handler procedures (from `with-exception-handler`, which is just that mark) and catch tokens (from `%catch`). It follows frames, so escapes, continuations and re-entry restore it without `dynamic-wind`; a coroutine starts with none, and an error escaping it is raised again in its resumer, with the marks of the code that resumed it.
+- **Delivery** (the VM's `executor.raise`, for `%raise` and for host errors alike) looks at the head of the list:
+  1. empty: unhandled; the VM builds the traceback from its frames and throws to the host;
+  2. a catch token: its `pre` runs if it has one, then the VM escapes to its `%catch` with the value wrapped in a `Caught`;
+  3. a handler procedure: called with the rest of the list installed. If it returns, that is the value of a continuable raise; otherwise "handler returned on non-continuable exception" is delivered to the rest of the list.
+- **Host errors** (a builtin throwing a JS `Error`) become error objects and are delivered as if raised where they happened, with the marks of a tail call that left no frame.
+- **Helper frames.** Two tiny bytecode functions built into the VM (`raiseHelpers` in `exec.ts`) sit under a handler it calls: one raises the secondary error when a non-continuable raise's handler returns, one escapes to a catch token with what its `pre` returned. Their marks hold the outer handlers.
+- **Fast paths.** `%catch` compiles to `CALLCATCH proc tok pre`; in direct code, an escape to its token, or an error whose innermost handler is its token (and which has no `pre` and no `dynamic-wind` to unwind), is caught right at the site by a JS `try/catch`. `%raise` compiles to `RAISE obj continuable`; from direct code, raising to a plain catch token is such an escape.
+- **Surface.** `raise` / `raise-continuable` are `%raise` (direct calls are rewritten); the prelude keeps procedures of those names for use as values. `try` / `try-catch` are `%catch`, with the catch procedure running after unwinding like Racket's `with-handlers`. `(pcall f arg ...)` evaluates `f` and the arguments, then returns `(values #t result ...)` or `(values #f err)` (`%values-cons` prepends to the result values). `guard` escapes with `%call/ec` and re-raises with `raise-continuable` through a full continuation when no clause matches. Luau's `xpcall(f, h)` is `%catch` with `h` as `pre`.
 
 ### Coroutine intrinsics
 - **Forms**: `(%coroutine-create <proc>)`, `(%coroutine-resume <co> <val> ...)`, `(%coroutine-yield <val> ...)`, `(%coroutine-status <co>)`, `(%coroutine-close <co>)`, plus `(%coroutine-resume-list <co> <lst>)` / `(%coroutine-yield-list <lst>)` which take the values as a runtime list (used by the prelude wrappers)
@@ -132,7 +150,7 @@ Besides the core forms, the compiler directly recognizes the following low-level
 
 ### How intrinsics are compiled
 - **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines builtins that have an entry in `BUILTIN_INLINES` (`inline.ts`, the AOT-only table of `InlineFn`s by builtin name; `CALLRT` operations use `RUNTIME_INLINES` there the same way: arithmetic, `eq?`, every predicate, every `c[ad]+r`, `list`, `cons`, and the table and vector intrinsics), keeping a call to the builtin as the fallback so errors are unchanged. Builtins are never tail called: a builtin call in tail position compiles as a call followed by `RETURN`, since it cannot grow the Scheme stack.
-- **Runtime operations that only need the execution context** (`%coroutine-create`, `%coroutine-status`, `%coroutine-close`, `%handlers`, `%set-handlers!`, `%set-raise-proc`, the wind/unwind steps of `%dynamic-wind`, and internal helpers with no public builtin: `%values->list`, `%first-value`, `%marks-first`, `%marks->list`, `%debug-frames`, `%debug-traceback` and the list/apply conversions behind `%coroutine-yield-list` and `%apply-multi`) compile to `CALLRT idx dst start nargs`, where `idx` indexes the `RUNTIME` table in `exec.ts`.
+- **Runtime operations that only need the execution context** (`%coroutine-create`, `%coroutine-status`, `%coroutine-close`, the wind/unwind steps of `%dynamic-wind`, and internal helpers with no public builtin: `%values->list`, `%first-value`, `%marks-first`, `%marks->list`, `%handler-key`, `%values-cons`, `%debug-frames`, `%debug-traceback` and the list/apply conversions behind `%coroutine-yield-list` and `%apply-multi`) compile to `CALLRT idx dst start nargs`, where `idx` indexes the `RUNTIME` table in `exec.ts`.
 - **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `isTail` operand; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
 
 ## Standard Library & Prelude Mappings
@@ -148,6 +166,7 @@ The standard library builds the public Scheme procedures on top of these `%` int
             (%apply-multi proc lst)))
     ```
 - `call/cc` and `call-with-current-continuation`: Wraps `(%call/cc proc)`
+- `call/ec`, `call-with-escape-continuation` and `(let/ec k body ...)`: Wrap `(%call/ec proc)`. `guard` uses it; `try` and `pcall` use `%catch`, which is built the same way.
 - `+ - * / modulo remainder = eq? < <= > >=`:
   - The syntax transformer rewrites direct calls into the matching intrinsic, e.g. `(+ a b c)` becomes `(%+ a b c)`.
   - Uses as a value (e.g. `(map + xs ys)`) get the builtin of the same name, whose callback is the same operation function the opcode runs (`ts/ops.ts`), so there is no duplicated logic.
@@ -218,9 +237,13 @@ Each compiled function gets two JS functions from the same AOT IR (`AotCompiler.
 - **Resume entry** (`resumeFn`): takes a heap `Frame` and continues at `frame.ip` using `switch (ip)`. Registers are JS locals; a liveness analysis decides which ones are loaded on entry and spilled to `frame.regs` before a call that may leave the function. The driver loop uses this entry.
 - **Direct entry** (`directFn`, fixed arity or rest-list variants): takes the arguments as JS arguments and returns the result. It allocates no frame, and is emitted as structured JS (`if`/`else` from `IF`/`ELSE`/`ENDIF`, self tail calls as `continue`). Non-tail calls to compiled closures with a matching arity call their direct entry, up to a depth of `MAX_JS_DEPTH`: every direct entry takes the current depth as an argument (`direct$(ctx, closure, executor, depth, ...args)`) and passes `depth + 1` on, and resume code starts at 1. A call to the function's own closure with its own arity (plain recursion) calls itself by name, skipping the closure and arity checks.
 
-Direct code has no heap frames, so when something needs them (`call/cc`, invoking a continuation, a call that cannot be made directly, a host error, the depth limit, a coroutine switch) it throws a `Suspend`. Each direct function it passes through rebuilds its own `Frame` from its locals at `rip` (the resume point of the call it was making; `rip = -1` marks a tail call, which adds no frame). The heap-mode caller that started the direct chain attaches its frame and performs the pending action (`executor.resumeSuspend`), after which execution continues in resume mode. Rebuilding frames on every capture is expensive, so when direct calls of a function keep ending in a `Suspend` for `call/cc`, a continuation call or a yield (`DIRECT_SUSPEND_LIMIT` times, counted on the outermost direct function the `Suspend` passed through), that function's direct entry is switched off and calls to it use heap frames from then on, where capturing needs no rebuilding. Depth-limit suspends and errors do not count. Likewise, direct code resumes a coroutine in a nested driver loop only `DIRECT_SUSPEND_LIMIT` times per function; after that it suspends instead, since resuming from heap frames is a switch inside one driver loop.
+Direct code has no heap frames, so when something needs them (`call/cc`, invoking a continuation, a call that cannot be made directly, a host error, the depth limit, a coroutine switch) it throws a `Suspend`. Each direct function it passes through rebuilds its own `Frame` from its locals at `rip` (the resume point of the call it was making; `rip = -1` marks a tail call, which adds no frame). The heap-mode caller that started the direct chain attaches its frame and performs the pending action (`executor.resumeSuspend`), after which execution continues in resume mode. Rebuilding frames on every capture is expensive, so when direct calls of a function keep ending in a `Suspend` for `call/cc`, a continuation call or a yield (`DIRECT_SUSPEND_LIMIT` times, counted on the outermost direct function the `Suspend` passed through), that function's direct entry is switched off and calls to it use heap frames from then on, where capturing needs no rebuilding. Errors count too, since each direct function an error passes through catches and rethrows it (a JS throw costs about 200ns), while heap code handles it with a single throw; depth-limit suspends do not count. Builtins also raise errors without a JS stack trace (`hostError` in `errors.ts`), since Anima builds its own tracebacks and V8's stack capture was most of the cost of a handled error. Likewise, direct code resumes a coroutine in a nested driver loop only `DIRECT_SUSPEND_LIMIT` times per function; after that it suspends instead, since resuming from heap frames is a switch inside one driver loop.
 
 Tail calls from heap code also use the callee's direct entry when it has one: the resume function returns the callee's value right after, so the JS stack does not grow, and a `Suspend` out of the callee rebuilds its frames on top of the tail caller's caller. A long chain of tail calls that way would reach the depth limit and unwind a thousand JS frames every time, so once a function's heap tail calls have come back as a `Suspend` `DIRECT_SUSPEND_LIMIT` times, its tail calls use heap frames instead, which run such chains in constant space.
+
+Top-level code starts through its direct entry too (it is a zero-argument function), falling back to heap frames the same way on a `Suspend`. A function that nests structured control flow more than `MAX_STRUCTURED_NESTING` levels deep (e.g. a `cond` with hundreds of clauses) gets a `switch`-based direct entry instead, since V8 fails to compile JS nested thousands of levels deep.
+
+The prelude is compiled once per implementation, and each `Anima` instance runs its own copy (`ByteCode.fresh`: shared instructions, its own templates and adaptive counters), so one program's heap-mode switches never reach another instance. The JS source of copied code is generated once and cached by instruction array; each copy only builds its own functions from it (about 0.2ms per instance).
 
 Global variable reads are cached per instruction site, keyed by the environment and `Env.globalsVersion`, which changes whenever an environment compiled code has read globals from is modified.
 
@@ -232,7 +255,7 @@ A non-tail resume from direct code instead runs the coroutine in a nested driver
 
 ## Errors
 
-- A **host error** (a JS exception thrown by a builtin or by compiled code) is handled by `executor.handleHostException`, which calls the prelude's raise procedure so Scheme handlers (`with-exception-handler`, `try`) can catch it as an `ErrorObject`.
+- A **host error** (a JS exception thrown by a builtin or by compiled code) is handled by `executor.handleHostException`, which delivers it as an `ErrorObject` through the exception model (see above), so handlers and `%catch` see it like any raised value.
 - `UnhandledSchemeError` is thrown by `raise` when no handler is installed. At the top level it becomes the JS error seen by the host. Inside a coroutine it kills the coroutine and is re-raised in the resumer.
 - `ReRaise` carries an error that escaped a coroutine into its resumer, so the resumer's handlers receive the original raised value.
 - `EscapedError` wraps an error that has already been through `handleHostException`, so enclosing compiled code does not handle it a second time. The driver loop unwraps it.
@@ -243,7 +266,7 @@ A non-tail resume from direct code instead runs the coroutine in a nested driver
 - **Names**: a lambda is named after what it is bound to (`define`, `set!`, `let`), else `lambda@file:line`. Exported prelude procedures take their public name.
 - **Source positions**: the reader records the position of every list form, and `%at` overrides it. The syntax transformer carries positions through macro expansion (an expansion inherits its macro call's position). The compiler emits `Pos` IR nodes, which lower into `ByteCode.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
 - **Tracebacks**: `(debug-frames [co] [level])` and `(debug-traceback [co] [msg] [level])` capture the caller's continuation with a tail `call/cc` and walk its frames (direct AOT code rebuilds its frames for this, as it does for any `call/cc`). A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. The host can get a suspended coroutine's traceback with `Anima.traceback(co)`.
-- **Unhandled errors**: the prelude's `raise` builds a traceback before giving up, and it is attached to the JS error as `animaTraceback`. For an error that escaped a coroutine, the coroutine's traceback is kept.
+- **Unhandled errors**: the VM builds a traceback from the raising frame before giving up, and it is attached to the JS error as `animaTraceback`. For an error that escaped a coroutine, the coroutine's traceback is kept.
 - **Debug mode** (`implDebug` / `implAotDebug`, i.e. `new Compiler(true)`): the compiled `ByteCode` is flagged `debug`, and interpreter and AOT code for it
   - record every tail call in a continuation mark on the frame it replaces (the last 16 callees, repeats collapsed to `name xN`), which tracebacks show on that frame as `(tail calls: ...)`; as a mark it travels with continuations and coroutines;
   - track the exact position of the last operation (`frame.posIp`, or `dip` in direct code), so errors inside inlined builtins report the right position.

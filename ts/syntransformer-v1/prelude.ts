@@ -17,7 +17,9 @@ import {
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
     CORE_WITH_MARK,
-    CORE_CURRENT_MARKS,
+    CORE_CATCH,
+    OP_RAISE,
+    OP_CURRENT_MARKS,
     SOURCE_POS,
     AbstractClosure,
     Cons
@@ -272,17 +274,17 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         const args = toArray(expr);
         if (args.length < 2 || args.length > 3) throw new Error("continuation-mark-set-first requires 2 or 3 arguments");
         const [set, key, none] = args;
-        const current = list(CORE_CURRENT_MARKS);
+        const current = list(OP_CURRENT_MARKS);
         const setExpr = set === false ? current : (() => {
             const tmp = Symbol("marks");
             return list(CORE_LET, list(list(tmp, set)), list(CORE_IF, tmp, tmp, current));
         })();
         return { expanded: list(Symbol.for("%marks-first"), setExpr, key, args.length === 3 ? none : false), state: TransformState.Recurse };
     });
-    evaluator.registerTransform(Symbol.for("current-continuation-marks"), lowerTo(CORE_CURRENT_MARKS, orig => {
+    evaluator.registerTransform(Symbol.for("current-continuation-marks"), lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("current-continuation-marks takes no arguments");
     }));
-    evaluator.registerTransform(CORE_CURRENT_MARKS, lowerTo(CORE_CURRENT_MARKS, orig => {
+    evaluator.registerTransform(OP_CURRENT_MARKS, lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("%current-marks takes no arguments");
     }));
     coreForm(OP_SET, CORE_SET, orig => {
@@ -621,7 +623,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
         const expanded = list(
             list(
-                Symbol.for("call/cc"),
+                Symbol.for("call/ec"),
                 list(
                     OP_LAMBDA,
                     list(guard_k),
@@ -643,6 +645,49 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
     evaluator.registerTransform(Symbol.for("call-with-current-continuation"), (evaluator, expr, orig) => {
         return { expanded: cons(Symbol.for("%call/cc"), expr), state: TransformState.DoChildren };
+    });
+
+    evaluator.registerTransform(Symbol.for("call/ec"), (evaluator, expr, orig) => {
+        return { expanded: cons(Symbol.for("%call/ec"), expr), state: TransformState.DoChildren };
+    });
+
+    evaluator.registerTransform(Symbol.for("call-with-escape-continuation"), (evaluator, expr, orig) => {
+        return { expanded: cons(Symbol.for("%call/ec"), expr), state: TransformState.DoChildren };
+    });
+
+    const catchForm = (name: string) => lowerTo(CORE_CATCH, orig => {
+        if (orig.length !== 3) throw new Error(`${name} must be of form (${name} thunk handler)`);
+    });
+    evaluator.registerTransform(CORE_CATCH, lowerTo(CORE_CATCH, orig => {
+        if (orig.length !== 3 && orig.length !== 4) throw new Error("%catch must be of form (%catch thunk handler [pre])");
+    }));
+    evaluator.registerTransform(OP_RAISE, lowerTo(OP_RAISE, orig => {
+        if (orig.length !== 2 && orig.length !== 3) throw new Error("%raise must be of form (%raise obj [continuable])");
+    }));
+    evaluator.registerTransform(Symbol.for("raise"), lowerTo(OP_RAISE, orig => {
+        if (orig.length !== 2) throw new Error("raise takes 1 argument");
+    }));
+    evaluator.registerTransform(Symbol.for("raise-continuable"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length !== 2) throw new Error("raise-continuable takes 1 argument");
+        return { expanded: list(OP_RAISE, expr.car, true), state: TransformState.DoChildren };
+    });
+    evaluator.registerTransform(Symbol.for("try"), catchForm("try"));
+    evaluator.registerTransform(Symbol.for("try-catch"), catchForm("try-catch"));
+
+    // (pcall f arg ...): (values #t result ...), or (values #f err) if calling f raises; f and the arguments are evaluated first
+    evaluator.registerTransform(Symbol.for("pcall"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 2) throw new Error("pcall must be of form (pcall f arg ...)");
+        const vars = toArray(expr).map((_, i) => Symbol(`pcall_${i}`));
+        const call = fromArray(vars);
+        const thunk = list(OP_LAMBDA, null, list(Symbol.for("%values-cons"), true, call));
+        const e = Symbol("pcall_e");
+        const handler = list(OP_LAMBDA, list(e), list(Symbol.for("values"), false, e));
+        return { expanded: list(OP_LET, fromArray(vars.map((v, i) => list(v, toArray(expr)[i]))), list(CORE_CATCH, thunk, handler)), state: TransformState.Recurse };
+    });
+
+    evaluator.registerTransform(Symbol.for("let/ec"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3 || typeof expr.car !== "symbol") throw new Error("let/ec must be of form (let/ec name body...)");
+        return { expanded: list(Symbol.for("%call/ec"), cons(OP_LAMBDA, cons(list(expr.car), expr.cdr))), state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(Symbol.for("apply"), (evaluator, expr, orig) => {

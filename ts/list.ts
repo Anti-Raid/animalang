@@ -1,3 +1,5 @@
+import { hostError } from "./errors";
+
 export class Cons {
     public car: any;
     public cdr: any;
@@ -5,7 +7,7 @@ export class Cons {
     private _cachedLength: number = -3;
 
     private static globalEpoch: symbol = Symbol();
-    private _lastValidEpoch: symbol = Symbol();
+    private _lastValidEpoch: symbol | null = null;
 
     constructor(car: any, cdr: any) {
         this.car = car;
@@ -72,7 +74,7 @@ export class Cons {
     }
 
     public toDottedArray(): { elements: any[]; rest: any } {
-        if (this.isCyclic()) throw new Error("cannot convert circular list");
+        if (this.isCyclic()) throw hostError("cannot convert circular list");
         const elements: any[] = [];
         let curr: any = this;
         while (curr instanceof Cons) {
@@ -83,7 +85,7 @@ export class Cons {
     }
 
     public toArray(): any[] {
-        if (this.isCyclic()) throw new Error("cannot convert circular list to array");
+        if (this.isCyclic()) throw hostError("cannot convert circular list to array");
         const elements: any[] = [];
         let curr: any = this;
         while (curr instanceof Cons) {
@@ -134,7 +136,7 @@ export class Cons {
     // Iterable support for for..of
     public *[Symbol.iterator](): Generator<any, any, unknown> {
         if (this.isCyclic()) {
-            throw new Error("cannot iterate circular list");
+            throw hostError("cannot iterate circular list");
         }
         let curr: any = this;
         while (curr instanceof Cons) {

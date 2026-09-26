@@ -15,6 +15,10 @@ export interface TransformResult {
 export type Transform = (evaluator: MacroEvaluator, expr: any, orig: any) => TransformResult;
 
 const MAX_TRANSFORM_DEPTH = 1000
+// how deeply transformation may recurse on the js stack: below where the stack runs out (about 1200 for the deepest
+// frames per level), so running out is always reported the same way, whatever the JIT has made of the frames
+const MAX_NESTING = 1100
+const TOO_DEEP = "program is nested too deeply to expand (or a macro keeps expanding into itself)"
 export class MacroEvaluator {
     readonly meta: AnimaMeta
     readonly #transformers: Map<symbol, Transform>
@@ -51,6 +55,7 @@ export class MacroEvaluator {
 
     // expansions on the path to the transformer currently running, or -1 outside one
     #depth = -1
+    #nesting = 0
 
     transform(ast: any): any {
         // called from inside a transformer (e.g. for a lambda body): keep counting toward the expansion limit
@@ -58,9 +63,7 @@ export class MacroEvaluator {
         try {
             return this.#transform(this.#stripAt(ast), 0)
         } catch (e) {
-            if (e instanceof RangeError && /call stack/i.test(e.message)) {
-                throw new Error("program is nested too deeply to expand (or a macro keeps expanding into itself)")
-            }
+            if (e instanceof RangeError && /call stack/i.test(e.message)) throw new Error(TOO_DEEP)
             throw e
         }
     }
@@ -96,6 +99,15 @@ export class MacroEvaluator {
     }
 
     #transform(ast: any, depth: number): any {
+        try {
+            if (++this.#nesting > MAX_NESTING) throw new Error(TOO_DEEP)
+            return this.#transformNode(ast, depth)
+        } finally {
+            this.#nesting--
+        }
+    }
+
+    #transformNode(ast: any, depth: number): any {
         if (ast instanceof Cons) {
             const op = ast.car;
 

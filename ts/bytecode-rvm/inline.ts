@@ -95,10 +95,13 @@ export const BUILTIN_INLINES = new Map<string, InlineFn>([
 
 // runtime operations (CALLRT), by name
 export const RUNTIME_INLINES = new Map<string, InlineFn>([
-    ["handlers", () => `ctx.handlers`],
-    ["set-handlers!", ([h]) => `(ctx.handlers = ${h}, undefined)`],
-    ["set-raise-proc", ([p]) => `(executor.raiseProc = ${p}, undefined)`],
     ["wind", ([before, after]) => `(ctx.wind = new WindPoint(ctx.wind, ${before}, ${after}), undefined)`],
     ["end-wind", () => `(ctx.wind !== null && (ctx.wind = ctx.wind.parent), undefined)`],
+    ["end-escape", () => `undefined`],
+    ["caught?", unaryInline(v => `${v} instanceof Caught`)],
+    ["caught-value", unaryInline(v => `${v}.error`)],
+    ["make-caught", unaryInline(v => `new Caught(${v})`)],
+    ["handler-key", () => `EXCEPTION_HANDLERS`],
+    ["values-cons", ([x, v]) => `(${v} instanceof MultipleValues ? new MultipleValues([${x}, ...${v}.values]) : new MultipleValues([${x}, ${v}]))`],
     ["first-value", unaryInline(v => `(${v} instanceof MultipleValues ? ${v}.values[0] : ${v})`)],
 ]);

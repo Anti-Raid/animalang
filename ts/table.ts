@@ -1,3 +1,5 @@
+import { hostError } from "./errors";
+
 const isArrayKey = (key: any): key is number => typeof key === "number" && Number.isInteger(key) && key >= 1;
 
 // Anima's (and transpiled Luau's) table: keys 1..n live densely in an array part, everything else in a hash part.
@@ -49,9 +51,9 @@ export class Table implements Iterable<[any, any]> {
             this.delete(key);
             return this;
         }
-        if (this.#frozen) throw new Error("Cannot modify a frozen Table");
-        if (key === undefined) throw new Error("table key cannot be <#void>");
-        if (typeof key === "number" && Number.isNaN(key)) throw new Error("table key cannot be NaN");
+        if (this.#frozen) throw hostError("Cannot modify a frozen Table");
+        if (key === undefined) throw hostError("table key cannot be <#void>");
+        if (typeof key === "number" && Number.isNaN(key)) throw hostError("table key cannot be NaN");
 
         const arr = this.#arr;
         if (isArrayKey(key) && key <= arr.length + 1) {
@@ -75,7 +77,7 @@ export class Table implements Iterable<[any, any]> {
     }
 
     delete(key: any): boolean {
-        if (this.#frozen) throw new Error("Cannot modify a frozen Table");
+        if (this.#frozen) throw hostError("Cannot modify a frozen Table");
         const arr = this.#arr;
         if (isArrayKey(key) && key <= arr.length) {
             // keep the array part dense: whatever followed the removed key moves to the hash part
@@ -89,7 +91,7 @@ export class Table implements Iterable<[any, any]> {
     }
 
     clear(): void {
-        if (this.#frozen) throw new Error("Cannot modify a frozen Table");
+        if (this.#frozen) throw hostError("Cannot modify a frozen Table");
         this.#arr = [];
         this.#hash.clear();
     }

@@ -73,3 +73,12 @@ export const recordTailMark = (marks: Marks, frame: number, name: string): Marks
         : [...trail, { name, count: 1 }].slice(-TAIL_TRAIL_SIZE);
     return markSet(marks, frame, TAIL_TRAIL, next);
 };
+
+// The exception handlers in effect are a mark under this key: a list, innermost first, of handler procedures and the
+// catch tokens of enclosing %catch forms
+export const EXCEPTION_HANDLERS = Symbol("exception handlers");
+
+// what a %catch receives when an error is caught: it unwinds to the %catch, which then calls its handler
+export class Caught {
+    constructor(readonly error: any) {}
+}

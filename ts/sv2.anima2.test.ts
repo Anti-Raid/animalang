@@ -1,6 +1,6 @@
 // Made w/ lots of help from gemini cli
 import { ASTStringifier, AbstractByteCode, MissingVarError, isDeepEqual, Table, Env, ASPParseError, BS, BSReader } from './common';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from './list';
 import { BuiltinFunction } from './std';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
@@ -10,14 +10,19 @@ import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
 
 describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-const bcCache: Record<string, AbstractByteCode> = {}
+let bcCache: Record<string, AbstractByteCode> = {}
 describe('Anima', () => {
-    let evaluator = new Anima(vmImpl)
+    let evaluator: Anima
     let s = new ASTStringifier()
-    evaluator.scope.set(Symbol.for("port"), 8080)
-    evaluator.scope.set(Symbol.for("protocol"), "tcp")
-    evaluator.scope.set(Symbol.for("is_active"), true)
-    evaluator.scope.set(Symbol.for("user_role"), null)
+    // every test starts from a fresh instance, so none depends on what ran before it
+    beforeEach(() => {
+        evaluator = new Anima(vmImpl)
+        bcCache = {}
+        evaluator.scope.set(Symbol.for("port"), 8080)
+        evaluator.scope.set(Symbol.for("protocol"), "tcp")
+        evaluator.scope.set(Symbol.for("is_active"), true)
+        evaluator.scope.set(Symbol.for("user_role"), null)
+    })
     
     const run = (expr: string) => {
         if (bcCache[expr]) return s.stringify(evaluator.evaluateRaw(bcCache[expr]))
@@ -685,6 +690,114 @@ describe('Anima', () => {
                   (f '(2 3 4)))
             `)).toBe("24");
         });
+    });
+
+    describe('Exception handlers as continuation marks', () => {
+        it('runs a handler with the outer handlers installed', () => {
+            expect(run(`(with-exception-handler (lambda (e) (+ e 1))
+                          (lambda () (with-exception-handler (lambda (e) (raise-continuable (* e 10)))
+                                       (lambda () (raise-continuable 1)))))`)).toBe("11")
+            expect(run(`(try (lambda () (with-exception-handler (lambda (e) (raise (list 'wrapped e))) (lambda () (raise 'x)))) (lambda (e) e))`)).toBe("(wrapped x)")
+            expect(run(`(try (lambda () (with-exception-handler (lambda (e) 'ignored) (lambda () (raise 'x)))) (lambda (e) (error-message e)))`)).toBe('"handler returned on non-continuable exception"')
+        })
+
+        it('catches errors from a tail call that leaves no frame', () => {
+            expect(run(`(define hm-len vector-length) (try (lambda () (hm-len 5)) (lambda (e) 'caught))`)).toBe("caught")
+            expect(run(`(define (hm-tail) (hm-len 5)) (try hm-tail (lambda (e) 'caught))`)).toBe("caught")
+        })
+
+        it('restores handlers after escapes and on re-entry', () => {
+            expect(run(`(list (try (lambda () (raise 1)) (lambda (e) e)) (try (lambda () (raise 2)) (lambda (e) e)))`)).toBe("(1 2)")
+            expect(run(`(define hm-k #f) (define hm-n 0)
+                        (define hm-r (with-exception-handler (lambda (e) (list 'handled e)) (lambda () (call/cc (lambda (c) (set! hm-k c))) (raise-continuable hm-n))))
+                        (set! hm-n (+ hm-n 1))
+                        (if (< hm-n 2) (hm-k #f) hm-r)`)).toBe("(handled 1)")
+        })
+
+        it('installs handlers in tail position in constant stack space', () => {
+            expect(run(`(define (hm-loop n) (if (= n 0) 'ok (with-exception-handler (lambda (e) e) (lambda () (hm-loop (- n 1)))))) (hm-loop 100000)`)).toBe("ok")
+        })
+    });
+
+    describe('pcall and %catch', () => {
+        it('returns #t and all the values, or #f and the error', () => {
+            expect(run(`(call-with-values (lambda () (pcall + 1 2)) list)`)).toBe("(#t 3)")
+            expect(run(`(call-with-values (lambda () (pcall (lambda () (values 1 2)))) list)`)).toBe("(#t 1 2)")
+            expect(run(`(call-with-values (lambda () (pcall (lambda () (values)))) list)`)).toBe("(#t)")
+            expect(run(`(call-with-values (lambda () (pcall raise 'x)) list)`)).toBe("(#f x)")
+            expect(run(`(call-with-values (lambda () (pcall vector-length 5)) (lambda (ok e) (list ok (error-message e))))`)).toBe('(#f "vector-length requires a vector")')
+            expect(run(`(call-with-values (lambda () (pcall 5)) (lambda (ok e) ok))`)).toBe("#f")
+            expect(run(`(define pc-f pcall) (call-with-values (lambda () (pc-f raise 'z)) list)`)).toBe("(#f z)")
+        })
+
+        it('evaluates the procedure and arguments before protecting the call', () => {
+            expect(run(`(try (lambda () (pcall car (car '()))) (lambda (e) 'outer))`)).toBe("outer")
+        })
+
+        it('unwinds before running the handler', () => {
+            expect(run(`(define pc-log '())
+                        (try (lambda () (dynamic-wind (lambda () #f) (lambda () (raise 'x)) (lambda () (set! pc-log (cons 'after pc-log)))))
+                             (lambda (e) (set! pc-log (cons 'handler pc-log))))
+                        pc-log`)).toBe("(handler after)")
+            expect(run(`(try (lambda () (try (lambda () (raise 1)) (lambda (e) (raise (+ e 1))))) (lambda (e) e))`)).toBe("2")
+        })
+
+        it('lets inner handlers see errors first', () => {
+            expect(run(`(call-with-values (lambda () (pcall (lambda () (with-exception-handler (lambda (e) 42) (lambda () (+ 1 (raise-continuable 'c))))))) list)`)).toBe("(#t 43)")
+            expect(run(`(call-with-values (lambda () (pcall raise-continuable 'y)) list)`)).toBe("(#f y)")
+        })
+
+        it('evaluates the %catch handler only when an error is caught', () => {
+            expect(run(`(define ce-n 0) (list (%catch (lambda () 1) (begin (set! ce-n (+ ce-n 1)) (lambda (e) e))) ce-n)`)).toBe("(1 0)")
+            expect(run(`(list (%catch (lambda () (raise 5)) (begin (set! ce-n (+ ce-n 1)) (lambda (e) (* e 2)))) ce-n)`)).toBe("(10 1)")
+            expect(run(`(let ((h (lambda (e) (list 'h e)))) (list (%catch (lambda () (raise 1)) h)))`)).toBe("((h 1))")
+        })
+
+        it('keeps nested handlers once raising code runs on heap frames', () => {
+            expect(run(`(define (ce-many n) (if (= n 0) 'done (begin (try (lambda () (raise n)) (lambda (e) e)) (ce-many (- n 1)))))
+                        (ce-many 50)
+                        (try (lambda () (try (lambda () (raise 'inner)) (lambda (e) (raise (list 'wrapped e))))) (lambda (e) e))`)).toBe("(wrapped inner)")
+            expect(run(`(define (ce-cm) (with-continuation-mark 'ce-q 7 (call/cc (lambda (k) (continuation-mark-set-first #f 'ce-q)))))
+                        (let loop ((i 0) (s 0)) (if (= i 20) s (loop (+ i 1) (+ s (ce-cm)))))`)).toBe("140")
+        })
+
+        it('calls the %catch handler in tail position', () => {
+            expect(run(`(define (ce-loop n) (if (= n 0) 'ok (%catch (lambda () (raise n)) (lambda (e) (ce-loop (- e 1)))))) (ce-loop 100000)`)).toBe("ok")
+        })
+
+        it('catches repeatedly, from coroutines, and lets escapes through', () => {
+            expect(run(`(let loop ((i 0) (n 0)) (if (= i 50) n (loop (+ i 1) (+ n (try (lambda () (vector-length i)) (lambda (e) 1))))))`)).toBe("50")
+            expect(run(`(call-with-values (lambda () (pcall coroutine-resume (coroutine-create (lambda () (raise 'co))))) list)`)).toBe("(#f co)")
+            expect(run(`(call/ec (lambda (k) (try (lambda () (k 'esc)) (lambda (e) 'no))))`)).toBe("esc")
+        })
+    });
+
+    describe('The exception model (%raise / %catch)', () => {
+        it('delivers %raise to handlers, continuable or not', () => {
+            expect(run(`(with-exception-handler (lambda (e) (* e 2)) (lambda () (+ 1 (%raise 20 #t))))`)).toBe("41")
+            expect(run(`(%catch (lambda () (with-exception-handler (lambda (e) 'ignored) (lambda () (%raise 'x)))) (lambda (e) (error-message e)))`)).toBe('"handler returned on non-continuable exception"')
+            expect(run(`(%catch (lambda () (%raise 'x)) (lambda (e) (list 'caught e)))`)).toBe("(caught x)")
+        })
+
+        it('runs %catch pre-handlers before unwinding, with the outer handlers', () => {
+            expect(run(`(define em-log '())
+                        (%catch (lambda () (dynamic-wind (lambda () #f) (lambda () (%raise 'x)) (lambda () (set! em-log (cons 'after em-log)))))
+                                (lambda (v) (list v (reverse em-log)))
+                                (lambda (e) (set! em-log (cons 'pre em-log)) (list 'pre-saw e)))`)).toBe("((pre-saw x) (pre after))")
+            expect(run(`(%catch (lambda () (%catch (lambda () (%raise 1)) (lambda (v) (list 'inner v)) (lambda (e) (%raise (+ e 1))))) (lambda (v) (list 'outer v)))`)).toBe("(outer 2)")
+            expect(run(`(%catch (lambda () (car '())) (lambda (v) v) (lambda (e) (error-message e)))`)).toBe('"car: list is too short"')
+            expect(run(`(define em-many (let loop ((i 0) (n 0)) (if (= i 30) n (loop (+ i 1) (+ n (%catch (lambda () (%raise i)) (lambda (v) v) (lambda (e) 1))))))) em-many`)).toBe("30")
+        })
+
+        it('mixes handler procedures and catches in one list', () => {
+            expect(run(`(%catch (lambda () (with-exception-handler (lambda (e) (%raise (list 'from-handler e))) (lambda () (%raise 'x)))) (lambda (v) v))`)).toBe("(from-handler x)")
+            expect(run(`(with-exception-handler (lambda (e) 99) (lambda () (%catch (lambda () (+ 1 (%raise 'y #t))) (lambda (v) (list 'caught v)))))`)).toBe("(caught y)")
+            expect(run(`(call-with-values (lambda () (pcall (lambda () (with-exception-handler (lambda (e) (list 'h e)) (lambda () (%raise 'z #t)))))) list)`)).toBe("(#t (h z))")
+        })
+
+        it('reports unhandled raises with a traceback', () => {
+            expect(() => run(`(define (em-bad) (%raise 'nope)) (list (em-bad))`)).toThrow("nope")
+        })
     });
 
     describe('Exception Handling & Dynamic Wind', () => {
@@ -1593,6 +1706,73 @@ describe('Anima', () => {
         })
     });
 
+    describe('call/ec (escape continuations)', () => {
+        it('returns normally or escapes with a value', () => {
+            expect(run(`(call/ec (lambda (k) 7))`)).toBe("7")
+            expect(run(`(call/ec (lambda (k) (+ 1 (k 42))))`)).toBe("42")
+            expect(run(`(call-with-escape-continuation (lambda (k) (k 'x)))`)).toBe("x")
+            expect(run(`(define ec-f call/ec) (ec-f (lambda (k) (k 3)))`)).toBe("3")
+            expect(run(`(let/ec out (map (lambda (x) (if (= x 3) (out x) x)) '(1 2 3 4)))`)).toBe("3")
+            expect(run(`(call/ec (lambda (k) (procedure? k)))`)).toBe("#t")
+        })
+
+        it('escapes from deep non-tail recursion', () => {
+            expect(run(`(define (ec-deep k n) (if (= n 0) (k 'done) (+ 1 (ec-deep k (- n 1)))))
+                        (call/ec (lambda (k) (ec-deep k 5000)))`)).toBe("done")
+        })
+
+        it('escapes many times in a loop', () => {
+            expect(run(`(let loop ((i 0) (s 0)) (if (= i 100) s (loop (+ i 1) (+ s (call/ec (lambda (k) (k i)))))))`)).toBe("4950")
+        })
+
+        it('runs dynamic-wind after thunks when escaping, every time', () => {
+            expect(run(`(define ec-log '())
+                        (define (ec-wind i) (call/ec (lambda (k) (dynamic-wind (lambda () (set! ec-log (cons 'in ec-log))) (lambda () (k i)) (lambda () (set! ec-log (cons 'out ec-log)))))))
+                        (let loop ((i 0) (s 0)) (if (= i 20) (list s (length ec-log) (car ec-log)) (loop (+ i 1) (+ s (ec-wind i)))))`)).toBe("(190 40 out)")
+        })
+
+        it('restores continuation marks after an escape', () => {
+            expect(run(`(with-continuation-mark 'ec-m 1
+                          (let ((v (call/ec (lambda (k) (with-continuation-mark 'ec-m 2 (+ 0 (k (continuation-mark-set-first #f 'ec-m))))))))
+                            (list v (continuation-mark-set-first #f 'ec-m))))`)).toBe("(2 1)")
+        })
+
+        it('escapes from code that captured a full continuation', () => {
+            expect(run(`(call/ec (lambda (k) (+ 1 (call/cc (lambda (c) (k 5))))))`)).toBe("5")
+            expect(run(`(define (ec-cc i) (call/ec (lambda (k) (call/cc (lambda (c) c)) (+ 1 (k i)))))
+                        (let loop ((i 0) (s 0)) (if (= i 20) s (loop (+ i 1) (+ s (ec-cc i)))))`)).toBe("190")
+        })
+
+        it('cannot be invoked after its extent has ended', () => {
+            expect(() => run(`(define ec-saved #f) (call/ec (lambda (k) (set! ec-saved k) 1)) (ec-saved 2)`)).toThrow("outside of its dynamic extent")
+            expect(() => run(`(define ec-inner #f) (define ec-count 0)
+                              (define ec-r (call/ec (lambda (outer) (+ 100 (call/ec (lambda (inner) (set! ec-inner inner) (dynamic-wind (lambda () 0) (lambda () (outer 1)) (lambda () 0))))))))
+                              (set! ec-count (+ ec-count 1))
+                              (if (< ec-count 3) (ec-inner 2) ec-r)`)).toThrow("outside of its dynamic extent")
+        })
+
+        it('keeps the frames of a stale escape for handlers and tracebacks', () => {
+            expect(run(`(define ec-stale (call/ec (lambda (k) k)))
+                        (define (ec-use n) (if (= n 0) (ec-stale 1) (+ 1 (ec-use (- n 1)))))
+                        (try (lambda () (ec-use 3)) (lambda (e) 'stale))`)).toBe("stale")
+        })
+
+        it('escapes from an extent re-entered through call/cc', () => {
+            expect(run(`(define ec-re #f) (define ec-n 0)
+                        (call/ec (lambda (k) (call/cc (lambda (c) (set! ec-re c))) (set! ec-n (+ ec-n 1)) (if (< ec-n 3) (ec-re #f) (k ec-n))))`)).toBe("3")
+            expect(run(`(define ec-re2 #f) (define ec-m 0)
+                        (define ec-v (call/ec (lambda (k) (call/cc (lambda (c) (set! ec-re2 c))) (k 'out))))
+                        (set! ec-m (+ ec-m 1))
+                        (if (< ec-m 2) (ec-re2 #f) (list ec-v ec-m))`)).toBe("(out 2)")
+        })
+
+        it('keeps try working, including nested and on host errors', () => {
+            expect(run(`(try (lambda () (try (lambda () (raise 'inner)) (lambda (e) (raise (list 'wrapped e))))) (lambda (e) e))`)).toBe("(wrapped inner)")
+            expect(run(`(let loop ((i 0) (n 0)) (if (= i 20) n (loop (+ i 1) (+ n (try (lambda () (car '())) (lambda (e) 1))))))`)).toBe("20")
+            expect(run(`(try (lambda () 'fine) (lambda (e) 'bad))`)).toBe("fine")
+        })
+    });
+
     describe('Continuation marks', () => {
         it('reads marks, and drops them when a non-tail mark body returns', () => {
             expect(run(`(with-continuation-mark 'k 1 (continuation-mark-set-first #f 'k))`)).toBe("1")
@@ -1909,7 +2089,8 @@ describe('Anima', () => {
 })
 
 describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s", (_mode, vmImpl) => {
-    const evaluator = new Anima(vmImpl);
+    let evaluator: Anima;
+    beforeEach(() => { evaluator = new Anima(vmImpl) });
     const runFile = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src, "t.anima"));
     const errorOf = (src: string): any => {
         try {
@@ -1943,8 +2124,8 @@ describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s
 
     it("keeps the prelude out of tail-call trails", () => {
         const err = errorOf(`(define (g) (raise 'x)) (list (g))`);
-        // the frame that tail-called raise is not part of raise's continuation, so no trail shows here
-        expect(err.animaTraceback).toBe("x\nstack traceback:\n  t.anima:1:31 in top-level");
+        // raise is delivered from g itself, not a prelude procedure g tail-called
+        expect(err.animaTraceback).toBe("x\nstack traceback:\n  t.anima:1:13 in g\n  t.anima:1:31 in top-level");
     });
 });
 
@@ -2037,7 +2218,8 @@ describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
 });
 
 describe('Vectors (using JS Arrays)', () => {
-    let evaluator = new Anima(vmImpl);
+    let evaluator: Anima;
+    beforeEach(() => { evaluator = new Anima(vmImpl) });
     let s = new ASTStringifier();
 
     const run = (expr: string) => {
@@ -2152,7 +2334,8 @@ describe('Vectors (using JS Arrays)', () => {
 });
 
 describe('Tables (using Table class)', () => {
-    let evaluator = new Anima(vmImpl);
+    let evaluator: Anima;
+    beforeEach(() => { evaluator = new Anima(vmImpl) });
     let s = new ASTStringifier();
 
     const run = (expr: string) => {
@@ -2417,7 +2600,8 @@ describe('Tables (using Table class)', () => {
 });
 
 describe('Floats, Infinities & NaNs', () => {
-    let evaluator = new Anima(vmImpl);
+    let evaluator: Anima;
+    beforeEach(() => { evaluator = new Anima(vmImpl) });
     let s = new ASTStringifier();
 
     const run = (expr: string) => {
