@@ -33,7 +33,16 @@ export const windowApplyArgs = (regs: readonly any[], startReg: number, nargs: n
     return spliceLast(regs.slice(startReg, startReg + nargs));
 };
 
-export const applyArgsList = (regs: readonly any[], start: number, nargs: number) => {
+// the same for a window whose last register holds a forwarded rest array rather than a list; `multi` (%apply-multi)
+// spreads the array's own last element as a list. Always a new array, as the rest array may be applied again
+export const windowRestArgs = (regs: readonly any[], startReg: number, nargs: number, multi: boolean): any[] => {
+    const args = regs.slice(startReg, startReg + nargs - 1);
+    const rest: any[] = regs[startReg + nargs - 1];
+    for (let i = 0; i < rest.length; i++) args.push(rest[i]);
+    return multi ? spliceLast(args) : args;
+};
+
+export const applyArgsList =(regs: readonly any[], start: number, nargs: number) => {
     if (nargs !== 1) throw hostError("%apply-args requires 1 argument");
     const lst = regs[start];
     return Cons.fromArray(spliceLast(lst === null ? [] : [...lst]));

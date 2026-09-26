@@ -710,6 +710,43 @@ describe('Anima', () => {
                   (f '(2 3 4)))
             `)).toBe("24");
         });
+
+        // a rest parameter only spread back into a call is bound to an array, never built as a list
+        it('forwards rest arguments that are only spread into %apply', () => {
+            expect(run(`(define (fw-sum . xs) (%apply %+ xs)) (list (fw-sum) (fw-sum 1 2 3) (apply fw-sum '(4 5)) (map fw-sum '(1 2) '(10 20)))`)).toBe("(0 6 9 (11 22))")
+            expect(run(`(define (fw-lead a . xs) (%apply %+ a 10 xs)) (fw-lead 1 2 3)`)).toBe("16")
+            // into procedures, in and out of tail position, and applied twice
+            expect(run(`(define (fw-list . xs) (%apply list 0 xs)) (fw-list 1 2)`)).toBe("(0 1 2)")
+            expect(run(`(define (fw-car . xs) (car (%apply list xs))) (fw-car 7 8)`)).toBe("7")
+            expect(run(`(define (fw-k a b c d e . r) (list a e r)) (define (fw-twice . xs) (list (%apply fw-k xs) (%apply fw-k xs) (%apply %* xs))) (fw-twice 1 2 3 4 5 6 7)`))
+                .toBe("((1 5 (6 7)) (1 5 (6 7)) 5040)")
+            // %apply-multi spreads the last argument as a list, as apply does
+            expect(run(`(define (fw-ap f . xs) (%apply-multi f xs)) (list (fw-ap + 1 2 '(3 4)) (fw-ap list '()))`)).toBe("(10 ())")
+            expect(() => run(`(define (fw-ap f . xs) (%apply-multi f xs)) (fw-ap + 1 2)`)).toThrow(/must be a list/)
+            // a self tail call rebinds the rest array
+            expect(run(`(define (fw-loop n . xs) (if (= n 0) (%apply %+ xs) (fw-loop (- n 1) n 1))) (fw-loop 3)`)).toBe("2")
+            expect(() => run(`(define (fw-one . xs) (%apply %car xs)) (fw-one 1 2)`)).toThrow("car requires 1 arguments, got 2")
+
+            const bc = evaluator.compileRaw(`(define (fw-t . xs) (%apply %+ xs))`) as ByteCode
+            const fn = bc.constants.find((c: any) => c instanceof Closure)!
+            expect(fn.tmpl.restArray).toBe(true)
+            const ops: OpCode[] = []
+            for (let ip = 0; ip < fn.tmpl.code.inst.length; ip += INSTRUCTION_LENGTHS[fn.tmpl.code.inst[ip] as OpCode]) ops.push(fn.tmpl.code.inst[ip])
+            expect(ops).toContain(OpCode.APPLYINTR)
+            const back = readFull(dumpFull(bc), evaluator.intrinsics) as ByteCode
+            expect(back.constants.find((c: any) => c instanceof Closure)!.tmpl.restArray).toBe(true)
+        });
+
+        it('keeps a rest list wherever the rest parameter is seen as a value', () => {
+            expect(run(`(define (nf-read . xs) (%apply %+ xs) xs) (nf-read 1 2)`)).toBe("(1 2)")
+            expect(run(`(define (nf-cap . xs) (lambda () (%apply %+ xs))) ((nf-cap 1 2))`)).toBe("3")
+            expect(run(`(define (nf-set . xs) (set! xs (cdr xs)) (%apply %+ xs)) (nf-set 1 2 3)`)).toBe("5")
+            // shadowed by a local of the same name: that one is a list, spread as a list
+            expect(run(`(define (nf-shadow . xs) (let ((xs (list 5 6))) (%apply %+ xs))) (nf-shadow 1)`)).toBe("11")
+            expect(run(`(define (nf-inner . xs) (let ((xs (list 5 6))) (%apply %+ xs)) (%apply %* xs)) (nf-inner 2 3)`)).toBe("6")
+            const bc = evaluator.compileRaw(`(define (nf-t . xs) (%apply %+ xs) xs)`) as ByteCode
+            expect(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.restArray).toBe(false)
+        });
     });
 
     describe('Exception handlers as continuation marks', () => {

@@ -2,9 +2,15 @@ import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
-import { arityMessage, rtIdx } from "./exec";
+import { APPLY_MULTI, APPLY_REST, arityMessage, rtIdx } from "./exec";
 import { CORE_OPS, isCompilerIntrinsic } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
+
+const lastItem = (list: Cons): any => {
+    let curr = list
+    while (curr.cdr instanceof Cons) curr = curr.cdr
+    return curr.car
+}
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
@@ -346,7 +352,8 @@ export class Compiler {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
-        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName);
+        const restArray = remParams !== null && ascope.getVarinfo(remParams)!.forwardsRest
+        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, restArray);
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
     }
 
@@ -650,7 +657,7 @@ export class Compiler {
             curr = curr.cdr;
         }
 
-        this.#emitApplyNode(opts, procReg, startReg, nargs);
+        this.#emitApplyNode(opts, procReg, startReg, nargs, this.#isRestArray(lastItem(argsExprList), opts) ? APPLY_REST : 0);
 
         opts.scope.regAlloc.freeBlock(startReg, nargs);
         if (isTemp) opts.scope.freeTemp(procReg);
@@ -668,7 +675,8 @@ export class Compiler {
             i++;
             curr = curr.cdr;
         }
-        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntApply", pos: intrinsic.pos, destReg, startReg, nargs }));
+        const restArray = this.#isRestArray(lastItem(argsExprList), opts);
+        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntApply", pos: intrinsic.pos, destReg, startReg, nargs, restArray }));
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
@@ -683,19 +691,28 @@ export class Compiler {
 
         const listReg = opts.scope.allocTemp();
         this.#compile(lstExpr, { ...opts, destReg: listReg, isTail: false });
-        opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%apply-args"), destReg: listReg, startReg: listReg, nargs: 1 });
-        this.#emitApplyNode(opts, procReg, listReg, 1);
+        if (this.#isRestArray(lstExpr, opts)) {
+            this.#emitApplyNode(opts, procReg, listReg, 1, APPLY_REST | APPLY_MULTI);
+        } else {
+            opts.nodes.push({ t: "RtCall", rtIdx: rtIdx("%apply-args"), destReg: listReg, startReg: listReg, nargs: 1 });
+            this.#emitApplyNode(opts, procReg, listReg, 1, 0);
+        }
 
         opts.scope.freeTemp(listReg);
         if (isTemp) opts.scope.freeTemp(procReg);
     }
 
-    #emitApplyNode(opts: CmpOpts, procReg: number, startReg: number, nargs: number) {
+    #emitApplyNode(opts: CmpOpts, procReg: number, startReg: number, nargs: number, flags: number) {
         if (opts.isTail) {
-            opts.nodes.push({ t: "TailApply", procReg, startReg, nargs });
+            opts.nodes.push({ t: "TailApply", procReg, startReg, nargs, flags });
         } else {
-            opts.nodes.push({ t: "Apply", destReg: opts.destReg, procReg, startReg, nargs });
+            opts.nodes.push({ t: "Apply", destReg: opts.destReg, procReg, startReg, nargs, flags });
         }
+    }
+
+    // whether an %apply's list is a rest parameter the closure receives as an array (see VariableMetadata.forwardsRest)
+    #isRestArray(expr: any, opts: CmpOpts): boolean {
+        return typeof expr === "symbol" && opts.scope.resolve(expr).type === "Local" && opts.ascope.getVarinfo(expr)?.forwardsRest === true
     }
     // a normal call
     #compileNormalCall(expr: Cons, opts: CmpOpts) {

@@ -1,5 +1,5 @@
 import { BS, BSReader, type SerializableBytecode } from "../common"
-import { ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
+import { APPLY_MULTI, APPLY_REST, APPLY_TAIL, ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
 import type { Intrinsics } from "./intrinsics"
 
 const intrinsicName = (code: ByteCode, pos: number): string => code.intrinsics.find(used => used.pos === pos)?.name ?? `#${pos}`
@@ -118,7 +118,11 @@ const stringifyInst = (inst: ByteCode): string[] => {
             case OpCode.APPLY: {
                 const proc = inst.inst[idx + 1];
                 const procStr = `r${proc}`;
-                line += `${padOp(OpCode[opcode])} ${procStr}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${inst.inst[idx + 4] ? ", tail" : ""}`;
+                const flags = inst.inst[idx + 4];
+                const flagStr = opcode === OpCode.CALL
+                    ? (flags ? ", tail" : "")
+                    : `${flags & APPLY_TAIL ? ", tail" : ""}${flags & APPLY_REST ? ", rest-array" : ""}${flags & APPLY_MULTI ? ", multi" : ""}`;
+                line += `${padOp(OpCode[opcode])} ${procStr}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${flagStr}`;
                 idx += 5;
                 break;
             }
@@ -204,7 +208,8 @@ const stringifyInst = (inst: ByteCode): string[] => {
 
             case OpCode.CALLINT:
             case OpCode.APPLYINT:
-                line += `${padOp(inst.inst[idx] === OpCode.CALLINT ? "CALLINT" : "APPLYINT")} ${intrinsicName(inst, inst.inst[idx + 1])}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
+            case OpCode.APPLYINTR:
+                line += `${padOp(OpCode[opcode])} ${intrinsicName(inst, inst.inst[idx + 1])}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
                 idx += 5;
                 break;
 
@@ -233,7 +238,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 20
+export const BYTECODE_VERSION = 21
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

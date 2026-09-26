@@ -87,12 +87,13 @@ Besides the core forms, the compiler directly recognizes the following low-level
   - Unpacks the trailing `<lst>` argument and splices its elements after any preceding `<arg> ...` expressions before calling `<proc>`.
   - `<proc>` may be a registered leaf intrinsic (`(%apply %name args)`), which compiles to `APPLYINT` (see below).
   - Emits `OpCode.APPLY` (with its tail flag set in tail position) with `nargs >= 1` indicating the width of the register window `[startReg, startReg + nargs)`.
+  - **Rest forwarding**: when `<lst>` is a lambda's rest parameter that is never used any other way (not read as a value, assigned, or captured), the closure is marked `restArray`. Its rest arguments are then bound as a plain array instead of a list, and the `%apply` spreads that array (`APPLYINTR` for an intrinsic, the `APPLY_REST` flag for a procedure). So a wrapper like `(lambda args (%apply %+ args))` builds no list, and applying an intrinsic this way passes the array itself as the argument window. The array is only ever seen by these instructions.
 
 ### `%apply-multi`
 - **Form**: `(%apply-multi <proc> <lst>)`
 - **Semantics**:
   - Runtime-list variant of `%apply`: the elements of `<lst>` are the arguments, with the last element spliced in the same way (e.g. a variadic `apply` procedure passes its rest parameter here).
-  - Compiles as `(%apply <proc> <flattened>)`, where the `%apply-args` runtime operation (`CALLRT`) first splices the last element of `<lst>` into a flat argument list.
+  - Compiles as `(%apply <proc> <flattened>)`, where the `%apply-args` runtime operation (`CALLRT`) first splices the last element of `<lst>` into a flat argument list. A forwarded rest parameter (see `%apply`) skips that: `APPLY` with the `APPLY_REST | APPLY_MULTI` flags splices the array's last element directly.
 
 ### The exception model
 - **One handler list.** The handlers in effect are a continuation mark under the key `(%handler-key)` returns: a list, innermost first, whose entries are handler procedures (from `with-exception-handler`, which is just that mark) and catch tokens (from `%catch`). It follows frames, so escapes, continuations and re-entry restore it without `dynamic-wind`; a coroutine starts with none, and an error escaping it is raised again in its resumer, with the marks of the code that resumed it.
@@ -162,7 +163,7 @@ This section describes how compiled code runs. The code lives in `exec.ts` (runt
 ## Pipeline
 
 1. A front end reads the source and lowers it to core forms (a call of a builtin becoming a call of its intrinsic).
-2. `analysis.ts` works out which variables live in `Box`es: those captured (used from inside a nested `%lambda`; a `%let` is not a boundary), and those assigned with `set!` that are live across a call, i.e. read after a call that is not a leaf (may call back into the VM) before being assigned again. A continuation captured during such a call restores the frame's registers when re-entered, so only then would a register copy differ from a shared location. A second, backward liveness pass over the core forms (with a fixed point for `%loop`, and `%escape` flowing to its block's continuation) finds them; calls of leaf intrinsics do not count.
+2. `analysis.ts` works out which variables live in `Box`es: those captured (used from inside a nested `%lambda`; a `%let` is not a boundary), and those assigned with `set!` that are live across a call, i.e. read after a call that is not a leaf (may call back into the VM) before being assigned again. A continuation captured during such a call restores the frame's registers when re-entered, so only then would a register copy differ from a shared location. A second, backward liveness pass over the core forms (with a fixed point for `%loop`, and `%escape` flowing to its block's continuation) finds them; calls of leaf intrinsics do not count. It also finds the rest parameters that are only ever the list of an `%apply` / `%apply-multi`, which are forwarded as arrays (see `%apply`).
 3. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers, and `IR.lower` turns those into a `ByteCode` (a `Uint32Array` of instructions plus a constant pool).
 4. The bytecode runs either in the interpreter (`BytecodeInterpreter`) or, in `"aot"` mode, is compiled to JS functions (`AotCompiler`).
 

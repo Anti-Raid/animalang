@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, rtIdx, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import { APPLY_TAIL, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, rtIdx, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 
 let nextLabelId = 0;
@@ -71,11 +71,14 @@ export type Node = {
     destReg?: number,
     startReg: number,
     nargs: number,
+    // APPLY_REST / APPLY_MULTI
+    flags: number,
 } | {
     t: "TailApply",
     procReg: number,
     startReg: number,
     nargs: number,
+    flags: number,
 } | {
     t: "Return",
     reg: number
@@ -176,7 +179,9 @@ export type Node = {
     pos: number,
     destReg: number,
     startReg: number,
-    nargs: number
+    nargs: number,
+    // the last argument is a forwarded rest array (APPLYINTR)
+    restArray: boolean
 } | {
     // a leaf intrinsic (CALLINT)
     t: "IntCall",
@@ -297,7 +302,7 @@ export class IR {
                     inst.push(OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "IntApply":
-                    inst.push(OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
+                    inst.push(node.restArray ? OpCode.APPLYINTR : OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "CurrentStack":
                     inst.push(OpCode.CURSTACK, node.skip)
@@ -326,12 +331,12 @@ export class IR {
                     break
                 }
                 case "Apply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, 0)
+                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags)
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailApply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, 1)
+                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags | APPLY_TAIL)
                     break
                 }
                 case "Return": {
@@ -340,7 +345,7 @@ export class IR {
                 }
                 case "NewClosure": {
                     const closureBc = this.lower(node.template.code, node.template.numRegs)
-                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name)
+                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name, node.template.restArray)
                     if(ct.upvarLocs.length === 0) {
                         // We can just directly push the template as a raw constant in the pool
                         const cidx = cpool.mutPush(Closure.fromTemplate(ct))
@@ -437,7 +442,7 @@ export class ClosureTemplateIR {
     numRegs: number;
     upvarLocs: UpVarLoc[] // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null) {
+    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public restArray: boolean = false) {
         this.params = params
         this.remParams = remParams
         this.code = code

@@ -21,7 +21,7 @@ import {
     formatPos
 } from "../common";
 import { Cons } from "../list";
-import { listToArray, windowApplyArgs, valuesToList, listToValues, applyArgsList, makeList } from "./lists";
+import { listToArray, windowApplyArgs, windowRestArgs, valuesToList, listToValues, applyArgsList, makeList } from "./lists";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markOwn, markSet, markValues, recordTailMark, TAIL_TRAIL, type Marks, type TailTrail } from "../marks";
 import { RUNTIME_INLINES } from "./inline";
 import { hostError } from "../errors";
@@ -72,6 +72,7 @@ export enum OpCode {
     CALLINT,     // pos dst start n    reg[dst] = the leaf intrinsic at pos in the code's table applied to reg[start .. start+n)
     APPLYINT,    // pos dst start n    like CALLINT, with the last argument a list spread into the arguments (count checked here)
     ELSEIF,      // cond elseIp        like IF, for a later condition of the same chain (IF ... ELSE end; ELSEIF ... ELSE end; ... ENDIF)
+    APPLYINTR,   // pos dst start n    like APPLYINT, with the last argument a forwarded rest array (see ClosureTemplate.restArray)
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -114,7 +115,15 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.CALLINT]: 5,
     [OpCode.APPLYINT]: 5,
     [OpCode.ELSEIF]: 3,
+    [OpCode.APPLYINTR]: 5,
 };
+
+// APPLY's last operand
+export const APPLY_TAIL = 1;
+// the last argument register holds a forwarded rest array (see ClosureTemplate.restArray), not a list
+export const APPLY_REST = 2;
+// with APPLY_REST, for %apply-multi: the rest array's own last element is a list, spread too
+export const APPLY_MULTI = 4;
 
 // UNPACK flags
 export const UNPACK_REST = 1;
@@ -198,7 +207,7 @@ export class ByteCode implements AbstractByteCode {
             const inst = SHARED_INSTS.has(this.inst) ? this.inst.slice() : this.inst;
             for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) {
                 const op = inst[ip];
-                if (op === OpCode.CALLINT || op === OpCode.CALLHOST || op === OpCode.APPLYINT) inst[ip + 1] = moved.get(inst[ip + 1]) ?? inst[ip + 1];
+                if (op === OpCode.CALLINT || op === OpCode.CALLHOST || op === OpCode.APPLYINT || op === OpCode.APPLYINTR) inst[ip + 1] = moved.get(inst[ip + 1]) ?? inst[ip + 1];
             }
             this.inst = inst;
         }
@@ -245,11 +254,11 @@ export class ByteCode implements AbstractByteCode {
         SHARED_INSTS.add(this.inst);
         copy.bind(table);
         copy.constants = this.constants.map(c => {
-            if (c instanceof ClosureTemplate) return new ClosureTemplate(c.params, c.remParams, c.code.fresh(copies, table), c.upvarLocs, c.name);
+            if (c instanceof ClosureTemplate) return new ClosureTemplate(c.params, c.remParams, c.code.fresh(copies, table), c.upvarLocs, c.name, c.restArray);
             // a closure with no upvars (made once, when compiled) is shared by the copies, unless it must be bound
             if (c instanceof Closure && !c.tmpl.code.runsWith(table)) {
                 const tmpl = c.tmpl;
-                return Closure.fromTemplate(new ClosureTemplate(tmpl.params, tmpl.remParams, tmpl.code.fresh(copies, table), tmpl.upvarLocs, tmpl.name), c.debugName);
+                return Closure.fromTemplate(new ClosureTemplate(tmpl.params, tmpl.remParams, tmpl.code.fresh(copies, table), tmpl.upvarLocs, tmpl.name, tmpl.restArray), c.debugName);
             }
             return c;
         });
@@ -313,7 +322,9 @@ export class ClosureTemplate implements SerializableBytecode {
     code: ByteCode;
     upvarLocs: UpVarLoc[]; // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null) {
+    // `restArray`: the rest parameter is only ever spread back into a call (the compiler's analysis proves it), so it is
+    // bound to a plain array of the rest arguments rather than a list, and only APPLY / APPLYINTR ever read it
+    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null, public restArray: boolean = false) {
         this.params = params;
         this.remParams = remParams;
         this.code = code;
@@ -326,6 +337,7 @@ export class ClosureTemplate implements SerializableBytecode {
         bs.writeValue(this.code);
         bs.writeValue(this.upvarLocs);
         bs.writeValue(this.name);
+        bs.writeValue(this.restArray);
     }
 
     static register(bsr: BSReader) {
@@ -335,7 +347,8 @@ export class ClosureTemplate implements SerializableBytecode {
             const code = bsr.readSerializable<ByteCode>("ByteCode");
             const upvarLocs = bsr.readArray() as UpVarLoc[];
             const name = bsr.read() as string | null;
-            return new ClosureTemplate(params, remParams, code, upvarLocs, name);
+            const restArray = bsr.read() as boolean;
+            return new ClosureTemplate(params, remParams, code, upvarLocs, name, restArray);
         });
     }
 }
@@ -854,7 +867,9 @@ export class VMExecutor {
             closureRegs[i] = args[startOffset + i];
         }
 
-        if (template.remParams !== null) {
+        if (template.restArray) {
+            closureRegs[arity] = args.slice(startOffset + arity, startOffset + nargs);
+        } else if (template.remParams !== null) {
             let restList: any = null;
             for (let i = nargs - 1; i >= arity; i--) {
                 restList = new Cons(args[startOffset + i], restList);
@@ -881,8 +896,10 @@ export class VMExecutor {
         const code = proc.tmpl.code;
         const fn = code.directFn!;
         const numPos = code.directRestArity;
-        let rest: Cons | null = null;
-        for (let i = args.length - 1; i >= numPos; i--) rest = new Cons(args[i], rest);
+        let rest: Cons | any[] | null = null;
+        // `args` is always a fresh array the caller gives up, so a rest array with no positional params can be it
+        if (proc.tmpl.restArray) rest = numPos === 0 ? args : args.slice(numPos);
+        else for (let i = args.length - 1; i >= numPos; i--) rest = new Cons(args[i], rest);
         // spreading into the call is slow, so the common arities are called directly
         switch (numPos) {
             case 0: return fn(ctx, proc, this, depth, marks, mframe, rest);
@@ -1444,7 +1461,9 @@ export class BytecodeInterpreter {
                             const numPos = tmpl.params.length;
                             if (tmpl.remParams !== null ? nargs >= numPos : nargs === numPos) {
                                 let restList: any = null;
-                                if (tmpl.remParams !== null) {
+                                if (tmpl.restArray) {
+                                    restList = regs.slice(startReg + numPos, startReg + nargs);
+                                } else if (tmpl.remParams !== null) {
                                     for (let i = nargs - 1; i >= numPos; i--) {
                                         restList = new Cons(regs[startReg + i], restList);
                                     }
@@ -1501,14 +1520,25 @@ export class BytecodeInterpreter {
                         regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, windowApplyArgs(regs, startReg, inst[ip++]));
                         break;
                     }
+                    case OpCode.APPLYINTR: {
+                        const entry = frame.code.table!.entries[inst[ip++]];
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        // a rest array alone is the argument array itself: intrinsics never write to or keep it
+                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, nargs === 1 ? regs[startReg] : windowRestArgs(regs, startReg, nargs, false));
+                        break;
+                    }
                     case OpCode.APPLY: {
                         const proc = regs[inst[ip++]];
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
-                        const isTail = inst[ip++] !== 0;
+                        const flags = inst[ip++];
+                        const isTail = (flags & APPLY_TAIL) !== 0;
                         if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(proc));
                         frame.ip = ip;
-                        return executor.apply(ctx, proc, frame, windowApplyArgs(regs, startReg, nargs), isTail);
+                        const args = (flags & APPLY_REST) !== 0 ? windowRestArgs(regs, startReg, nargs, (flags & APPLY_MULTI) !== 0) : windowApplyArgs(regs, startReg, nargs);
+                        return executor.apply(ctx, proc, frame, args, isTail);
                     }
                     case OpCode.CALLCC: {
                         const procReg = inst[ip++];
@@ -1585,6 +1615,7 @@ const JIT_DEPS = {
     Closure,
     WindPoint,
     windowApplyArgs,
+    windowRestArgs,
     RUNTIME_FNS,
     listToArray,
     Cons,
@@ -1608,6 +1639,12 @@ const JIT_DEPS = {
     EXCEPTION_HANDLERS,
 };
 
+// generated code: the argument array of an APPLY, from its window in `regs` (a js expression) at `start`
+const applyArgs = (term: { flags: number; nargs: number }, regs: string, start: number): string =>
+    (term.flags & APPLY_REST) !== 0
+        ? `windowRestArgs(${regs}, ${start}, ${term.nargs}, ${(term.flags & APPLY_MULTI) !== 0})`
+        : `windowApplyArgs(${regs}, ${start}, ${term.nargs})`;
+
 // `at` is the ip of the instruction an op or terminator was decoded from
 type AotInst = { at?: number } & (
     | { k: "LoadConst"; dst: number; idx: number }
@@ -1620,7 +1657,7 @@ type AotInst = { at?: number } & (
     | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
     | { k: "MoveAcc"; dst: number }
     | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number }
-    | { k: "IntCall" | "IntApply"; pos: number; dst: number; start: number; nargs: number }
+    | { k: "IntCall" | "IntApply" | "IntApplyRest"; pos: number; dst: number; start: number; nargs: number }
     | { k: "Unpack"; src: number; start: number; count: number; flags: number }
     | { k: "SetMark"; key: number; val: number }
     | { k: "MarkSave" | "MarkRestore"; reg: number }
@@ -1633,8 +1670,8 @@ type AotTerm = { at?: number } & (
     | { k: "Branch"; cond: number; then: number; else: number; elseif: boolean }
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
-    | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean }
-    | { k: "Apply"; proc: number; isTail: boolean; start: number; nargs: number; resume: number }
+    | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean; restArray: boolean }
+    | { k: "Apply"; proc: number; isTail: boolean; flags: number; start: number; nargs: number; resume: number }
     | { k: "CallCC"; proc: number; isTail: boolean; resume: number }
     | { k: "CallEC"; proc: number; tok: number; resume: number }
     | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
@@ -1807,6 +1844,8 @@ export class AotCompiler {
                     if (inst[nextIp - 1] === 0) blocks.add(nextIp);
                     break;
                 case OpCode.APPLY:
+                    if ((inst[nextIp - 1] & APPLY_TAIL) === 0) blocks.add(nextIp);
+                    break;
                 case OpCode.CALLCC:
                 case OpCode.CORESUME:
                 case OpCode.CALLHOST:
@@ -1909,7 +1948,7 @@ export class AotCompiler {
                         const hasRest = tmpl ? tmpl.remParams !== null : false;
                         const arityFits = tmpl !== undefined && (hasRest ? nargs >= numPos : nargs === numPos);
                         term = arityFits
-                            ? { k: "MaybeSelfTailCall", proc: procIdx, start, nargs, ip, numPos, hasRest }
+                            ? { k: "MaybeSelfTailCall", proc: procIdx, start, nargs, ip, numPos, hasRest, restArray: tmpl.restArray }
                             : { k: "TailCall", proc: procIdx, start, nargs, ip };
                         break;
                     }
@@ -1947,13 +1986,15 @@ export class AotCompiler {
                         insts.push({ k: "IntCall", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.APPLYINT:
-                        insts.push({ k: "IntApply", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                    case OpCode.APPLYINTR:
+                        insts.push({ k: inst[opIp] === OpCode.APPLYINT ? "IntApply" : "IntApplyRest", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.APPLY: {
                         const procIdx = inst[ip++];
                         const start = inst[ip++];
                         const nargs = inst[ip++];
-                        term = { k: "Apply", proc: procIdx, isTail: inst[ip++] !== 0, start, nargs, resume: ip };
+                        const flags = inst[ip++];
+                        term = { k: "Apply", proc: procIdx, isTail: (flags & APPLY_TAIL) !== 0, flags, start, nargs, resume: ip };
                         break;
                     }
                     case OpCode.CALLCC: {
@@ -2062,7 +2103,7 @@ class Liveness {
             case "SetBox": return [inst.dst, inst.src];
             case "SetUpvar": case "SetGlobal": return [inst.src];
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
-            case "RtCall": case "IntCall": case "IntApply": return windowRegs(inst.start, inst.nargs);
+            case "RtCall": case "IntCall": case "IntApply": case "IntApplyRest": return windowRegs(inst.start, inst.nargs);
             case "Unpack": return [inst.src];
             case "SetMark": return [inst.key, inst.val];
             case "MarkRestore": return [inst.reg, inst.reg + 1];
@@ -2271,7 +2312,9 @@ abstract class FunctionEmitter extends CodeEmitter {
 
     protected selfMoves(term: Extract<AotTerm, { k: "MaybeSelfTailCall" }>): string {
         const moves: string[] = [];
-        if (term.hasRest) {
+        if (term.restArray) {
+            moves.push(`const rest = [${Array.from({ length: term.nargs - term.numPos }, (_, i) => `r${term.start + term.numPos + i}`).join(", ")}];`);
+        } else if (term.hasRest) {
             moves.push(`let rest = null;`);
             for (let i = term.nargs - 1; i >= term.numPos; i--) moves.push(`rest = new Cons(r${term.start + i}, rest);`);
         }
@@ -2352,6 +2395,12 @@ abstract class FunctionEmitter extends CodeEmitter {
             case "IntApply": {
                 const entry = this.table!.entries[inst.pos];
                 return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, windowApplyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}));`);
+            }
+            case "IntApplyRest": {
+                // a rest array alone is the argument array itself: intrinsics never write to or keep it
+                const entry = this.table!.entries[inst.pos];
+                const args = inst.nargs === 1 ? `r${inst.start}` : `windowRestArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}, false)`;
+                return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, ${args});`);
             }
             default: {
                 const _: never = inst;
@@ -2601,7 +2650,7 @@ class ResumeEmitter extends FunctionEmitter {
                 return this.emit(`
                     frame.ip = ${term.resume};
                     ${this.#spills(term.isTail ? window : live.spillsFor(term.resume, window))}
-                    return executor.apply(ctx, r${term.proc}, frame, windowApplyArgs(regs, ${term.start}, ${term.nargs}), ${term.isTail});
+                    return executor.apply(ctx, r${term.proc}, frame, ${applyArgs(term, "regs", term.start)}, ${term.isTail});
                 `);
             }
             case "CallCC":
@@ -2979,7 +3028,7 @@ class DirectEmitter extends FunctionEmitter {
                 return this.emit(`
                     {
                         const proc = r${term.proc};
-                        const args = windowApplyArgs([${this.argList(term.start, term.nargs)}], 0, ${term.nargs});
+                        const args = ${applyArgs(term, `[${this.argList(term.start, term.nargs)}]`, 0)};
                         rip = ${term.isTail ? -1 : term.resume};
                         ${this.#callArray(term.isTail)}
                     }

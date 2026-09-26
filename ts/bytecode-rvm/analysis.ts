@@ -19,6 +19,9 @@ import {
   Cons,
 } from "../common";
 import { AnalysisScope, VariableMetadata } from "./scope";
+
+const OP_APPLY = Symbol.for("%apply");
+const OP_APPLY_MULTI = Symbol.for("%apply-multi");
 import { CORE_FORMS, CORE_OPS } from "./core";
 import type { Intrinsics } from "./intrinsics";
 
@@ -64,7 +67,8 @@ export class AstAnalysis {
                     lambdaScope.define(p); 
                 }
                 if (extractedParams.remParams) {
-                    lambdaScope.define(extractedParams.remParams); 
+                    lambdaScope.define(extractedParams.remParams);
+                    lambdaScope.getVarinfo(extractedParams.remParams)!.isRestParam = true;
                 }
 
                 this.scopeMap.set(ast, lambdaScope);
@@ -141,6 +145,19 @@ export class AstAnalysis {
             case OP_DEFINE_GLOBAL: {
                 const value = ast.cdr.cdr.car;
                 this.visit(value, scope);
+                return;
+            }
+            // (%apply proc arg ... lst) / (%apply-multi proc lst): a variable as lst is only spread, so it may be a
+            // forwarded rest parameter
+            case OP_APPLY:
+            case OP_APPLY_MULTI: {
+                let curr: any = ast.cdr;
+                while (curr instanceof Cons) {
+                    if (curr.cdr === null && typeof curr.car === "symbol" && curr !== ast.cdr) scope.readApplyList(curr.car);
+                    else this.visit(curr.car, scope);
+                    curr = curr.cdr;
+                }
+                if (curr !== null) this.visit(curr, scope);
                 return;
             }
         }
