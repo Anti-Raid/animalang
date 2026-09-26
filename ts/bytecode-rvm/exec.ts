@@ -68,6 +68,7 @@ export enum OpCode {
                  //                    (reg[pre], unless pre is NO_REG, runs on the error before unwinding)
     RAISE,       // obj continuable    deliver reg[obj] to the innermost exception handler
     CURSTACK,    // skip               a snapshot of the current stack, minus its innermost skip frames
+    CALLHOST,    // rt start n tail    call host intrinsic runtime[rt] on reg[start .. start+n); a HostTail result is called in its place
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -106,6 +107,7 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.CALLCATCH]: 4,
     [OpCode.RAISE]: 3,
     [OpCode.CURSTACK]: 2,
+    [OpCode.CALLHOST]: 5,
 };
 
 // UNPACK flags
@@ -149,6 +151,10 @@ export class ByteCode implements AbstractByteCode {
     // chains in constant space without unwinding the js stack
     public tailSuspends: number = 0;
 
+    // the runtime operations CALLRT operands refer to, as indices into `runtime`, resolved by name to the operations
+    // registered now
+    readonly rt: number[];
+
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
         public constants: any[],
@@ -157,13 +163,21 @@ export class ByteCode implements AbstractByteCode {
         public lineTable: Uint32Array = new Uint32Array(0),
         public files: string[] = [],
         // compiled in debug mode: records tail calls and exact error positions (never mixed with non-debug code)
-        public debug: boolean = false
-    ) {}
+        public debug: boolean = false,
+        // metadata: the names of the runtime operations the code uses
+        public readonly runtime: string[] = []
+    ) {
+        this.rt = runtime.map(name => {
+            const idx = RUNTIME_IDX.get(name);
+            if (idx === undefined) throw new Error(`bytecode uses the runtime operation '${name}', which is not registered`);
+            return idx;
+        });
+    }
 
     fresh(copies: Map<ByteCode, ByteCode> = new Map()): ByteCode {
         const known = copies.get(this);
         if (known !== undefined) return known;
-        const copy = new ByteCode([], this.inst, this.numReg, this.lineTable, this.files, this.debug);
+        const copy = new ByteCode([], this.inst, this.numReg, this.lineTable, this.files, this.debug, this.runtime);
         copies.set(this, copy);
         SHARED_INSTS.add(this.inst);
         copy.constants = this.constants.map(c => c instanceof ClosureTemplate
@@ -195,6 +209,7 @@ export class ByteCode implements AbstractByteCode {
         bs.writeU32Arr(this.lineTable);
         bs.writeArray(this.files);
         bs.writeValue(this.debug);
+        bs.writeArray(this.runtime);
     }
 
     static register(bsr: BSReader) {
@@ -205,7 +220,8 @@ export class ByteCode implements AbstractByteCode {
             const lineTable = bsr.readU32Arr();
             const files = bsr.readArray() as string[];
             const debug = bsr.read() as boolean;
-            return new ByteCode(constants, inst, numReg, lineTable, files, debug);
+            const runtime = bsr.readArray() as string[];
+            return new ByteCode(constants, inst, numReg, lineTable, files, debug, runtime);
         });
     }
 }
@@ -460,19 +476,19 @@ export class EscapeContinuation extends IProcedure {
 // register 0 with what a pre-unwind handler returned
 let helpers: { handlerReturned: Closure, escapeWith: Closure } | null = null;
 const raiseHelpers = () => helpers ??= {
-    handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [
+    handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [], [
         OpCode.LOADCONST, 0, 0,
         OpCode.RAISE, 0, 0,
         OpCode.RETURN, 0,
     ]),
-    escapeWith: helperClosure(3, [], [
+    escapeWith: helperClosure(3, [], ["make-caught"], [
         OpCode.MOVEACC, 1,
-        OpCode.CALLRT, RUNTIME_IDX.get("make-caught")!, 2, 1, 1,
+        OpCode.CALLRT, 0, 2, 1, 1,
         OpCode.CALL, 0, 2, 1, 1,
     ]),
 };
-const helperClosure = (numReg: number, constants: any[], inst: number[]): Closure =>
-    new Closure(new ClosureTemplate([], null, new ByteCode(constants, new Uint32Array(inst), numReg), [], "raise"), [], "raise");
+const helperClosure = (numReg: number, constants: any[], runtime: string[], inst: number[]): Closure =>
+    new Closure(new ClosureTemplate([], null, new ByteCode(constants, new Uint32Array(inst), numReg, undefined, undefined, false, runtime), [], "raise"), [], "raise");
 
 // the handler a %catch installs: raising to it escapes to the %catch with the error wrapped in a Caught
 export class CatchToken extends EscapeContinuation {
@@ -1167,6 +1183,25 @@ export const RUNTIME: [name: string, fn: RuntimeFn][] = [
 
 export const RUNTIME_IDX = new Map(RUNTIME.map(([name], idx) => [name, idx]));
 
+// A host intrinsic that is not a leaf may return this instead of a value: the value is then (proc args ...), called as
+// Scheme code (so it can yield, capture continuations and raise)
+export class HostTail {
+    constructor(readonly proc: any, readonly args: any[]) {}
+}
+
+export const hostTail = (proc: any, ...args: any[]): HostTail => new HostTail(proc, args);
+
+// the functions of host intrinsics, by runtime index, called directly by AOT code
+export const HOST_FNS: (((...args: any[]) => any) | undefined)[] = [];
+
+export const addRuntimeOp = (name: string, fn: RuntimeFn): number => {
+    if (RUNTIME_IDX.has(name)) throw new Error(`the runtime operation '${name}' is already registered`);
+    const idx = RUNTIME.push([name, fn]) - 1;
+    RUNTIME_FNS.push(fn);
+    RUNTIME_IDX.set(name, idx);
+    return idx;
+};
+
 const RUNTIME_FNS = RUNTIME.map(([, fn]) => fn);
 
 export class BytecodeInterpreter {
@@ -1371,7 +1406,7 @@ export class BytecodeInterpreter {
                         return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]), frame.marks, frame.mframe);
                     }
                     case OpCode.CALLRT: {
-                        const fn = RUNTIME_FNS[inst[ip++]];
+                        const fn = RUNTIME_FNS[frame.code.rt[inst[ip++]]];
                         const destReg = inst[ip++];
                         const startReg = inst[ip++];
                         regs[destReg] = fn(ctx, executor, regs, startReg, inst[ip++]);
@@ -1420,6 +1455,18 @@ export class BytecodeInterpreter {
                         ctx.acc = new StackSnapshot(frameInfos(frame, skip));
                         break;
                     }
+                    case OpCode.CALLHOST: {
+                        const fn = RUNTIME_FNS[frame.code.rt[inst[ip++]]];
+                        const startReg = inst[ip++];
+                        const nargs = inst[ip++];
+                        const isTail = inst[ip++] !== 0;
+                        frame.ip = ip;
+                        const res = fn(ctx, executor, regs, startReg, nargs);
+                        if (res instanceof HostTail) return executor.invoke(ctx, res.proc, frame, res.args, 0, res.args.length, isTail);
+                        ctx.acc = res;
+                        if (isTail) return executor.setRetVal(ctx, frame.parent, res);
+                        break;
+                    }
                     default: {
                         const _: never = opcode;
                         throw new Error(`Unhandled opcode: ${opcode}`);
@@ -1465,6 +1512,8 @@ const JIT_DEPS = {
     countControlSuspend,
     StackSnapshot,
     frameInfos,
+    HOST_FNS,
+    HostTail,
     CatchToken,
     Caught,
     catchHere,
@@ -1506,6 +1555,7 @@ type AotTerm = { at?: number } & (
     | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
     | { k: "Raise"; obj: number; continuable: boolean; resume: number }
     | { k: "CurStack"; skip: number; resume: number }
+    | { k: "HostCall"; rt: number; start: number; nargs: number; isTail: boolean; resume: number }
     | { k: "Yield"; val: number; resume: number }
     | { k: "CoResume"; co: number; list: number; isTail: boolean; resume: number }
     | { k: "Return"; reg: number });
@@ -1646,6 +1696,7 @@ export class AotCompiler {
                 case OpCode.APPLY:
                 case OpCode.CALLCC:
                 case OpCode.CORESUME:
+                case OpCode.CALLHOST:
                     if (inst[nextIp - 1] === 0) blocks.add(nextIp);
                     break;
             }
@@ -1784,7 +1835,7 @@ export class AotCompiler {
                         break;
                     }
                     case OpCode.CALLRT:
-                        insts.push({ k: "RtCall", rt: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                        insts.push({ k: "RtCall", rt: code.rt[inst[ip++]], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.APPLY: {
                         const procIdx = inst[ip++];
@@ -1817,6 +1868,13 @@ export class AotCompiler {
                     case OpCode.CURSTACK:
                         term = { k: "CurStack", skip: inst[ip++], resume: ip };
                         break;
+                    case OpCode.CALLHOST: {
+                        const rt = code.rt[inst[ip++]];
+                        const start = inst[ip++];
+                        const nargs = inst[ip++];
+                        term = { k: "HostCall", rt, start, nargs, isTail: inst[ip++] !== 0, resume: ip };
+                        break;
+                    }
                     case OpCode.RETURN:
                         term = { k: "Return", reg: inst[ip++] };
                         break;
@@ -1870,6 +1928,7 @@ class Liveness {
     static #resumePoint(term: AotTerm): number | null {
         switch (term.k) {
             case "Call": case "Apply": case "CallCC": case "CallEC": case "CallCatch": case "Raise": case "CurStack": case "Yield": case "CoResume": return term.resume;
+            case "HostCall": return term.isTail ? null : term.resume;
             default: return null;
         }
     }
@@ -1919,6 +1978,7 @@ class Liveness {
             case "CallEC": return [term.proc];
             case "CallCatch": return term.pre === NO_REG ? [term.proc] : [term.proc, term.pre];
             case "Raise": return [term.obj];
+            case "HostCall": return windowRegs(term.start, term.nargs);
             case "Yield": return [term.val];
             case "CoResume": return [term.co, term.list];
             case "Return": return [term.reg];
@@ -1932,7 +1992,7 @@ class Liveness {
             case "Block": case "Loop": return [term.body];
             case "Branch": return [term.then, term.else];
             case "Call": case "CallEC": case "CallCatch": case "Raise": case "CurStack": case "Yield": return [term.resume];
-            case "Apply": case "CallCC": case "CoResume": return term.isTail ? [] : [term.resume];
+            case "Apply": case "CallCC": case "CoResume": case "HostCall": return term.isTail ? [] : [term.resume];
             case "MaybeSelfTailCall": return [0];
             default: return [];
         }
@@ -2175,6 +2235,13 @@ abstract class FunctionEmitter extends CodeEmitter {
         }
     }
 
+    // an expression calling a host intrinsic: its inline template, whose fallback is a direct call of its function
+    protected hostCall(rt: number, start: number, nargs: number): string {
+        const args = windowRegs(start, nargs).map(r => `r${r}`);
+        const direct = `HOST_FNS[${rt}](${args.join(", ")})`;
+        return RUNTIME_INLINES.get(RUNTIME[rt][0])?.(args, direct, "tmp") ?? direct;
+    }
+
     // an expression computing a builtin call inline (see inline.ts), or null
     protected inlineBuiltin(builtin: number, start: number, nargs: number): string | null {
         const inline = BUILTIN_INLINES.get(Symbol.keyFor(IBUILTINS[builtin].name)!);
@@ -2367,6 +2434,20 @@ class ResumeEmitter extends FunctionEmitter {
                     frame.ip = ${term.resume};
                     ctx.acc = new StackSnapshot(frameInfos(frame, ${term.skip}));
                     ${this.jump(term.resume, next)}
+                `);
+            case "HostCall":
+                return this.emit(`
+                    frame.ip = ${term.resume};
+                    {
+                        const res = ${this.hostCall(term.rt, term.start, term.nargs)};
+                        if (res instanceof HostTail) {
+                            ${term.isTail ? "" : this.#spills(live.spillsFor(term.resume))}
+                            return executor.invoke(ctx, res.proc, frame, res.args, 0, res.args.length, ${term.isTail});
+                        }
+                        ctx.acc = res;
+                        ${term.isTail ? "return executor.setRetVal(ctx, frame.parent, res);" : ""}
+                    }
+                    ${term.isTail ? "" : this.jump(term.resume, next)}
                 `);
             case "TailCall":
                 return this.emit(`
@@ -2621,6 +2702,23 @@ class DirectEmitter extends FunctionEmitter {
         `;
     }
 
+    // calls `proc` with the array `args` (both in scope), leaving the value in acc, or returning it for a tail call
+    #callArray(isTail: boolean): string {
+        const done = isTail ? "return" : "acc =";
+        const frameArg = isTail ? "mframe" : "mframe + 1";
+        return `
+            if (proc instanceof BuiltinFunction) {
+                ${done} proc.cb(args, 0, args.length);
+            } else if (${this.directGuard("proc", "args.length")}) {
+                ${done} executor.callDirect(ctx, proc, args, depth + 1, marks, ${frameArg});
+            } else if (${this.restGuard("proc", "args.length")}) {
+                ${done} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${frameArg});
+            } else {
+                throw Suspend.invoke(proc, args);
+            }
+        `;
+    }
+
     #call(procReg: number, start: number, nargs: number, resume: number, marksExpr: string = "marks"): string {
         const args = this.argList(start, nargs);
         return `
@@ -2695,6 +2793,20 @@ class DirectEmitter extends FunctionEmitter {
                     rip = ${term.resume};
                     throw Suspend.stack(${term.skip});
                 `);
+            case "HostCall":
+                return this.emit(`
+                    {
+                        rip = ${term.isTail ? -1 : term.resume};
+                        const res = ${this.hostCall(term.rt, term.start, term.nargs)};
+                        if (res instanceof HostTail) {
+                            const proc = res.proc, args = res.args;
+                            ${this.#callArray(term.isTail)}
+                        } else {
+                            ${term.isTail ? "return res;" : "acc = res;"}
+                        }
+                    }
+                    ${term.isTail ? "" : this.jump(term.resume, next)}
+                `);
             case "TailCall":
                 return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs)} }`);
             case "MaybeSelfTailCall":
@@ -2710,23 +2822,12 @@ class DirectEmitter extends FunctionEmitter {
                     }
                 `);
             case "Apply": {
-                const done = term.isTail ? "return" : "acc =";
                 return this.emit(`
                     {
                         const proc = ${this.procExpr(term.proc)};
                         const args = windowApplyArgs([${this.argList(term.start, term.nargs)}], 0, ${term.nargs});
                         rip = ${term.isTail ? -1 : term.resume};
-                        if (proc instanceof BuiltinFunction) {
-                            ${done} proc.cb(args, 0, args.length);
-                        } else if (${this.directGuard("proc", "args.length")}) {
-                            ${term.isTail ? "const val =" : "acc ="} executor.callDirect(ctx, proc, args, depth + 1, marks, ${term.isTail ? "mframe" : "mframe + 1"});
-                            ${term.isTail ? "return val;" : ""}
-                        } else if (${this.restGuard("proc", "args.length")}) {
-                            ${term.isTail ? "const val =" : "acc ="} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${term.isTail ? "mframe" : "mframe + 1"});
-                            ${term.isTail ? "return val;" : ""}
-                        } else {
-                            throw Suspend.invoke(proc, args);
-                        }
+                        ${this.#callArray(term.isTail)}
                     }
                     ${term.isTail ? "" : this.jump(term.resume, next)}
                 `);

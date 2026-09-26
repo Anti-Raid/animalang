@@ -8,6 +8,19 @@ import { BUILTINS_START, INSTRUCTION_LENGTHS } from './bytecode-rvm/exec';
 import { Anima } from './anima';
 import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
+import { registerHostIntrinsic } from './bytecode-rvm/intrinsics';
+import { hostTail } from './bytecode-rvm/exec';
+import { IProcedure } from './common';
+import { hostError } from './errors';
+
+// host intrinsics are process-wide, so the ones under test are registered once
+registerHostIntrinsic("%test-add", (a: any, b: any) => a + b, {
+    args: [2, 2],
+    leaf: true,
+    inline: ([a, b], slow) => `(typeof ${a} === "number" && typeof ${b} === "number" ? ${a} + ${b} : ${slow})`,
+});
+registerHostIntrinsic("%test-call-or", (f: any, ...args: any[]) => f instanceof IProcedure ? hostTail(f, ...args) : f, { args: [1, Infinity] });
+registerHostIntrinsic("%test-fail", (msg: string) => { throw hostError(msg) }, { args: [1, 1], leaf: true });
 
 describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
 let bcCache: Record<string, AbstractByteCode> = {}
@@ -812,6 +825,34 @@ describe('Anima', () => {
         it('calls the prelude procedure otherwise', () => {
             expect(run(`(define (cwv-p) (values 3 4)) (call-with-values cwv-p list)`)).toBe("(3 4)")
             expect(run(`(call-with-values (lambda () (values 1 2)) (if #t list vector))`)).toBe("(1 2)")
+        })
+    });
+
+    describe('Host intrinsics', () => {
+        it('calls leaf intrinsics, inline and not', () => {
+            expect(run(`(%test-add 1 2)`)).toBe("3")
+            expect(run(`(%test-add "a" "b")`)).toBe('"ab"')
+            expect(run(`(define (ht-sum n acc) (if (= n 0) acc (ht-sum (- n 1) (%test-add acc n)))) (ht-sum 100 0)`)).toBe("5050")
+            expect(() => run(`(%test-add 1)`)).toThrow()
+        })
+
+        it('runs tail requests as Scheme calls', () => {
+            expect(run(`(%test-call-or 5)`)).toBe("5")
+            expect(run(`(%test-call-or (lambda (x) (* x 2)) 21)`)).toBe("42")
+            expect(run(`(%test-call-or + 1 2)`)).toBe("3")
+            expect(run(`(+ 1 (%test-call-or (lambda () 41)))`)).toBe("42")
+            expect(run(`(define (ht-loop n) (if (= n 0) 'ok (%test-call-or ht-loop (- n 1)))) (ht-loop 100000)`)).toBe("ok")
+        })
+
+        it('lets tail requests yield, re-enter and raise', () => {
+            expect(run(`(define ht-co (coroutine-create (lambda () (+ 1 (%test-call-or (lambda () (coroutine-yield 'y) 10))))))
+                        (list (coroutine-resume ht-co) (coroutine-resume ht-co))`)).toBe("(y 11)")
+            expect(run(`(define ht-k #f) (define ht-n 0)
+                        (define ht-r (+ 100 (%test-call-or (lambda () (call/cc (lambda (k) (set! ht-k k) 1))))))
+                        (set! ht-n (+ ht-n 1))
+                        (if (< ht-n 3) (ht-k ht-n) (list ht-r ht-n))`)).toBe("(102 3)")
+            expect(run(`(try (lambda () (%test-fail "boom")) (lambda (e) (error-message e)))`)).toBe('"boom"')
+            expect(run(`(try (lambda () (%test-call-or (lambda () (raise 'inner)))) (lambda (e) e))`)).toBe("inner")
         })
     });
 
@@ -2861,6 +2902,22 @@ describe('Floats, Infinities & NaNs', () => {
         wrongVersion[1] = BYTECODE_VERSION + 1;
         expect(() => readFull(wrongVersion)).toThrow(`bytecode version ${BYTECODE_VERSION + 1} is not supported`);
         expect(() => readFull(full.subarray(2))).toThrow("not anima bytecode");
+    });
+
+    it("serializes host intrinsics by name", () => {
+        const bc = evaluator.compileRaw("(list (%test-add 1 2) (%test-call-or (lambda (x) x) 4))") as ByteCode;
+        expect(bc.runtime).toContain("%test-add");
+        expect(bc.runtime).toContain("%test-call-or");
+        expect(s.stringify(evaluator.evaluateRaw(readFull(dumpFull(bc)) as ByteCode))).toBe("(3 4)");
+        const unknown = evaluator.compileRaw("(%test-add 1 2)") as ByteCode;
+        unknown.runtime[unknown.runtime.indexOf("%test-add")] = "%not-registered";
+        expect(() => readFull(dumpFull(unknown))).toThrow("'%not-registered', which is not registered");
+    });
+
+    it("rejects bad host intrinsic registrations", () => {
+        expect(() => registerHostIntrinsic("no-percent", () => 1)).toThrow("start with '%'");
+        expect(() => registerHostIntrinsic("%test-add", () => 1)).toThrow("already defined");
+        expect(() => registerHostIntrinsic("%marks-first", () => 1)).toThrow("already defined");
     });
 });
 

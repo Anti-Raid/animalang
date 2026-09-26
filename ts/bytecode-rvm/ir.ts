@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, RUNTIME_IDX, UNPACK_REST, UNPACK_STRICT, type UpVarLoc } from "./exec";
+import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, RUNTIME, RUNTIME_IDX, UNPACK_REST, UNPACK_STRICT, type UpVarLoc } from "./exec";
 
 let nextLabelId = 0;
 
@@ -164,6 +164,14 @@ export type Node = {
     t: "CurrentMarks",
     destReg: number
 } | {
+    // a host intrinsic that may return a tail request (CALLHOST)
+    t: "HostCall",
+    rtIdx: number,
+    startReg: number,
+    nargs: number,
+    isTail: boolean,
+    destReg?: number
+} | {
     t: "CurrentStack",
     skip: number,
     destReg?: number
@@ -193,6 +201,13 @@ export class IR {
         const lineTable: number[] = []
         const files: string[] = []
         const jumpIdxs: Map<number, JumpLabel> = new Map()
+        // the runtime operations used, by name (the bytecode's metadata); CALLRT operands index this
+        const runtime: string[] = []
+        const rtSlot = (idx: number): number => {
+            const name = RUNTIME[idx][0]
+            const slot = runtime.indexOf(name)
+            return slot !== -1 ? slot : runtime.push(name) - 1
+        }
         const resolvedLabels: Map<JumpLabel, number> = new Map()
         for(let i = 0; i < nodes.length; i++) {
             const node = nodes[i]
@@ -253,6 +268,10 @@ export class IR {
                     break
                 case "CurrentMarks":
                     inst.push(OpCode.CURMARKS, node.destReg)
+                    break
+                case "HostCall":
+                    inst.push(OpCode.CALLHOST, rtSlot(node.rtIdx), node.startReg, node.nargs, node.isTail ? 1 : 0)
+                    if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
                     break
                 case "CurrentStack":
                     inst.push(OpCode.CURSTACK, node.skip)
@@ -345,7 +364,7 @@ export class IR {
                     if (node.t === "CallEC") inst.push(OpCode.CALLEC, node.procReg, node.tokReg);
                     else inst.push(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
                     if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    inst.push(OpCode.CALLRT, RUNTIME_IDX.get("end-escape")!, node.tokReg, node.tokReg, 1);
+                    inst.push(OpCode.CALLRT, rtSlot(RUNTIME_IDX.get("end-escape")!), node.tokReg, node.tokReg, 1);
                     break;
                 }
                 case "CoYield": {
@@ -359,7 +378,7 @@ export class IR {
                     break;
                 }
                 case "RtCall": {
-                    inst.push(OpCode.CALLRT, node.rtIdx, node.destReg, node.startReg, node.nargs);
+                    inst.push(OpCode.CALLRT, rtSlot(node.rtIdx), node.destReg, node.startReg, node.nargs);
                     break;
                 }
                 case "Pos": {
@@ -384,7 +403,7 @@ export class IR {
             inst[jump] = resolvedOffset
         }
 
-        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug)
+        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, runtime)
     }
 }
 

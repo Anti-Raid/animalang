@@ -4,7 +4,7 @@ import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { IBUILTINS_IDX_MAP } from "../std";
 import { BUILTINS_START, OpCode, RUNTIME_IDX } from "./exec";
-import { BUILTIN_INTRINSICS, RUNTIME_INTRINSICS } from "./intrinsics";
+import { BUILTIN_INTRINSICS, HOST_CALLING, RUNTIME_INTRINSICS } from "./intrinsics";
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLCC = Symbol.for("%call/cc");
@@ -201,6 +201,12 @@ export class Compiler {
             }
 
             const runtime = RUNTIME_INTRINSICS.get(operator)
+            if (runtime !== undefined && HOST_CALLING.has(operator)) {
+                this.#compileRuntimeOp(expr, opts, runtime.min, runtime.max, (start, nargs, dest) => {
+                    opts.nodes.push({ t: "HostCall", rtIdx: runtime.idx, startReg: start, nargs, isTail: opts.isTail, destReg: dest })
+                })
+                return
+            }
             if (runtime !== undefined) {
                 this.#compileRuntimeOp(expr, opts, runtime.min, runtime.max, (start, nargs, dest) => {
                     this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "RtCall", rtIdx: runtime.idx, destReg, startReg: start, nargs }))
@@ -468,6 +474,7 @@ export class Compiler {
             lastNode.t === "TailApply" ||
             lastNode.t === "Return" ||
             lastNode.t === "TailCallCC" ||
+            (lastNode.t === "HostCall" && lastNode.isTail) ||
             (lastNode.t === "CoResume" && lastNode.isTail)
         ) {
             return true // all of these ops alr return
