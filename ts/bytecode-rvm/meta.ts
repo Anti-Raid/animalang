@@ -1,32 +1,10 @@
-import type { AnimaMeta } from "../common";
-import { Compiler } from "./compiler";
-import { deepPrint } from "./utils";
-import { AnimaVM, ByteCode } from "./vm";
+import type { ExecutionMode } from "./exec";
 
-export const impl: AnimaMeta = {
-    id: "rvm",
-    vm: () => new AnimaVM("interp"),
-    compiler: () => new Compiler(),
-    deepPrint: (bc) => deepPrint(bc as ByteCode)
-};
+// How an instance compiles and runs code: interpreted, or compiled to JS ("aot"); and as debug code (exact error
+// positions and tail-call trails in tracebacks)
+export type AnimaOptions = { readonly mode: ExecutionMode, readonly debug: boolean };
 
-export const implAot: AnimaMeta = {
-    id: "rvm-aot",
-    vm: () => new AnimaVM("aot"),
-    compiler: () => new Compiler(),
-    deepPrint: (bc) => deepPrint(bc as ByteCode)
-};
-
-export const implDebug: AnimaMeta = {
-    id: "rvm-debug",
-    vm: () => new AnimaVM("interp"),
-    compiler: () => new Compiler(true),
-    deepPrint: (bc) => deepPrint(bc as ByteCode)
-};
-
-export const implAotDebug: AnimaMeta = {
-    id: "rvm-aot-debug",
-    vm: () => new AnimaVM("aot"),
-    compiler: () => new Compiler(true),
-    deepPrint: (bc) => deepPrint(bc as ByteCode)
-};
+export const impl: AnimaOptions = { mode: "interp", debug: false };
+export const implAot: AnimaOptions = { mode: "aot", debug: false };
+export const implDebug: AnimaOptions = { mode: "interp", debug: true };
+export const implAotDebug: AnimaOptions = { mode: "aot", debug: true };

@@ -48,7 +48,7 @@ export const markValues = (marks: Marks, key: any): any[] => {
     return out;
 };
 
-// the marks of a continuation, as a Scheme value
+// the marks of a continuation, as a value code can hold
 export class ContinuationMarkSet extends OpaqueValue {
     constructor(readonly marks: Marks) {
         super();

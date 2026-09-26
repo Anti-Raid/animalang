@@ -2,6 +2,36 @@
 
 Anima is the custom (Scheme-inspired) language used in settings v2 in antiraid for dynamic branching + complex client-side validation etc.
 
+## Migrating to the intrinsics API
+
+The host API changed. Host functions now go through intrinsics only: there are no host callbacks anymore (`BuiltinFunction` is gone), and a JS function placed in scope is not a procedure Anima code can call.
+
+- **Creating an instance**: `new Anima(implRvm)` is now `createScheme(implRvm)` (or `implRvmAot`). `new Anima(options)` still exists, but makes a bare instance with no language: no reader, builtins or prelude.
+- **Registering host functions**: the global `registerHostIntrinsic(name, fn, options)` is now `anima.registerIntrinsic(name, fn, options)`. Each instance has its own intrinsics. Names start with `%`, and a name only works in code compiled after it is registered. `anima.freeze()` stops further registrations.
+- **The function signature is `fn(regs, start, nargs)`**: the arguments are `regs[start]` to `regs[start + nargs - 1]`. `registerHostIntrinsic` functions took `(...args)` and need porting; `BuiltinFunction` callbacks already had this signature. Do not keep `regs` after the call returns.
+- **Options**: `{ args: [min, max], leaf, inline, deps }`. The argument count is checked when code compiles. Set `leaf: true` for a function that only computes a value; it is cheaper to call and can have an inline template for AOT code.
+- **Calling back into Anima**: an intrinsic that is not a leaf calls an Anima procedure by returning `hostTail(proc, ...args)` (or `hostTailFrom(proc, regs, from, count)`) instead of calling it itself. The call then runs in the VM, so the procedure can yield, capture continuations and raise.
+- **Host functions as values**: an intrinsic is not a value. Wrap it in a procedure, e.g. `(define (clamp . args) (%apply %clamp args))` for a leaf, or a fixed-arity `(lambda (f x) (%with-double f x))` for any intrinsic.
+- **Serialized code** records the intrinsics it uses by name: load it with `readFull(bytes, anima.intrinsics)` into an instance that has registered them.
+
+```ts
+import { createScheme, implRvm, hostTail } from "animalang";
+
+const anima = createScheme(implRvm); // was: new Anima(implRvm)
+
+// a leaf: computes a value from its arguments, never calls back into Anima
+anima.registerIntrinsic("%clamp", (regs, start) => Math.min(Math.max(regs[start], regs[start + 1]), regs[start + 2]), { args: [3, 3], leaf: true });
+// not a leaf: calls an Anima procedure by returning a tail request
+anima.registerIntrinsic("%with-double", (regs, start) => hostTail(regs[start], regs[start + 1] * 2), { args: [2, 2] });
+
+anima.evaluateRaw(anima.compileRaw(`
+  (define (clamp . args) (%apply %clamp args))
+  (define (with-double f x) (%with-double f x))
+  (list (map (lambda (x) (clamp x 0 10)) '(-5 5 50)) (with-double (lambda (y) (+ y 1)) 5))`)); // ((0 5 10) 11)
+```
+
+See `ts/bytecode-rvm/README.md` (intrinsics) and `ts/scheme/README.md` (the Scheme front end) for the details.
+
 ## Specification
 
 ### Grammar

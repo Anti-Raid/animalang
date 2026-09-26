@@ -13,24 +13,28 @@ import {
   CORE_WITH_MARK,
   CORE_CATCH,
   OP_CURRENT_MARKS,
-  OP_CURRENT_STACK,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
 } from "../common";
 import { AnalysisScope, VariableMetadata } from "./scope";
-import { BUILTIN_INTRINSICS, RUNTIME_INTRINSICS, RUNTIME_INTRINSICS_CALLING_SCHEME } from "./intrinsics";
-import { IBUILTINS_IDX_MAP } from "../std";
+
+const OP_APPLY = Symbol.for("%apply");
+const OP_APPLY_MULTI = Symbol.for("%apply-multi");
+import { CORE_FORMS } from "./core";
+import type { Intrinsics } from "./intrinsics";
 
 // Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
 export class AstAnalysis {
     scopeMap = new WeakMap<object, AnalysisScope>();
-    
+
+    constructor(private readonly intrinsics: Intrinsics) {}
+
     analyze(ast: any) {
         const baseScope = new AnalysisScope(null);
         if (ast instanceof Cons) this.scopeMap.set(ast, baseScope);
         this.visit(ast, baseScope);
-        new CallLiveness(this.scopeMap).expr(ast, baseScope, new Set(), new Map());
+        new CallLiveness(this.scopeMap, this.intrinsics).expr(ast, baseScope, new Set(), new Map());
         return baseScope;
     }
 
@@ -62,7 +66,8 @@ export class AstAnalysis {
                     lambdaScope.define(p); 
                 }
                 if (extractedParams.remParams) {
-                    lambdaScope.define(extractedParams.remParams); 
+                    lambdaScope.define(extractedParams.remParams);
+                    lambdaScope.getVarinfo(extractedParams.remParams)!.isRestParam = true;
                 }
 
                 this.scopeMap.set(ast, lambdaScope);
@@ -141,6 +146,19 @@ export class AstAnalysis {
                 this.visit(value, scope);
                 return;
             }
+            // (%apply proc arg ... lst) / (%apply-multi proc lst): a variable as lst is only spread, so it may be a
+            // forwarded rest parameter
+            case OP_APPLY:
+            case OP_APPLY_MULTI: {
+                let curr: any = ast.cdr;
+                while (curr instanceof Cons) {
+                    if (curr.cdr === null && typeof curr.car === "symbol" && curr !== ast.cdr) scope.readApplyList(curr.car);
+                    else this.visit(curr.car, scope);
+                    curr = curr.cdr;
+                }
+                if (curr !== null) this.visit(curr, scope);
+                return;
+            }
         }
         // Visit children (no scope change)
         let curr: any = ast;
@@ -162,12 +180,6 @@ const union = (a: Live, b: Live): Live => {
     return out;
 };
 
-// % forms whose operands are expressions and which may call Scheme code (and so capture a continuation)
-const CALLING_INTRINSICS = new Set([
-    "%call/cc", "%call/ec", "%raise", "%apply", "%apply-multi", "%dynamic-wind",
-    "%coroutine-yield", "%coroutine-yield-list", "%coroutine-resume", "%coroutine-resume-list",
-].map(name => Symbol.for(name)));
-
 // Second pass: backward liveness of the variables that are assigned but not captured, marking those that are live
 // after a call (see VariableMetadata.isBoxed). `expr` returns the variables live before `ast` given those live after
 // it (`out`); `blocks` gives what is live after each %block an %escape can reach.
@@ -176,7 +188,7 @@ class CallLiveness {
     // live sets only grow, so starting from the previous result reaches the same fixed point in about one pass
     readonly #loopHeads = new Map<object, Live>();
 
-    constructor(private readonly scopeMap: WeakMap<object, AnalysisScope>) {}
+    constructor(private readonly scopeMap: WeakMap<object, AnalysisScope>, private readonly intrinsics: Intrinsics) {}
 
     #candidate(scope: AnalysisScope, sym: symbol): VariableMetadata | null {
         const meta = scope.getVarinfo(sym);
@@ -190,18 +202,15 @@ class CallLiveness {
         return live;
     }
 
-    // whether calling this operator may run Scheme code, where a continuation of the current frame can be captured
-    #callsScheme(op: any, scope: AnalysisScope): boolean {
-        if (typeof op !== "symbol") return true;
-        if (BUILTIN_INTRINSICS.has(op)) return false;
-        if (RUNTIME_INTRINSICS.has(op)) return RUNTIME_INTRINSICS_CALLING_SCHEME.has(op);
-        if (CALLING_INTRINSICS.has(op)) return true;
-        // builtins cannot be shadowed and never call Scheme code
-        return !(IBUILTINS_IDX_MAP.has(op) && scope.getVarinfo(op) === null);
+    // whether calling this operator never calls back into the VM, where a continuation of the current frame could be captured
+    #isLeaf(op: any, scope: AnalysisScope): boolean {
+        if (typeof op !== "symbol") return false;
+        return (CORE_FORMS.get(op) ?? this.intrinsics.get(op))?.leaf ?? false;
     }
 
+    // intrinsics' operands are expressions, but the operator is not evaluated
     #isIntrinsic(op: any): boolean {
-        return typeof op === "symbol" && (BUILTIN_INTRINSICS.has(op) || RUNTIME_INTRINSICS.has(op) || CALLING_INTRINSICS.has(op));
+        return typeof op === "symbol" && (CORE_FORMS.has(op) || this.intrinsics.get(op) !== undefined);
     }
 
     // the variables bound by a %let / %let-values, as they are known in its own scope
@@ -226,9 +235,14 @@ class CallLiveness {
                 if (lambdaScope !== undefined) this.#seq(ast.cdr.cdr, lambdaScope, new Set(), new Map());
                 return out;
             }
+            // (%if c1 e1 c2 e2 ... [else]): each ci runs after the ones before it, then its branch or the rest of the chain
             case CORE_IF: {
-                const [cond, then, otherwise] = ast.cdr.toArray();
-                return this.expr(cond, scope, union(this.expr(then, scope, out, blocks), this.expr(otherwise, scope, out, blocks)), blocks);
+                const args = ast.cdr.toArray();
+                let live = args.length % 2 === 1 ? this.expr(args[args.length - 1], scope, out, blocks) : out;
+                for (let i = args.length - (args.length % 2 === 1 ? 3 : 2); i >= 0; i -= 2) {
+                    live = this.expr(args[i], scope, union(this.expr(args[i + 1], scope, out, blocks), live), blocks);
+                }
+                return live;
             }
             case CORE_BEGIN:
                 return this.#seq(ast.cdr, scope, out, blocks);
@@ -275,7 +289,6 @@ class CallLiveness {
                 return this.expr(key, scope, this.expr(value, scope, this.expr(body, scope, out, blocks), blocks), blocks);
             }
             case OP_CURRENT_MARKS:
-            case OP_CURRENT_STACK:
                 return out;
             // (thunk) is called; only if it raised is the handler evaluated and called
             case CORE_CATCH: {
@@ -297,9 +310,9 @@ class CallLiveness {
             }
         }
 
-        // a call (or intrinsic): operands are evaluated first, then the call runs; anything live after a call that may run
-        // Scheme code could be read after re-entering a continuation captured during it
-        if (this.#callsScheme(op, scope)) {
+        // a call (or intrinsic): operands are evaluated first, then the call runs; anything live after a call that is not a
+        // leaf could be read after re-entering a continuation captured during it
+        if (!this.#isLeaf(op, scope)) {
             for (const meta of out) meta.liveAcrossCall = true;
         }
         const operands = this.#isIntrinsic(op) ? (ast.cdr instanceof Cons ? ast.cdr.toArray() : []) : ast.toArray();

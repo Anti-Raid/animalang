@@ -1,5 +1,9 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Env, OP_QUOTE, CORE_QUOTE, OP_AT, SOURCE_POS } from "../common"
-import { Bootstrapper } from "../std";
+import { Cons, Env, CORE_QUOTE, SOURCE_POS } from "../../common"
+import { Compiler } from "../../bytecode-rvm/compiler"
+import { AnimaVM } from "../../bytecode-rvm/vm"
+import type { AnimaOptions } from "../../bytecode-rvm/meta"
+import { OP_QUOTE, OP_AT } from "../symbols"
+import type { Intrinsics } from "../../bytecode-rvm/intrinsics";
 
 export enum TransformState {
     Recurse, // check the new expr as if it was a new expr
@@ -20,25 +24,22 @@ const MAX_TRANSFORM_DEPTH = 1000
 const MAX_NESTING = 1100
 const TOO_DEEP = "program is nested too deeply to expand (or a macro keeps expanding into itself)"
 export class MacroEvaluator {
-    readonly meta: AnimaMeta
     readonly #transformers: Map<symbol, Transform>
-    readonly #bootstrapper: Bootstrapper
 
     scope: Env
-    readonly expandcmp: AbstractCompiler
-    readonly expandvm: AbstractVM;
+    readonly expandcmp: Compiler
+    readonly expandvm: AnimaVM;
 
-    constructor(meta: AnimaMeta, maxSteps: number) {
-        this.meta = meta
-        this.expandcmp = meta.compiler()
-        this.expandvm = meta.vm(maxSteps)
+    // macros run with the same intrinsics as the code they expand
+    constructor(options: AnimaOptions, maxSteps: number, readonly intrinsics: Intrinsics) {
+        this.expandcmp = new Compiler(intrinsics, options.debug)
+        this.expandvm = new AnimaVM(options.mode, intrinsics)
         this.#transformers = new Map<symbol, Transform>()
-        this.#bootstrapper = new Bootstrapper()
         this.scope = new Env()
     }
 
-    init() {
-        const publicScope = this.#bootstrapper.setupPublicScope(this.meta, this.expandcmp, this.expandvm, this)
+    // macros run in a scope chained to `publicScope` (the prelude's exports, set up with this evaluator's compiler and VM)
+    init(publicScope: Env) {
         this.scope = publicScope.chained()
     }
 
@@ -153,13 +154,22 @@ export class MacroEvaluator {
         }
     }
 
+    // transforms every element of a list (and an improper tail), one element at a time rather than one js frame each
     #mapTransform(list: any, depth: number): any {
-        if (list instanceof Cons) {
-            const out = new Cons(this.#transform(list.car, depth), this.#mapTransform(list.cdr, depth));
-            const pos = SOURCE_POS.get(list);
-            if (pos !== undefined) SOURCE_POS.set(out, pos);
-            return out;
+        const cells: Cons[] = [];
+        const items: any[] = [];
+        let curr: any = list;
+        while (curr instanceof Cons) {
+            cells.push(curr);
+            items.push(this.#transform(curr.car, depth));
+            curr = curr.cdr;
         }
-        return list;
+        let out: any = curr;
+        for (let i = cells.length - 1; i >= 0; i--) {
+            out = new Cons(items[i], out);
+            const pos = SOURCE_POS.get(cells[i]);
+            if (pos !== undefined) SOURCE_POS.set(out, pos);
+        }
+        return out;
     }
 }

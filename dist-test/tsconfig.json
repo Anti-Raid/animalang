@@ -1,0 +1,7 @@
+{
+	// the smoke tests import the built package ('animalang' resolves to dist), so they are checked after a build, by
+	// `npm run test:dist`, rather than with the sources
+	"extends": "../tsconfig.json",
+	"include": ["*.ts"],
+	"exclude": []
+}

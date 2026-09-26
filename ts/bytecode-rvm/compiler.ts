@@ -1,18 +1,20 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, OP_CURRENT_MARKS, OP_CURRENT_STACK, CORE_CATCH, OP_RAISE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
-import { IBUILTINS_IDX_MAP } from "../std";
-import { BUILTINS_START, OpCode, RUNTIME_IDX } from "./exec";
-import { BUILTIN_INTRINSICS, HOST_CALLING, RUNTIME_INTRINSICS } from "./intrinsics";
+import { corePos } from "./exec";
+import { arityMessage } from "./arity";
+import { hasCore, isCoreForm, newIntrinsics } from "./core";
+import { Intrinsics, type Intrinsic } from "./intrinsics";
+
+const lastItem = (list: Cons): any => {
+    let curr = list
+    while (curr.cdr instanceof Cons) curr = curr.cdr
+    return curr.car
+}
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
-const OP_CALLCC = Symbol.for("%call/cc");
 const OP_CALLEC = Symbol.for("%call/ec");
-const OP_CO_YIELD = Symbol.for("%coroutine-yield");
-const OP_CO_YIELD_LIST = Symbol.for("%coroutine-yield-list");
-const OP_CO_RESUME = Symbol.for("%coroutine-resume");
-const OP_CO_RESUME_LIST = Symbol.for("%coroutine-resume-list");
 const OP_APPLY = Symbol.for("%apply");
 const OP_APPLY_MARGS = Symbol.for("%apply-multi")
 
@@ -47,11 +49,13 @@ interface CmpOpts {
 export class Compiler {
     #s = new ASTStringifier()
 
-    constructor(private readonly debug: boolean = false) {}
+    constructor(readonly intrinsics: Intrinsics = newIntrinsics(), private readonly debug: boolean = false) {
+        if (!hasCore(intrinsics)) throw new Error("the compiler's intrinsics must start with the core operations (see newIntrinsics)")
+    }
 
     compile(trExpr: any, debug: boolean = this.debug) {
         // Step 1 is to analyze our variables so we know what to box and what not to box
-        let analyzer = new AstAnalysis()
+        let analyzer = new AstAnalysis(this.intrinsics)
         const ascope = analyzer.analyze(trExpr)
 
         const scope = new CompilerScope(null)
@@ -61,7 +65,7 @@ export class Compiler {
         if (!this.#nodesEndsInRet(nodes)) {
             nodes.push({t: "Return", reg: retReg})
         }
-        const ir = new IR(debug)
+        const ir = new IR(this.intrinsics, debug)
         return ir.lower(nodes, scope.numRegs)
     }
 
@@ -136,20 +140,11 @@ export class Compiler {
                 case CORE_WITH_MARK:
                     this.#compileWithMark(expr, opts)
                     return
-                case OP_CURRENT_STACK: {
-                    const skip = expr.cdr === null ? 0 : expr.cdr.car
-                    if (expr.length > 2 || !Number.isInteger(skip) || skip < 0) throw new Error("%current-stack takes an optional literal count of frames to skip")
-                    opts.nodes.push({ t: "CurrentStack", skip, destReg: opts.destReg })
-                    return
-                }
                 case OP_CURRENT_MARKS:
                     if (opts.destReg !== undefined) opts.nodes.push({ t: "CurrentMarks", destReg: opts.destReg })
                     return
                 case OP_DYNAMIC_WIND:
                     this.#compileDynamicWind(expr, opts)
-                    return
-                case OP_CALLCC:
-                    this.#compileCallCC(expr, opts)
                     return
                 case OP_CALLEC:
                     this.#compileCallEC(expr, opts)
@@ -157,40 +152,8 @@ export class Compiler {
                 case CORE_CATCH:
                     this.#compileCatch(expr, opts)
                     return
-                case OP_RAISE:
-                    this.#compileRaise(expr, opts)
-                    return
                 case OP_DEFINE_GLOBAL:
                     this.#compileDefine(expr, opts)
-                    return
-                case OP_CO_YIELD:
-                    this.#compileRuntimeOp(expr, opts, 0, Infinity, (start, nargs, dest) => {
-                        if (nargs === 1) {
-                            opts.nodes.push({ t: "CoYield", valReg: start, destReg: dest })
-                            return
-                        }
-                        this.#withBuiltinResult(opts, "values", start, nargs, valReg => opts.nodes.push({ t: "CoYield", valReg, destReg: dest }))
-                    })
-                    return
-                case OP_CO_RESUME:
-                    this.#compileRuntimeOp(expr, opts, 1, Infinity, (start, nargs, dest) => {
-                        this.#withBuiltinResult(opts, "list", start + 1, nargs - 1, listReg => {
-                            opts.nodes.push({ t: "CoResume", coReg: start, listReg, isTail: opts.isTail, destReg: dest })
-                        })
-                    })
-                    return
-                case OP_CO_RESUME_LIST:
-                    this.#compileRuntimeOp(expr, opts, 2, 2, (start, nargs, dest) => {
-                        opts.nodes.push({ t: "CoResume", coReg: start, listReg: start + 1, isTail: opts.isTail, destReg: dest })
-                    })
-                    return
-                case OP_CO_YIELD_LIST:
-                    this.#compileRuntimeOp(expr, opts, 1, 1, (start, nargs, dest) => {
-                        this.#withDest(opts, undefined, valReg => {
-                            opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("list->values")!, destReg: valReg, startReg: start, nargs })
-                            opts.nodes.push({ t: "CoYield", valReg, destReg: dest })
-                        })
-                    })
                     return
                 case OP_APPLY:
                     this.#compileApply(expr, opts)
@@ -200,32 +163,20 @@ export class Compiler {
                     return
             }
 
-            const runtime = RUNTIME_INTRINSICS.get(operator)
-            if (runtime !== undefined && HOST_CALLING.has(operator)) {
-                this.#compileRuntimeOp(expr, opts, runtime.min, runtime.max, (start, nargs, dest) => {
-                    opts.nodes.push({ t: "HostCall", rtIdx: runtime.idx, startReg: start, nargs, isTail: opts.isTail, destReg: dest })
+            const intrinsic = this.intrinsics.get(operator)
+            if (intrinsic !== undefined && intrinsic.leaf) {
+                this.#compileRuntimeOp(expr, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                    this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "IntCall", pos: intrinsic.pos, destReg, startReg: start, nargs }))
                 })
                 return
             }
-            if (runtime !== undefined) {
-                this.#compileRuntimeOp(expr, opts, runtime.min, runtime.max, (start, nargs, dest) => {
-                    this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "RtCall", rtIdx: runtime.idx, destReg, startReg: start, nargs }))
+            if (intrinsic !== undefined) {
+                this.#compileRuntimeOp(expr, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                    // an intrinsic whose value is that of the call itself (see `tail`) is a call and then a return
+                    opts.nodes.push({ t: "HostCall", pos: intrinsic.pos, startReg: start, nargs, isTail: opts.isTail && intrinsic.tail, destReg: dest })
                 })
                 return
             }
-
-            const builtinIdx = BUILTIN_INTRINSICS.get(operator)
-            if (builtinIdx !== undefined) {
-                this.#compileWindowIntrinsic(expr, builtinIdx, opts)
-                return
-            }
-        }
-
-        // intrinsic
-        const builtinsIdx = IBUILTINS_IDX_MAP.get(operator)
-        if (builtinsIdx !== undefined) {
-            this.#compileWindowIntrinsic(expr, builtinsIdx, opts)
-            return
         }
 
         this.#compileNormalCall(expr, opts)
@@ -249,33 +200,27 @@ export class Compiler {
     }
 
     // compiles both if calls as well as code that is converted into if calls
+    // (%if c1 e1 c2 e2 ... [else]): the first ei whose ci is true, else `else` (or <#void>). One chain whatever the number
+    // of clauses: IF c1 L1; e1; ELSE end; L1: <c2>; ELSEIF c2 L2; e2; ELSE end; L2: ...; else; ENDIF; end:
     #compileIfCall(expr: Cons, opts: CmpOpts) {
-        if (expr.length !== 4) {
-            throw new Error(`if condition must be in format ["if", condition, true_expr, false_expr] but only have ${expr.length-1} arguments`)
+        const args = expr.cdr instanceof Cons ? expr.cdr.toArray() : []
+        if (args.length < 2) {
+            throw new Error(`%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else]), but got ${args.length} arguments`)
         }
-
-        const cond = expr.cdr.car;
-        const thenExpr = expr.cdr.cdr.car;
-        const elseExpr = expr.cdr.cdr.cdr.car;
-
-        // We need to compile the first arg first and leave it to a temp reg
-        const condReg = opts.scope.allocTemp()
-        this.#compile(cond, { ...opts, destReg: condReg, isTail: false })
-        // we place the bytecode as <jumpiffalse [false code]><true code><jump [|]><false code>|
-        const falseLabel = new JumpLabel()
         const endLabel = new JumpLabel()
-        opts.nodes.push({t: "If", reg: condReg, elseLabel: falseLabel})
-        opts.scope.freeTemp(condReg) // we can free the reg here
-        // Place true code
-        this.#compile(thenExpr, opts)
-        // Place else separator
-        opts.nodes.push({t: "Else", endLabel})
-        // Place false code as well as jump to start of false code
-        opts.nodes.push({t:"Label", label: falseLabel})
-        this.#compile(elseExpr, opts)
-        // Place EndIf and end label
-        opts.nodes.push({t: "EndIf"})
-        opts.nodes.push({t: "Label", label: endLabel})
+        for (let i = 0; i + 1 < args.length; i += 2) {
+            const condReg = opts.scope.allocTemp()
+            this.#compile(args[i], { ...opts, destReg: condReg, isTail: false })
+            const nextLabel = new JumpLabel()
+            opts.nodes.push({ t: i === 0 ? "If" : "ElseIf", reg: condReg, elseLabel: nextLabel })
+            opts.scope.freeTemp(condReg)
+            this.#compile(args[i + 1], opts)
+            opts.nodes.push({ t: "Else", endLabel })
+            opts.nodes.push({ t: "Label", label: nextLabel })
+        }
+        this.#compile(args.length % 2 === 1 ? args[args.length - 1] : undefined, opts)
+        opts.nodes.push({ t: "EndIf" })
+        opts.nodes.push({ t: "Label", label: endLabel })
     }
 
     #compileQuote(expr: Cons, opts: CmpOpts) {
@@ -291,6 +236,7 @@ export class Compiler {
         const sym = expr.cdr.car;
         const val = expr.cdr.cdr.car;
         if (typeof sym !== "symbol") throw new Error("internal error: complex defines should be transformed by AnimaTransform prior to reaching here")
+        this.#ensureNotIntrinsic(sym, "define")
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
@@ -305,6 +251,7 @@ export class Compiler {
     #compileSet(expr: Cons, opts: CmpOpts) {
         // AnimaTransform ensures sets are of correct form
         const sym = expr.cdr.car;
+        this.#ensureNotIntrinsic(sym, "set!")
         const val = expr.cdr.cdr.car;
 
         // We need to compile the second arg first and leave it on a temp reg
@@ -325,6 +272,8 @@ export class Compiler {
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
 
         const { params, remParams } = unpackLambdaExprArgs(expr, "lambda")
+        for (const p of params) this.#ensureNotIntrinsic(p, "lambda")
+        this.#ensureNotIntrinsic(remParams, "lambda")
         const lambdaNodes: Node[] = []
         if (opts.pos !== undefined) lambdaNodes.push({ t: "Pos", pos: opts.pos })
 
@@ -354,7 +303,8 @@ export class Compiler {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
-        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName);
+        const restArray = remParams !== null && ascope.getVarinfo(remParams)!.forwardsRest
+        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, restArray);
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
     }
 
@@ -390,6 +340,7 @@ export class Compiler {
         const seen = new Set<symbol>()
         for (const { sym, reg } of bound) {
             ensureCanBind(sym, seen, "let-values")
+            this.#ensureNotIntrinsic(sym, "let-values")
             const inf = ascope.getVarinfo(sym)
             if (!inf) throw new Error("Could not fetch varinfo")
             const destReg = opts.scope.addLocal(sym)
@@ -471,11 +422,8 @@ export class Compiler {
         const lastNode = nodes[last]
         if (
             lastNode.t === "TailCall" ||
-            lastNode.t === "TailApply" ||
             lastNode.t === "Return" ||
-            lastNode.t === "TailCallCC" ||
-            (lastNode.t === "HostCall" && lastNode.isTail) ||
-            (lastNode.t === "CoResume" && lastNode.isTail)
+            (lastNode.t === "HostCall" && lastNode.isTail)
         ) {
             return true // all of these ops alr return
         }
@@ -495,26 +443,12 @@ export class Compiler {
         this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: afterProcReg, isTail: false });
 
         opts.nodes.push({ t: "Call", procReg: beforeProcReg, startReg: 0, nargs: 0 });
-        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("wind")!, destReg, startReg: beforeProcReg, nargs: 2 }));
+        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%wind"), destReg, startReg: beforeProcReg, nargs: 2 }));
         opts.nodes.push({ t: "Call", procReg: thunkProcReg, destReg: opts.destReg, startReg: 0, nargs: 0 });
-        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("end-wind")!, destReg, startReg: 0, nargs: 0 }));
+        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%end-wind"), destReg, startReg: 0, nargs: 0 }));
         opts.nodes.push({ t: "Call", procReg: afterProcReg, startReg: 0, nargs: 0 });
 
         opts.scope.regAlloc.freeBlock(block, 3);
-    }
-
-    #compileCallCC(expr: Cons, opts: CmpOpts) {
-        if (expr.length !== 2) {
-            throw new Error(`%call/cc requires 1 argument, got ${expr.length - 1}`);
-        }
-        const procReg = opts.scope.allocTemp();
-        this.#compile(expr.cdr.car, { ...opts, destReg: procReg, isTail: false });
-        if (opts.isTail) {
-            opts.nodes.push({ t: "TailCallCC", procReg });
-        } else {
-            opts.nodes.push({ t: "CallCC", destReg: opts.destReg, procReg });
-        }
-        opts.scope.freeTemp(procReg);
     }
 
     // always a non-tail call: the escape continuation is deactivated when it returns
@@ -528,19 +462,6 @@ export class Compiler {
         opts.nodes.push({ t: "CallEC", procReg, tokReg, destReg: opts.destReg });
         opts.scope.freeTemp(tokReg);
         opts.scope.freeTemp(procReg);
-    }
-
-    // (%raise obj [continuable]): continuable must be a literal
-    #compileRaise(expr: Cons, opts: CmpOpts) {
-        if (expr.length !== 2 && expr.length !== 3) {
-            throw new Error(`%raise requires 1 or 2 arguments (obj, continuable), got ${expr.length - 1}`);
-        }
-        const flag = expr.length === 3 ? expr.cdr.cdr.car : false;
-        if (typeof flag !== "boolean") throw new Error("%raise: continuable must be #t or #f");
-        const objReg = opts.scope.allocTemp();
-        this.#compile(expr.cdr.car, { ...opts, destReg: objReg, isTail: false });
-        opts.nodes.push({ t: "Raise", objReg, continuable: flag, destReg: opts.destReg });
-        opts.scope.freeTemp(objReg);
     }
 
     // (%catch thunk handler [pre]): CALLCATCH gives the value of (thunk), or a Caught when it raised, after which the
@@ -562,7 +483,7 @@ export class Compiler {
         opts.scope.freeTemp(procReg);
 
         const condReg = opts.scope.allocTemp();
-        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("caught?")!, destReg: condReg, startReg: resReg, nargs: 1 });
+        opts.nodes.push({ t: "IntCall", pos: corePos("%caught?"), destReg: condReg, startReg: resReg, nargs: 1 });
         const elseLabel = new JumpLabel();
         const endLabel = new JumpLabel();
         opts.nodes.push({ t: "If", reg: condReg, elseLabel });
@@ -570,7 +491,7 @@ export class Compiler {
 
         const call = opts.scope.regAlloc.allocBlock(2);
         this.#compile(expr.cdr.cdr.car, { ...opts, destReg: call, isTail: false });
-        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("caught-value")!, destReg: call + 1, startReg: resReg, nargs: 1 });
+        opts.nodes.push({ t: "IntCall", pos: corePos("%caught-value"), destReg: call + 1, startReg: resReg, nargs: 1 });
         if (opts.isTail) opts.nodes.push({ t: "TailCall", procReg: call, startReg: call + 1, nargs: 1 });
         else opts.nodes.push({ t: "Call", procReg: call, destReg: opts.destReg, startReg: call + 1, nargs: 1 });
         opts.scope.regAlloc.freeBlock(call, 2);
@@ -585,10 +506,7 @@ export class Compiler {
 
     #compileRuntimeOp(expr: Cons, opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {
         const nargs = expr.cdr === null ? 0 : expr.cdr.length
-        if (nargs < minArgs || nargs > maxArgs) {
-            const expected = minArgs === maxArgs ? `${minArgs}` : maxArgs === Infinity ? `at least ${minArgs}` : `${minArgs} to ${maxArgs}`
-            throw new Error(`${String(expr.car.description)} requires ${expected} arguments, got ${nargs}`)
-        }
+        if (nargs < minArgs || nargs > maxArgs) throw new Error(arityMessage(String(expr.car.description), minArgs, maxArgs, nargs))
         const startReg = opts.scope.regAlloc.allocBlock(nargs)
         let curr: any = expr.cdr
         let i = 0
@@ -601,9 +519,9 @@ export class Compiler {
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
 
-    #withBuiltinResult(opts: CmpOpts, builtin: string, startReg: number, nargs: number, use: (reg: number) => void) {
+    #withRtResult(opts: CmpOpts, op: string, startReg: number, nargs: number, use: (reg: number) => void) {
         const reg = opts.scope.allocTemp()
-        opts.nodes.push({ t: "IBuiltin", builtinIdx: BUILTINS_START + IBUILTINS_IDX_MAP.get(Symbol.for(builtin))!, destReg: reg, startReg, nargs })
+        opts.nodes.push({ t: "IntCall", pos: corePos(op), destReg: reg, startReg, nargs })
         use(reg)
         opts.scope.freeTemp(reg)
     }
@@ -614,35 +532,23 @@ export class Compiler {
         if (dest === undefined) opts.scope.freeTemp(destReg)
     }
 
-    #compileWindowIntrinsic(expr: Cons, builtinIdx: number, opts: CmpOpts) {
-        const nargs = expr.cdr === null ? 0 : expr.cdr.length
-        const startReg = opts.scope.regAlloc.allocBlock(nargs)
-        let curr: any = expr.cdr
-        let i = 0
-        while (curr instanceof Cons) {
-            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false })
-            i++
-            curr = curr.cdr
-        }
+    #isIntrinsic(sym: symbol): boolean {
+        return isCoreForm(sym) || this.intrinsics.get(sym) !== undefined
+    }
 
-        const destReg = opts.destReg ?? opts.scope.allocTemp()
-        opts.nodes.push({ t: "IBuiltin", builtinIdx: BUILTINS_START + builtinIdx, destReg, startReg, nargs })
-        if (opts.destReg === undefined) opts.scope.freeTemp(destReg)
-        opts.scope.regAlloc.freeBlock(startReg, nargs)
+    // a call of an intrinsic's name always calls the intrinsic, so the name cannot be a variable too; nor can the names
+    // the front end reserved
+    #ensureNotIntrinsic(sym: any, syntaxCtx: string) {
+        if (typeof sym !== "symbol") return
+        const reserved = this.intrinsics.reserved.get(sym)
+        if (reserved === "special form") throw new Error(`${String(sym)}: bad syntax`)
+        if (reserved === "builtin") throw new Error(`${syntaxCtx}: cannot bind builtin ${Symbol.keyFor(sym)}`)
+        if (this.#isIntrinsic(sym)) throw new Error(`${syntaxCtx}: cannot bind ${String(sym.description)}, which is an intrinsic`)
     }
 
     #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
-        if (BUILTIN_INTRINSICS.has(procExpr) || RUNTIME_INTRINSICS.has(procExpr)) {
+        if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
             throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
-        }
-        if (typeof procExpr === "symbol") {
-            const resolved = opts.scope.resolve(procExpr);
-            if (resolved.type === "Global") {
-                const builtinsIdx = IBUILTINS_IDX_MAP.get(procExpr);
-                if (builtinsIdx !== undefined) {
-                    return { procReg: BUILTINS_START + builtinsIdx, isTemp: false };
-                }
-            }
         }
         const procReg = opts.scope.allocTemp();
         this.#compile(procExpr, { ...opts, destReg: procReg, isTail: false });
@@ -655,8 +561,33 @@ export class Compiler {
         }
         const procExpr = expr.cdr.car;
         const argsExprList = expr.cdr.cdr;
-        const { procReg, isTemp } = this.#resolveProcReg(procExpr, opts);
+        const intrinsic = typeof procExpr === "symbol" ? this.intrinsics.get(procExpr) : undefined;
+        if (intrinsic !== undefined) {
+            this.#compileApplyIntrinsic(intrinsic, argsExprList, opts);
+            return;
+        }
+        this.#compileApplyCall(procExpr, argsExprList.toArray(), opts, this.#isRestArray(lastItem(argsExprList), opts) ? "%apply-array" : "%apply-list");
+    }
 
+    // applying a procedure is a call of a core operation (see %apply-list) over [proc, arg ..., lst]. `inPlace` runs on
+    // the last argument's register first
+    #compileApplyCall(procExpr: any, argExprs: any[], opts: CmpOpts, op: string, inPlace?: string) {
+        if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
+            throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
+        }
+        const nargs = 1 + argExprs.length;
+        const startReg = opts.scope.regAlloc.allocBlock(nargs);
+        this.#compile(procExpr, { ...opts, destReg: startReg, isTail: false });
+        argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + 1 + i, isTail: false }));
+        const last = startReg + nargs - 1;
+        if (inPlace !== undefined) opts.nodes.push({ t: "IntCall", pos: corePos(inPlace), destReg: last, startReg: last, nargs: 1 });
+        opts.nodes.push({ t: "HostCall", pos: corePos(op), startReg, nargs, isTail: opts.isTail, destReg: opts.destReg });
+        opts.scope.regAlloc.freeBlock(startReg, nargs);
+    }
+
+    // (%apply %intrinsic arg ... lst): the argument count is only known at run time, so APPLYINT checks it there
+    #compileApplyIntrinsic(intrinsic: Intrinsic, argsExprList: any, opts: CmpOpts) {
+        if (!intrinsic.leaf) throw new Error(`%apply: ${intrinsic.name} is not a leaf intrinsic, so it cannot be applied`);
         const nargs = argsExprList === null ? 0 : argsExprList.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
         let curr: any = argsExprList;
@@ -666,11 +597,9 @@ export class Compiler {
             i++;
             curr = curr.cdr;
         }
-
-        this.#emitApplyNode(opts, procReg, startReg, nargs);
-
+        const restArray = this.#isRestArray(lastItem(argsExprList), opts);
+        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntApply", pos: intrinsic.pos, destReg, startReg, nargs, restArray }));
         opts.scope.regAlloc.freeBlock(startReg, nargs);
-        if (isTemp) opts.scope.freeTemp(procReg);
     }
 
     #compileApplyMulti(expr: Cons, opts: CmpOpts) {
@@ -680,23 +609,13 @@ export class Compiler {
         const procExpr = expr.cdr.car;
         const lstExpr = expr.cdr.cdr.car;
 
-        const { procReg, isTemp } = this.#resolveProcReg(procExpr, opts);
-
-        const listReg = opts.scope.allocTemp();
-        this.#compile(lstExpr, { ...opts, destReg: listReg, isTail: false });
-        opts.nodes.push({ t: "RtCall", rtIdx: RUNTIME_IDX.get("apply-args")!, destReg: listReg, startReg: listReg, nargs: 1 });
-        this.#emitApplyNode(opts, procReg, listReg, 1);
-
-        opts.scope.freeTemp(listReg);
-        if (isTemp) opts.scope.freeTemp(procReg);
+        if (this.#isRestArray(lstExpr, opts)) this.#compileApplyCall(procExpr, [lstExpr], opts, "%apply-array-multi");
+        else this.#compileApplyCall(procExpr, [lstExpr], opts, "%apply-list", "%apply-args");
     }
 
-    #emitApplyNode(opts: CmpOpts, procReg: number, startReg: number, nargs: number) {
-        if (opts.isTail) {
-            opts.nodes.push({ t: "TailApply", procReg, startReg, nargs });
-        } else {
-            opts.nodes.push({ t: "Apply", destReg: opts.destReg, procReg, startReg, nargs });
-        }
+    // whether an %apply's list is a rest parameter the closure receives as an array (see VariableMetadata.forwardsRest)
+    #isRestArray(expr: any, opts: CmpOpts): boolean {
+        return typeof expr === "symbol" && opts.scope.resolve(expr).type === "Local" && opts.ascope.getVarinfo(expr)?.forwardsRest === true
     }
     // a normal call
     #compileNormalCall(expr: Cons, opts: CmpOpts) {
@@ -742,6 +661,7 @@ export class Compiler {
         for (let i = 0; i < bindings.length; i++) {
             const sym = bindings[i].car
             ensureCanBind(sym, seen, "let")
+            this.#ensureNotIntrinsic(sym, "let")
             const inf = ascope.getVarinfo(sym)
             if (!inf) throw new Error("Could not fetch varinfo")
             const destReg = opts.scope.addLocal(sym)
