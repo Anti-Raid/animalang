@@ -2,7 +2,7 @@
 
 `createScheme(impl, maxSteps?)` (`index.ts`) makes an `Anima` instance that runs Scheme. The compiler and VM underneath know only the core forms and intrinsics (see `../bytecode-rvm/README.md`); everything Scheme adds is here:
 
-1. **Intrinsics.** Every builtin procedure (`intrinsics.ts`) is registered on the instance as the leaf intrinsic `%name`, always first and in the same order, so the cached prelude finds them at the same positions in every instance.
+1. **Intrinsics.** Every builtin procedure (`builtins.ts`) is registered on the instance as the leaf intrinsic `%name`, always first and in the same order, so the cached prelude finds them at the same positions in every instance.
 2. **Reserved names.** The surface keywords (`symbols.ts`), the builtins' names and the prelude's exports go into the instance's `Intrinsics.reserved`, so code cannot bind them (`define: cannot bind builtin car`).
 3. **Reader and transformer.** `reader.ts` parses source; `transformer/` expands macros and lowers the surface syntax to core forms.
 4. **Prelude.** `prelude.ts` defines the procedures behind the builtins' names and the rest of the standard library. It is compiled once for all instances and implementations, kept unbound, and each instance runs its own copy bound to its intrinsics by name.
@@ -44,20 +44,20 @@ A named `let` whose name is only called in tail position of its body, with the r
 
 ## Builtins
 
-A builtin is a JS function over a register window (`fn(regs, start, nargs)`), with an argument count range (`SCHEME_BUILTINS` in `intrinsics.ts`; the arithmetic, `c[ad]+r` and predicate functions come from `ops.ts`). Each is reachable two ways:
+A builtin is one entry of `SCHEME_BUILTINS` (`builtins.ts`): its name, argument count range, JS function over a register window (`fn(regs, start, nargs)`) and optionally an AOT template. The function never checks the count: the compiler checks direct calls, and `APPLYINT` applied ones. Each is reachable two ways:
 
-- **Direct calls.** The transformer rewrites `(name arg ...)` to `(%name arg ...)` (`SCHEME_ALIASES`) when the argument count is in range, so the call compiles to `CALLINT`, and to inline JS in AOT code when the builtin has a template (`INLINES`, whose `deps` give it `Cons`, `Table` and so on). `list` and `values` map to the compiler's own `%list` and `%values`. A call with a count out of range is left as an ordinary call, so it still compiles, and fails only if it runs.
-- **As values.** `(map car xs)` uses the prelude's procedure of that name, a wrapper around the intrinsic: `(define ($car a0) (%car a0))` for a fixed count, `(define ($+ . args) (%apply %+ args))` otherwise (`APPLYINT`, which checks the count at run time). A wrong count is reported by the procedure: `cons: expected exactly 2 args, got 1`, or `%-: expected at least 1 args, got 0` (one message format for closures and intrinsics). `list` is `(define ($list . args) args)`, since a rest parameter is already a fresh list, and `values` is `(define ($values . args) (%list->values args))`.
+- **Direct calls.** The transformer rewrites `(name arg ...)` to `(%name arg ...)` (`SCHEME_ALIASES`) when the argument count is in range, so the call compiles to `CALLINT`, and to inline JS in AOT code when the builtin has a template (whose `deps` give it `Cons`, `Table` and so on). The same table maps other procedures to the VM's own operations and forms, each with its own range: `list` and `values` to `%list` and `%values`; `call/cc`, `call/ec` (and their long names), `dynamic-wind`, `raise` and `apply` to `%call/cc`, `%call/ec`, `%dynamic-wind`, `%raise` and `%apply`; and the `coroutine-*` procedures to their `%` operations. A call with a count out of range is left as an ordinary call, so it still compiles, and fails only if it runs.
+- **As values.** `(map car xs)` uses the prelude's procedure of that name, a wrapper generated from the alias table (`ALIAS_WRAPPERS`): `(define ($car a0) (%car a0))` for a fixed count (the control aliases too, e.g. `(define ($call/cc a0) (%call/cc a0))`), `(define ($+ . args) (%apply %+ args))` otherwise (`APPLYINT`, which checks the count at run time). A wrong count is reported by the procedure: `cons: expected exactly 2 args, got 1`, or `%-: expected at least 1 args, got 0` (one message format for closures and intrinsics). `list` is `(define ($list . args) args)`, since a rest parameter is already a fresh list, and `values` is `(define ($values . args) (%list->values args))`.
 
 Builtins, like every name the prelude exports, cannot be rebound.
 
 ## Standard library
 
 - `apply`: a direct call `(apply proc arg ... lst)` becomes `(%apply proc arg ... lst)`; as a value, it is the prelude procedure `(define $apply (lambda (proc . lst) (%apply-multi proc lst)))`.
-- `call/cc` and `call-with-current-continuation` wrap `(%call/cc proc)`; `call/ec`, `call-with-escape-continuation` and `(let/ec k body ...)` wrap `(%call/ec proc)`. `guard` uses `%call/ec`; `try` and `pcall` use `%catch`.
-- `coroutine-create coroutine-resume coroutine-yield coroutine-status coroutine-close`: direct calls become the matching `%` form; as values, prelude wrappers around them.
+- `call/cc` and `call-with-current-continuation` are aliases of `%call/cc`; `call/ec` and `call-with-escape-continuation` of `%call/ec`, which `(let/ec k body ...)` also uses. `guard` uses `%call/ec`; `try` and `pcall` use `%catch`.
+- `coroutine-create coroutine-resume coroutine-yield coroutine-status coroutine-close`: aliases of the matching `%` operations; as values, generated wrappers (and for resume and yield, prelude procedures that pass the values as a list).
 - `values`, `call-with-values`: `(values a b)` is a `MultipleValues` object, `(values x)` is just `x` and `(values)` is zero values. `call-with-values` is a prelude procedure built on `%values->list`, except that a direct call whose producer and consumer are literal lambdas is rewritten to `receive`, binding the values without a list. `receive`, `let-values` (parallel binding) and `let*-values` are macros built on it. Multiple values reaching a single-value context stay a `MultipleValues` object and print as `(values a b)`.
-- `dynamic-wind` wraps `(%dynamic-wind before thunk after)`.
+- `dynamic-wind` is an alias of `(%dynamic-wind before thunk after)`.
 - Exceptions (see the exception model in `../bytecode-rvm/README.md`): `raise` / `raise-continuable` are `%raise` (direct calls are rewritten); the prelude keeps procedures of those names for use as values. `try` / `try-catch` are `%catch`, with the catch procedure running after unwinding like Racket's `with-handlers`. `(pcall f arg ...)` evaluates `f` and the arguments, then returns `(values #t result ...)` or `(values #f err)` (`%values-cons` prepends to the result values). `guard` escapes with `%call/ec` and re-raises with `raise-continuable` through a full continuation when no clause matches. Luau's `xpcall(f, h)` is `%catch` with `h` as `pre`.
 
 ### `debug-frames` / `debug-traceback`

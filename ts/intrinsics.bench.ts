@@ -1,14 +1,13 @@
 import { bench, describe } from "vitest";
 import { Anima } from "./anima";
 import { createScheme } from "./scheme";
-import type { AbstractByteCode, AnimaMeta } from "./common";
 import { ASTStringifier, IProcedure } from "./common";
-import { impl, implAot } from "./bytecode-rvm/meta";
+import { impl, implAot, type AnimaOptions } from "./bytecode-rvm/meta";
 import { HostTail, type ByteCode } from "./bytecode-rvm/exec";
 import { dumpFull, readFull } from "./bytecode-rvm/utils";
 
 // --- the only part that follows the intrinsics API as it changes ---
-const makeInstance = (vmImpl: AnimaMeta) => {
+const makeInstance = (vmImpl: AnimaOptions) => {
     const anima = createScheme(vmImpl);
     anima.registerIntrinsic("%bench-add", (regs, s) => regs[s] + regs[s + 1], {
         args: [2, 2],
@@ -108,7 +107,7 @@ const GROUPS: [group: string, calls: Record<string, string>][] = [
     }],
 ];
 
-const MODES: [mode: string, vmImpl: AnimaMeta][] = [["interp", impl], ["aot", implAot]];
+const MODES: [mode: string, vmImpl: AnimaOptions][] = [["interp", impl], ["aot", implAot]];
 
 const printer = new ASTStringifier();
 const stringify = (v: any): string => printer.stringify(v);
@@ -135,7 +134,7 @@ const OPTS = { time: 1000, warmupTime: 300 };
 for (const { mode, anima, groups } of prepared) {
     for (const [group, runs] of groups) {
         describe(`${mode}: ${group}`, () => {
-            for (const { name, bc } of runs) bench(name, () => { anima.evaluateRaw(bc as AbstractByteCode); }, OPTS);
+            for (const { name, bc } of runs) bench(name, () => { anima.evaluateRaw(bc as ByteCode); }, OPTS);
         });
     }
 }

@@ -1,4 +1,7 @@
-import { AbstractCompiler, AbstractVM, AnimaMeta, Cons, Env, CORE_QUOTE, SOURCE_POS } from "../../common"
+import { Cons, Env, CORE_QUOTE, SOURCE_POS } from "../../common"
+import { Compiler } from "../../bytecode-rvm/compiler"
+import { AnimaVM } from "../../bytecode-rvm/vm"
+import type { AnimaOptions } from "../../bytecode-rvm/meta"
 import { OP_QUOTE, OP_AT } from "../symbols"
 import type { Intrinsics } from "../../bytecode-rvm/intrinsics";
 
@@ -21,18 +24,16 @@ const MAX_TRANSFORM_DEPTH = 1000
 const MAX_NESTING = 1100
 const TOO_DEEP = "program is nested too deeply to expand (or a macro keeps expanding into itself)"
 export class MacroEvaluator {
-    readonly meta: AnimaMeta
     readonly #transformers: Map<symbol, Transform>
 
     scope: Env
-    readonly expandcmp: AbstractCompiler
-    readonly expandvm: AbstractVM;
+    readonly expandcmp: Compiler
+    readonly expandvm: AnimaVM;
 
     // macros run with the same intrinsics as the code they expand
-    constructor(meta: AnimaMeta, maxSteps: number, readonly intrinsics: Intrinsics) {
-        this.meta = meta
-        this.expandcmp = meta.compiler(intrinsics)
-        this.expandvm = meta.vm(maxSteps, intrinsics)
+    constructor(options: AnimaOptions, maxSteps: number, readonly intrinsics: Intrinsics) {
+        this.expandcmp = new Compiler(intrinsics, options.debug)
+        this.expandvm = new AnimaVM(options.mode, intrinsics)
         this.#transformers = new Map<symbol, Transform>()
         this.scope = new Env()
     }

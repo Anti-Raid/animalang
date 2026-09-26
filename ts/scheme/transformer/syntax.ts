@@ -18,12 +18,12 @@ import {
     OP_CURRENT_MARKS,
     OP_CURRENT_STACK,
     SOURCE_POS,
-    AbstractClosure,
     Cons
 } from "../../common";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
 import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
-import { SCHEME_ALIASES } from "../intrinsics";
+import { SCHEME_ALIASES } from "../builtins";
+import type { Closure } from "../../bytecode-rvm/exec";
 
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
@@ -287,9 +287,6 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     });
     evaluator.registerTransform(Symbol.for("current-continuation-marks"), lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("current-continuation-marks takes no arguments");
-    }));
-    evaluator.registerTransform(OP_CURRENT_STACK, lowerTo(OP_CURRENT_STACK, orig => {
-        if (orig.length > 2) throw new Error("%current-stack takes at most 1 argument");
     }));
     // direct calls take the snapshot in the caller itself, so no prelude frame shows in it
     for (const name of ["debug-frames", "debug-traceback"]) {
@@ -563,7 +560,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         let cmpexpr = list(OP_LAMBDA, list(Symbol.for("orig")), expr.cdr.car);
         let trCmpExpr = evaluator.transform(cmpexpr);
         let cmpExprBc = evaluator.expandcmp.compile(trCmpExpr);
-        const res: AbstractClosure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
+        const res: Closure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
         evaluator.registerTransform(onsym, (evaluator, expr, orig) => {
             const resp = evaluator.expandvm.evaluateClosure(res, evaluator.scope, [orig]);
             return { expanded: resp, state: TransformState.Recurse };
@@ -652,33 +649,11 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded, state: TransformState.Recurse };
     });
 
-    evaluator.registerTransform(Symbol.for("call/cc"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/cc"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("call-with-current-continuation"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/cc"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("call/ec"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/ec"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("call-with-escape-continuation"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/ec"), expr), state: TransformState.DoChildren };
-    });
-
     const catchForm = (name: string) => lowerTo(CORE_CATCH, orig => {
         if (orig.length !== 3) throw new Error(`${name} must be of form (${name} thunk handler)`);
     });
     evaluator.registerTransform(CORE_CATCH, lowerTo(CORE_CATCH, orig => {
         if (orig.length !== 3 && orig.length !== 4) throw new Error("%catch must be of form (%catch thunk handler [pre])");
-    }));
-    evaluator.registerTransform(OP_RAISE, lowerTo(OP_RAISE, orig => {
-        if (orig.length !== 2 && orig.length !== 3) throw new Error("%raise must be of form (%raise obj [continuable])");
-    }));
-    evaluator.registerTransform(Symbol.for("raise"), lowerTo(OP_RAISE, orig => {
-        if (orig.length !== 2) throw new Error("raise takes 1 argument");
     }));
     evaluator.registerTransform(Symbol.for("raise-continuable"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length !== 2) throw new Error("raise-continuable takes 1 argument");
@@ -702,20 +677,6 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (!(orig instanceof Cons) || orig.length < 3 || typeof expr.car !== "symbol") throw new Error("let/ec must be of form (let/ec name body...)");
         return { expanded: list(Symbol.for("%call/ec"), cons(OP_LAMBDA, cons(list(expr.car), expr.cdr))), state: TransformState.Recurse };
     });
-
-    evaluator.registerTransform(Symbol.for("apply"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%apply"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("dynamic-wind"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
-    });
-
-    for (const name of ["list", "cons", "vector-ref", "vector-set!", "vector-length", "table-ref", "table-set!", "table-has?", "table-border", "coroutine-create", "coroutine-resume", "coroutine-yield", "coroutine-status", "coroutine-close"]) {
-        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
-            return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
-        });
-    }
 
     // (call-with-values (lambda () p ...) (lambda formals c ...)) binds the values directly, like receive; anything else
     // calls the prelude procedure
@@ -748,15 +709,12 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(CORE_LET_VALUES_STRICT, expr), state: TransformState.Recurse };
     });
 
-    // (name arg ...) of a builtin calls its intrinsic directly when the argument count fits; otherwise it stays an
-    // ordinary call of the prelude's procedure, which reports the wrong count when (and if) it runs
-    for (const [name, target] of SCHEME_ALIASES) {
+    // (name arg ...) of a builtin or another aliased procedure calls its target directly when the argument count fits;
+    // otherwise it stays an ordinary call of the prelude's procedure, which reports the wrong count when (and if) it runs
+    for (const [name, { target, min, max }] of SCHEME_ALIASES) {
         evaluator.registerTransform(name, (evaluator, expr, orig) => {
-            const range = evaluator.intrinsics.get(target);
-            if (range === undefined) throw new Error(`internal error: ${String(target.description)} is not an intrinsic`);
             const nargs = expr === null ? 0 : expr instanceof Cons && !expr.isImproper() ? expr.length : -1;
-            const fits = nargs >= range.min && nargs <= range.max;
-            return { expanded: fits ? cons(target, expr) : orig, state: TransformState.DoChildren };
+            return { expanded: nargs >= min && nargs <= max ? cons(target, expr) : orig, state: TransformState.DoChildren };
         });
     }
 };

@@ -1,5 +1,5 @@
-import { ASTStringifier, ErrorObject, Env, unpackValues, type AbstractVM } from "../common";
-import { OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
+import { ASTStringifier, ErrorObject, Env, unpackValues } from "../common";
+import { type ExecutionMode, OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 import { Intrinsics } from "./intrinsics";
 import { newIntrinsics } from "./core";
 
@@ -16,9 +16,9 @@ export {
     Coroutine
 };
 
-export type ExecutionMode = "interp" | "aot";
+export type { ExecutionMode };
 
-export class AnimaVM implements AbstractVM {
+export class AnimaVM {
     readonly executor: VMExecutor;
     public mode: ExecutionMode;
 

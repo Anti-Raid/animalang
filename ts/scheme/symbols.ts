@@ -36,5 +36,3 @@ export const SCHEME_SPECIAL_FORMS: readonly symbol[] = [
     OP_AT,
 ];
 
-// procedures code cannot bind besides the builtins and the prelude's exports (the transformer rewrites their calls)
-export const SCHEME_RESERVED: readonly symbol[] = ["apply", "call/cc", "call-with-current-continuation", "dynamic-wind"].map(name => Symbol.for(name));

@@ -1,4 +1,3 @@
-import type { Intrinsics } from "./bytecode-rvm/intrinsics";
 import { Cons } from "./list";
 import { Table } from "./table";
 import { Env } from "./env";
@@ -856,29 +855,4 @@ export class ConstPool {
 let n = 0
 export const symGen = (base: string) => {
     return Symbol(`${base}${n++}`)
-}
-
-// eslint-disable-next-line
-export interface AbstractClosure extends SerializableBytecode {}
-// eslint-disable-next-line
-export interface AbstractByteCode extends SerializableBytecode {
-    // a copy with its own runtime state (e.g. adaptive compilation counters), sharing what never changes, bound to `intrinsics`
-    fresh?(copies?: Map<any, any>, intrinsics?: Intrinsics | null): AbstractByteCode
-}
-export interface AbstractVM {
-    evaluateRaw(code: AbstractByteCode, scope: Env): any,
-    evaluateClosure(code: AbstractClosure, scope: Env, args: any[]): any,
-    resumeCoroutine(co: any, args: any[]): { done: boolean, value: any, values: any[] },
-    closeCoroutine(co: any): void,
-    traceback(co: any, msg?: string): string
-}
-export interface AbstractCompiler {
-    compile(trExpr: any, debug?: boolean): AbstractByteCode
-}
-export interface AnimaMeta {
-    id: string,
-    // the compiler and VM of one instance share its intrinsics
-    vm(maxSteps: number, intrinsics: Intrinsics): AbstractVM
-    compiler(intrinsics: Intrinsics): AbstractCompiler
-    deepPrint(bc: AbstractByteCode): void;
 }
