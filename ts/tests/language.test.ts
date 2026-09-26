@@ -389,12 +389,20 @@ describe('Anima', () => {
             // the pending yield raises, under the coroutine's own handlers, and the coroutine goes on
             expect(run(`(define rc (coroutine-create (lambda () (coroutine-yield (try (lambda () (coroutine-yield 1)) (lambda (e) (list 'caught e)))) 'end)))
                         (list (coroutine-resume rc) (coroutine-raise rc 'boom) (coroutine-status rc) (coroutine-resume rc) (coroutine-status rc))`)).toBe("(1 (caught boom) suspended end dead)");
-            // unhandled: the coroutine dies and the error is raised again in the resumer; as with any error a coroutine does
-            // not handle, its dynamic-wind after-thunks do not run
+            // unhandled: the coroutine dies and the error is raised again in the resumer, after its dynamic-wind after-thunks
             expect(run(`(define rlog '())
                         (define rd (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1) 'never) (lambda () (set! rlog (cons 'after rlog)))))))
                         (coroutine-resume rd)
-                        (list (try (lambda () (coroutine-raise rd 'bad)) (lambda (e) (list 'out e))) rlog (coroutine-status rd))`)).toBe("((out bad) () dead)");
+                        (list (try (lambda () (coroutine-raise rd 'bad)) (lambda (e) (list 'out e))) rlog (coroutine-status rd))`)).toBe("((out bad) (after) dead)");
+            // the same for an error the coroutine raises itself: nested after-thunks run innermost first, and an error in one
+            // replaces the original
+            expect(run(`(define dlog '())
+                        (define (note x) (lambda () (set! dlog (cons x dlog))))
+                        (define dw-co (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1) (car '())) (note 'inner))) (note 'outer)))))
+                        (coroutine-resume dw-co)
+                        (list (try (lambda () (coroutine-resume dw-co)) (lambda (e) 'failed)) (reverse dlog) (coroutine-status dw-co))`)).toBe("(failed (inner outer) dead)");
+            expect(run(`(define dw-bad (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (raise 'first)) (lambda () (raise 'second))))))
+                        (list (try (lambda () (coroutine-resume dw-bad)) (lambda (e) e)) (coroutine-status dw-bad))`)).toBe("(second dead)");
             // a coroutine that never ran dies without running
             expect(run(`(define rn-ran #f) (define rn (coroutine-create (lambda () (set! rn-ran #t))))
                         (list (try (lambda () (coroutine-raise rn 'early)) (lambda (e) e)) rn-ran (coroutine-status rn))`)).toBe("(early #f dead)");
@@ -419,6 +427,10 @@ describe('Anima', () => {
             evaluator.coroutineResume(hostDies);
             expect(() => evaluator.coroutineRaise(hostDies, Symbol.for("fatal"))).toThrow("fatal");
             expect(hostDies.status).toBe("dead");
+            const hostWind = evaluator.evaluateRaw(evaluator.compileRaw(`(define host-unwound #f) (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1)) (lambda () (set! host-unwound #t)))))`));
+            evaluator.coroutineResume(hostWind);
+            expect(() => evaluator.coroutineRaise(hostWind, Symbol.for("fatal"))).toThrow("fatal");
+            expect(run("host-unwound")).toBe("#t");
         });
 
         it('multiple values', () => {

@@ -265,11 +265,18 @@ export class VMExecutor {
             const co = ctx.coroutine;
             if (co !== null && co.closing) throw err;
             if (co !== null && co.status === "running") {
-                co.status = "dead";
                 co.frame = null;
+                // the coroutine is left: its pending dynamic-wind after-thunks run first, and an error in one replaces this one
+                let error = err.error;
+                try {
+                    this.#unwindCoroutine(co);
+                } catch (thunkErr) {
+                    error = thunkErr instanceof UnhandledError ? thunkErr.error : thunkErr;
+                }
+                co.status = "dead";
                 const resumer = this.#detachResumer(co);
-                if (resumer.ctx.barrier) throw new ReRaise(err.error);
-                return this.handleHostException(resumer.ctx, resumer.frame, new ReRaise(err.error, resumer.marks, resumer.mframe));
+                if (resumer.ctx.barrier) throw new ReRaise(error);
+                return this.handleHostException(resumer.ctx, resumer.frame, new ReRaise(error, resumer.marks, resumer.mframe));
             }
             const out = err.error instanceof Error ? err.error : new Error(String(err.error));
             if (err.traceback !== undefined && (out as any).animaTraceback === undefined) (out as any).animaTraceback = err.traceback;
@@ -406,10 +413,8 @@ export class VMExecutor {
         if (co.status === "dead") return;
         if (co.status !== "suspended") throw hostError(`coroutine-close: cannot close a ${co.status} coroutine`);
 
-        const cctx = co.ctx;
         co.frame = null;
-        const actions = computeWindTransition(cctx.wind, null);
-        if (actions.length === 0) {
+        if (co.ctx.wind === null) {
             co.status = "dead";
             return;
         }
@@ -417,18 +422,30 @@ export class VMExecutor {
         const outer = ctx?.coroutine ?? null;
         if (outer !== null) outer.status = "normal";
         co.status = "running";
+        try {
+            this.#unwindCoroutine(co);
+        } catch (err) {
+            throw new ReRaise(err instanceof UnhandledError ? err.error : err);
+        } finally {
+            co.status = "dead";
+            if (outer !== null) outer.status = "running";
+        }
+    }
+
+    // runs a coroutine's pending dynamic-wind after-thunks (innermost first, inside the coroutine, which cannot yield
+    // meanwhile) in a nested driver loop; an error in one is thrown
+    #unwindCoroutine(co: Coroutine): void {
+        const cctx = co.ctx;
+        const actions = computeWindTransition(cctx.wind, null);
+        if (actions.length === 0) return;
         co.closing = true;
         try {
             cctx.pendingWind = { actions, actionIdx: 0, targetFrame: null, targetVal: undefined, targetWind: null };
             const frame = this.advanceWindTransition(cctx);
             if (frame !== null) this.#runLoop(cctx, frame);
-        } catch (err) {
-            throw new ReRaise(err instanceof UnhandledError ? err.error : err);
         } finally {
             cctx.pendingWind = null;
             co.closing = false;
-            co.status = "dead";
-            if (outer !== null) outer.status = "running";
         }
     }
 
