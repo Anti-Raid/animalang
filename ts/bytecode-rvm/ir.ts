@@ -164,6 +164,10 @@ export type Node = {
     t: "CurrentMarks",
     destReg: number
 } | {
+    t: "CurrentStack",
+    skip: number,
+    destReg?: number
+} | {
     // an %escape: jump to the end of a %block
     t: "Jump",
     label: JumpLabel
@@ -249,6 +253,10 @@ export class IR {
                     break
                 case "CurrentMarks":
                     inst.push(OpCode.CURMARKS, node.destReg)
+                    break
+                case "CurrentStack":
+                    inst.push(OpCode.CURSTACK, node.skip)
+                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
                     break
                 case "Unpack": {
                     inst.push(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))

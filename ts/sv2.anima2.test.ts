@@ -800,6 +800,21 @@ describe('Anima', () => {
         })
     });
 
+    describe('call-with-values with literal lambdas', () => {
+        it('binds the values like receive', () => {
+            expect(run(`(call-with-values (lambda () (values 1 2)) (lambda (a b) (list b a)))`)).toBe("(2 1)")
+            expect(run(`(call-with-values (lambda () (values 1 2 3)) (lambda (a . rest) (list a rest)))`)).toBe("(1 (2 3))")
+            expect(run(`(call-with-values (lambda () (values)) (lambda args args))`)).toBe("()")
+            expect(run(`(call-with-values (lambda () (define x 5) (values x 6)) (lambda (a b) (define y (+ a b)) y))`)).toBe("11")
+            expect(() => run(`(call-with-values (lambda () (values 1 2)) (lambda (a) a))`)).toThrow()
+        })
+
+        it('calls the prelude procedure otherwise', () => {
+            expect(run(`(define (cwv-p) (values 3 4)) (call-with-values cwv-p list)`)).toBe("(3 4)")
+            expect(run(`(call-with-values (lambda () (values 1 2)) (if #t list vector))`)).toBe("(1 2)")
+        })
+    });
+
     describe('Exception Handling & Dynamic Wind', () => {
         it('executes dynamic-wind before, body, and after in order', () => {
             expect(run(`
@@ -2035,7 +2050,28 @@ describe('Anima', () => {
 
         it("tail calls drop frames", () => {
             const tb = runFile(`(define (a) (debug-traceback)) (define (b) (a)) (car (list (b)))`);
-            expect(tb).toBe("stack traceback:\n  t.anima:1:60 in top-level");
+            // b tail-called a, so only a (which took the snapshot) and top-level remain
+            expect(tb).toBe("stack traceback:\n  t.anima:1:13 in a\n  t.anima:1:60 in top-level");
+        });
+
+        it("tracebacks of coroutines waiting on one they resumed", () => {
+            expect(runFile(`(define tb-outer #f)
+(define tb-inner (coroutine-create (lambda () (debug-traceback tb-outer))))
+(define (tb-resumer) (list (coroutine-resume tb-inner)))
+(set! tb-outer (coroutine-create (lambda () (car (tb-resumer)))))
+(coroutine-resume tb-outer)`)).toMatch(/^stack traceback:\n  t\.anima:3:\d+ in tb-resumer\n  t\.anima:4:\d+ in lambda@t\.anima:4$/);
+            // a tail resume replaces its caller's frame, so the trace starts below it
+            expect(runFile(`(define tb-outer2 #f)
+(define tb-inner2 (coroutine-create (lambda () (debug-traceback tb-outer2))))
+(define (tb-resumer2) (coroutine-resume tb-inner2))
+(set! tb-outer2 (coroutine-create (lambda () (car (list (tb-resumer2))))))
+(coroutine-resume tb-outer2)`)).toMatch(/^stack traceback:\n  t\.anima:4:\d+ in lambda@t\.anima:4$/);
+        });
+
+        it("takes stack snapshots without capturing a continuation", () => {
+            expect(runFile(`(define (sn-a) (debug-frames)) (define (sn-b) (list (sn-a))) (length (car (sn-b)))`)).toBe(3);
+            expect(runFile(`(define sn-tb debug-traceback) (define (sn-c) (list (sn-tb "via value"))) (car (sn-c))`)).toBe("via value\nstack traceback:\n  t.anima:1:53 in sn-c\n  t.anima:1:80 in top-level");
+            expect(runFile(`(define (sn-loop i acc) (if (= i 20) acc (sn-loop (+ i 1) (+ acc (length (debug-frames)))))) (sn-loop 0 0)`)).toBe(20);
         });
 
         it("unhandled errors carry a traceback", () => {

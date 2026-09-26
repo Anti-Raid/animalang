@@ -20,6 +20,7 @@ import {
     CORE_CATCH,
     OP_RAISE,
     OP_CURRENT_MARKS,
+    OP_CURRENT_STACK,
     SOURCE_POS,
     AbstractClosure,
     Cons
@@ -284,6 +285,16 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     evaluator.registerTransform(Symbol.for("current-continuation-marks"), lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("current-continuation-marks takes no arguments");
     }));
+    evaluator.registerTransform(OP_CURRENT_STACK, lowerTo(OP_CURRENT_STACK, orig => {
+        if (orig.length > 2) throw new Error("%current-stack takes at most 1 argument");
+    }));
+    // direct calls take the snapshot in the caller itself, so no prelude frame shows in it
+    for (const name of ["debug-frames", "debug-traceback"]) {
+        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => ({
+            expanded: list(Symbol.for(`%${name}`), list(OP_CURRENT_STACK), cons(Symbol.for("list"), expr)),
+            state: TransformState.DoChildren,
+        }));
+    }
     evaluator.registerTransform(OP_CURRENT_MARKS, lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("%current-marks takes no arguments");
     }));
@@ -703,6 +714,17 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
         });
     }
+
+    // (call-with-values (lambda () p ...) (lambda formals c ...)) binds the values directly, like receive; anything else
+    // calls the prelude procedure
+    evaluator.registerTransform(Symbol.for("call-with-values"), (evaluator, expr, orig) => {
+        const isLambda = (x: any) => x instanceof Cons && (x.car === OP_LAMBDA || x.car === CORE_LAMBDA) && x.cdr instanceof Cons && x.cdr.cdr instanceof Cons;
+        if (orig instanceof Cons && orig.length === 3 && isLambda(expr.car) && expr.car.cdr.car === null && isLambda(cadr(expr))) {
+            const producer = expr.car, consumer = cadr(expr);
+            return { expanded: cons(Symbol.for("receive"), cons(consumer.cdr.car, cons(cons(OP_LET, cons(null, producer.cdr.cdr)), consumer.cdr.cdr))), state: TransformState.Recurse };
+        }
+        return { expanded: orig, state: TransformState.DoChildren };
+    });
 
     evaluator.registerTransform(Symbol.for("receive"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length < 4) throw new Error("receive must be of form (receive formals expr body...)");

@@ -41,6 +41,15 @@ export const isDeepEqual = (a: any, b: any): boolean => {
         if (len !== b.length) return false;
         if (len === 0) return true;
 
+        // proper or improper: walk both, then compare the tails
+        if (len !== -2) {
+            let pa: any = a, pb: any = b;
+            for (; pa instanceof Cons && pb instanceof Cons; pa = pa.cdr, pb = pb.cdr) {
+                if (!isDeepEqual(pa.car, pb.car)) return false;
+            }
+            return isDeepEqual(pa, pb);
+        }
+
         const iterA = a[Symbol.iterator]();
         const iterB = b[Symbol.iterator]();
 
@@ -118,6 +127,7 @@ export const CORE_WITH_MARK = Symbol.for("%with-mark");
 export const CORE_CATCH = Symbol.for("%catch");
 export const OP_RAISE = Symbol.for("%raise");
 export const OP_CURRENT_MARKS = Symbol.for("%current-marks");
+export const OP_CURRENT_STACK = Symbol.for("%current-stack");
 export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
@@ -156,7 +166,10 @@ export const SPECIAL_FORMS = new Set([
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
     CORE_WITH_MARK,
+    CORE_CATCH,
     OP_CURRENT_MARKS,
+    OP_CURRENT_STACK,
+    OP_RAISE,
     OP_DEFINE_GLOBAL,
     OP_AT,
 ])

@@ -78,6 +78,10 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Form**: `(%raise <obj> [<continuable>])`, from `raise`, `raise-continuable`, `error` and Luau's `error()`
 - **Semantics**: Delivers `<obj>` to the innermost exception handler (see the exception model below). `<continuable>` is a literal `#t` or `#f` (default `#f`).
 
+### `%current-stack`
+- **Form**: `(%current-stack [<skip>])`, where `<skip>` is a literal count (default 0)
+- **Semantics**: A snapshot of the current stack (each frame's name, position and tail-call trail), taken when it runs, without its innermost `<skip>` frames. Heap code reads its frames directly (`CURSTACK`); direct code suspends to rebuild them, capturing no continuation. That rebuild counts toward the heap-mode switch, so code that keeps taking snapshots moves to heap frames, where they are cheap.
+
 ### `%current-marks`
 - **Form**: `(%current-marks)`, from `current-continuation-marks`
 - **Semantics**: The current continuation's marks, as a continuation mark set.
@@ -145,8 +149,19 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Semantics**: The first of `<expr>`'s multiple values, `<expr>` itself if it is a single value, or `<#void>` if it has none. This is Lua's truncation of a call used as a single value (`g() + 1`, `f(g(), x)`); the AOT emitter inlines it as an `instanceof MultipleValues` check.
 
 ### `%debug-frames` / `%debug-traceback`
-- **Forms**: `(%debug-frames <k> <args>)`, `(%debug-traceback <k> <args>)`, where `<k>` is a continuation and `<args>` is the list `([coroutine] [msg] [level])`
-- **Semantics**: Walk the frames of `<k>` (or of a suspended coroutine) and return a list of `#(name file line col)` records, or a traceback string. Used by the prelude's `debug-frames` and `debug-traceback`.
+- **Forms**: `(%debug-frames <stack> <args>)`, `(%debug-traceback <stack> <args>)`, where `<stack>` is a stack snapshot from `%current-stack` and `<args>` is the list `([coroutine] [msg] [level])`
+- **Semantics**: Describe the frames of `<stack>` (or of a suspended coroutine) as a list of `#(name file line col)` records, or a traceback string.
+- **How the surface procedures reach them**:
+  - A direct call is rewritten by the syntax transformer, at compile time, so the prelude procedure is never called and the snapshot is taken in the calling function itself (its first frame):
+    ```scheme
+    (debug-traceback "here" 2)   ; what you write
+    (%debug-traceback (%current-stack) (list "here" 2))   ; what the compiler receives
+    ```
+    `debug-frames` is rewritten the same way.
+  - A use as a value (e.g. `(define tb debug-traceback)`, then `(tb "here")`) has no call site to rewrite, so it calls the prelude procedure, which takes the snapshot in its own frame and skips it:
+    ```scheme
+    (define $debug-traceback (lambda args (%debug-traceback (%current-stack 1) args)))
+    ```
 
 ### How intrinsics are compiled
 - **Pure functions over a register window** (`%+`, `%car`, `%null?`, `%list`, ...) that are also public builtins compile to `CALL idx start nargs 0; MOVEACC dst`, where `idx - BUILTINS_START` indexes `IBUILTINS`. The AOT decoder fuses the pair into one inline builtin call (no block split), and inlines builtins that have an entry in `BUILTIN_INLINES` (`inline.ts`, the AOT-only table of `InlineFn`s by builtin name; `CALLRT` operations use `RUNTIME_INLINES` there the same way: arithmetic, `eq?`, every predicate, every `c[ad]+r`, `list`, `cons`, and the table and vector intrinsics), keeping a call to the builtin as the fallback so errors are unchanged. Builtins are never tail called: a builtin call in tail position compiles as a call followed by `RETURN`, since it cannot grow the Scheme stack.
@@ -174,7 +189,7 @@ The standard library builds the public Scheme procedures on top of these `%` int
 - Single-argument predicates (`null? pair? list? number? integer? ... table-frozen?`, the `PREDICATES` table in `ts/ops.ts`): Direct calls are rewritten to `%` forms (e.g. `(null? x)` becomes `(%null? x)`), which compile to a `CALL` of the builtin with that name. Uses as a value get a builtin generated from the same table.
 - `car`, `cdr`, `caar` ... `cddddr` (all compositions up to 4 levels) and `first second third`: Direct calls are rewritten to `%` forms (e.g. `(third x)` becomes `(%third x)`), which compile to a `CALL` of the builtin with that name (generated from `CXR_PATHS` in `ts/ops.ts`). Uses as a value get the builtin of the same name, which runs the same function, so errors name the procedure either way (e.g. `third: list is too short`).
 - `coroutine-create coroutine-resume coroutine-yield coroutine-status coroutine-close`: Direct calls are rewritten to the matching `%` form. Uses as a value resolve to prelude wrappers around the intrinsics.
-- `values call-with-values`: `(values a b)` is a `MultipleValues` object (`common.ts`), `(values x)` is just `x` and `(values)` is zero values. `values` is a builtin, `call-with-values` is a prelude procedure (built on the `%values->list` intrinsic, which compiles to `CALLRT` and turns zero, one or multiple values into a list), and `receive`, `let-values` (parallel binding) and `let*-values` are syntax transformer macros built on `call-with-values`. Multiple values reaching a single-value context stay a `MultipleValues` object and print as `(values a b)`.
+- `values call-with-values`: `(values a b)` is a `MultipleValues` object (`common.ts`), `(values x)` is just `x` and `(values)` is zero values. `values` is a builtin, `call-with-values` is a prelude procedure (built on the `%values->list` intrinsic, which compiles to `CALLRT` and turns zero, one or multiple values into a list), except that a direct call whose producer and consumer are literal lambdas is rewritten to `receive`, binding the values without a list, and `receive`, `let-values` (parallel binding) and `let*-values` are syntax transformer macros built on `call-with-values`. Multiple values reaching a single-value context stay a `MultipleValues` object and print as `(values a b)`.
 - `list`:
   - Direct calls `(list a b ...)` are rewritten to `(%list a b ...)`.
   - Uses as a value resolve to the prelude procedure `(define $list (lambda args args))`, since a rest parameter is already a fresh list.
@@ -251,7 +266,7 @@ Global variable reads are cached per instruction site, keyed by the environment 
 
 Each coroutine owns an execution context. Resuming records `co.resumer = { ctx, frame }` and hands the coroutine's next frame to the driver loop; yielding or finishing hands control back to the resumer's frame. So resume and yield are frame switches inside one driver loop, and a resume in tail position records the caller's caller, which makes it a proper tail call.
 
-A non-tail resume from direct code instead runs the coroutine in a nested driver loop (`coResumeNested`), because it is already on the JS stack; control returning to the throwaway "barrier" context ends the nested loop. Nesting is capped by `MAX_NESTED_RESUMES`, after which the in-loop path is used. The host resumes coroutines the same way.
+A non-tail resume from direct code instead runs the coroutine in a nested driver loop (`coResumeNested`), because it is already on the JS stack (except inside a coroutine: a coroutine resuming another suspends to heap frames, so they can be traced while it waits); control returning to the throwaway "barrier" context ends the nested loop. Nesting is capped by `MAX_NESTED_RESUMES`, after which the in-loop path is used. The host resumes coroutines the same way.
 
 ## Errors
 
@@ -265,7 +280,7 @@ A non-tail resume from direct code instead runs the coroutine in a nested driver
 
 - **Names**: a lambda is named after what it is bound to (`define`, `set!`, `let`), else `lambda@file:line`. Exported prelude procedures take their public name.
 - **Source positions**: the reader records the position of every list form, and `%at` overrides it. The syntax transformer carries positions through macro expansion (an expansion inherits its macro call's position). The compiler emits `Pos` IR nodes, which lower into `ByteCode.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
-- **Tracebacks**: `(debug-frames [co] [level])` and `(debug-traceback [co] [msg] [level])` capture the caller's continuation with a tail `call/cc` and walk its frames (direct AOT code rebuilds its frames for this, as it does for any `call/cc`). A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. The host can get a suspended coroutine's traceback with `Anima.traceback(co)`.
+- **Tracebacks**: `(debug-frames [co] [level])` and `(debug-traceback [co] [msg] [level])` take a snapshot of the stack in the calling function: the syntax transformer rewrites a direct call to `(%debug-traceback (%current-stack) (list args ...))` (see `%debug-frames` / `%debug-traceback`), so the caller itself is its first frame. A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. `(debug-traceback co)` traces another coroutine: a suspended one from where it yielded, a normal one (waiting on a coroutine it resumed) from where it resumed it, and an unstarted or dead one as empty. The host can get a coroutine's traceback with `Anima.traceback(co)`.
 - **Unhandled errors**: the VM builds a traceback from the raising frame before giving up, and it is attached to the JS error as `animaTraceback`. For an error that escaped a coroutine, the coroutine's traceback is kept.
 - **Debug mode** (`implDebug` / `implAotDebug`, i.e. `new Compiler(true)`): the compiled `ByteCode` is flagged `debug`, and interpreter and AOT code for it
   - record every tail call in a continuation mark on the frame it replaces (the last 16 callees, repeats collapsed to `name xN`), which tracebacks show on that frame as `(tail calls: ...)`; as a mark it travels with continuations and coroutines;

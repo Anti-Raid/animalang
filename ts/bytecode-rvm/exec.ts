@@ -67,6 +67,7 @@ export enum OpCode {
     CALLCATCH,   // proc tok pre       reg[tok] = a new catch token; call reg[proc] with it as the innermost exception handler
                  //                    (reg[pre], unless pre is NO_REG, runs on the error before unwinding)
     RAISE,       // obj continuable    deliver reg[obj] to the innermost exception handler
+    CURSTACK,    // skip               a snapshot of the current stack, minus its innermost skip frames
 }
 
 export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
@@ -104,6 +105,7 @@ export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
     [OpCode.CALLEC]: 3,
     [OpCode.CALLCATCH]: 4,
     [OpCode.RAISE]: 3,
+    [OpCode.CURSTACK]: 2,
 };
 
 // UNPACK flags
@@ -602,6 +604,12 @@ export class Suspend {
         return sig;
     }
 
+    // direct code taking a snapshot of the stack: its frames are rebuilt, and the snapshot is the value. Code that keeps
+    // doing it is better off on heap frames, where a snapshot needs no rebuilding, so it counts like a control transfer
+    static stack(skip: number) {
+        return new Suspend((ctx, executor, caller) => executor.setRetVal(ctx, caller, new StackSnapshot(frameInfos(caller, skip))), undefined, true);
+    }
+
     static callCC(proc: any) {
         return new Suspend((ctx, executor, caller, sig) => executor.callCC(ctx, proc, caller, false, sig.marks, sig.mframe), undefined, true);
     }
@@ -770,14 +778,36 @@ export class VMExecutor {
         return closureRegs;
     }
 
+    // calls a closure's fixed-arity direct entry with an argument array
+    public callDirect(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
+        const fn = proc.tmpl.code.directFn!;
+        switch (args.length) {
+            case 0: return fn(ctx, proc, this, depth, marks, mframe);
+            case 1: return fn(ctx, proc, this, depth, marks, mframe, args[0]);
+            case 2: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1]);
+            case 3: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2]);
+            case 4: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2], args[3]);
+        }
+        return fn(ctx, proc, this, depth, marks, mframe, ...args);
+    }
+
     public callDirectRest(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
         const code = proc.tmpl.code;
+        const fn = code.directFn!;
         const numPos = code.directRestArity;
         let rest: Cons | null = null;
         for (let i = args.length - 1; i >= numPos; i--) rest = new Cons(args[i], rest);
+        // spreading into the call is slow, so the common arities are called directly
+        switch (numPos) {
+            case 0: return fn(ctx, proc, this, depth, marks, mframe, rest);
+            case 1: return fn(ctx, proc, this, depth, marks, mframe, args[0], rest);
+            case 2: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], rest);
+            case 3: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2], rest);
+            case 4: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2], args[3], rest);
+        }
         args.length = numPos;
         args.push(rest);
-        return code.directFn!(ctx, proc, this, depth, marks, mframe, ...args);
+        return fn(ctx, proc, this, depth, marks, mframe, ...args);
     }
 
     // --- continuations and dynamic-wind ---
@@ -935,7 +965,11 @@ export class VMExecutor {
         if (co.status !== "suspended") throw hostError(`coroutine-resume: cannot resume a ${co.status} coroutine`);
 
         co.resumer = { ctx, frame: resumeTo, marks, mframe };
-        if (ctx.coroutine !== null) ctx.coroutine.status = "normal";
+        // a coroutine resuming another keeps its frames where they can be traced while it waits
+        if (ctx.coroutine !== null) {
+            ctx.coroutine.status = "normal";
+            ctx.coroutine.frame = resumeTo;
+        }
         co.status = "running";
         if (!co.started) {
             co.started = true;
@@ -1037,6 +1071,17 @@ type RuntimeFn = (ctx: ExecutionContext, executor: VMExecutor, regs: readonly an
 // `tails`: the tail calls that led to the frame's current procedure (recorded by debug code), oldest first
 export type FrameInfo = { name: string, pos: SourcePos | null, tails: TailTrail | null };
 
+// what (%current-stack) returns: the frames as they were when it ran
+export class StackSnapshot extends OpaqueValue {
+    constructor(readonly frames: FrameInfo[]) {
+        super();
+    }
+
+    get typeName() {
+        return "stack";
+    }
+}
+
 export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] => {
     const out: FrameInfo[] = [];
     for (let f = frame, i = 0; f !== null; f = f.parent, i++) {
@@ -1057,14 +1102,15 @@ export const formatTraceback = (frames: FrameInfo[], msg?: string): string => {
 };
 
 // (%debug-frames k args) / (%debug-traceback k args): args is ([coroutine] [msg] [level]), k the caller's continuation
+// the frames %debug-frames / %debug-traceback describe: the stack snapshot they are given, or a coroutine's
 const debugTarget = (ctx: ExecutionContext, regs: readonly any[], start: number) => {
-    let frame = (regs[start] as VMContinuation).frame;
+    let frames = (regs[start] as StackSnapshot).frames;
     const args = listToArray(regs[start + 1]);
     if (args[0] instanceof Coroutine) {
         const co = args.shift() as Coroutine;
-        if (co !== ctx.coroutine) frame = co.frame;
+        if (co !== ctx.coroutine) frames = frameInfos(co.frame);
     }
-    return { frame, args };
+    return { frames, args };
 };
 
 const tracebackMessage = (msg: any): string | undefined => {
@@ -1099,15 +1145,15 @@ export const RUNTIME: [name: string, fn: RuntimeFn][] = [
     ["list->values", (ctx, executor, regs, start, nargs) => listToValues(regs, start, nargs)],
     ["apply-args", (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
     ["debug-frames", (ctx, executor, regs, start) => {
-        const { frame, args } = debugTarget(ctx, regs, start);
+        const { frames, args } = debugTarget(ctx, regs, start);
         const level = typeof args[0] === "number" ? args[0] : 0;
-        return Cons.fromArray(frameInfos(frame, level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
+        return Cons.fromArray(frames.slice(level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
     }],
     ["debug-traceback", (ctx, executor, regs, start) => {
-        const { frame, args } = debugTarget(ctx, regs, start);
+        const { frames, args } = debugTarget(ctx, regs, start);
         const msg = typeof args[0] === "number" ? undefined : args.shift();
         const level = typeof args[0] === "number" ? args[0] : 0;
-        return formatTraceback(frameInfos(frame, level), tracebackMessage(msg));
+        return formatTraceback(frames.slice(level), tracebackMessage(msg));
     }],
     // Lua's truncation of multiple values to one: the first value, or <#void> for none
     ["first-value", (ctx, executor, regs, start) => {
@@ -1368,6 +1414,12 @@ export class BytecodeInterpreter {
                         frame.ip = ip;
                         return executor.raise(ctx, frame, regs[objReg], continuable);
                     }
+                    case OpCode.CURSTACK: {
+                        const skip = inst[ip++];
+                        frame.ip = ip;
+                        ctx.acc = new StackSnapshot(frameInfos(frame, skip));
+                        break;
+                    }
                     default: {
                         const _: never = opcode;
                         throw new Error(`Unhandled opcode: ${opcode}`);
@@ -1411,6 +1463,8 @@ const JIT_DEPS = {
     Suspend,
     EscapeContinuation,
     countControlSuspend,
+    StackSnapshot,
+    frameInfos,
     CatchToken,
     Caught,
     catchHere,
@@ -1451,6 +1505,7 @@ type AotTerm = { at?: number } & (
     | { k: "CallEC"; proc: number; tok: number; resume: number }
     | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
     | { k: "Raise"; obj: number; continuable: boolean; resume: number }
+    | { k: "CurStack"; skip: number; resume: number }
     | { k: "Yield"; val: number; resume: number }
     | { k: "CoResume"; co: number; list: number; isTail: boolean; resume: number }
     | { k: "Return"; reg: number });
@@ -1582,6 +1637,7 @@ export class AotCompiler {
                 case OpCode.CALLEC:
                 case OpCode.CALLCATCH:
                 case OpCode.RAISE:
+                case OpCode.CURSTACK:
                     blocks.add(nextIp);
                     break;
                 case OpCode.CALL:
@@ -1758,6 +1814,9 @@ export class AotCompiler {
                         term = { k: "Raise", obj, continuable: inst[ip++] !== 0, resume: ip };
                         break;
                     }
+                    case OpCode.CURSTACK:
+                        term = { k: "CurStack", skip: inst[ip++], resume: ip };
+                        break;
                     case OpCode.RETURN:
                         term = { k: "Return", reg: inst[ip++] };
                         break;
@@ -1810,7 +1869,7 @@ class Liveness {
 
     static #resumePoint(term: AotTerm): number | null {
         switch (term.k) {
-            case "Call": case "Apply": case "CallCC": case "CallEC": case "CallCatch": case "Raise": case "Yield": case "CoResume": return term.resume;
+            case "Call": case "Apply": case "CallCC": case "CallEC": case "CallCatch": case "Raise": case "CurStack": case "Yield": case "CoResume": return term.resume;
             default: return null;
         }
     }
@@ -1872,7 +1931,7 @@ class Liveness {
             case "Jump": return [term.target];
             case "Block": case "Loop": return [term.body];
             case "Branch": return [term.then, term.else];
-            case "Call": case "CallEC": case "CallCatch": case "Raise": case "Yield": return [term.resume];
+            case "Call": case "CallEC": case "CallCatch": case "Raise": case "CurStack": case "Yield": return [term.resume];
             case "Apply": case "CallCC": case "CoResume": return term.isTail ? [] : [term.resume];
             case "MaybeSelfTailCall": return [0];
             default: return [];
@@ -2303,6 +2362,12 @@ class ResumeEmitter extends FunctionEmitter {
                     ${this.#spills(live.spillsFor(term.resume))}
                     return executor.raise(ctx, frame, r${term.obj}, ${term.continuable});
                 `);
+            case "CurStack":
+                return this.emit(`
+                    frame.ip = ${term.resume};
+                    ctx.acc = new StackSnapshot(frameInfos(frame, ${term.skip}));
+                    ${this.jump(term.resume, next)}
+                `);
             case "TailCall":
                 return this.emit(`
                     {
@@ -2625,6 +2690,11 @@ class DirectEmitter extends FunctionEmitter {
                     rip = ${term.resume};
                     throw Suspend.raise(r${term.obj}, ${term.continuable}, marks);
                 `);
+            case "CurStack":
+                return this.emit(`
+                    rip = ${term.resume};
+                    throw Suspend.stack(${term.skip});
+                `);
             case "TailCall":
                 return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs)} }`);
             case "MaybeSelfTailCall":
@@ -2649,7 +2719,7 @@ class DirectEmitter extends FunctionEmitter {
                         if (proc instanceof BuiltinFunction) {
                             ${done} proc.cb(args, 0, args.length);
                         } else if (${this.directGuard("proc", "args.length")}) {
-                            ${term.isTail ? "const val =" : "acc ="} proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, marks, ${term.isTail ? "mframe" : "mframe + 1"}, ...args);
+                            ${term.isTail ? "const val =" : "acc ="} executor.callDirect(ctx, proc, args, depth + 1, marks, ${term.isTail ? "mframe" : "mframe + 1"});
                             ${term.isTail ? "return val;" : ""}
                         } else if (${this.restGuard("proc", "args.length")}) {
                             ${term.isTail ? "const val =" : "acc ="} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${term.isTail ? "mframe" : "mframe + 1"});
@@ -2680,7 +2750,8 @@ class DirectEmitter extends FunctionEmitter {
                 }
                 return this.emit(`
                     rip = ${term.resume};
-                    if (executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > ${DIRECT_SUSPEND_LIMIT}) throw Suspend.resume(r${term.co}, listToArray(r${term.list}), marks, mframe);
+                    // inside a coroutine, its frames must stay on the heap, where it can be traced while it waits
+                    if (ctx.coroutine !== null || executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > ${DIRECT_SUSPEND_LIMIT}) throw Suspend.resume(r${term.co}, listToArray(r${term.list}), marks, mframe);
                     acc = executor.coResumeNested(ctx, r${term.co}, listToArray(r${term.list}));
                     ${this.jump(term.resume, next)}
                 `);

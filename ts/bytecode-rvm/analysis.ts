@@ -13,6 +13,7 @@ import {
   CORE_WITH_MARK,
   CORE_CATCH,
   OP_CURRENT_MARKS,
+  OP_CURRENT_STACK,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
@@ -274,6 +275,7 @@ class CallLiveness {
                 return this.expr(key, scope, this.expr(value, scope, this.expr(body, scope, out, blocks), blocks), blocks);
             }
             case OP_CURRENT_MARKS:
+            case OP_CURRENT_STACK:
                 return out;
             // (thunk) is called; only if it raised is the handler evaluated and called
             case CORE_CATCH: {

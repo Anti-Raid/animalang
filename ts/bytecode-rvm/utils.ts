@@ -155,6 +155,11 @@ const stringifyInst = (inst: ByteCode): string[] => {
                 idx += 4;
                 break;
 
+            case OpCode.CURSTACK:
+                line += `${padOp("CURSTACK")} skip=${inst.inst[idx + 1]}`;
+                idx += 2;
+                break;
+
             case OpCode.RAISE:
                 line += `${padOp("RAISE")} r${inst.inst[idx + 1]}${inst.inst[idx + 2] ? ", continuable" : ""}`;
                 idx += 3;
@@ -214,7 +219,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 15
+export const BYTECODE_VERSION = 16
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

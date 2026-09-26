@@ -445,11 +445,11 @@ export const STD_PRELUDE = `
 
 (define $debug-frames
     (lambda args
-        (%call/cc (lambda (k) (%debug-frames k args)))))
+        (%debug-frames (%current-stack 1) args)))
 
 (define $debug-traceback
     (lambda args
-        (%call/cc (lambda (k) (%debug-traceback k args)))))
+        (%debug-traceback (%current-stack 1) args)))
 
 ; raising and catching are core forms (%raise, %catch) the VM delivers; handlers are a continuation mark under
 ; (%handler-key): a list, innermost first, of handler procedures and catch tokens

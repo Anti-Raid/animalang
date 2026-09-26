@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_RAISE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, OP_CURRENT_MARKS, OP_CURRENT_STACK, CORE_CATCH, OP_RAISE, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -136,6 +136,12 @@ export class Compiler {
                 case CORE_WITH_MARK:
                     this.#compileWithMark(expr, opts)
                     return
+                case OP_CURRENT_STACK: {
+                    const skip = expr.cdr === null ? 0 : expr.cdr.car
+                    if (expr.length > 2 || !Number.isInteger(skip) || skip < 0) throw new Error("%current-stack takes an optional literal count of frames to skip")
+                    opts.nodes.push({ t: "CurrentStack", skip, destReg: opts.destReg })
+                    return
+                }
                 case OP_CURRENT_MARKS:
                     if (opts.destReg !== undefined) opts.nodes.push({ t: "CurrentMarks", destReg: opts.destReg })
                     return

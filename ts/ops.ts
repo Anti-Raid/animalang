@@ -239,7 +239,9 @@ export const listToArray = (lst: Cons | null): any[] => lst === null ? [] : [...
 const spliceLast = (args: any[]): any[] => {
     const finalArg = args.pop();
     if (finalArg instanceof Cons) {
-        for (const v of finalArg) args.push(v);
+        let p: any = finalArg;
+        for (; p instanceof Cons; p = p.cdr) args.push(p.car);
+        if (p !== null) throw hostError(`apply: last argument must be a list but got ${String(finalArg)}`);
     } else if (finalArg !== null) {
         throw hostError(`apply: last argument must be a list but got ${String(finalArg)}`);
     }
