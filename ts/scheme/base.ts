@@ -1,5 +1,5 @@
-import { Intrinsics } from "../bytecode-rvm/intrinsics";
-import { isCompilerIntrinsic } from "../bytecode-rvm/core";
+import type { Intrinsics } from "../bytecode-rvm/intrinsics";
+import { newIntrinsics } from "../bytecode-rvm/core";
 import { registerSchemeIntrinsics, SCHEME_ALIASES } from "./intrinsics";
 import { SCHEME_RESERVED, SCHEME_SPECIAL_FORMS } from "./symbols";
 
@@ -10,7 +10,7 @@ let base: Intrinsics | null = null;
 
 export const schemeBase = (): Intrinsics => {
     if (base !== null) return base;
-    const table = new Intrinsics(isCompilerIntrinsic);
+    const table = newIntrinsics();
     registerSchemeIntrinsics(table);
     for (const sym of SCHEME_SPECIAL_FORMS) table.reserved.set(sym, "special form");
     for (const sym of [...SCHEME_ALIASES.keys(), ...SCHEME_RESERVED]) table.reserved.set(sym, "builtin");

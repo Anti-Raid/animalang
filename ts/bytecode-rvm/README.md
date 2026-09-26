@@ -59,7 +59,7 @@ Besides the core forms, the compiler directly recognizes the following low-level
   When a continuation crosses this dynamic extent, transitions automatically run the appropriate `<before>` and `<after>` thunks.
 
 ### `%call/cc`
-- **Form**: `(%call/cc <proc>)`
+- **Form**: `(%call/cc <proc>)`, a control operation (see below)
 - **Semantics**:
   - In non-tail position: Captures the current continuation and passes it as a single argument to `<proc>`.
   - In tail position: Replaces the current frame with the caller's continuation and tail-calls `<proc>`.
@@ -70,12 +70,12 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - Cheaper than `%call/cc` because it never needs heap frames: in direct code the call runs inside a JS `try/catch`, and an escape that has no `dynamic-wind` to unwind is caught right there. Escapes that do unwind, or that come from heap code, rebuild the frames and jump like a continuation, to the nearest frame on the caller chain that still holds `k` in the `%call/ec`'s register (the register is cleared when it returns, so a `k` whose extent has ended finds no frame; copies of the frame made by `call/cc` hold `k` too, so escapes out of a re-entered extent work). JS exceptions are slow (hundreds of ns), so a function whose `%call/ec` keeps being escaped from switches to heap frames after `DIRECT_SUSPEND_LIMIT` escapes, where the receiver gets a heap frame and escapes are plain jumps.
 
 ### `%raise`
-- **Form**: `(%raise <obj> [<continuable>])`, from `raise`, `raise-continuable`, `error` and Luau's `error()`
-- **Semantics**: Delivers `<obj>` to the innermost exception handler (see the exception model below). `<continuable>` is a literal `#t` or `#f` (default `#f`).
+- **Form**: `(%raise <obj> [<continuable>])`, from `raise`, `raise-continuable`, `error` and Luau's `error()`; a control operation (see below)
+- **Semantics**: Delivers `<obj>` to the innermost exception handler (see the exception model below). `<continuable>` is `#t` or `#f` (default `#f`); anything else is an error.
 
 ### `%current-stack`
-- **Form**: `(%current-stack [<skip>])`, where `<skip>` is a literal count (default 0)
-- **Semantics**: A snapshot of the current stack (each frame's name, position and tail-call trail), taken when it runs, without its innermost `<skip>` frames. Heap code reads its frames directly (`CURSTACK`); direct code suspends to rebuild them, capturing no continuation. That rebuild counts toward the heap-mode switch, so code that keeps taking snapshots moves to heap frames, where they are cheap.
+- **Form**: `(%current-stack [<skip>])`, where `<skip>` is a count (default 0); a control operation (see below)
+- **Semantics**: A snapshot of the current stack (each frame's name, position and tail-call trail), taken when it runs, without its innermost `<skip>` frames. Heap code reads its frames directly; direct code suspends to rebuild them, capturing no continuation. That rebuild counts toward the heap-mode switch, so code that keeps taking snapshots moves to heap frames, where they are cheap.
 
 ### `%current-marks`
 - **Form**: `(%current-marks)`, from `current-continuation-marks`
@@ -86,14 +86,14 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Semantics**:
   - Unpacks the trailing `<lst>` argument and splices its elements after any preceding `<arg> ...` expressions before calling `<proc>`.
   - `<proc>` may be a registered leaf intrinsic (`(%apply %name args)`), which compiles to `APPLYINT` (see below).
-  - Emits `OpCode.APPLY` (with its tail flag set in tail position) with `nargs >= 1` indicating the width of the register window `[startReg, startReg + nargs)`.
-  - **Rest forwarding**: when `<lst>` is a lambda's rest parameter that is never used any other way (not read as a value, assigned, or captured), the closure is marked `restArray`. Its rest arguments are then bound as a plain array instead of a list, and the `%apply` spreads that array (`APPLYINTR` for an intrinsic, the `APPLY_REST` flag for a procedure). So a wrapper like `(lambda args (%apply %+ args))` builds no list, and applying an intrinsic this way passes the array itself as the argument window. The array is only ever seen by these instructions.
+  - Otherwise it is a call of the control operation `%apply-list` over `[proc, arg ..., lst]` (a tail call in tail position), which returns a call request (`HostTail`) of `<proc>` with the spliced arguments.
+  - **Rest forwarding**: when `<lst>` is a lambda's rest parameter that is never used any other way (not read as a value, assigned, or captured), the closure is marked `restArray`. Its rest arguments are then bound as a plain array instead of a list, and the `%apply` spreads that array (`APPLYINTR` for an intrinsic, `%apply-array` for a procedure, which checks it is given an array). So a wrapper like `(lambda args (%apply %+ args))` builds no list, and applying an intrinsic this way passes the array itself as the argument window. The array is only ever seen by these instructions.
 
 ### `%apply-multi`
 - **Form**: `(%apply-multi <proc> <lst>)`
 - **Semantics**:
   - Runtime-list variant of `%apply`: the elements of `<lst>` are the arguments, with the last element spliced in the same way (e.g. a variadic `apply` procedure passes its rest parameter here).
-  - Compiles as `(%apply <proc> <flattened>)`, where the `%apply-args` runtime operation (`CALLRT`) first splices the last element of `<lst>` into a flat argument list. A forwarded rest parameter (see `%apply`) skips that: `APPLY` with the `APPLY_REST | APPLY_MULTI` flags splices the array's last element directly.
+  - Compiles as `(%apply <proc> <flattened>)`, where the `%apply-args` core operation first splices the last element of `<lst>` into a flat argument list. A forwarded rest parameter (see `%apply`) skips that: `%apply-array-multi` splices the array's last element directly.
 
 ### The exception model
 - **One handler list.** The handlers in effect are a continuation mark under the key `(%handler-key)` returns: a list, innermost first, whose entries are handler procedures (from `with-exception-handler`, which is just that mark) and catch tokens (from `%catch`). It follows frames, so escapes, continuations and re-entry restore it without `dynamic-wind`; a coroutine starts with none, and an error escaping it is raised again in its resumer, with the marks of the code that resumed it.
@@ -103,12 +103,12 @@ Besides the core forms, the compiler directly recognizes the following low-level
   3. a handler procedure: called with the rest of the list installed. If it returns, that is the value of a continuable raise; otherwise "handler returned on non-continuable exception" is delivered to the rest of the list.
 - **Host errors** (an intrinsic throwing a JS `Error`) become error objects and are delivered as if raised where they happened, with the marks of a tail call that left no frame.
 - **Helper frames.** Two tiny bytecode functions built into the VM (`raiseHelpers` in `exec.ts`) sit under a handler it calls: one raises the secondary error when a non-continuable raise's handler returns, one escapes to a catch token with what its `pre` returned. Their marks hold the outer handlers.
-- **Fast paths.** `%catch` compiles to `CALLCATCH proc tok pre`; in direct code, an escape to its token, or an error whose innermost handler is its token (and which has no `pre` and no `dynamic-wind` to unwind), is caught right at the site by a JS `try/catch`. `%raise` compiles to `RAISE obj continuable`; from direct code, raising to a plain catch token is such an escape.
+- **Fast paths.** `%catch` compiles to `CALLCATCH proc tok pre`; in direct code, an escape to its token, or an error whose innermost handler is its token (and which has no `pre` and no `dynamic-wind` to unwind), is caught right at the site by a JS `try/catch`. `%raise` is a control operation; from direct code, raising to a plain catch token is such an escape.
 ### Coroutine intrinsics
 - **Forms**: `(%coroutine-create <proc>)`, `(%coroutine-resume <co> <val> ...)`, `(%coroutine-yield <val> ...)`, `(%coroutine-status <co>)`, `(%coroutine-close <co>)`, plus `(%coroutine-resume-list <co> <lst>)` / `(%coroutine-yield-list <lst>)` which take the values as a runtime list (for procedures that take the values as a list)
 - **Semantics**:
   - Asymmetric, one-shot coroutines. Each coroutine owns its own execution context (frames, wind stack, handler stack), so it can be resumed from any later evaluation, including by the host via `Anima.coroutineResume(co, ...vals)`, which returns `{ done, value, values }` (`value` is the first of `values`).
-  - Resume and yield switch coroutines inside the driver loop (every frame records its execution context), so nothing nests on the JS stack. `%coroutine-resume` in tail position is a proper tail call: the coroutine's yields and final value go straight to the caller's caller, so chains of tail resumes (schedulers, symmetric hand-offs) run in constant space. It compiles to `CORESUME` (tail flag set in tail position) with the values as a list register.
+  - Resume and yield switch coroutines inside the driver loop (every frame records its execution context), so nothing nests on the JS stack. `%coroutine-resume` in tail position is a proper tail call: the coroutine's yields and final value go straight to the caller's caller, so chains of tail resumes (schedulers, symmetric hand-offs) run in constant space. They are control operations (see below); the variadic forms take their values over the argument window.
   - The first resume passes its values as the procedure's arguments. Later resumes make the pending `%coroutine-yield` return their values, and `%coroutine-resume` returns the yielded values, both as multiple values (see `values`).
   - Status is one of `suspended`, `running`, `normal` (it resumed another coroutine) or `dead`. Resuming a non-suspended coroutine is an error.
   - An error the coroutine does not handle marks it `dead` and is raised again in the resumer as-is.
@@ -123,8 +123,8 @@ Besides the core forms, the compiler directly recognizes the following low-level
 ### `%debug-frames` / `%debug-traceback`
 - **Forms**: `(%debug-frames <stack> <args>)`, `(%debug-traceback <stack> <args>)`, where `<stack>` is a stack snapshot from `%current-stack` and `<args>` is the list `([coroutine] [msg] [level])`
 - **Semantics**: Describe the frames of `<stack>` (or of a suspended coroutine) as a list of `#(name file line col)` records, or a traceback string.
-### Runtime operations
-Compiler intrinsics that compile to `CALLRT` (a fixed index into `RUNTIME` in `exec.ts`). The compiler emits several of them itself when lowering other forms, but every one can also be written directly; each has a fixed argument count and a `leaf` flag (see host intrinsics):
+### Core operations
+The VM's own operations. They are intrinsics like any other (see host intrinsics), registered in `CORE_INTRINSICS` (`exec.ts`), which every table starts from (`newIntrinsics` in `core.ts`; the compiler refuses a table that does not). So each is at the same position in every table: the compiler emits several of them itself when lowering other forms (by `corePos(name)`), and every one can also be written directly. They compile like any intrinsic (`CALLINT`, or `CALLHOST` for `%coroutine-close`), with AOT templates for the small ones. Those that need the running context are registered with `context` and get `ctx` and `executor` as extra arguments:
 
 | Form | Arguments | Leaf | What it does |
 |---|---|---|---|
@@ -142,19 +142,22 @@ Compiler intrinsics that compile to `CALLRT` (a fixed index into `RUNTIME` in `e
 | `%marks-first`, `%marks->list` | 3, 2 | yes | `continuation-mark-set-first` / `continuation-mark-set->list` |
 | `%debug-frames`, `%debug-traceback` | 2 | yes | see above |
 
+### Control operations
+Core operations that transfer control, so they are not leaves: `%call/cc`, `%raise`, `%current-stack`, `%coroutine-yield`, `%coroutine-yield-list`, `%coroutine-resume`, `%coroutine-resume-list`, and `%apply-list`, `%apply-array` and `%apply-array-multi` (what `%apply` and `%apply-multi` of a procedure compile to). Each returns a `ControlRequest` describing the transfer, which the VM carries out at the call (`CALLHOST`), exactly as a host intrinsic's `HostTail` is (see below): heap code with the calling frame (`run`), direct code by suspending to heap frames, or for a nested resume by running the coroutine in place (`direct`). So they need no opcodes of their own, and the AOT compiler and the interpreter handle them in one place. In debug code, a request made in tail position records its procedure (or coroutine) as the tail call. `%raise`, `%current-stack` and the yields are registered with `tail: false`: their value is that of the call itself, so they are never compiled as tail calls.
+
 ### Host intrinsics
-- **Registering**: `anima.registerIntrinsic(name, fn, { args, leaf, inline, deps })` makes `(name arg ...)` an intrinsic of that instance: its compiler, VM and front end share one `Intrinsics` table, and nothing about it is global. `name` must start with `%`, and cannot be a compiler intrinsic or an intrinsic already registered. A name only means the intrinsic in code compiled after it is registered. `anima.freeze()` stops further registrations; compiling and loading are unaffected.
-- **Calling convention**: `fn(regs, start, nargs)` reads its arguments from `regs[start .. start+nargs)`. It must not write to `regs` or keep it: in the interpreter it is the caller's live register file. `args` is `[min, max]`, checked at compile time.
+- **Registering**: `anima.registerIntrinsic(name, fn, { args, leaf, inline, deps })` makes `(name arg ...)` an intrinsic of that instance: its compiler, VM and front end share one `Intrinsics` table, and nothing about it is global. `name` must start with `%`, and cannot be a core form, a core operation or an intrinsic already registered. A name only means the intrinsic in code compiled after it is registered. `anima.freeze()` stops further registrations; compiling and loading are unaffected.
+- **Calling convention**: `fn(regs, start, nargs)` reads its arguments from `regs[start .. start+nargs)`. It must not write to `regs` or keep it: in the interpreter it is the caller's live register file. `args` is `[min, max]`, checked at compile time. `context: true` (for the core operations) also passes the running `ExecutionContext` and `VMExecutor`: `fn(regs, start, nargs, ctx, executor)`.
 - **Inlining**: `inline(args, slow, tmp, d)` is an AOT template: given the argument expressions (plain variables, so they may be repeated), the direct call `slow`, a scratch variable `tmp` and `d`, it returns a JS expression, or null to make the direct call. `deps` names the values the template needs (`deps: { Table }`); the template refers to them as `${d.Table}`, which generated code reads from a local set up once per function. Using a name that is not in `deps` is an error when the code is generated.
 - **Tail requests**: unless it is a `leaf`, an intrinsic may return `hostTail(proc, arg ...)` (or `new HostTail(proc, args)`) instead of a value; the value is then `(proc arg ...)`, made as an ordinary call (a tail call if the intrinsic was in tail position), so it can yield, capture continuations and raise. This is how host libraries (userdata, Luau tables and their metamethods) call back into the VM. Such intrinsics compile to `CALLHOST pos start nargs tail` and count as calls for the boxing analysis. To pass on the rest of the window, copy it with a loop: `regs.slice` with a spread costs about twice as much on windows this small.
 - **Leaves** (`leaf: true`) never call back into the VM: they compile to `CALLINT pos dst start nargs` and are not calls for the boxing analysis. "Leaf" does not mean pure: a leaf may have side effects.
 - Errors an intrinsic throws are host errors (see the exception model); `hostError` in `errors.ts` makes one without the cost of a JS stack trace.
 
 ### How intrinsics are compiled
-- **Runtime operations** (see above) compile to `CALLRT idx dst start nargs`, where `idx` is a fixed index into the `RUNTIME` table in `exec.ts`.
+- **Core operations** (see above) are intrinsics at fixed positions (below `CORE_COUNT`) in every table, so they compile as below.
 - **Applying a registered leaf intrinsic** (`(%apply %name arg ... lst)`, e.g. in a first-class wrapper `(lambda args (%apply %name args))`) compiles to `APPLYINT pos dst start nargs`: the last argument is spread as by `%apply`, and since the count is only known at run time, it is checked against the intrinsic's `args` there. Only leaves can be applied.
 - **Registered intrinsics** compile to `CALLINT pos dst start nargs` (leaves) or `CALLHOST pos start nargs tail`, where `pos` is the intrinsic's position in the table the code is compiled against. The interpreter calls `code.table.fns[pos](regs, start, nargs)`; AOT code inlines the intrinsic's template when it has one; a call that is the fast path goes through a local the function is read into once (which V8 can inline), while a template's fallback goes through `RT[pos]`, so V8 does not inline the function into a cold path, which measurably slows the hot one.
-- **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `tail` operand whose bit 0 is set in tail position; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
+- **Control flow**: `CALL` and `CALLHOST` take a trailing `tail` operand (bit 0 set in tail position; non-tail forms are followed by `MOVEACC`), and `RETURN` leaves the function. The control operations are `CALLHOST`s of core intrinsics (see above); only `%call/ec` and `%catch` keep opcodes (`CALLEC`, `CALLCATCH`), because their continuation lives in a register of the calling frame.
 
 # Runtime Architecture
 
@@ -237,7 +240,7 @@ The library follows Racket: `with-continuation-mark`, `current-continuation-mark
 
 ## Bytecode serialization
 
-`dumpFull`/`readFull` (`utils.ts`) prefix the serialized bytecode with a magic word and `BYTECODE_VERSION`. Bump the version whenever opcodes, runtime operation indices or the serialized layout change.
+`dumpFull`/`readFull` (`utils.ts`) prefix the serialized bytecode with a magic word and `BYTECODE_VERSION`. Bump the version whenever opcodes, core operation positions or the serialized layout change. Code that only uses core operations loads without a table (it is bound to `CORE_INTRINSICS`).
 
 Each `ByteCode` refers to the `Intrinsics` table it was compiled against (`table`, null when it uses no intrinsics), and records the intrinsics it uses in its metadata (`intrinsics`: position, name, and whether it was compiled as a leaf). `CALLINT`/`CALLHOST` operands are positions in that table, so code always calls the intrinsics it was compiled with, whichever instance runs it.
 

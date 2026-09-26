@@ -5,7 +5,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from './list';
 import { createScheme } from './scheme';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
-import { Closure, INSTRUCTION_LENGTHS, rtIdx } from './bytecode-rvm/exec';
+import { Closure, CORE_COUNT, CORE_INTRINSICS, corePos, INSTRUCTION_LENGTHS } from './bytecode-rvm/exec';
+import { Compiler } from './bytecode-rvm/compiler';
+import { Intrinsics } from './bytecode-rvm/intrinsics';
 import { Anima } from './anima';
 import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION, stringifyInst } from './bytecode-rvm/utils';
@@ -14,7 +16,7 @@ import { arityMessage, bindArgs, closureArity, restValue } from './bytecode-rvm/
 import { hostTail } from './bytecode-rvm/exec';
 import { IProcedure } from './common';
 import { hostError } from './errors';
-import { CORE_FORMS, CORE_OPS } from './bytecode-rvm/core';
+import { CORE_FORMS, hasCore, newIntrinsics } from './bytecode-rvm/core';
 import { readdirSync, readFileSync } from 'fs';
 
 // intrinsics belong to an instance, so every instance that uses these registers them
@@ -2365,12 +2367,74 @@ describe("Opcode spec", () => {
         expect(lines.some(line => /LOADCONST +dst=r\d+, const=\(2\)$/.test(line))).toBe(true)
         expect(lines.some(line => /CALL +proc=r\d+, start=r\d+, nargs=3, tail=tail$/.test(line))).toBe(true)
         expect(sum.some(line => /APPLYINTR +pos=%\+, dst=r\d+, start=r\d+, nargs=1$/.test(line))).toBe(true)
-        expect(ap.some(line => /APPLY +proc=r\d+, start=r\d+, nargs=1, tail=tail\|rest-array\|multi$/.test(line))).toBe(true)
+        expect(ap.some(line => /CALLHOST +pos=%apply-array-multi, start=r\d+, nargs=2, tail=tail$/.test(line))).toBe(true)
         // ips count by the spec's lengths
         const ips = lines.filter(line => /^\d{4}:/.test(line)).map(line => +line.slice(0, 4))
         for (let i = 1; i < ips.length; i++) expect(ips[i] - ips[i - 1]).toBe(INSTRUCTION_LENGTHS[bc.inst[ips[i - 1]] as OpCode])
     })
 
+})
+
+describe("Core operations", () => {
+    it("are the first entries of every table, at the same positions", () => {
+        const a = createScheme(impl), b = createScheme(implAot)
+        for (const table of [a.intrinsics, b.intrinsics, newIntrinsics(), newIntrinsics(a.intrinsics)]) {
+            expect(hasCore(table)).toBe(true)
+            expect(table.byName("%list")!.pos).toBe(corePos("%list"))
+        }
+        expect(CORE_COUNT).toBe(CORE_INTRINSICS.entries.length)
+        expect(() => new Compiler(new Intrinsics())).toThrow("must start with the core operations")
+        expect(() => a.registerIntrinsic("%list", () => null)).toThrow("'%list' is already defined")
+        expect(() => CORE_INTRINSICS.register("%x", () => null)).toThrow("frozen")
+        expect(() => a.registerIntrinsic("%x", () => null, { context: true })).toThrow("only the VM's core operations do")
+        // leaves that take the context have their own opcode, so other intrinsic calls pass just the window
+        const ops = (a.compileRaw("(%coroutine-create (lambda () 1))") as ByteCode).inst
+        expect(Array.from(ops)).toContain(OpCode.CALLCTX)
+    })
+
+    it("compile and apply like any intrinsic", () => {
+        for (const vmImpl of [impl, implAot]) {
+            const anima = createScheme(vmImpl)
+            const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)))
+            expect(run("(%list 1 2 3)")).toBe("(1 2 3)")
+            expect(run("(%apply %list 1 '(2 3))")).toBe("(1 2 3)")
+            // one that takes the context, applied
+            expect(run("(let ((co (%coroutine-create (lambda () 1)))) (%apply %coroutine-status (list co)))")).toBe("suspended")
+            expect(run("(let ((co (%coroutine-create (lambda () 1)))) (%coroutine-close co) (%coroutine-status co))")).toBe("dead")
+            expect(() => run("(%list->values 1 2)")).toThrow("%list->values: expected exactly 1 args, got 2")
+        }
+        const anima = createScheme(impl)
+        const bc = anima.compileRaw("(%list 1 2)") as ByteCode
+        expect(stringifyInst(bc).some(line => /CALLINT +pos=%list, /.test(line))).toBe(true)
+        // code that only uses core operations loads without a table
+        expect(new ASTStringifier().stringify(anima.evaluateRaw(readFull(dumpFull(bc)) as ByteCode))).toBe("(1 2)")
+    })
+})
+
+describe("Control operations", () => {
+    it("are core intrinsics that return requests the VM carries out at the call", () => {
+        for (const vmImpl of [impl, implAot]) {
+            const anima = createScheme(vmImpl)
+            const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)))
+            for (const name of ["%call/cc", "%raise", "%current-stack", "%coroutine-yield", "%coroutine-resume", "%apply-list", "%apply-array"]) {
+                const entry = CORE_INTRINSICS.byName(name)!
+                expect(entry.leaf, name).toBe(false)
+                expect(anima.intrinsics.byName(name), name).toBe(entry)
+            }
+            expect(run("(+ 1 (%call/cc (lambda (k) (k 41))))")).toBe("42")
+            // a tail %call/cc is a tail call: a loop through it runs in constant space
+            expect(run("(define (cc-loop n) (if (= n 0) 'done (%call/cc (lambda (k) (cc-loop (- n 1)))))) (cc-loop 100000)")).toBe("done")
+            expect(run("(%catch (lambda () (%raise 'boom)) (lambda (e) (list 'caught e)))")).toBe("(caught boom)")
+            expect(() => run("(%raise 'boom 5)")).toThrow("%raise: continuable must be #t or #f")
+            expect(run("(define (cs-f skip) (vector-ref (car (%debug-frames (%current-stack skip) '())) 0)) (cs-f 0)")).toBe('"cs-f"')
+            expect(() => run("(%current-stack -1)")).toThrow("%current-stack: expected a count of frames to skip")
+            expect(() => run("(%apply-array list '(1))")).toThrow("%apply-array: the last argument must be a rest array")
+            expect(run("(let ((co (%coroutine-create (lambda (a) (+ a (%coroutine-yield (* a 2))))))) (list (%coroutine-resume co 5) (%coroutine-resume co 1)))")).toBe("(10 6)")
+        }
+        const bc = createScheme(impl).compileRaw("(define (cc-f g) (%call/cc g))") as ByteCode
+        const lines = stringifyInst(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code)
+        expect(lines.some(line => /CALLHOST +pos=%call\/cc, start=r\d+, nargs=1, tail=tail$/.test(line))).toBe(true)
+    })
 })
 
 describe("Argument binding", () => {
@@ -3125,7 +3189,8 @@ describe('Floats, Infinities & NaNs', () => {
 
     it("serializes intrinsics by name and binds them to the loading table", () => {
         const bc = evaluator.compileRaw("(list (%test-add 1 2) (%test-call-or (lambda (x) x) 4))") as ByteCode;
-        expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%test-add", "%test-call-or"]);
+        // core operations (here %list) are recorded like any other
+        expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%list", "%test-add", "%test-call-or"]);
         const dumped = dumpFull(bc);
         expect(s.stringify(evaluator.evaluateRaw(readFull(dumped, evaluator.intrinsics) as ByteCode))).toBe("(3 4)");
 
@@ -3244,15 +3309,15 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Function with straight-line ops followed by an unhandled opcode:
         // 0: LOADU32 r1, 50
         // 3: LOADU32 r2, 60
-        // 6: CALLRT %list, dest=r0, start=r1, nargs=2
+        // 6: CALLINT %list, dest=r0, start=r1, nargs=2
         // 11: RETURN r0
         const inst = new Uint32Array([
             OpCode.LOADU32, 1, 50,
             OpCode.LOADU32, 2, 60,
-            OpCode.CALLRT, rtIdx("%list"), 0, 1, 2,
+            OpCode.CALLINT, corePos("%list"), 0, 1, 2,
             OpCode.RETURN, 0
         ]);
-        const bc = new ByteCode([], inst, 4);
+        const bc = new ByteCode([], inst, 4, undefined, undefined, false, CORE_INTRINSICS, [{ pos: corePos("%list"), name: "%list", leaf: true }]);
 
         // Compile it with JIT
         AotCompiler.compile(bc);
@@ -3394,7 +3459,7 @@ describe("Compiler intrinsics", () => {
     it("are all documented in the compiler's README", () => {
         const readme = readFileSync(new URL("./bytecode-rvm/README.md", import.meta.url), "utf8");
         const documented = (name: string) => new RegExp("[`(]" + name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&") + "[`\\s)]").test(readme);
-        expect([...CORE_FORMS.keys(), ...CORE_OPS.keys()].map(sym => Symbol.keyFor(sym)!).filter(name => !documented(name))).toEqual([]);
+        expect([...[...CORE_FORMS.keys()].map(sym => Symbol.keyFor(sym)!), ...CORE_INTRINSICS.entries.map(entry => entry.name)].filter(name => !documented(name))).toEqual([]);
     });
 
     it("belong to a compiler that knows nothing of the Scheme front end", () => {

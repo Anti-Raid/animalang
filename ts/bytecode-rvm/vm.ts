@@ -1,7 +1,7 @@
 import { ASTStringifier, ErrorObject, Env, unpackValues, type AbstractVM } from "../common";
 import { OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 import { Intrinsics } from "./intrinsics";
-import { isCompilerIntrinsic } from "./core";
+import { newIntrinsics } from "./core";
 
 export {
     CodeEmitter,
@@ -23,7 +23,7 @@ export class AnimaVM implements AbstractVM {
     public mode: ExecutionMode;
 
     // the intrinsics this VM's compiler compiles against (code carries the table it was compiled or loaded with)
-    constructor(mode: ExecutionMode = "interp", readonly intrinsics: Intrinsics = new Intrinsics(isCompilerIntrinsic)) {
+    constructor(mode: ExecutionMode = "interp", readonly intrinsics: Intrinsics = newIntrinsics()) {
         this.mode = mode;
         this.executor = new VMExecutor(this);
     }

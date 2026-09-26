@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { APPLY_TAIL, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, rtIdx, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, corePos, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import { OPCODES } from "./opcodes";
 
@@ -67,20 +67,6 @@ export type Node = {
     startReg: number,
     nargs: number,
 } | {
-    t: "Apply",
-    procReg: number,
-    destReg?: number,
-    startReg: number,
-    nargs: number,
-    // APPLY_REST / APPLY_MULTI
-    flags: number,
-} | {
-    t: "TailApply",
-    procReg: number,
-    startReg: number,
-    nargs: number,
-    flags: number,
-} | {
     t: "Return",
     reg: number
 } | {
@@ -103,32 +89,10 @@ export type Node = {
     destReg: number,
     srcReg: number
 } | {
-    t: "CallCC",
-    destReg?: number,
-    procReg: number
-} | {
-    t: "TailCallCC",
-    procReg: number
-} | {
     t: "CallEC" | "CallCatch",
     procReg: number,
     tokReg: number,
     preReg?: number,
-    destReg?: number
-} | {
-    t: "Raise",
-    objReg: number,
-    continuable: boolean,
-    destReg?: number
-} | {
-    t: "CoYield",
-    valReg: number,
-    destReg?: number
-} | {
-    t: "CoResume",
-    coReg: number,
-    listReg: number,
-    isTail: boolean,
     destReg?: number
 } | {
     // start of a %block whose escapes jump to `end`
@@ -191,10 +155,6 @@ export type Node = {
     startReg: number,
     nargs: number
 } | {
-    t: "CurrentStack",
-    skip: number,
-    destReg?: number
-} | {
     // an %escape: jump to the end of a %block
     t: "Jump",
     label: JumpLabel
@@ -202,12 +162,6 @@ export type Node = {
     // marks where the following code came from (goes into the line table, emits nothing)
     t: "Pos",
     pos: SourcePos
-} | {
-    t: "RtCall",
-    rtIdx: number,
-    destReg: number,
-    startReg: number,
-    nargs: number
 }
 
 export class IR {
@@ -305,14 +259,10 @@ export class IR {
                     if (!node.isTail && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
                 case "IntCall":
-                    emit(OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
+                    emit(this.table.entries[node.pos].context ? OpCode.CALLCTX : OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "IntApply":
                     emit(node.restArray ? OpCode.APPLYINTR : OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
-                    break
-                case "CurrentStack":
-                    emit(OpCode.CURSTACK, node.skip)
-                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
                 case "Unpack": {
                     emit(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
@@ -334,15 +284,6 @@ export class IR {
                 }
                 case "TailCall": {
                     emit(OpCode.CALL, node.procReg, node.startReg, node.nargs, 1)
-                    break
-                }
-                case "Apply": {
-                    emit(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags)
-                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
-                    break
-                }
-                case "TailApply": {
-                    emit(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags | APPLY_TAIL)
                     break
                 }
                 case "Return": {
@@ -378,40 +319,12 @@ export class IR {
                     emit(OpCode.MOVE, node.destReg, node.srcReg)
                     break
                 }
-                case "CallCC": {
-                    emit(OpCode.CALLCC, node.procReg, 0);
-                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "TailCallCC": {
-                    emit(OpCode.CALLCC, node.procReg, 1);
-                    break;
-                }
-                case "Raise": {
-                    emit(OpCode.RAISE, node.objReg, node.continuable ? 1 : 0);
-                    if (node.continuable && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
                 case "CallEC":
                 case "CallCatch": {
                     if (node.t === "CallEC") emit(OpCode.CALLEC, node.procReg, node.tokReg);
                     else emit(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
                     if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
-                    emit(OpCode.CALLRT, rtIdx("%end-escape"), node.tokReg, node.tokReg, 1);
-                    break;
-                }
-                case "CoYield": {
-                    emit(OpCode.COYIELD, node.valReg);
-                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "CoResume": {
-                    emit(OpCode.CORESUME, node.coReg, node.listReg, node.isTail ? 1 : 0);
-                    if (!node.isTail && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "RtCall": {
-                    emit(OpCode.CALLRT, node.rtIdx, node.destReg, node.startReg, node.nargs);
+                    emit(OpCode.CALLINT, use(corePos("%end-escape")), node.tokReg, node.tokReg, 1);
                     break;
                 }
                 case "Pos": {

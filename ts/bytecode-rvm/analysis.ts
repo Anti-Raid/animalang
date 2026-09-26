@@ -13,7 +13,6 @@ import {
   CORE_WITH_MARK,
   CORE_CATCH,
   OP_CURRENT_MARKS,
-  OP_CURRENT_STACK,
   OP_DEFINE_GLOBAL,
   unpackLambdaExprArgs,
   Cons,
@@ -22,7 +21,7 @@ import { AnalysisScope, VariableMetadata } from "./scope";
 
 const OP_APPLY = Symbol.for("%apply");
 const OP_APPLY_MULTI = Symbol.for("%apply-multi");
-import { CORE_FORMS, CORE_OPS } from "./core";
+import { CORE_FORMS } from "./core";
 import type { Intrinsics } from "./intrinsics";
 
 // Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
@@ -206,12 +205,12 @@ class CallLiveness {
     // whether calling this operator never calls back into the VM, where a continuation of the current frame could be captured
     #isLeaf(op: any, scope: AnalysisScope): boolean {
         if (typeof op !== "symbol") return false;
-        return (CORE_FORMS.get(op) ?? CORE_OPS.get(op) ?? this.intrinsics.get(op))?.leaf ?? false;
+        return (CORE_FORMS.get(op) ?? this.intrinsics.get(op))?.leaf ?? false;
     }
 
     // intrinsics' operands are expressions, but the operator is not evaluated
     #isIntrinsic(op: any): boolean {
-        return typeof op === "symbol" && (CORE_FORMS.has(op) || CORE_OPS.has(op) || this.intrinsics.get(op) !== undefined);
+        return typeof op === "symbol" && (CORE_FORMS.has(op) || this.intrinsics.get(op) !== undefined);
     }
 
     // the variables bound by a %let / %let-values, as they are known in its own scope
@@ -290,7 +289,6 @@ class CallLiveness {
                 return this.expr(key, scope, this.expr(value, scope, this.expr(body, scope, out, blocks), blocks), blocks);
             }
             case OP_CURRENT_MARKS:
-            case OP_CURRENT_STACK:
                 return out;
             // (thunk) is called; only if it raised is the handler evaluated and called
             case CORE_CATCH: {

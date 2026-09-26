@@ -24,7 +24,6 @@ import {
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
 import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
 import { SCHEME_ALIASES } from "../intrinsics";
-import { CORE_OPS } from "../../bytecode-rvm/core";
 
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
@@ -753,7 +752,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     // ordinary call of the prelude's procedure, which reports the wrong count when (and if) it runs
     for (const [name, target] of SCHEME_ALIASES) {
         evaluator.registerTransform(name, (evaluator, expr, orig) => {
-            const range = evaluator.intrinsics.get(target) ?? CORE_OPS.get(target);
+            const range = evaluator.intrinsics.get(target);
             if (range === undefined) throw new Error(`internal error: ${String(target.description)} is not an intrinsic`);
             const nargs = expr === null ? 0 : expr instanceof Cons && !expr.isImproper() ? expr.length : -1;
             const fits = nargs >= range.min && nargs <= range.max;

@@ -112,8 +112,9 @@ export const CORE_LET_VALUES_STRICT = Symbol.for("%let-values/strict");
 // (%with-mark key value body): body runs with a continuation mark; (%current-marks): the current continuation's marks
 export const CORE_WITH_MARK = Symbol.for("%with-mark");
 export const CORE_CATCH = Symbol.for("%catch");
-export const OP_RAISE = Symbol.for("%raise");
 export const OP_CURRENT_MARKS = Symbol.for("%current-marks");
+// core operations (intrinsics, not forms) front ends lower to
+export const OP_RAISE = Symbol.for("%raise");
 export const OP_CURRENT_STACK = Symbol.for("%current-stack");
 export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
@@ -140,8 +141,6 @@ export const SPECIAL_FORMS = new Set([
     CORE_WITH_MARK,
     CORE_CATCH,
     OP_CURRENT_MARKS,
-    OP_CURRENT_STACK,
-    OP_RAISE,
     OP_DEFINE_GLOBAL,
 ])
 

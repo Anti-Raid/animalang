@@ -1,6 +1,6 @@
 import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, Env, Cons, CORE_LAMBDA } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
-import { isCompilerIntrinsic } from "./bytecode-rvm/core"
+import { newIntrinsics } from "./bytecode-rvm/core"
 
 // A language on top of the core: reads source into its syntax tree and lowers that to the core forms
 export interface FrontEnd {
@@ -41,10 +41,10 @@ export class Anima {
         return this.#impl
     }
 
-    // `base`: intrinsics (and reserved names) to start with, e.g. a front end's
+    // `base`: intrinsics (and reserved names) to start with, e.g. a front end's (made with newIntrinsics)
     constructor(impl: AnimaMeta, readonly maxSteps: number = 0, base?: Intrinsics) {
         this.#impl = impl
-        this.#intrinsics = new Intrinsics(isCompilerIntrinsic, base)
+        this.#intrinsics = newIntrinsics(base)
         this.#vm = impl.vm(maxSteps, this.#intrinsics)
         this.#comp = impl.compiler(this.#intrinsics)
     }

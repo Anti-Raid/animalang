@@ -7,13 +7,8 @@
 // a register that is not there (an optional register operand)
 export const NO_REG = 0xFFFFFFFF;
 
-// the `tail` operand of CALL, APPLY, CALLCC, CORESUME and CALLHOST: bit 0 is set in tail position
+// the `tail` operand of CALL and CALLHOST: bit 0 is set in tail position
 export const TAIL = 1;
-// APPLY's other `tail` bits: the last argument register holds a forwarded rest array (see ClosureTemplate.restArray),
-// not a list; and, with it, for %apply-multi, the rest array's own last element is a list, spread too
-export const APPLY_TAIL = TAIL;
-export const APPLY_REST = 2;
-export const APPLY_MULTI = 4;
 
 // UNPACK flags
 export const UNPACK_REST = 1;
@@ -28,7 +23,6 @@ export type OperandKind =
     | "bool"      // 0 or 1
     | "ip"        // a jump target: an instruction index (always starts a basic block)
     | "intrinsic" // a position in the code's intrinsics table (remapped when the code is bound to another table)
-    | "runtime"   // an index in RUNTIME
     | "tail"      // bit 0: in tail position (see TAIL); other bits by opcode, named in `bits`
     | "flags";    // bits named in `bits`
 
@@ -62,15 +56,7 @@ export const OPCODES: readonly OpSpec[] = Object.freeze([
     { name: "UNBOX", operands: [["dst", "reg"], ["src", "reg"]], doc: "reg[dst] = the value of the box reg[src]" },
     { name: "SETBOX", operands: [["box", "reg"], ["src", "reg"]], doc: "the box reg[box] now holds reg[src]" },
     { name: "MOVE", operands: [["dst", "reg"], ["src", "reg"]], doc: "reg[dst] = reg[src]" },
-    { name: "CALLCC", operands: [["proc", "reg"], ["tail", "tail"]], ...TAIL_CALL, doc: "call reg[proc] with the current continuation" },
-    { name: "APPLY",
-        operands: [["proc", "reg"], ["start", "reg"], ["nargs", "u32"], ["tail", "tail"]], split: "nonTail", bits: ["tail", "rest-array", "multi"],
-        doc: "like CALL, with the last argument a list spread into the arguments (see APPLY_REST / APPLY_MULTI)",
-    },
     { name: "MOVEACC", operands: [["dst", "reg"]], doc: "reg[dst] = the accumulator (the last call's result)" },
-    { name: "COYIELD", operands: [["val", "reg"]], split: "always", doc: "yield reg[val] (already packed multiple values) from the running coroutine" },
-    { name: "CALLRT", operands: [["rt", "runtime"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "reg[dst] = RUNTIME[rt] applied to reg[start .. start+nargs)" },
-    { name: "CORESUME", operands: [["co", "reg"], ["list", "reg"], ["tail", "tail"]], ...TAIL_CALL, doc: "resume the coroutine reg[co] with the values in the list reg[list]" },
     { name: "BLOCK", operands: [["end", "ip"]], split: "always", doc: "start of a %block ending at end (for structured AOT code)" },
     { name: "LOOP", operands: [["end", "ip"]], split: "always", doc: "start of a %loop ending at end; its body starts after this" },
     { name: "ENDLOOP", operands: [["head", "ip"]], split: "always", doc: "end of a %loop's body: jump back to head" },
@@ -88,8 +74,6 @@ export const OPCODES: readonly OpSpec[] = Object.freeze([
         operands: [["proc", "reg"], ["tok", "reg"], ["pre", "optreg"]], split: "always",
         doc: "reg[tok] = a new catch token; call reg[proc] with it as the innermost exception handler (reg[pre], if any, runs on the error before unwinding)",
     },
-    { name: "RAISE", operands: [["obj", "reg"], ["continuable", "bool"]], split: "always", doc: "deliver reg[obj] to the innermost exception handler" },
-    { name: "CURSTACK", operands: [["skip", "u32"]], split: "always", doc: "a snapshot of the current stack, minus its innermost skip frames" },
     { name: "CALLHOST",
         operands: [["pos", "intrinsic"], ["start", "reg"], ["nargs", "u32"], ["tail", "tail"]], ...TAIL_CALL,
         doc: "call the non-leaf intrinsic at pos in the code's table on reg[start .. start+nargs); a HostTail result is called in its place",
@@ -98,6 +82,7 @@ export const OPCODES: readonly OpSpec[] = Object.freeze([
     { name: "APPLYINT", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "like CALLINT, with the last argument a list spread into the arguments (the count is checked here)" },
     { name: "ELSEIF", operands: [["cond", "reg"], ["else", "ip"]], split: "always", doc: "like IF, for a later condition of the same chain (IF ... ELSE end; ELSEIF ... ELSE end; ... ENDIF)" },
     { name: "APPLYINTR", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "like APPLYINT, with the last argument a forwarded rest array (see ClosureTemplate.restArray)" },
+    { name: "CALLCTX", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "like CALLINT, for an intrinsic that takes the context (a core operation): also passes ctx and executor" },
 ]);
 
 export const INSTRUCTION_LENGTHS: readonly number[] = Object.freeze(OPCODES.map(spec => 1 + spec.operands.length));

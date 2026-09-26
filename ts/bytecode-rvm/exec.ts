@@ -23,14 +23,13 @@ import {
 import { Cons } from "../list";
 import { listToArray, windowApplyArgs, windowRestArgs, valuesToList, listToValues, applyArgsList, makeList } from "./lists";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markOwn, markSet, markValues, recordTailMark, TAIL_TRAIL, type Marks, type TailTrail } from "../marks";
-import { RUNTIME_INLINES } from "./inline";
 import { hostError } from "../errors";
-import type { Intrinsics, Intrinsic } from "./intrinsics";
+import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions, type InlineFn } from "./intrinsics";
 import { arityMessage, closureArity, fitsArity, checkArity, restList, bindArgs, type Arity } from "./arity";
-import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS, NO_REG, APPLY_TAIL, APPLY_REST, APPLY_MULTI, UNPACK_REST, UNPACK_STRICT, basicBlockStarts } from "./opcodes";
+import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS, NO_REG, UNPACK_REST, UNPACK_STRICT, basicBlockStarts } from "./opcodes";
 
 
-export { INSTRUCTION_LENGTHS, NO_REG, APPLY_TAIL, APPLY_REST, APPLY_MULTI, UNPACK_REST, UNPACK_STRICT } from "./opcodes";
+export { INSTRUCTION_LENGTHS, NO_REG, TAIL, UNPACK_REST, UNPACK_STRICT } from "./opcodes";
 
 // The opcodes, whose operands and meaning OPCODES (opcodes.ts) describes, in the same order. Declared here because the
 // interpreter switches over them: esbuild only inlines an enum's values in the file that declares it
@@ -51,12 +50,7 @@ export enum OpCode {
     UNBOX,
     SETBOX,
     MOVE,
-    CALLCC,
-    APPLY,
     MOVEACC,
-    COYIELD,
-    CALLRT,
-    CORESUME,
     BLOCK,
     LOOP,
     ENDLOOP,
@@ -68,13 +62,12 @@ export enum OpCode {
     CURMARKS,
     CALLEC,
     CALLCATCH,
-    RAISE,
-    CURSTACK,
     CALLHOST,
     CALLINT,
     APPLYINT,
     ELSEIF,
     APPLYINTR,
+    CALLCTX,
 }
 
 // the values of `val` for UNPACK: checks the count when strict; missing values read as undefined (<#void>)
@@ -237,7 +230,7 @@ export class ByteCode implements AbstractByteCode {
         bs.writeArray(this.intrinsics.flatMap(({ pos, name, leaf }) => [pos, name, leaf]));
     }
 
-    // loaded code is bound to `table`, by name
+    // loaded code is bound to `table`, by name; without one, to the core operations (code that uses others needs a table)
     static register(bsr: BSReader, table: Intrinsics | null = null) {
         bsr.registerFactory("ByteCode", (bsr) => {
             const inst = bsr.readU32Arr();
@@ -249,9 +242,11 @@ export class ByteCode implements AbstractByteCode {
             const flat = bsr.readArray();
             const intrinsics: UsedIntrinsic[] = [];
             for (let i = 0; i < flat.length; i += 3) intrinsics.push({ pos: flat[i], name: flat[i + 1], leaf: flat[i + 2] });
-            if (intrinsics.length > 0 && table === null) throw new Error("bytecode that uses intrinsics needs an intrinsics table to load");
+            if (table === null && intrinsics.some(used => CORE_INTRINSICS.byName(used.name) === undefined)) {
+                throw new Error("bytecode that uses intrinsics needs an intrinsics table to load");
+            }
             const code = new ByteCode(constants, inst, numReg, lineTable, files, debug, null, intrinsics);
-            code.bind(table);
+            code.bind(table ?? CORE_INTRINSICS);
             return code;
         });
     }
@@ -520,17 +515,22 @@ let helpers: { handlerReturned: Closure, escapeWith: Closure } | null = null;
 const raiseHelpers = () => helpers ??= {
     handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [
         OpCode.LOADCONST, 0, 0,
-        OpCode.RAISE, 0, 0,
+        OpCode.CALLHOST, corePos("%raise"), 0, 1, 0,
         OpCode.RETURN, 0,
     ]),
     escapeWith: helperClosure(3, [], [
         OpCode.MOVEACC, 1,
-        OpCode.CALLRT, rtIdx("%make-caught"), 2, 1, 1,
+        OpCode.CALLINT, corePos("%make-caught"), 2, 1, 1,
         OpCode.CALL, 0, 2, 1, 1,
     ]),
 };
-const helperClosure = (numReg: number, constants: any[], inst: number[]): Closure =>
-    new Closure(new ClosureTemplate([], null, new ByteCode(constants, new Uint32Array(inst), numReg), [], "raise"), [], "raise");
+const helperClosure = (numReg: number, constants: any[], inst: number[]): Closure => {
+    const positions = new Set<number>();
+    for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip]]) for (const off of INTRINSIC_OPERANDS[inst[ip]]) positions.add(inst[ip + off]);
+    const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
+    const code = new ByteCode(constants, new Uint32Array(inst), numReg, undefined, undefined, false, CORE_INTRINSICS, used);
+    return new Closure(new ClosureTemplate([], null, code, [], "raise"), [], "raise");
+};
 
 // the handler a %catch installs: raising to it escapes to the %catch with the error wrapped in a Caught
 export class CatchToken extends EscapeContinuation {
@@ -1096,7 +1096,6 @@ export class VMExecutor {
     }
 }
 
-type RuntimeFn = (ctx: ExecutionContext, executor: VMExecutor, regs: readonly any[], start: number, nargs: number) => any;
 
 // `tails`: the tail calls that led to the frame's current procedure (recorded by debug code), oldest first
 export type FrameInfo = { name: string, pos: SourcePos | null, tails: TailTrail | null };
@@ -1156,76 +1155,276 @@ const markSetArg = (who: string, set: any): Marks => {
     return set.marks;
 };
 
-// A compiler intrinsic that is a runtime operation: CALLRT runs RUNTIME[idx], with a fixed index. `leaf`: never calls back
-// into the VM (so no continuation can be captured while it runs)
-export type RuntimeOp = { name: string, args: [min: number, max: number], leaf: boolean, fn: RuntimeFn };
+// What an intrinsic that is not a leaf may return instead of a value: a transfer of control the VM carries out where the
+// intrinsic was called (CALLHOST), as if the call site were that operation. The VM carries it out at once, reading its
+// fields before running anything else, so the core operations reuse one request of each kind (`of`) rather than
+// allocating one per call, which shows in tight coroutine loops. This is how the VM's control operations
+// (%call/cc, %raise, the coroutine operations, applying a procedure) are intrinsics rather than opcodes, and how host
+// intrinsics call back into the VM (HostTail)
+export abstract class ControlRequest {
+    // for a request made in tail position, what debug code records as the tail call (see recordTailMark)
+    get tailProc(): any {
+        return undefined;
+    }
 
-export const RUNTIME: readonly RuntimeOp[] = Object.freeze(([
-    ["%coroutine-create", [1, 1], true, (ctx, executor, regs, start) => executor.coCreate(ctx, regs[start])],
-    ["%coroutine-status", [1, 1], true, (ctx, executor, regs, start) => executor.coStatus(regs[start])],
-    // closing a coroutine runs its dynamic-wind after-thunks
-    ["%coroutine-close", [1, 1], false, (ctx, executor, regs, start) => { executor.coClose(ctx, regs[start]); }],
-    ["%wind", [2, 2], true, (ctx, executor, regs, start) => { ctx.wind = new WindPoint(ctx.wind, regs[start], regs[start + 1]); }],
-    ["%end-wind", [0, 0], true, (ctx) => { if (ctx.wind !== null) ctx.wind = ctx.wind.parent; }],
-    ["%end-escape", [1, 1], true, () => undefined],
-    ["%caught?", [1, 1], true, (ctx, executor, regs, start) => regs[start] instanceof Caught],
-    ["%caught-value", [1, 1], true, (ctx, executor, regs, start) => regs[start].error],
-    ["%make-caught", [1, 1], true, (ctx, executor, regs, start) => new Caught(regs[start])],
-    ["%handler-key", [0, 0], true, () => EXCEPTION_HANDLERS],
-    ["%values-cons", [2, 2], true, (ctx, executor, regs, start) => {
-        const vals = regs[start + 1];
-        return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
-    }],
-    ["%list", [0, Infinity], true, (ctx, executor, regs, start, nargs) => makeList(regs, start, nargs)],
-    ["%values", [0, Infinity], true, (ctx, executor, regs, start, nargs) => packValues(regs.slice(start, start + nargs))],
-    ["%values->list", [1, 1], true, (ctx, executor, regs, start, nargs) => valuesToList(regs, start, nargs)],
-    ["%list->values", [1, 1], true, (ctx, executor, regs, start, nargs) => listToValues(regs, start, nargs)],
-    ["%apply-args", [1, 1], true, (ctx, executor, regs, start, nargs) => applyArgsList(regs, start, nargs)],
-    ["%debug-frames", [2, 2], true, (ctx, executor, regs, start) => {
-        const { frames, args } = debugTarget(ctx, regs, start);
-        const level = typeof args[0] === "number" ? args[0] : 0;
-        return Cons.fromArray(frames.slice(level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
-    }],
-    ["%debug-traceback", [2, 2], true, (ctx, executor, regs, start) => {
-        const { frames, args } = debugTarget(ctx, regs, start);
-        const msg = typeof args[0] === "number" ? undefined : args.shift();
-        const level = typeof args[0] === "number" ? args[0] : 0;
-        return formatTraceback(frames.slice(level), tracebackMessage(msg));
-    }],
-    // Lua's truncation of multiple values to one: the first value, or <#void> for none
-    ["%first-value", [1, 1], true, (ctx, executor, regs, start) => {
-        const val = regs[start];
-        return val instanceof MultipleValues ? val.values[0] : val;
-    }],
-    // (%marks-first set key none) / (%marks->list set key): continuation-mark-set-first / ->list
-    ["%marks-first", [3, 3], true, (ctx, executor, regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2])],
-    ["%marks->list", [2, 2], true, (ctx, executor, regs, start) => Cons.fromArray(markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1]))],
-] as [string, [number, number], boolean, RuntimeFn][]).map(([name, args, leaf, fn]) => Object.freeze({ name, args, leaf, fn })));
+    // carried out by heap code, in `frame`, whose ip is already past the call: a non-tail request leaves its value in
+    // ctx.acc (read by the MOVEACC that follows), a tail one hands it to frame's caller. Returns the frame to run next
+    abstract run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null;
 
-export const RUNTIME_IDX: ReadonlyMap<string, number> = new Map(RUNTIME.map(({ name }, idx) => [name, idx]));
-
-// the index of a runtime operation the compiler or the VM emits itself
-export const rtIdx = (name: string): number => {
-    const idx = RUNTIME_IDX.get(name);
-    if (idx === undefined) throw new Error(`internal error: no runtime operation '${name}'`);
-    return idx;
-};
+    // carried out by direct code, which has no heap frame (its resume point is already recorded): the value, or a Suspend
+    // thrown to carry it out on heap frames. HostTail is handled inline in direct code instead
+    abstract direct(ctx: ExecutionContext, executor: VMExecutor, closure: Closure, marks: Marks, mframe: number, isTail: boolean): any;
+}
 
 // A host intrinsic that is not a leaf may return this instead of a value: the value is then (proc args ...), made as an
 // ordinary call (so it can yield, capture continuations and raise)
-export class HostTail {
-    constructor(readonly proc: any, readonly args: any[]) {}
+export class HostTail extends ControlRequest {
+    constructor(readonly proc: any, readonly args: any[]) {
+        super();
+    }
+
+    get tailProc(): any {
+        return this.proc;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
+        return executor.invoke(ctx, this.proc, frame, this.args, 0, this.args.length, isTail);
+    }
+
+    direct(): any {
+        throw Suspend.invoke(this.proc, this.args);
+    }
 }
 
 export const hostTail = (proc: any, ...args: any[]): HostTail => new HostTail(proc, args);
 
-// an intrinsic's argument count checked at run time (for APPLYINT, whose count the compiler cannot know)
-const applyIntrinsic = (fn: (regs: any[], start: number, nargs: number) => any, name: string, min: number, max: number, args: any[]): any => {
-    if (args.length < min || args.length > max) throw hostError(arityMessage(name, min, max, args.length));
-    return fn(args, 0, args.length);
+// (%call/cc proc)
+class CallCCRequest extends ControlRequest {
+    proc: any = undefined;
+
+    static readonly #reused = new CallCCRequest();
+    static of(proc: any): CallCCRequest {
+        const r = CallCCRequest.#reused;
+        r.proc = proc;
+        return r;
+    }
+
+    get tailProc(): any {
+        return this.proc;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
+        return executor.callCC(ctx, this.proc, frame, isTail);
+    }
+
+    direct(): any {
+        throw Suspend.callCC(this.proc);
+    }
+}
+
+// (%coroutine-yield v ...): never in tail position (the value it is resumed with is the value of the call)
+class YieldRequest extends ControlRequest {
+    val: any = undefined;
+
+    static readonly #reused = new YieldRequest();
+    static of(val: any): YieldRequest {
+        const r = YieldRequest.#reused;
+        r.val = val;
+        return r;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
+        return executor.coYield(ctx, frame, this.val);
+    }
+
+    direct(): any {
+        throw Suspend.yield(this.val);
+    }
+}
+
+// (%coroutine-resume co v ...)
+class ResumeRequest extends ControlRequest {
+    co: any = undefined;
+    args: any[] = [];
+
+    static readonly #reused = new ResumeRequest();
+    static of(co: any, args: any[]): ResumeRequest {
+        const r = ResumeRequest.#reused;
+        r.co = co;
+        r.args = args;
+        return r;
+    }
+
+    get tailProc(): any {
+        return this.co;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
+        return executor.coResume(ctx, isTail ? frame.parent : frame, this.co, this.args, frame.marks, frame.mframe);
+    }
+
+    direct(ctx: ExecutionContext, executor: VMExecutor, closure: Closure, marks: Marks, mframe: number, isTail: boolean): any {
+        // inside a coroutine, its frames must stay on the heap, where it can be traced while it waits
+        if (isTail || ctx.coroutine !== null || executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > DIRECT_SUSPEND_LIMIT) {
+            throw Suspend.resume(this.co, this.args, marks, mframe);
+        }
+        return executor.coResumeNested(ctx, this.co, this.args);
+    }
+}
+
+// (%raise obj [continuable]): never in tail position (a continuable raise returns where it was raised)
+class RaiseRequest extends ControlRequest {
+    obj: any = undefined;
+    continuable: boolean = false;
+
+    static readonly #reused = new RaiseRequest();
+    static of(obj: any, continuable: boolean): RaiseRequest {
+        const r = RaiseRequest.#reused;
+        r.obj = obj; r.continuable = continuable;
+        return r;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
+        return executor.raise(ctx, frame, this.obj, this.continuable);
+    }
+
+    direct(ctx: ExecutionContext, executor: VMExecutor, closure: Closure, marks: Marks): any {
+        throw Suspend.raise(this.obj, this.continuable, marks);
+    }
+}
+
+// (%current-stack [skip]): never in tail position (the frames it describes are those of the call)
+class StackRequest extends ControlRequest {
+    skip: number = 0;
+
+    static readonly #reused = new StackRequest();
+    static of(skip: number): StackRequest {
+        const r = StackRequest.#reused;
+        r.skip = skip;
+        return r;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
+        ctx.acc = new StackSnapshot(frameInfos(frame, this.skip));
+        return frame;
+    }
+
+    direct(): any {
+        throw Suspend.stack(this.skip);
+    }
+}
+
+// a one-argument template; the argument is always a register name, so it may be repeated freely
+const unaryInline = (inline: (a: string, d: Readonly<Record<string, string>>) => string): InlineFn =>
+    (args, slow, tmp, d) => args.length === 1 ? inline(args[0], d) : null;
+
+// The VM's own operations, as intrinsics: the first entries of every table (see newIntrinsics in core.ts), so each is at
+// the same position in all of them, and the compiler and the VM refer to them by that position (corePos). They are
+// %-named compiler intrinsics like the core forms, and code may call them directly. `context`: called with the running
+// ExecutionContext and VMExecutor
+export const CORE_INTRINSICS: Intrinsics = (() => {
+    const table = new Intrinsics();
+    const deps = { Cons, MultipleValues, WindPoint, Caught, EXCEPTION_HANDLERS };
+    const core = (name: string, args: [number, number], fn: IntrinsicFn, options: Omit<IntrinsicOptions, "args" | "deps"> = {}) =>
+        table.register(name, fn, { args, leaf: true, ...options, deps: options.inline === undefined ? undefined : deps });
+    core("%coroutine-create", [1, 1], (regs, start, nargs, ctx, executor) => executor.coCreate(ctx, regs[start]), { context: true });
+    core("%coroutine-status", [1, 1], (regs, start, nargs, ctx, executor) => executor.coStatus(regs[start]), { context: true });
+    // closing a coroutine runs its dynamic-wind after-thunks
+    core("%coroutine-close", [1, 1], (regs, start, nargs, ctx, executor) => { executor.coClose(ctx, regs[start]); }, { context: true, leaf: false });
+    core("%wind", [2, 2], (regs, start, nargs, ctx) => { ctx.wind = new WindPoint(ctx.wind, regs[start], regs[start + 1]); }, {
+        context: true, inline: ([before, after], slow, tmp, d) => `(ctx.wind = new ${d.WindPoint}(ctx.wind, ${before}, ${after}), undefined)`,
+    });
+    core("%end-wind", [0, 0], (regs, start, nargs, ctx) => { if (ctx.wind !== null) ctx.wind = ctx.wind.parent; }, {
+        context: true, inline: () => `(ctx.wind !== null && (ctx.wind = ctx.wind.parent), undefined)`,
+    });
+    core("%end-escape", [1, 1], () => undefined, { inline: () => `undefined` });
+    core("%caught?", [1, 1], (regs, start) => regs[start] instanceof Caught, { inline: unaryInline((v, d) => `${v} instanceof ${d.Caught}`) });
+    core("%caught-value", [1, 1], (regs, start) => regs[start].error, { inline: unaryInline(v => `${v}.error`) });
+    core("%make-caught", [1, 1], (regs, start) => new Caught(regs[start]), { inline: unaryInline((v, d) => `new ${d.Caught}(${v})`) });
+    core("%handler-key", [0, 0], () => EXCEPTION_HANDLERS, { inline: (args, slow, tmp, d) => d.EXCEPTION_HANDLERS });
+    core("%values-cons", [2, 2], (regs, start) => {
+        const vals = regs[start + 1];
+        return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
+    }, { inline: ([x, v], slow, tmp, d) => `(${v} instanceof ${d.MultipleValues} ? new ${d.MultipleValues}([${x}, ...${v}.values]) : new ${d.MultipleValues}([${x}, ${v}]))` });
+    core("%list", [0, Infinity], (regs, start, nargs) => makeList(regs, start, nargs), {
+        inline: (args, slow, tmp, d) => args.reduceRight((tail, arg) => `new ${d.Cons}(${arg}, ${tail})`, "null"),
+    });
+    core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)));
+    core("%values->list", [1, 1], (regs, start, nargs) => valuesToList(regs, start, nargs));
+    core("%list->values", [1, 1], (regs, start, nargs) => listToValues(regs, start, nargs));
+    core("%apply-args", [1, 1], (regs, start, nargs) => applyArgsList(regs, start, nargs));
+    core("%debug-frames", [2, 2], (regs, start, nargs, ctx) => {
+        const { frames, args } = debugTarget(ctx, regs, start);
+        const level = typeof args[0] === "number" ? args[0] : 0;
+        return Cons.fromArray(frames.slice(level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
+    }, { context: true });
+    core("%debug-traceback", [2, 2], (regs, start, nargs, ctx) => {
+        const { frames, args } = debugTarget(ctx, regs, start);
+        const msg = typeof args[0] === "number" ? undefined : args.shift();
+        const level = typeof args[0] === "number" ? args[0] : 0;
+        return formatTraceback(frames.slice(level), tracebackMessage(msg));
+    }, { context: true });
+    // Lua's truncation of multiple values to one: the first value, or <#void> for none
+    core("%first-value", [1, 1], (regs, start) => {
+        const val = regs[start];
+        return val instanceof MultipleValues ? val.values[0] : val;
+    }, { inline: unaryInline((v, d) => `(${v} instanceof ${d.MultipleValues} ? ${v}.values[0] : ${v})`) });
+    // (%marks-first set key none) / (%marks->list set key): continuation-mark-set-first / ->list
+    core("%marks-first", [3, 3], (regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2]));
+    core("%marks->list", [2, 2], (regs, start) => Cons.fromArray(markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1])));
+
+    // Control operations: not leaves, they return a ControlRequest the VM carries out at the call. Those whose value is
+    // that of the call itself (`tail: false`) are never compiled as tail calls
+    const control = (name: string, args: [number, number], fn: IntrinsicFn, tail: boolean = true) => core(name, args, fn, { leaf: false, tail });
+    // regs[from .. to) as a new array: a loop, as slicing a frame's registers is several times slower on these windows
+    const copyWindow = (regs: any[], from: number, to: number): any[] => {
+        const out: any[] = [];
+        for (let i = from; i < to; i++) out.push(regs[i]);
+        return out;
+    };
+    control("%call/cc", [1, 1], (regs, start) => CallCCRequest.of(regs[start]));
+    control("%coroutine-yield", [0, Infinity], (regs, start, nargs) => YieldRequest.of(nargs === 1 ? regs[start] : packValues(copyWindow(regs, start, start + nargs))), false);
+    control("%coroutine-yield-list", [1, 1], (regs, start, nargs) => YieldRequest.of(listToValues(regs, start, nargs)), false);
+    control("%coroutine-resume", [1, Infinity], (regs, start, nargs) => ResumeRequest.of(regs[start], copyWindow(regs, start + 1, start + nargs)));
+    control("%coroutine-resume-list", [2, 2], (regs, start) => ResumeRequest.of(regs[start], listToArray(regs[start + 1])));
+    control("%raise", [1, 2], (regs, start, nargs) => {
+        const continuable = nargs === 2 ? regs[start + 1] : false;
+        if (typeof continuable !== "boolean") throw hostError("%raise: continuable must be #t or #f");
+        return RaiseRequest.of(regs[start], continuable);
+    }, false);
+    control("%current-stack", [0, 1], (regs, start, nargs) => {
+        const skip = nargs === 1 ? regs[start] : 0;
+        if (!Number.isInteger(skip) || skip < 0) throw hostError("%current-stack: expected a count of frames to skip");
+        return StackRequest.of(skip);
+    }, false);
+    // applying a procedure ((%apply proc arg ... lst) and %apply-multi compile to these): (proc arg ... last), where
+    // last is a list, a forwarded rest array (see ClosureTemplate.restArray), or for %apply-multi a rest array whose own
+    // last element is a list
+    control("%apply-list", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], windowApplyArgs(regs, start + 1, nargs - 1)));
+    const restArray = (regs: any[], start: number, nargs: number) => {
+        if (!Array.isArray(regs[start + nargs - 1])) throw hostError("%apply-array: the last argument must be a rest array");
+    };
+    control("%apply-array", [2, Infinity], (regs, start, nargs) => (restArray(regs, start, nargs), new HostTail(regs[start], windowRestArgs(regs, start + 1, nargs - 1, false))));
+    control("%apply-array-multi", [2, 2], (regs, start, nargs) => (restArray(regs, start, nargs), new HostTail(regs[start], windowRestArgs(regs, start + 1, nargs - 1, true))));
+    return table.freeze();
+})();
+
+// how many core operations there are: positions below this are theirs in every table
+export const CORE_COUNT = CORE_INTRINSICS.entries.length;
+
+// the position of a core operation the compiler or the VM emits itself
+export const corePos = (name: string): number => {
+    const entry = CORE_INTRINSICS.byName(name);
+    if (entry === undefined) throw new Error(`internal error: no core operation '${name}'`);
+    return entry.pos;
 };
 
-const RUNTIME_FNS: readonly RuntimeFn[] = RUNTIME.map(({ fn }) => fn);
+
+// an intrinsic's argument count checked at run time (for APPLYINT, whose count the compiler cannot know)
+const applyIntrinsic = (fn: IntrinsicFn, name: string, min: number, max: number, args: any[], ctx: ExecutionContext, executor: VMExecutor): any => {
+    if (args.length < min || args.length > max) throw hostError(arityMessage(name, min, max, args.length));
+    return fn(args, 0, args.length, ctx, executor);
+};
 
 export class BytecodeInterpreter {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
@@ -1401,26 +1600,6 @@ export class BytecodeInterpreter {
                         regs[inst[ip++]] = ctx.acc;
                         break;
                     }
-                    case OpCode.COYIELD: {
-                        const valReg = inst[ip++];
-                        frame.ip = ip;
-                        return executor.coYield(ctx, frame, regs[valReg]);
-                    }
-                    case OpCode.CORESUME: {
-                        const coReg = inst[ip++];
-                        const listReg = inst[ip++];
-                        const isTail = inst[ip++] !== 0;
-                        if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(regs[coReg]));
-                        frame.ip = ip;
-                        return executor.coResume(ctx, isTail ? frame.parent : frame, regs[coReg], listToArray(regs[listReg]), frame.marks, frame.mframe);
-                    }
-                    case OpCode.CALLRT: {
-                        const fn = RUNTIME_FNS[inst[ip++]];
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
-                        regs[destReg] = fn(ctx, executor, regs, startReg, inst[ip++]);
-                        break;
-                    }
                     case OpCode.CALLINT: {
                         const fn = frame.code.table!.fns[inst[ip++]];
                         const destReg = inst[ip++];
@@ -1428,11 +1607,18 @@ export class BytecodeInterpreter {
                         regs[destReg] = fn(regs, startReg, inst[ip++]);
                         break;
                     }
+                    case OpCode.CALLCTX: {
+                        const fn = frame.code.table!.fns[inst[ip++]];
+                        const destReg = inst[ip++];
+                        const startReg = inst[ip++];
+                        regs[destReg] = fn(regs, startReg, inst[ip++], ctx, executor);
+                        break;
+                    }
                     case OpCode.APPLYINT: {
                         const entry = frame.code.table!.entries[inst[ip++]];
                         const destReg = inst[ip++];
                         const startReg = inst[ip++];
-                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, windowApplyArgs(regs, startReg, inst[ip++]));
+                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, windowApplyArgs(regs, startReg, inst[ip++]), ctx, executor);
                         break;
                     }
                     case OpCode.APPLYINTR: {
@@ -1441,26 +1627,8 @@ export class BytecodeInterpreter {
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         // a rest array alone is the argument array itself: intrinsics never write to or keep it
-                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, nargs === 1 ? regs[startReg] : windowRestArgs(regs, startReg, nargs, false));
+                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, nargs === 1 ? regs[startReg] : windowRestArgs(regs, startReg, nargs, false), ctx, executor);
                         break;
-                    }
-                    case OpCode.APPLY: {
-                        const proc = regs[inst[ip++]];
-                        const startReg = inst[ip++];
-                        const nargs = inst[ip++];
-                        const flags = inst[ip++];
-                        const isTail = (flags & APPLY_TAIL) !== 0;
-                        if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(proc));
-                        frame.ip = ip;
-                        const args = (flags & APPLY_REST) !== 0 ? windowRestArgs(regs, startReg, nargs, (flags & APPLY_MULTI) !== 0) : windowApplyArgs(regs, startReg, nargs);
-                        return executor.apply(ctx, proc, frame, args, isTail);
-                    }
-                    case OpCode.CALLCC: {
-                        const procReg = inst[ip++];
-                        const isTail = inst[ip++] !== 0;
-                        if (isTail && frame.code.debug) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(regs[procReg]));
-                        frame.ip = ip;
-                        return executor.callCC(ctx, regs[procReg], frame, isTail);
                     }
                     case OpCode.CALLEC: {
                         const procReg = inst[ip++];
@@ -1477,26 +1645,18 @@ export class BytecodeInterpreter {
                         frame.ip = ip;
                         return executor.callCatch(ctx, regs[procReg], frame, tok);
                     }
-                    case OpCode.RAISE: {
-                        const objReg = inst[ip++];
-                        const continuable = inst[ip++] !== 0;
-                        frame.ip = ip;
-                        return executor.raise(ctx, frame, regs[objReg], continuable);
-                    }
-                    case OpCode.CURSTACK: {
-                        const skip = inst[ip++];
-                        frame.ip = ip;
-                        ctx.acc = new StackSnapshot(frameInfos(frame, skip));
-                        break;
-                    }
                     case OpCode.CALLHOST: {
-                        const fn = frame.code.table!.fns[inst[ip++]];
+                        const entry = frame.code.table!.entries[inst[ip++]];
                         const startReg = inst[ip++];
                         const nargs = inst[ip++];
                         const isTail = inst[ip++] !== 0;
                         frame.ip = ip;
-                        const res = fn(regs, startReg, nargs);
-                        if (res instanceof HostTail) return executor.invoke(ctx, res.proc, frame, res.args, 0, res.args.length, isTail);
+                        // only core operations take the context: passing it to the others costs measurably
+                        const res = entry.context ? entry.fn(regs, startReg, nargs, ctx, executor) : entry.fn(regs, startReg, nargs);
+                        if (res instanceof ControlRequest) {
+                            if (isTail && frame.code.debug && res.tailProc !== undefined) frame.marks = recordTailMark(frame.marks, frame.mframe, tailName(res.tailProc));
+                            return res.run(ctx, executor, frame, isTail);
+                        }
                         ctx.acc = res;
                         if (isTail) return executor.setRetVal(ctx, frame.parent, res);
                         break;
@@ -1531,7 +1691,6 @@ const JIT_DEPS = {
     WindPoint,
     windowApplyArgs,
     windowRestArgs,
-    RUNTIME_FNS,
     listToArray,
     Cons,
     MISSING,
@@ -1546,6 +1705,7 @@ const JIT_DEPS = {
     StackSnapshot,
     frameInfos,
     HostTail,
+    ControlRequest,
     applyIntrinsic,
     CatchToken,
     Caught,
@@ -1553,12 +1713,6 @@ const JIT_DEPS = {
     markFirst,
     EXCEPTION_HANDLERS,
 };
-
-// generated code: the argument array of an APPLY, from its window in `regs` (a js expression) at `start`
-const applyArgs = (term: { flags: number; nargs: number }, regs: string, start: number): string =>
-    (term.flags & APPLY_REST) !== 0
-        ? `windowRestArgs(${regs}, ${start}, ${term.nargs}, ${(term.flags & APPLY_MULTI) !== 0})`
-        : `windowApplyArgs(${regs}, ${start}, ${term.nargs})`;
 
 // `at` is the ip of the instruction an op or terminator was decoded from
 type AotInst = { at?: number } & (
@@ -1571,7 +1725,6 @@ type AotInst = { at?: number } & (
     | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }
     | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
     | { k: "MoveAcc"; dst: number }
-    | { k: "RtCall"; rt: number; dst: number; start: number; nargs: number }
     | { k: "IntCall" | "IntApply" | "IntApplyRest"; pos: number; dst: number; start: number; nargs: number }
     | { k: "Unpack"; src: number; start: number; count: number; flags: number }
     | { k: "SetMark"; key: number; val: number }
@@ -1586,15 +1739,9 @@ type AotTerm = { at?: number } & (
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; arity: Arity }
-    | { k: "Apply"; proc: number; isTail: boolean; flags: number; start: number; nargs: number; resume: number }
-    | { k: "CallCC"; proc: number; isTail: boolean; resume: number }
     | { k: "CallEC"; proc: number; tok: number; resume: number }
     | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
-    | { k: "Raise"; obj: number; continuable: boolean; resume: number }
-    | { k: "CurStack"; skip: number; resume: number }
     | { k: "HostCall"; pos: number; start: number; nargs: number; isTail: boolean; resume: number }
-    | { k: "Yield"; val: number; resume: number }
-    | { k: "CoResume"; co: number; list: number; isTail: boolean; resume: number }
     | { k: "Return"; reg: number });
 
 type AotBlock = { start: number; insts: AotInst[]; term: AotTerm };
@@ -1834,38 +1981,14 @@ export class AotCompiler {
                     case OpCode.CURMARKS:
                         insts.push({ k: "CurMarks", dst: inst[ip++] });
                         break;
-                    case OpCode.COYIELD:
-                        term = { k: "Yield", val: inst[ip++], resume: ip };
-                        break;
-                    case OpCode.CORESUME: {
-                        const co = inst[ip++];
-                        const list = inst[ip++];
-                        term = { k: "CoResume", co, list, isTail: inst[ip++] !== 0, resume: ip };
-                        break;
-                    }
-                    case OpCode.CALLRT:
-                        insts.push({ k: "RtCall", rt: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
-                        break;
                     case OpCode.CALLINT:
+                    case OpCode.CALLCTX:
                         insts.push({ k: "IntCall", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.APPLYINT:
                     case OpCode.APPLYINTR:
                         insts.push({ k: inst[opIp] === OpCode.APPLYINT ? "IntApply" : "IntApplyRest", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
-                    case OpCode.APPLY: {
-                        const procIdx = inst[ip++];
-                        const start = inst[ip++];
-                        const nargs = inst[ip++];
-                        const flags = inst[ip++];
-                        term = { k: "Apply", proc: procIdx, isTail: (flags & APPLY_TAIL) !== 0, flags, start, nargs, resume: ip };
-                        break;
-                    }
-                    case OpCode.CALLCC: {
-                        const proc = inst[ip++];
-                        term = { k: "CallCC", proc, isTail: inst[ip++] !== 0, resume: ip };
-                        break;
-                    }
                     case OpCode.CALLEC: {
                         const proc = inst[ip++];
                         term = { k: "CallEC", proc, tok: inst[ip++], resume: ip };
@@ -1877,14 +2000,6 @@ export class AotCompiler {
                         term = { k: "CallCatch", proc, tok, pre: inst[ip++], resume: ip };
                         break;
                     }
-                    case OpCode.RAISE: {
-                        const obj = inst[ip++];
-                        term = { k: "Raise", obj, continuable: inst[ip++] !== 0, resume: ip };
-                        break;
-                    }
-                    case OpCode.CURSTACK:
-                        term = { k: "CurStack", skip: inst[ip++], resume: ip };
-                        break;
                     case OpCode.CALLHOST: {
                         const pos = inst[ip++];
                         const start = inst[ip++];
@@ -1940,7 +2055,7 @@ class Liveness {
 
     static #resumePoint(term: AotTerm): number | null {
         switch (term.k) {
-            case "Call": case "Apply": case "CallCC": case "CallEC": case "CallCatch": case "Raise": case "CurStack": case "Yield": case "CoResume": return term.resume;
+            case "Call": case "CallEC": case "CallCatch": return term.resume;
             case "HostCall": return term.isTail ? null : term.resume;
             default: return null;
         }
@@ -1967,7 +2082,7 @@ class Liveness {
             case "SetBox": return [inst.dst, inst.src];
             case "SetUpvar": case "SetGlobal": return [inst.src];
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
-            case "RtCall": case "IntCall": case "IntApply": case "IntApplyRest": return windowRegs(inst.start, inst.nargs);
+            case "IntCall": case "IntApply": case "IntApplyRest": return windowRegs(inst.start, inst.nargs);
             case "Unpack": return [inst.src];
             case "SetMark": return [inst.key, inst.val];
             case "MarkRestore": return [inst.reg, inst.reg + 1];
@@ -1986,14 +2101,9 @@ class Liveness {
         switch (term.k) {
             case "Branch": return [term.cond];
             case "Call": case "TailCall": case "MaybeSelfTailCall": return [term.proc, ...windowRegs(term.start, term.nargs)];
-            case "Apply": return [term.proc, ...windowRegs(term.start, term.nargs)];
-            case "CallCC": return [term.proc];
             case "CallEC": return [term.proc];
             case "CallCatch": return term.pre === NO_REG ? [term.proc] : [term.proc, term.pre];
-            case "Raise": return [term.obj];
             case "HostCall": return windowRegs(term.start, term.nargs);
-            case "Yield": return [term.val];
-            case "CoResume": return [term.co, term.list];
             case "Return": return [term.reg];
             default: return [];
         }
@@ -2004,8 +2114,8 @@ class Liveness {
             case "Jump": return [term.target];
             case "Block": case "Loop": return [term.body];
             case "Branch": return [term.then, term.else];
-            case "Call": case "CallEC": case "CallCatch": case "Raise": case "CurStack": case "Yield": return [term.resume];
-            case "Apply": case "CallCC": case "CoResume": case "HostCall": return term.isTail ? [] : [term.resume];
+            case "Call": case "CallEC": case "CallCatch": return [term.resume];
+            case "HostCall": return term.isTail ? [] : [term.resume];
             case "MaybeSelfTailCall": return [0];
             default: return [];
         }
@@ -2108,12 +2218,15 @@ abstract class FunctionEmitter extends CodeEmitter {
         return `${this.debugPos(x.at + 1)}${tailProc !== undefined ? ` ${this.marksVar} = recordTailMark(${this.marksVar}, ${this.mframeVar}, tailName(${tailProc}));` : ""}`;
     }
 
+    // debug code only: records a control request made in tail position as the tail call, as debugHooks does for a call
+    protected tailMark(req: string): string {
+        if (!this.debug) return "";
+        return `if (${req}.tailProc !== undefined) ${this.marksVar} = recordTailMark(${this.marksVar}, ${this.mframeVar}, tailName(${req}.tailProc));`;
+    }
+
     protected tailProcOf(term: AotTerm): string | undefined {
         switch (term.k) {
             case "TailCall": case "MaybeSelfTailCall": return `r${term.proc}`;
-            case "Apply": return term.isTail ? `r${term.proc}` : undefined;
-            case "CallCC": return term.isTail ? `r${term.proc}` : undefined;
-            case "CoResume": return term.isTail ? `r${term.co}` : undefined;
             default: return undefined;
         }
     }
@@ -2123,7 +2236,8 @@ abstract class FunctionEmitter extends CodeEmitter {
     protected abstract emitTerm(term: AotTerm, next: number): void;
 
     // a (regs, start, nargs)-style call of `fn` over the register window; runtime functions also take (ctx, executor) first
-    protected abstract windowCall(fn: string, start: number, nargs: number, withRuntime?: boolean): string;
+    // a call of `fn` over the register window (followed by ctx and executor for an intrinsic that takes the context)
+    protected abstract windowCall(fn: string, start: number, nargs: number, withContext?: boolean): string;
 
     // where the value of the last call is (read by MOVEACC)
     protected abstract readonly accExpr: string;
@@ -2248,22 +2362,17 @@ abstract class FunctionEmitter extends CodeEmitter {
                 if ((inst.flags & UNPACK_REST) !== 0) moves.push(`r${inst.start + inst.count} = restValues(tmp, ${inst.count});`);
                 return this.emit(`tmp = unpackForBinding(r${inst.src}, ${inst.count}, ${inst.flags}); ${moves.join(" ")}`);
             }
-            case "RtCall": {
-                const slow = this.windowCall(`RUNTIME_FNS[${inst.rt}]`, inst.start, inst.nargs, true);
-                const inline = RUNTIME_INLINES.get(RUNTIME[inst.rt].name)?.(windowRegs(inst.start, inst.nargs).map(r => `r${r}`), slow, "tmp", {});
-                return this.emit(`r${inst.dst} = ${inline ?? slow};`);
-            }
             case "IntCall":
                 return this.emit(`r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)};`);
             case "IntApply": {
                 const entry = this.table!.entries[inst.pos];
-                return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, windowApplyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}));`);
+                return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, windowApplyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}), ctx, executor);`);
             }
             case "IntApplyRest": {
                 // a rest array alone is the argument array itself: intrinsics never write to or keep it
                 const entry = this.table!.entries[inst.pos];
                 const args = inst.nargs === 1 ? `r${inst.start}` : `windowRestArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}, false)`;
-                return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, ${args});`);
+                return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, ${args}, ctx, executor);`);
             }
             default: {
                 const _: never = inst;
@@ -2276,9 +2385,9 @@ abstract class FunctionEmitter extends CodeEmitter {
     // fallback goes through RT[pos], so V8 does not inline the function into the cold path (which slows the hot one)
     protected intrinsicCall(pos: number, start: number, nargs: number): string {
         const entry = this.table!.entries[pos];
-        const direct = this.windowCall(`I${pos}`, start, nargs);
+        const direct = this.windowCall(`I${pos}`, start, nargs, entry.context);
         if (entry.inline === undefined) return direct;
-        const inlined = entry.inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`RT[${pos}]`, start, nargs), "tmp", inlineDeps(entry, this.usedDeps));
+        const inlined = entry.inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`RT[${pos}]`, start, nargs, entry.context), "tmp", inlineDeps(entry, this.usedDeps));
         return inlined ?? direct;
     }
 
@@ -2343,9 +2452,9 @@ class ResumeEmitter extends FunctionEmitter {
         return `frame.posIp = ${ip};`;
     }
 
-    protected windowCall(fn: string, start: number, nargs: number, withRuntime: boolean = false): string {
+    protected windowCall(fn: string, start: number, nargs: number, withContext: boolean = false): string {
         const spills = windowRegs(start, nargs).map(r => `regs[${r}] = r${r}`);
-        return `(${[...spills, `${fn}(${withRuntime ? "ctx, executor, " : ""}regs, ${start}, ${nargs})`].join(", ")})`;
+        return `(${[...spills, `${fn}(regs, ${start}, ${nargs}${withContext ? ", ctx, executor" : ""})`].join(", ")})`;
     }
 
     #spills(regs: number[]): string {
@@ -2455,26 +2564,14 @@ class ResumeEmitter extends FunctionEmitter {
                     ${this.#spills(live.spillsFor(term.resume, [term.tok]))}
                     return executor.callCatch(ctx, r${term.proc}, frame, r${term.tok});
                 `);
-            case "Raise":
-                return this.emit(`
-                    frame.ip = ${term.resume};
-                    ${this.#spills(live.spillsFor(term.resume))}
-                    return executor.raise(ctx, frame, r${term.obj}, ${term.continuable});
-                `);
-            case "CurStack":
-                return this.emit(`
-                    frame.ip = ${term.resume};
-                    ctx.acc = new StackSnapshot(frameInfos(frame, ${term.skip}));
-                    ${this.jump(term.resume, next)}
-                `);
             case "HostCall":
                 return this.emit(`
                     frame.ip = ${term.resume};
                     {
                         const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
-                        if (res instanceof HostTail) {
-                            ${term.isTail ? "" : this.#spills(live.spillsFor(term.resume))}
-                            return executor.invoke(ctx, res.proc, frame, res.args, 0, res.args.length, ${term.isTail});
+                        if (res instanceof ControlRequest) {
+                            ${term.isTail ? this.tailMark("res") : this.#spills(live.spillsFor(term.resume))}
+                            return res.run(ctx, executor, frame, ${term.isTail});
                         }
                         ctx.acc = res;
                         ${term.isTail ? "return executor.setRetVal(ctx, frame.parent, res);" : ""}
@@ -2508,32 +2605,6 @@ class ResumeEmitter extends FunctionEmitter {
                         `)}
                     }
                 `);
-            case "Apply": {
-                const window = windowRegs(term.start, term.nargs);
-                return this.emit(`
-                    frame.ip = ${term.resume};
-                    ${this.#spills(term.isTail ? window : live.spillsFor(term.resume, window))}
-                    return executor.apply(ctx, r${term.proc}, frame, ${applyArgs(term, "regs", term.start)}, ${term.isTail});
-                `);
-            }
-            case "CallCC":
-                return this.emit(`
-                    frame.ip = ${term.resume};
-                    ${term.isTail ? "" : this.#spills(live.spillsFor(term.resume))}
-                    return executor.callCC(ctx, r${term.proc}, frame, ${term.isTail});
-                `);
-            case "Yield":
-                return this.emit(`
-                    frame.ip = ${term.resume};
-                    ${this.#spills(live.spillsFor(term.resume))}
-                    return executor.coYield(ctx, frame, r${term.val});
-                `);
-            case "CoResume":
-                return this.emit(`
-                    frame.ip = ${term.resume};
-                    ${term.isTail ? "" : this.#spills(live.spillsFor(term.resume))}
-                    return executor.coResume(ctx, ${term.isTail ? "frame.parent" : "frame"}, r${term.co}, listToArray(r${term.list}), frame.marks, frame.mframe);
-                `);
             case "Return":
                 return this.emit(`
                     ctx.acc = r${term.reg};
@@ -2564,8 +2635,8 @@ class DirectEmitter extends FunctionEmitter {
         return `dip = ${ip};`;
     }
 
-    protected windowCall(fn: string, start: number, nargs: number, withRuntime: boolean = false): string {
-        return `${fn}(${withRuntime ? "ctx, executor, " : ""}[${this.argList(start, nargs)}], 0, ${nargs})`;
+    protected windowCall(fn: string, start: number, nargs: number, withContext: boolean = false): string {
+        return `${fn}([${this.argList(start, nargs)}], 0, ${nargs}${withContext ? ", ctx, executor" : ""})`;
     }
 
     // the direct entry takes the parameters' values (the rest parameter's last) as js arguments
@@ -2851,24 +2922,18 @@ class DirectEmitter extends FunctionEmitter {
                     }
                     ${this.jump(term.resume, next)}
                 `);
-            case "Raise":
-                return this.emit(`
-                    rip = ${term.resume};
-                    throw Suspend.raise(r${term.obj}, ${term.continuable}, marks);
-                `);
-            case "CurStack":
-                return this.emit(`
-                    rip = ${term.resume};
-                    throw Suspend.stack(${term.skip});
-                `);
             case "HostCall":
                 return this.emit(`
                     {
                         rip = ${term.isTail ? -1 : term.resume};
                         const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
                         if (res instanceof HostTail) {
+                            ${term.isTail ? this.tailMark("res") : ""}
                             const proc = res.proc, args = res.args;
                             ${this.#callArray(term.isTail)}
+                        } else if (res instanceof ControlRequest) {
+                            ${term.isTail ? this.tailMark("res") : ""}
+                            ${term.isTail ? "return" : "acc ="} res.direct(ctx, executor, closure, marks, mframe, ${term.isTail});
                         } else {
                             ${term.isTail ? "return res;" : "acc = res;"}
                         }
@@ -2888,41 +2953,6 @@ class DirectEmitter extends FunctionEmitter {
                         }
                         ${this.#tailCall("proc", term.start, term.nargs)}
                     }
-                `);
-            case "Apply": {
-                return this.emit(`
-                    {
-                        const proc = r${term.proc};
-                        const args = ${applyArgs(term, `[${this.argList(term.start, term.nargs)}]`, 0)};
-                        rip = ${term.isTail ? -1 : term.resume};
-                        ${this.#callArray(term.isTail)}
-                    }
-                    ${term.isTail ? "" : this.jump(term.resume, next)}
-                `);
-            }
-            case "CallCC":
-                return this.emit(`
-                    rip = ${term.isTail ? -1 : term.resume};
-                    throw Suspend.callCC(r${term.proc});
-                `);
-            case "Yield":
-                return this.emit(`
-                    rip = ${term.resume};
-                    throw Suspend.yield(r${term.val});
-                `);
-            case "CoResume":
-                if (term.isTail) {
-                    return this.emit(`
-                        rip = -1;
-                        throw Suspend.resume(r${term.co}, listToArray(r${term.list}), marks, mframe);
-                    `);
-                }
-                return this.emit(`
-                    rip = ${term.resume};
-                    // inside a coroutine, its frames must stay on the heap, where it can be traced while it waits
-                    if (ctx.coroutine !== null || executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > ${DIRECT_SUSPEND_LIMIT}) throw Suspend.resume(r${term.co}, listToArray(r${term.list}), marks, mframe);
-                    acc = executor.coResumeNested(ctx, r${term.co}, listToArray(r${term.list}));
-                    ${this.jump(term.resume, next)}
                 `);
             case "Return":
                 return this.emit(`return r${term.reg};`);

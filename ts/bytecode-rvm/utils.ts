@@ -1,5 +1,5 @@
 import { ASTStringifier, BS, BSReader, type SerializableBytecode } from "../common"
-import { ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
+import { ByteCode, Closure, ClosureTemplate, OpCode } from "./exec"
 import { INSTRUCTION_LENGTHS, NO_REG, OPCODES, type OpSpec, type OperandKind } from "./opcodes"
 import type { Intrinsics } from "./intrinsics"
 
@@ -51,7 +51,6 @@ const operandToString = (code: ByteCode, spec: OpSpec, kind: OperandKind, value:
         case "upvar": return `upvar(${value})`
         case "ip": return `#${value}`
         case "intrinsic": return intrinsicName(code, value)
-        case "runtime": return RUNTIME[value]?.name ?? `#${value}`
         case "tail": case "flags": {
             const names = (spec.bits ?? []).filter((_, bit) => (value & (1 << bit)) !== 0)
             return names.length === 0 ? "-" : names.join("|")
@@ -90,7 +89,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 21
+export const BYTECODE_VERSION = 22
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()
