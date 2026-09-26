@@ -1,10 +1,6 @@
 import {
-    OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, 
-    OP_SET, OP_LETREC, OP_LETSTAR, ensureCanBind,
-    OP_AND,
-    OP_OR,
+    ensureCanBind,
     OP_DEFINE_GLOBAL,
-    OP_QUOTE,
     CORE_IF,
     CORE_LAMBDA,
     CORE_QUOTE,
@@ -22,11 +18,12 @@ import {
     OP_CURRENT_MARKS,
     OP_CURRENT_STACK,
     SOURCE_POS,
-    AbstractClosure,
     Cons
-} from "../common";
+} from "../../common";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
-import { CXR_PATHS, PREDICATES, ARITHMETIC } from "../ops";
+import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
+import { SCHEME_ALIASES } from "../builtins";
+import type { Closure } from "../../bytecode-rvm/exec";
 
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
@@ -176,8 +173,10 @@ const namedLetAsLoop = (evaluator: MacroEvaluator, name: symbol, params: symbol[
                 if (binds(e.cdr.car) || !mentions(e.cdr.cdr)) return e;
                 throw NOT_A_LOOP;
             case CORE_IF: {
-                const [cond, then, otherwise] = e.toArray().slice(1);
-                return keepPos(list(CORE_IF, rw(cond, false, blocks), rw(then, tail, blocks), rw(otherwise, tail, blocks)), e);
+                // conditions are values, branches (and the final else) are in the %if's tail position
+                const args = e.toArray().slice(1);
+                const isBranch = (i: number) => i % 2 === 1 || i === args.length - 1;
+                return keepPos(cons(CORE_IF, fromArray(args.map((a, i) => rw(a, tail && isBranch(i), blocks)))), e);
             }
             case CORE_BEGIN:
                 return keepPos(cons(CORE_BEGIN, seq(e.cdr, tail, blocks)), e);
@@ -244,11 +243,15 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         evaluator.registerTransform(core, lowerTo(core, validate, state));
     };
 
-    coreForm(OP_IF, CORE_IF, orig => {
+    evaluator.registerTransform(OP_IF, lowerTo(CORE_IF, orig => {
         if (orig.length !== 4) {
             throw new Error(`if condition must be in format ["if", condition, true_expr, false_expr] but only have ${orig.length - 1} arguments`);
         }
-    });
+    }));
+    // (%if c1 e1 c2 e2 ... [else]), e.g. from a transpiler's if/elseif/else
+    evaluator.registerTransform(CORE_IF, lowerTo(CORE_IF, orig => {
+        if (orig.length < 3) throw new Error(`%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else])`);
+    }));
     coreForm(OP_BEGIN, CORE_BEGIN, () => {});
     // quoted data is never transformed
     coreForm(OP_QUOTE, CORE_QUOTE, orig => {
@@ -284,9 +287,6 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     });
     evaluator.registerTransform(Symbol.for("current-continuation-marks"), lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("current-continuation-marks takes no arguments");
-    }));
-    evaluator.registerTransform(OP_CURRENT_STACK, lowerTo(OP_CURRENT_STACK, orig => {
-        if (orig.length > 2) throw new Error("%current-stack takes at most 1 argument");
     }));
     // direct calls take the snapshot in the caller itself, so no prelude frame shows in it
     for (const name of ["debug-frames", "debug-traceback"]) {
@@ -358,25 +358,24 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     evaluator.registerTransform(OP_COND, (evaluator, expr, orig) => {
         if (expr === null) return { expanded: undefined, state: TransformState.ReturnImm };
 
+        // one flat (%if c1 e1 c2 e2 ... [else]), however many clauses
         const clauses = toArray(expr);
-        let result: any = undefined; 
-        for (let i = clauses.length - 1; i >= 0; i--) {
+        const args: any[] = [];
+        for (let i = 0; i < clauses.length; i++) {
             const clause = clauses[i];
             if (!(clause instanceof Cons) || !(clause.cdr instanceof Cons)) {
                 throw new Error(`cond clause must be a list of at least 2 elements: (condition expr...)`);
             }
-
-            const condition = clause.car;
-            const resultExpr = wrapMulti(clause.cdr);
-
-            if (condition === OP_ELSE) {
+            if (clause.car === OP_ELSE) {
                 if (i !== clauses.length - 1) throw new Error("else must be the final clause in a cond statement");
-                result = resultExpr;
+                args.push(wrapMulti(clause.cdr));
             } else {
-                result = list(OP_IF, condition, resultExpr, result);
+                args.push(clause.car, wrapMulti(clause.cdr));
             }
         }
-        return { expanded: result, state: TransformState.Recurse };
+        // a cond of only an else clause is just its body
+        if (args.length === 1) return { expanded: args[0], state: TransformState.Recurse };
+        return { expanded: cons(CORE_IF, fromArray(args)), state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(OP_LET, (evaluator, expr, orig) => {        
@@ -561,7 +560,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         let cmpexpr = list(OP_LAMBDA, list(Symbol.for("orig")), expr.cdr.car);
         let trCmpExpr = evaluator.transform(cmpexpr);
         let cmpExprBc = evaluator.expandcmp.compile(trCmpExpr);
-        const res: AbstractClosure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
+        const res: Closure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
         evaluator.registerTransform(onsym, (evaluator, expr, orig) => {
             const resp = evaluator.expandvm.evaluateClosure(res, evaluator.scope, [orig]);
             return { expanded: resp, state: TransformState.Recurse };
@@ -650,33 +649,11 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded, state: TransformState.Recurse };
     });
 
-    evaluator.registerTransform(Symbol.for("call/cc"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/cc"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("call-with-current-continuation"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/cc"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("call/ec"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/ec"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("call-with-escape-continuation"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%call/ec"), expr), state: TransformState.DoChildren };
-    });
-
     const catchForm = (name: string) => lowerTo(CORE_CATCH, orig => {
         if (orig.length !== 3) throw new Error(`${name} must be of form (${name} thunk handler)`);
     });
     evaluator.registerTransform(CORE_CATCH, lowerTo(CORE_CATCH, orig => {
         if (orig.length !== 3 && orig.length !== 4) throw new Error("%catch must be of form (%catch thunk handler [pre])");
-    }));
-    evaluator.registerTransform(OP_RAISE, lowerTo(OP_RAISE, orig => {
-        if (orig.length !== 2 && orig.length !== 3) throw new Error("%raise must be of form (%raise obj [continuable])");
-    }));
-    evaluator.registerTransform(Symbol.for("raise"), lowerTo(OP_RAISE, orig => {
-        if (orig.length !== 2) throw new Error("raise takes 1 argument");
     }));
     evaluator.registerTransform(Symbol.for("raise-continuable"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length !== 2) throw new Error("raise-continuable takes 1 argument");
@@ -700,20 +677,6 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (!(orig instanceof Cons) || orig.length < 3 || typeof expr.car !== "symbol") throw new Error("let/ec must be of form (let/ec name body...)");
         return { expanded: list(Symbol.for("%call/ec"), cons(OP_LAMBDA, cons(list(expr.car), expr.cdr))), state: TransformState.Recurse };
     });
-
-    evaluator.registerTransform(Symbol.for("apply"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%apply"), expr), state: TransformState.DoChildren };
-    });
-
-    evaluator.registerTransform(Symbol.for("dynamic-wind"), (evaluator, expr, orig) => {
-        return { expanded: cons(Symbol.for("%dynamic-wind"), expr), state: TransformState.DoChildren };
-    });
-
-    for (const name of ["list", "cons", "vector-ref", "vector-set!", "vector-length", "table-ref", "table-set!", "table-has?", "table-border", "coroutine-create", "coroutine-resume", "coroutine-yield", "coroutine-status", "coroutine-close"]) {
-        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
-            return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
-        });
-    }
 
     // (call-with-values (lambda () p ...) (lambda formals c ...)) binds the values directly, like receive; anything else
     // calls the prelude procedure
@@ -746,9 +709,12 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: cons(CORE_LET_VALUES_STRICT, expr), state: TransformState.Recurse };
     });
 
-    for (const [name] of [...CXR_PATHS, ...PREDICATES, ...ARITHMETIC]) {
-        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
-            return { expanded: cons(Symbol.for(`%${name}`), expr), state: TransformState.DoChildren };
+    // (name arg ...) of a builtin or another aliased procedure calls its target directly when the argument count fits;
+    // otherwise it stays an ordinary call of the prelude's procedure, which reports the wrong count when (and if) it runs
+    for (const [name, { target, min, max }] of SCHEME_ALIASES) {
+        evaluator.registerTransform(name, (evaluator, expr, orig) => {
+            const nargs = expr === null ? 0 : expr instanceof Cons && !expr.isImproper() ? expr.length : -1;
+            return { expanded: nargs >= min && nargs <= max ? cons(target, expr) : orig, state: TransformState.DoChildren };
         });
     }
 };

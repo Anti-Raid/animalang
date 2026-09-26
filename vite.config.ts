@@ -6,6 +6,10 @@ export default defineConfig({
   plugins: [
     dts({ 
       insertTypesEntry: true, // Creates a types field reference in your entry point
+      // the library's own sources only: not the configs, tests or benchmarks
+      include: ['ts/**/*.ts'],
+      exclude: ['ts/tests/**', 'ts/**/*.bench.ts', 'ts/bench-entry.ts'],
+      compilerOptions: { types: ['node'] },
     })
   ],
   build: {

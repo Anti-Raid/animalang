@@ -1,15 +1,30 @@
-import { AbstractByteCode, AbstractClosure, AbstractCompiler, AbstractVM, AnimaMeta, ASP, ASTStringifier, Env, OP_LAMBDA, Cons } from "./common"
-import { Bootstrapper } from "./std"
-import { MacroEvaluator } from "./syntransformer-v1/macro"
-import { registerCoreSyntax } from "./syntransformer-v1/prelude"
+import { Env, Cons, CORE_LAMBDA } from "./common"
+import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
+import { newIntrinsics } from "./bytecode-rvm/core"
+import { Compiler } from "./bytecode-rvm/compiler"
+import { AnimaVM } from "./bytecode-rvm/vm"
+import type { ByteCode, Closure } from "./bytecode-rvm/exec"
+import type { AnimaOptions } from "./bytecode-rvm/meta"
+import { deepPrint } from "./bytecode-rvm/utils"
 
+// A language on top of the core: reads source into its syntax tree and lowers that to the core forms
+export interface FrontEnd {
+    read(source: string, file?: string): any
+    transform(ast: any): any
+    // a procedure of `params` whose body is `body`, in the front end's syntax
+    lambda(params: any, body: any): any
+}
+
+// A compiler and VM with their intrinsics. On its own it compiles core forms; a front end (see createScheme) adds a
+// language: its syntax, intrinsics and global scope
 export class Anima {
-    #vm: AbstractVM
-    #comp: AbstractCompiler
-    #scope: Env
-    #impl: AnimaMeta
-    #bootstrapper: Bootstrapper
-    #evaluator: MacroEvaluator
+    #vm: AnimaVM
+    #comp: Compiler
+    #scope: Env = new Env()
+    #options: AnimaOptions
+    #frontEnd: FrontEnd | null = null
+    // shared by this instance's compiler and VM (and its front end's)
+    readonly #intrinsics: Intrinsics
 
     get scope(): Env {
         return this.#scope
@@ -23,28 +38,55 @@ export class Anima {
         return this.#vm
     }
 
-    constructor(impl: AnimaMeta, maxSteps?: number) {
-        this.#impl = impl
-        this.#vm = impl.vm(maxSteps || 0)
-        this.#comp = impl.compiler()
-        this.#evaluator = new MacroEvaluator(impl, maxSteps || 0)
-        registerCoreSyntax(this.#evaluator)
-        this.#evaluator.init()
-        this.#bootstrapper = new Bootstrapper()
-        const publicScope = this.#bootstrapper.setupPublicScope(impl, this.#comp, this.#vm, this.#evaluator)
-        this.#scope = publicScope.chained()
+    get intrinsics(): Intrinsics {
+        return this.#intrinsics
     }
 
-    public evaluateRaw(code: AbstractByteCode): any {
+    get options(): AnimaOptions {
+        return this.#options
+    }
+
+    // `base`: intrinsics (and reserved names) to start with, e.g. a front end's (made with newIntrinsics)
+    constructor(options: AnimaOptions, readonly maxSteps: number = 0, base?: Intrinsics) {
+        this.#options = options
+        this.#intrinsics = newIntrinsics(base)
+        this.#vm = new AnimaVM(options.mode, this.#intrinsics)
+        this.#comp = new Compiler(this.#intrinsics, options.debug)
+    }
+
+    // gives the instance a language: `scope` is where its code runs
+    attachFrontEnd(frontEnd: FrontEnd, scope: Env): void {
+        if (this.#frontEnd !== null) throw new Error("this instance already has a front end")
+        this.#frontEnd = frontEnd
+        this.#scope = scope
+    }
+
+    // makes (name arg ...) call `fn` in code compiled from now on; names start with '%'
+    registerIntrinsic(name: string, fn: IntrinsicFn, options?: IntrinsicOptions): Intrinsic {
+        return this.#intrinsics.register(name, fn, options)
+    }
+
+    // no more intrinsics can be registered (compiling and loading are unaffected)
+    freeze(): this {
+        this.#intrinsics.freeze()
+        return this
+    }
+
+    public evaluateRaw(code: ByteCode): any {
         return this.#vm.evaluateRaw(code, this.#scope)
     }
 
-    public evaluateClosure(code: AbstractClosure, args: any[]): any {
+    public evaluateClosure(code: Closure, args: any[]): any {
         return this.#vm.evaluateClosure(code, this.#scope, args)
     }
 
     public coroutineResume(co: any, ...args: any[]): { done: boolean, value: any, values: any[] } {
         return this.#vm.resumeCoroutine(co, args)
+    }
+
+    // resumes `co` with its pending yield raising `obj` (as a raise inside the coroutine, so its handlers see it)
+    public coroutineRaise(co: any, obj: any): { done: boolean, value: any, values: any[] } {
+        return this.#vm.resumeCoroutine(co, [obj], true)
     }
 
     public coroutineClose(co: any): void {
@@ -56,28 +98,30 @@ export class Anima {
     }
 
     compileToClosure(s: string, args: any, globals: Env) {
-        const bast = new ASP(s, true).parse()
-        return this.compileAstToClosure(bast, args, globals)
+        return this.compileAstToClosure(this.#requireFrontEnd().read(s), args, globals)
     }
 
-    compileAstToClosure(bast: any, args: any, globals: Env): AbstractClosure {
-        const ast = Cons.list(OP_LAMBDA, args, bast)
+    compileAstToClosure(bast: any, args: any, globals: Env): Closure {
+        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : Cons.list(CORE_LAMBDA, args, bast)
         const bc = this.compileRawAst(ast)
-        const res = this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
-        return res
+        return this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
     }
 
     compileRaw(s: string, file?: string) {
-        const ast = new ASP(s, true, file).parse()
-        return this.compileRawAst(ast)
+        return this.compileRawAst(this.#requireFrontEnd().read(s, file))
     }
 
+    // the front end's syntax tree, or core forms if there is no front end
     compileRawAst(ast: any) {
-        let trExpr = this.#evaluator.transform(ast)
-        return this.#comp.compile(trExpr)
+        return this.#comp.compile(this.#frontEnd !== null ? this.#frontEnd.transform(ast) : ast)
     }
 
-    deepPrint(bc: AbstractByteCode) {
-        this.#impl.deepPrint(bc)
+    deepPrint(bc: ByteCode) {
+        deepPrint(bc)
+    }
+
+    #requireFrontEnd(): FrontEnd {
+        if (this.#frontEnd === null) throw new Error("this instance has no front end to read source with (see createScheme)")
+        return this.#frontEnd
     }
 }

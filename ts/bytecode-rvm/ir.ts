@@ -1,5 +1,7 @@
 import { ConstPool, type SourcePos } from "../common";
-import { BUILTINS_START, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, RUNTIME, RUNTIME_IDX, UNPACK_REST, UNPACK_STRICT, type UpVarLoc } from "./exec";
+import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, corePos, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import type { Intrinsics } from "./intrinsics";
+import { OPCODES } from "./opcodes";
 
 let nextLabelId = 0;
 
@@ -43,6 +45,11 @@ export type Node = {
     reg: number,
     elseLabel: JumpLabel,
 } | {
+    // the next condition of an %if chain (like If, but continuing the chain an If started)
+    t: "ElseIf",
+    reg: number,
+    elseLabel: JumpLabel,
+} | {
     t: "Else",
     endLabel: JumpLabel,
 } | {
@@ -60,30 +67,12 @@ export type Node = {
     startReg: number,
     nargs: number,
 } | {
-    t: "Apply",
-    procReg: number,
-    destReg?: number,
-    startReg: number,
-    nargs: number,
-} | {
-    t: "TailApply",
-    procReg: number,
-    startReg: number,
-    nargs: number,
-} | {
     t: "Return",
     reg: number
 } | {
     t: "NewClosure",
     destReg: number,
     template: ClosureTemplateIR
-} | {
-    // A call to a builtin function
-    t: "IBuiltin",
-    builtinIdx: number,
-    destReg: number,
-    startReg: number,
-    nargs: number
 } | {
     // reg[destReg] = [reg[srcReg]]
     t: "Box",
@@ -100,32 +89,10 @@ export type Node = {
     destReg: number,
     srcReg: number
 } | {
-    t: "CallCC",
-    destReg?: number,
-    procReg: number
-} | {
-    t: "TailCallCC",
-    procReg: number
-} | {
     t: "CallEC" | "CallCatch",
     procReg: number,
     tokReg: number,
     preReg?: number,
-    destReg?: number
-} | {
-    t: "Raise",
-    objReg: number,
-    continuable: boolean,
-    destReg?: number
-} | {
-    t: "CoYield",
-    valReg: number,
-    destReg?: number
-} | {
-    t: "CoResume",
-    coReg: number,
-    listReg: number,
-    isTail: boolean,
     destReg?: number
 } | {
     // start of a %block whose escapes jump to `end`
@@ -164,17 +131,29 @@ export type Node = {
     t: "CurrentMarks",
     destReg: number
 } | {
-    // a host intrinsic that may return a tail request (CALLHOST)
+    // an intrinsic that is not a leaf: may return a tail request (CALLHOST)
     t: "HostCall",
-    rtIdx: number,
+    pos: number,
     startReg: number,
     nargs: number,
     isTail: boolean,
     destReg?: number
 } | {
-    t: "CurrentStack",
-    skip: number,
-    destReg?: number
+    // (%apply %intrinsic arg ... lst) of a leaf intrinsic (APPLYINT)
+    t: "IntApply",
+    pos: number,
+    destReg: number,
+    startReg: number,
+    nargs: number,
+    // the last argument is a forwarded rest array (APPLYINTR)
+    restArray: boolean
+} | {
+    // a leaf intrinsic (CALLINT)
+    t: "IntCall",
+    pos: number,
+    destReg: number,
+    startReg: number,
+    nargs: number
 } | {
     // an %escape: jump to the end of a %block
     t: "Jump",
@@ -183,30 +162,31 @@ export type Node = {
     // marks where the following code came from (goes into the line table, emits nothing)
     t: "Pos",
     pos: SourcePos
-} | {
-    t: "RtCall",
-    rtIdx: number,
-    destReg: number,
-    startReg: number,
-    nargs: number
 }
 
 export class IR {
-    constructor(private readonly debug: boolean = false) {}
+    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false) {}
 
     lower(nodes: Node[], numRegs: number): ByteCode {
         const cpool = new ConstPool()
         const inst: number[] = []
+        // an instruction, with as many operands as OPCODES says it has
+        const emit = (op: OpCode, ...operands: number[]): number => {
+            if (operands.length !== OPCODES[op].operands.length) throw new Error(`internal error: ${OpCode[op]} takes ${OPCODES[op].operands.length} operands, got ${operands.length}`)
+            return inst.push(op, ...operands)
+        }
 
         const lineTable: number[] = []
         const files: string[] = []
         const jumpIdxs: Map<number, JumpLabel> = new Map()
-        // the runtime operations used, by name (the bytecode's metadata); CALLRT operands index this
-        const runtime: string[] = []
-        const rtSlot = (idx: number): number => {
-            const name = RUNTIME[idx][0]
-            const slot = runtime.indexOf(name)
-            return slot !== -1 ? slot : runtime.push(name) - 1
+        // the intrinsics used (the bytecode's metadata), by position
+        const used = new Map<number, UsedIntrinsic>()
+        const use = (pos: number): number => {
+            if (!used.has(pos)) {
+                const entry = this.table.entries[pos]
+                used.set(pos, { pos, name: entry.name, leaf: entry.leaf })
+            }
+            return pos
         }
         const resolvedLabels: Map<JumpLabel, number> = new Map()
         for(let i = 0; i < nodes.length; i++) {
@@ -217,26 +197,26 @@ export class IR {
                     const v = node.constant
 
                     if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) {
-                        inst.push(OpCode.LOADU32, node.destReg, v);
+                        emit(OpCode.LOADU32, node.destReg, v);
                     } else {
-                        inst.push(OpCode.LOADCONST, node.destReg, cpool.push(v))
+                        emit(OpCode.LOADCONST, node.destReg, cpool.push(v))
                     }
                     continue
                 }
                 case "LoadUpvar": {
-                    inst.push(OpCode.LOADUPVAR, node.destReg, node.upvarIdx, node.andUnbox ? 1 : 0)
+                    emit(OpCode.LOADUPVAR, node.destReg, node.upvarIdx, node.andUnbox ? 1 : 0)
                     break
                 }
                 case "SetUpvar": {
-                    inst.push(OpCode.SETUPVAR, node.srcReg, node.upvarIdx, node.andBox ? 1 : 0)
+                    emit(OpCode.SETUPVAR, node.srcReg, node.upvarIdx, node.andBox ? 1 : 0)
                     break
                 }
                 case "LoadGlobal": {
-                    inst.push(OpCode.LOADGLOBAL, node.destReg, cpool.push(node.sym))
+                    emit(OpCode.LOADGLOBAL, node.destReg, cpool.push(node.sym))
                     break
                 }
                 case "SetGlobal": {
-                    inst.push(OpCode.SETGLOBAL, node.srcReg, cpool.push(node.sym))
+                    emit(OpCode.SETGLOBAL, node.srcReg, cpool.push(node.sym))
                     break
                 }
                 case "Label": {
@@ -244,41 +224,48 @@ export class IR {
                     break
                 }
                 case "If": {
-                    const jidx = inst.push(OpCode.IF, node.reg, -1) - 1
+                    const jidx = emit(OpCode.IF, node.reg, -1) - 1
+                    jumpIdxs.set(jidx, node.elseLabel)
+                    break
+                }
+                case "ElseIf": {
+                    const jidx = emit(OpCode.ELSEIF, node.reg, -1) - 1
                     jumpIdxs.set(jidx, node.elseLabel)
                     break
                 }
                 case "Else": {
-                    const jidx = inst.push(OpCode.ELSE, -1) - 1
+                    const jidx = emit(OpCode.ELSE, -1) - 1
                     jumpIdxs.set(jidx, node.endLabel)
                     break
                 }
                 case "EndIf": {
-                    inst.push(OpCode.ENDIF)
+                    emit(OpCode.ENDIF)
                     break
                 }
                 case "SetMark":
-                    inst.push(OpCode.SETMARK, node.keyReg, node.valReg)
+                    emit(OpCode.SETMARK, node.keyReg, node.valReg)
                     break
                 case "MarkSave":
-                    inst.push(OpCode.MARKSAVE, node.reg)
+                    emit(OpCode.MARKSAVE, node.reg)
                     break
                 case "MarkRestore":
-                    inst.push(OpCode.MARKRESTORE, node.reg)
+                    emit(OpCode.MARKRESTORE, node.reg)
                     break
                 case "CurrentMarks":
-                    inst.push(OpCode.CURMARKS, node.destReg)
+                    emit(OpCode.CURMARKS, node.destReg)
                     break
                 case "HostCall":
-                    inst.push(OpCode.CALLHOST, rtSlot(node.rtIdx), node.startReg, node.nargs, node.isTail ? 1 : 0)
-                    if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                    emit(OpCode.CALLHOST, use(node.pos), node.startReg, node.nargs, node.isTail ? 1 : 0)
+                    if (!node.isTail && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
-                case "CurrentStack":
-                    inst.push(OpCode.CURSTACK, node.skip)
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                case "IntCall":
+                    emit(this.table.entries[node.pos].context ? OpCode.CALLCTX : OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
+                    break
+                case "IntApply":
+                    emit(node.restArray ? OpCode.APPLYINTR : OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "Unpack": {
-                    inst.push(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
+                    emit(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
                     break
                 }
                 case "Block":
@@ -286,99 +273,58 @@ export class IR {
                 case "EndLoop":
                 case "Jump": {
                     const op = { Block: OpCode.BLOCK, Loop: OpCode.LOOP, EndLoop: OpCode.ENDLOOP, Jump: OpCode.JUMP }[node.t]
-                    const jidx = inst.push(op, -1) - 1
+                    const jidx = emit(op, -1) - 1
                     jumpIdxs.set(jidx, node.t === "EndLoop" ? node.head : node.t === "Jump" ? node.label : node.end)
                     break
                 }
                 case "Call": {
-                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs, 0)
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                    emit(OpCode.CALL, node.procReg, node.startReg, node.nargs, 0)
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailCall": {
-                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs, 1)
-                    break
-                }
-                case "Apply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, 0)
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
-                    break
-                }
-                case "TailApply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, 1)
-                    break
-                }
-                case "IBuiltin": {
-                    inst.push(OpCode.CALL, node.builtinIdx, node.startReg, node.nargs, 0, OpCode.MOVEACC, node.destReg)
+                    emit(OpCode.CALL, node.procReg, node.startReg, node.nargs, 1)
                     break
                 }
                 case "Return": {
-                    inst.push(OpCode.RETURN, node.reg)
+                    emit(OpCode.RETURN, node.reg)
                     break
                 }
                 case "NewClosure": {
                     const closureBc = this.lower(node.template.code, node.template.numRegs)
-                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name)
+                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name, node.template.restArray)
                     if(ct.upvarLocs.length === 0) {
                         // We can just directly push the template as a raw constant in the pool
                         const cidx = cpool.mutPush(Closure.fromTemplate(ct))
-                        inst.push(OpCode.LOADCONST, node.destReg, cidx)
+                        emit(OpCode.LOADCONST, node.destReg, cidx)
                     } else {
                         const ctidx = cpool.mutPush(ct)
-                        inst.push(OpCode.NEWCLOSURE, node.destReg, ctidx)
+                        emit(OpCode.NEWCLOSURE, node.destReg, ctidx)
                     }
                     break
                 }
                 case "Box": {
-                    inst.push(OpCode.BOX, node.destReg, node.srcReg)
+                    emit(OpCode.BOX, node.destReg, node.srcReg)
                     break
                 }
                 case "SetBox": {
-                    inst.push(OpCode.SETBOX, node.destReg, node.srcReg)
+                    emit(OpCode.SETBOX, node.destReg, node.srcReg)
                     break
                 }
                 case "Unbox": {
-                    inst.push(OpCode.UNBOX, node.destReg, node.srcReg)
+                    emit(OpCode.UNBOX, node.destReg, node.srcReg)
                     break
                 }
                 case "Move": {
-                    inst.push(OpCode.MOVE, node.destReg, node.srcReg)
+                    emit(OpCode.MOVE, node.destReg, node.srcReg)
                     break
-                }
-                case "CallCC": {
-                    inst.push(OpCode.CALLCC, node.procReg, 0);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "TailCallCC": {
-                    inst.push(OpCode.CALLCC, node.procReg, 1);
-                    break;
-                }
-                case "Raise": {
-                    inst.push(OpCode.RAISE, node.objReg, node.continuable ? 1 : 0);
-                    if (node.continuable && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    break;
                 }
                 case "CallEC":
                 case "CallCatch": {
-                    if (node.t === "CallEC") inst.push(OpCode.CALLEC, node.procReg, node.tokReg);
-                    else inst.push(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    inst.push(OpCode.CALLRT, rtSlot(RUNTIME_IDX.get("end-escape")!), node.tokReg, node.tokReg, 1);
-                    break;
-                }
-                case "CoYield": {
-                    inst.push(OpCode.COYIELD, node.valReg);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "CoResume": {
-                    inst.push(OpCode.CORESUME, node.coReg, node.listReg, node.isTail ? 1 : 0);
-                    if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    break;
-                }
-                case "RtCall": {
-                    inst.push(OpCode.CALLRT, rtSlot(node.rtIdx), node.destReg, node.startReg, node.nargs);
+                    if (node.t === "CallEC") emit(OpCode.CALLEC, node.procReg, node.tokReg);
+                    else emit(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
+                    emit(OpCode.CALLINT, use(corePos("%end-escape")), node.tokReg, node.tokReg, 1);
                     break;
                 }
                 case "Pos": {
@@ -403,7 +349,7 @@ export class IR {
             inst[jump] = resolvedOffset
         }
 
-        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, runtime)
+        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
     }
 }
 
@@ -415,7 +361,7 @@ export class ClosureTemplateIR {
     numRegs: number;
     upvarLocs: UpVarLoc[] // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null) {
+    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public restArray: boolean = false) {
         this.params = params
         this.remParams = remParams
         this.code = code

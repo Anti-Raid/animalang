@@ -1,5 +1,7 @@
-import { ASTStringifier, ErrorObject, Env, unpackValues, type AbstractVM } from "../common";
-import { OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
+import { ASTStringifier, ErrorObject, Env, unpackValues } from "../common";
+import { type ExecutionMode, OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
+import { Intrinsics } from "./intrinsics";
+import { newIntrinsics } from "./core";
 
 export {
     CodeEmitter,
@@ -14,13 +16,14 @@ export {
     Coroutine
 };
 
-export type ExecutionMode = "interp" | "aot";
+export type { ExecutionMode };
 
-export class AnimaVM implements AbstractVM {
+export class AnimaVM {
     readonly executor: VMExecutor;
     public mode: ExecutionMode;
 
-    constructor(mode: ExecutionMode = "interp") {
+    // the intrinsics this VM's compiler compiles against (code carries the table it was compiled or loaded with)
+    constructor(mode: ExecutionMode = "interp", readonly intrinsics: Intrinsics = newIntrinsics()) {
         this.mode = mode;
         this.executor = new VMExecutor(this);
     }
@@ -33,13 +36,13 @@ export class AnimaVM implements AbstractVM {
 
     public evaluateClosure(code: Closure, scope: Env, args: any[]): any {
         const ctx = new ExecutionContext(this, scope);
-        const cargs = this.executor.createClosureArg(code.tmpl, args.length, args, 0);
+        const cargs = this.executor.createClosureArg(code, args.length, args, 0);
         return this.#run(ctx, this.executor.newFrame(ctx, code, cargs, null));
     }
 
-    public resumeCoroutine(co: Coroutine, args: any[]): { done: boolean, value: any, values: any[] } {
+    public resumeCoroutine(co: Coroutine, args: any[], raising: boolean = false): { done: boolean, value: any, values: any[] } {
         try {
-            const values = unpackValues(this.executor.coResumeNested(null, co, args));
+            const values = unpackValues(this.executor.coResumeNested(null, co, args, raising));
             return { done: co.status === "dead", value: values[0], values };
         } catch (err) {
             if (!(err instanceof ReRaise)) throw err;
