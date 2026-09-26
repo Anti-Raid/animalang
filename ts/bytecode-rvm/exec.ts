@@ -1314,6 +1314,20 @@ class StackRequest extends ControlRequest {
     }
 }
 
+// argument checks of the control operations, shared by their intrinsics and their AOT code (CONTROL_AOT)
+const raiseContinuable = (flag: any): boolean => {
+    if (typeof flag !== "boolean") throw hostError("%raise: continuable must be #t or #f");
+    return flag;
+};
+const stackSkip = (skip: any): number => {
+    if (!Number.isInteger(skip) || skip < 0) throw hostError("%current-stack: expected a count of frames to skip");
+    return skip;
+};
+const restArrayArgs = (regs: readonly any[], start: number, nargs: number, multi: boolean): any[] => {
+    if (!Array.isArray(regs[start + nargs - 1])) throw hostError("%apply-array: the last argument must be a rest array");
+    return windowRestArgs(regs, start, nargs, multi);
+};
+
 // a one-argument template; the argument is always a register name, so it may be repeated freely
 const unaryInline = (inline: (a: string, d: Readonly<Record<string, string>>) => string): InlineFn =>
     (args, slow, tmp, d) => args.length === 1 ? inline(args[0], d) : null;
@@ -1387,25 +1401,14 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     control("%coroutine-yield-list", [1, 1], (regs, start, nargs) => YieldRequest.of(listToValues(regs, start, nargs)), false);
     control("%coroutine-resume", [1, Infinity], (regs, start, nargs) => ResumeRequest.of(regs[start], copyWindow(regs, start + 1, start + nargs)));
     control("%coroutine-resume-list", [2, 2], (regs, start) => ResumeRequest.of(regs[start], listToArray(regs[start + 1])));
-    control("%raise", [1, 2], (regs, start, nargs) => {
-        const continuable = nargs === 2 ? regs[start + 1] : false;
-        if (typeof continuable !== "boolean") throw hostError("%raise: continuable must be #t or #f");
-        return RaiseRequest.of(regs[start], continuable);
-    }, false);
-    control("%current-stack", [0, 1], (regs, start, nargs) => {
-        const skip = nargs === 1 ? regs[start] : 0;
-        if (!Number.isInteger(skip) || skip < 0) throw hostError("%current-stack: expected a count of frames to skip");
-        return StackRequest.of(skip);
-    }, false);
+    control("%raise", [1, 2], (regs, start, nargs) => RaiseRequest.of(regs[start], nargs === 2 ? raiseContinuable(regs[start + 1]) : false), false);
+    control("%current-stack", [0, 1], (regs, start, nargs) => StackRequest.of(nargs === 1 ? stackSkip(regs[start]) : 0), false);
     // applying a procedure ((%apply proc arg ... lst) and %apply-multi compile to these): (proc arg ... last), where
     // last is a list, a forwarded rest array (see ClosureTemplate.restArray), or for %apply-multi a rest array whose own
     // last element is a list
     control("%apply-list", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], windowApplyArgs(regs, start + 1, nargs - 1)));
-    const restArray = (regs: any[], start: number, nargs: number) => {
-        if (!Array.isArray(regs[start + nargs - 1])) throw hostError("%apply-array: the last argument must be a rest array");
-    };
-    control("%apply-array", [2, Infinity], (regs, start, nargs) => (restArray(regs, start, nargs), new HostTail(regs[start], windowRestArgs(regs, start + 1, nargs - 1, false))));
-    control("%apply-array-multi", [2, 2], (regs, start, nargs) => (restArray(regs, start, nargs), new HostTail(regs[start], windowRestArgs(regs, start + 1, nargs - 1, true))));
+    control("%apply-array", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], restArrayArgs(regs, start + 1, nargs - 1, false)));
+    control("%apply-array-multi", [2, 2], (regs, start, nargs) => new HostTail(regs[start], restArrayArgs(regs, start + 1, nargs - 1, true)));
     return table.freeze();
 })();
 
@@ -1691,6 +1694,11 @@ const JIT_DEPS = {
     WindPoint,
     windowApplyArgs,
     windowRestArgs,
+    restArrayArgs,
+    raiseContinuable,
+    stackSkip,
+    packValues,
+    listToValues,
     listToArray,
     Cons,
     MISSING,
@@ -2196,6 +2204,64 @@ const inlineDeps = (entry: Intrinsic, used: Set<string>): Readonly<Record<string
     },
 });
 
+// AOT code for the core control operations: what carrying out their requests does (see ControlRequest), written out at
+// the call so there is no request to make and dispatch on, which shows in tight coroutine and call/cc loops. The
+// interpreter carries out the requests themselves. `args` are the arguments' registers (as js expressions): the count
+// was checked when compiling.
+//  - heap: resume code, after frame.ip is set (and, unless in tail position or `continues`, the live registers are
+//    spilled): statements that return the frame to run next, or with `continues`, set ctx.acc and carry on
+//  - direct: direct code, after rip is set: statements that throw a Suspend, or set acc (return it, in tail position),
+//    or declare `proc` and `args` and then run `callArray`, which calls proc with args (see DirectEmitter.#callArray)
+//  - tailProc: in tail position, the first argument is what debug code records as the tail call
+type ControlSite = { args: string[], isTail: boolean };
+type ControlAot = {
+    heap: (s: ControlSite) => string,
+    direct: (s: ControlSite, callArray: string) => string,
+    continues?: boolean,
+    tailProc?: boolean,
+};
+const valuesOf = (args: string[]) => args.length === 1 ? args[0] : `packValues([${args.join(", ")}])`;
+const resumeArgs = (name: string, args: string[]) => name === "%coroutine-resume" ? `[${args.slice(1).join(", ")}]` : `listToArray(${args[1]})`;
+const applyArgsOf = (name: string, args: string[]) => {
+    const rest = args.slice(1);
+    const window = `[${rest.join(", ")}], 0, ${rest.length}`;
+    return name === "%apply-list" ? `windowApplyArgs(${window})` : `restArrayArgs(${window}, ${name === "%apply-array-multi"})`;
+};
+const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, ControlAot>([
+    ["%call/cc", {
+        heap: s => `return executor.callCC(ctx, ${s.args[0]}, frame, ${s.isTail});`,
+        direct: s => `throw Suspend.callCC(${s.args[0]});`,
+        tailProc: true,
+    }],
+    ...["%coroutine-yield", "%coroutine-yield-list"].map((name): [string, ControlAot] => {
+        const val = (s: ControlSite) => name === "%coroutine-yield" ? valuesOf(s.args) : `listToValues([${s.args[0]}], 0, 1)`;
+        return [name, { heap: s => `return executor.coYield(ctx, frame, ${val(s)});`, direct: s => `throw Suspend.yield(${val(s)});` }];
+    }),
+    ...["%coroutine-resume", "%coroutine-resume-list"].map((name): [string, ControlAot] => [name, {
+        heap: s => `return executor.coResume(ctx, ${s.isTail ? "frame.parent" : "frame"}, ${s.args[0]}, ${resumeArgs(name, s.args)}, frame.marks, frame.mframe);`,
+        // inside a coroutine, its frames must stay on the heap, where it can be traced while it waits
+        direct: s => s.isTail
+            ? `throw Suspend.resume(${s.args[0]}, ${resumeArgs(name, s.args)}, marks, mframe);`
+            : `if (ctx.coroutine !== null || executor.nestedResumes >= MAX_NESTED_RESUMES || ++closure.tmpl.code.nestedResumes > ${DIRECT_SUSPEND_LIMIT}) throw Suspend.resume(${s.args[0]}, ${resumeArgs(name, s.args)}, marks, mframe);
+               acc = executor.coResumeNested(ctx, ${s.args[0]}, ${resumeArgs(name, s.args)});`,
+        tailProc: true,
+    }]),
+    ["%raise", {
+        heap: s => `return executor.raise(ctx, frame, ${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"});`,
+        direct: s => `throw Suspend.raise(${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"}, marks);`,
+    }],
+    ["%current-stack", {
+        heap: s => `ctx.acc = new StackSnapshot(frameInfos(frame, ${s.args.length === 1 ? `stackSkip(${s.args[0]})` : "0"}));`,
+        direct: s => `throw Suspend.stack(${s.args.length === 1 ? `stackSkip(${s.args[0]})` : "0"});`,
+        continues: true,
+    }],
+    ...["%apply-list", "%apply-array", "%apply-array-multi"].map((name): [string, ControlAot] => [name, {
+        heap: s => `{ const args = ${applyArgsOf(name, s.args)}; return executor.invoke(ctx, ${s.args[0]}, frame, args, 0, args.length, ${s.isTail}); }`,
+        direct: (s, callArray) => `{ const proc = ${s.args[0]}, args = ${applyArgsOf(name, s.args)}; ${callArray} }`,
+        tailProc: true,
+    }]),
+]);
+
 abstract class FunctionEmitter extends CodeEmitter {
     constructor(
         protected readonly blocks: AotBlock[],
@@ -2224,7 +2290,13 @@ abstract class FunctionEmitter extends CodeEmitter {
         return `if (${req}.tailProc !== undefined) ${this.marksVar} = recordTailMark(${this.marksVar}, ${this.mframeVar}, tailName(${req}.tailProc));`;
     }
 
+    // the AOT code of a core control operation a CALLHOST calls, if it is one
+    protected controlOf(term: Extract<AotTerm, { k: "HostCall" }>): ControlAot | undefined {
+        return term.pos < CORE_COUNT ? CONTROL_AOT.get(this.table!.entries[term.pos].name) : undefined;
+    }
+
     protected tailProcOf(term: AotTerm): string | undefined {
+        if (term.k === "HostCall" && term.isTail && this.controlOf(term)?.tailProc) return `r${term.start}`;
         switch (term.k) {
             case "TailCall": case "MaybeSelfTailCall": return `r${term.proc}`;
             default: return undefined;
@@ -2564,7 +2636,17 @@ class ResumeEmitter extends FunctionEmitter {
                     ${this.#spills(live.spillsFor(term.resume, [term.tok]))}
                     return executor.callCatch(ctx, r${term.proc}, frame, r${term.tok});
                 `);
-            case "HostCall":
+            case "HostCall": {
+                const control = this.controlOf(term);
+                if (control !== undefined) {
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail };
+                    return this.emit(`
+                        frame.ip = ${term.resume};
+                        ${term.isTail || control.continues ? "" : this.#spills(live.spillsFor(term.resume))}
+                        ${control.heap(site)}
+                        ${control.continues ? this.jump(term.resume, next) : ""}
+                    `);
+                }
                 return this.emit(`
                     frame.ip = ${term.resume};
                     {
@@ -2578,6 +2660,7 @@ class ResumeEmitter extends FunctionEmitter {
                     }
                     ${term.isTail ? "" : this.jump(term.resume, next)}
                 `);
+            }
             case "TailCall":
                 return this.emit(`
                     {
@@ -2922,7 +3005,16 @@ class DirectEmitter extends FunctionEmitter {
                     }
                     ${this.jump(term.resume, next)}
                 `);
-            case "HostCall":
+            case "HostCall": {
+                const control = this.controlOf(term);
+                if (control !== undefined) {
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail };
+                    return this.emit(`
+                        rip = ${term.isTail ? -1 : term.resume};
+                        ${control.direct(site, this.#callArray(term.isTail))}
+                        ${term.isTail ? "" : this.jump(term.resume, next)}
+                    `);
+                }
                 return this.emit(`
                     {
                         rip = ${term.isTail ? -1 : term.resume};
@@ -2940,6 +3032,7 @@ class DirectEmitter extends FunctionEmitter {
                     }
                     ${term.isTail ? "" : this.jump(term.resume, next)}
                 `);
+            }
             case "TailCall":
                 return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs)} }`);
             case "MaybeSelfTailCall":

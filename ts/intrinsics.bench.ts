@@ -62,6 +62,10 @@ const SETUP = `
 (define (coroutine-bench n)
   (let ((co (coroutine-create (lambda () (let loop ((i 0)) (coroutine-yield i) (loop (+ i 1)))))))
     (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (coroutine-resume co)))))))
+(define (sq x) (* x x))
+(define (sum-squares n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (sq i))))))
+(define (my-even? n) (if (= n 0) #t (my-odd? (- n 1))))
+(define (my-odd? n) (if (= n 0) #f (my-even? (- n 1))))
 (define (coroutine-create-bench n)
   (let loop ((i 0) (acc 0))
     (if (= i n) acc (loop (+ i 1) (if (eq? (coroutine-status (coroutine-create (lambda () i))) 'suspended) (+ acc 1) acc)))))
@@ -74,6 +78,10 @@ const GROUPS: [group: string, calls: Record<string, string>][] = [
         "sum loop 100k": "(sum-to 100000)",
         "cons 10k": "(build-list 10000)",
         "car/cdr walk 1k": "(list-sum xs)",
+    }],
+    ["calls between functions", {
+        "helper call 100k": "(sum-squares 100000)",
+        "mutual tail calls 100k": "(my-even? 100000)",
     }],
     ["tables and vectors", {
         "table set/ref 10k": "(table-bench 10000)",

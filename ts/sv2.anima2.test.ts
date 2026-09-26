@@ -2431,6 +2431,13 @@ describe("Control operations", () => {
             expect(() => run("(%apply-array list '(1))")).toThrow("%apply-array: the last argument must be a rest array")
             expect(run("(let ((co (%coroutine-create (lambda (a) (+ a (%coroutine-yield (* a 2))))))) (list (%coroutine-resume co 5) (%coroutine-resume co 1)))")).toBe("(10 6)")
         }
+        // AOT code carries control operations out at the call, with no request object
+        const co = createScheme(impl).compileRaw("(define (co-f v) (+ 1 (%coroutine-yield v)))") as ByteCode
+        const coTmpl = co.constants.find((c: any) => c instanceof Closure)!.tmpl
+        const src = AotCompiler.generateSource(coTmpl.code, coTmpl)
+        expect(src).toContain("executor.coYield(ctx, frame, r")
+        expect(src).toContain("throw Suspend.yield(r")
+        expect(src).not.toContain("res.run(")
         const bc = createScheme(impl).compileRaw("(define (cc-f g) (%call/cc g))") as ByteCode
         const lines = stringifyInst(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code)
         expect(lines.some(line => /CALLHOST +pos=%call\/cc, start=r\d+, nargs=1, tail=tail$/.test(line))).toBe(true)
