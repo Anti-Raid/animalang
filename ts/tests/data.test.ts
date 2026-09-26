@@ -739,6 +739,20 @@ describe('Floats, Infinities & NaNs', () => {
         // the original still runs with its own positions
         expect(s.stringify(evaluator.evaluateRaw(bc))).toBe("(3 4)");
 
+        // the same name at the same position with other bounds: applying it checks the count against the bound table's,
+        // as the interpreter does (AOT copies of the code must not share source that has the first table's bounds)
+        const bounded = (max: number) => {
+            const inst = createScheme(vmImpl);
+            inst.registerIntrinsic("%test-count", (regs, st, n) => n, { args: [0, max], leaf: true });
+            return inst;
+        };
+        const wide = bounded(3), narrow = bounded(1);
+        expect(narrow.intrinsics.byName("%test-count")!.pos).toBe(wide.intrinsics.byName("%test-count")!.pos);
+        const applied = wide.compileRaw("(%apply %test-count '(1 2))") as ByteCode;
+        expect(s.stringify(wide.evaluateRaw(applied))).toBe("2");
+        expect(() => narrow.evaluateRaw(applied.fresh(new Map(), narrow.intrinsics))).toThrow("%test-count: expected 0 to 1 args, got 2");
+        expect(s.stringify(wide.evaluateRaw(applied.fresh(new Map(), wide.intrinsics)))).toBe("2");
+
         expect(() => readFull(dumped, createScheme(vmImpl).intrinsics)).toThrow("'%test-add', which is not registered");
         expect(() => readFull(dumped)).toThrow("needs an intrinsics table");
     });

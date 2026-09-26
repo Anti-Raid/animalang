@@ -127,7 +127,8 @@ export class AotCompiler {
         if (a.length !== b.length) return false;
         for (let i = 0; i < a.length; i++) {
             const x = a[i], y = b[i];
-            if (x.pos !== y.pos || x.inline !== y.inline) return false;
+            // name and bounds are written into the source of APPLYINT (IntApply / IntApplyRest)
+            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max) return false;
             const dx = Object.entries(x.deps), dy = y.deps;
             if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
         }
@@ -135,7 +136,7 @@ export class AotCompiler {
     }
 
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps } = code.table!.entries[pos]; return { pos, inline, deps }; });
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max }; });
         let variants = this.#sources.get(code.inst);
         let factory = variants?.find(v => this.#sameUses(v.uses, uses))?.factory;
         if (factory === undefined) {
