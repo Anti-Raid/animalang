@@ -2,7 +2,8 @@ import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
-import { APPLY_MULTI, APPLY_REST, arityMessage, rtIdx } from "./exec";
+import { APPLY_MULTI, APPLY_REST, rtIdx } from "./exec";
+import { arityMessage } from "./arity";
 import { CORE_OPS, isCompilerIntrinsic } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 

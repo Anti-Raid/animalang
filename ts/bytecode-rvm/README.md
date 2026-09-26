@@ -154,11 +154,17 @@ Compiler intrinsics that compile to `CALLRT` (a fixed index into `RUNTIME` in `e
 - **Runtime operations** (see above) compile to `CALLRT idx dst start nargs`, where `idx` is a fixed index into the `RUNTIME` table in `exec.ts`.
 - **Applying a registered leaf intrinsic** (`(%apply %name arg ... lst)`, e.g. in a first-class wrapper `(lambda args (%apply %name args))`) compiles to `APPLYINT pos dst start nargs`: the last argument is spread as by `%apply`, and since the count is only known at run time, it is checked against the intrinsic's `args` there. Only leaves can be applied.
 - **Registered intrinsics** compile to `CALLINT pos dst start nargs` (leaves) or `CALLHOST pos start nargs tail`, where `pos` is the intrinsic's position in the table the code is compiled against. The interpreter calls `code.table.fns[pos](regs, start, nargs)`; AOT code inlines the intrinsic's template when it has one; a call that is the fast path goes through a local the function is read into once (which V8 can inline), while a template's fallback goes through `RT[pos]`, so V8 does not inline the function into a cold path, which measurably slows the hot one.
-- **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `isTail` operand; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
+- **Control flow that suspends or leaves the frame** keeps dedicated opcodes: `CALL`, `APPLY`, `CALLCC` and `CORESUME` (each with a trailing `tail` operand whose bit 0 is set in tail position; non-tail forms are followed by `MOVEACC`), `RETURN` and `COYIELD` (which takes one register holding the already-packed yield value).
 
 # Runtime Architecture
 
-This section describes how compiled code runs. The code lives in `exec.ts` (runtime, interpreter and AOT compiler), `vm.ts` (entry points) and `lists.ts` (the list and multiple-value helpers the runtime operations share).
+This section describes how compiled code runs. The code lives in `exec.ts` (runtime, interpreter and AOT compiler), `vm.ts` (entry points), `opcodes.ts` (the instruction set), `arity.ts` (argument counts and binding) and `lists.ts` (the list and multiple-value helpers the runtime operations share).
+
+## Instruction set
+`opcodes.ts` describes every opcode once, in `OPCODES`: its operands, each with a kind (a register, a constant, an immediate, an upvar, a jump target, an intrinsic position, a runtime index, a `tail` operand or flags, with the names of their bits), and whether the instruction after it starts a basic block (always, or unless it is a tail call; jump targets always do). Everything that walks instructions without running them is derived from it: instruction lengths, remapping intrinsic operands when code is bound to another table, the AOT compiler's basic blocks, and the disassembler (`stringifyInst` in `utils.ts`, which prints `NAME operand=value, ...`). `IR.lower` checks each instruction it emits against the spec. A new opcode needs its spec entry, and its cases in the interpreter and the AOT decoder, which are exhaustive switches.
+
+## Argument binding
+A procedure's argument count is an `Arity` (`arity.ts`): `min`, `max`, and for a closure, what its rest parameter holds (`none`, a `list`, or an `array` when the rest parameter is forwarded; see `%apply`). Intrinsics use the same `min`/`max`. Every way into a closure binds arguments with `bindArgs`: a new frame, a self tail call (which binds over its own registers, so the rest value is built first and positionals move down), and a direct entry's rest parameter (`restValue`); AOT code for self tail calls inlines the same steps. A wrong count is always reported as `name: expected exactly 2 args, got 1` (or `at least n`, or `n to m`), whether the callee is a closure or an intrinsic.
 
 ## Pipeline
 

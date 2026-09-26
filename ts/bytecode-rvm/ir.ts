@@ -1,6 +1,7 @@
 import { ConstPool, type SourcePos } from "../common";
 import { APPLY_TAIL, ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, rtIdx, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
+import { OPCODES } from "./opcodes";
 
 let nextLabelId = 0;
 
@@ -215,6 +216,11 @@ export class IR {
     lower(nodes: Node[], numRegs: number): ByteCode {
         const cpool = new ConstPool()
         const inst: number[] = []
+        // an instruction, with as many operands as OPCODES says it has
+        const emit = (op: OpCode, ...operands: number[]): number => {
+            if (operands.length !== OPCODES[op].operands.length) throw new Error(`internal error: ${OpCode[op]} takes ${OPCODES[op].operands.length} operands, got ${operands.length}`)
+            return inst.push(op, ...operands)
+        }
 
         const lineTable: number[] = []
         const files: string[] = []
@@ -237,26 +243,26 @@ export class IR {
                     const v = node.constant
 
                     if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) {
-                        inst.push(OpCode.LOADU32, node.destReg, v);
+                        emit(OpCode.LOADU32, node.destReg, v);
                     } else {
-                        inst.push(OpCode.LOADCONST, node.destReg, cpool.push(v))
+                        emit(OpCode.LOADCONST, node.destReg, cpool.push(v))
                     }
                     continue
                 }
                 case "LoadUpvar": {
-                    inst.push(OpCode.LOADUPVAR, node.destReg, node.upvarIdx, node.andUnbox ? 1 : 0)
+                    emit(OpCode.LOADUPVAR, node.destReg, node.upvarIdx, node.andUnbox ? 1 : 0)
                     break
                 }
                 case "SetUpvar": {
-                    inst.push(OpCode.SETUPVAR, node.srcReg, node.upvarIdx, node.andBox ? 1 : 0)
+                    emit(OpCode.SETUPVAR, node.srcReg, node.upvarIdx, node.andBox ? 1 : 0)
                     break
                 }
                 case "LoadGlobal": {
-                    inst.push(OpCode.LOADGLOBAL, node.destReg, cpool.push(node.sym))
+                    emit(OpCode.LOADGLOBAL, node.destReg, cpool.push(node.sym))
                     break
                 }
                 case "SetGlobal": {
-                    inst.push(OpCode.SETGLOBAL, node.srcReg, cpool.push(node.sym))
+                    emit(OpCode.SETGLOBAL, node.srcReg, cpool.push(node.sym))
                     break
                 }
                 case "Label": {
@@ -264,52 +270,52 @@ export class IR {
                     break
                 }
                 case "If": {
-                    const jidx = inst.push(OpCode.IF, node.reg, -1) - 1
+                    const jidx = emit(OpCode.IF, node.reg, -1) - 1
                     jumpIdxs.set(jidx, node.elseLabel)
                     break
                 }
                 case "ElseIf": {
-                    const jidx = inst.push(OpCode.ELSEIF, node.reg, -1) - 1
+                    const jidx = emit(OpCode.ELSEIF, node.reg, -1) - 1
                     jumpIdxs.set(jidx, node.elseLabel)
                     break
                 }
                 case "Else": {
-                    const jidx = inst.push(OpCode.ELSE, -1) - 1
+                    const jidx = emit(OpCode.ELSE, -1) - 1
                     jumpIdxs.set(jidx, node.endLabel)
                     break
                 }
                 case "EndIf": {
-                    inst.push(OpCode.ENDIF)
+                    emit(OpCode.ENDIF)
                     break
                 }
                 case "SetMark":
-                    inst.push(OpCode.SETMARK, node.keyReg, node.valReg)
+                    emit(OpCode.SETMARK, node.keyReg, node.valReg)
                     break
                 case "MarkSave":
-                    inst.push(OpCode.MARKSAVE, node.reg)
+                    emit(OpCode.MARKSAVE, node.reg)
                     break
                 case "MarkRestore":
-                    inst.push(OpCode.MARKRESTORE, node.reg)
+                    emit(OpCode.MARKRESTORE, node.reg)
                     break
                 case "CurrentMarks":
-                    inst.push(OpCode.CURMARKS, node.destReg)
+                    emit(OpCode.CURMARKS, node.destReg)
                     break
                 case "HostCall":
-                    inst.push(OpCode.CALLHOST, use(node.pos), node.startReg, node.nargs, node.isTail ? 1 : 0)
-                    if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                    emit(OpCode.CALLHOST, use(node.pos), node.startReg, node.nargs, node.isTail ? 1 : 0)
+                    if (!node.isTail && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
                 case "IntCall":
-                    inst.push(OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
+                    emit(OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "IntApply":
-                    inst.push(node.restArray ? OpCode.APPLYINTR : OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
+                    emit(node.restArray ? OpCode.APPLYINTR : OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "CurrentStack":
-                    inst.push(OpCode.CURSTACK, node.skip)
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                    emit(OpCode.CURSTACK, node.skip)
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
                 case "Unpack": {
-                    inst.push(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
+                    emit(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
                     break
                 }
                 case "Block":
@@ -317,30 +323,30 @@ export class IR {
                 case "EndLoop":
                 case "Jump": {
                     const op = { Block: OpCode.BLOCK, Loop: OpCode.LOOP, EndLoop: OpCode.ENDLOOP, Jump: OpCode.JUMP }[node.t]
-                    const jidx = inst.push(op, -1) - 1
+                    const jidx = emit(op, -1) - 1
                     jumpIdxs.set(jidx, node.t === "EndLoop" ? node.head : node.t === "Jump" ? node.label : node.end)
                     break
                 }
                 case "Call": {
-                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs, 0)
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                    emit(OpCode.CALL, node.procReg, node.startReg, node.nargs, 0)
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailCall": {
-                    inst.push(OpCode.CALL, node.procReg, node.startReg, node.nargs, 1)
+                    emit(OpCode.CALL, node.procReg, node.startReg, node.nargs, 1)
                     break
                 }
                 case "Apply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags)
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg)
+                    emit(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags)
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
                     break
                 }
                 case "TailApply": {
-                    inst.push(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags | APPLY_TAIL)
+                    emit(OpCode.APPLY, node.procReg, node.startReg, node.nargs, node.flags | APPLY_TAIL)
                     break
                 }
                 case "Return": {
-                    inst.push(OpCode.RETURN, node.reg)
+                    emit(OpCode.RETURN, node.reg)
                     break
                 }
                 case "NewClosure": {
@@ -349,63 +355,63 @@ export class IR {
                     if(ct.upvarLocs.length === 0) {
                         // We can just directly push the template as a raw constant in the pool
                         const cidx = cpool.mutPush(Closure.fromTemplate(ct))
-                        inst.push(OpCode.LOADCONST, node.destReg, cidx)
+                        emit(OpCode.LOADCONST, node.destReg, cidx)
                     } else {
                         const ctidx = cpool.mutPush(ct)
-                        inst.push(OpCode.NEWCLOSURE, node.destReg, ctidx)
+                        emit(OpCode.NEWCLOSURE, node.destReg, ctidx)
                     }
                     break
                 }
                 case "Box": {
-                    inst.push(OpCode.BOX, node.destReg, node.srcReg)
+                    emit(OpCode.BOX, node.destReg, node.srcReg)
                     break
                 }
                 case "SetBox": {
-                    inst.push(OpCode.SETBOX, node.destReg, node.srcReg)
+                    emit(OpCode.SETBOX, node.destReg, node.srcReg)
                     break
                 }
                 case "Unbox": {
-                    inst.push(OpCode.UNBOX, node.destReg, node.srcReg)
+                    emit(OpCode.UNBOX, node.destReg, node.srcReg)
                     break
                 }
                 case "Move": {
-                    inst.push(OpCode.MOVE, node.destReg, node.srcReg)
+                    emit(OpCode.MOVE, node.destReg, node.srcReg)
                     break
                 }
                 case "CallCC": {
-                    inst.push(OpCode.CALLCC, node.procReg, 0);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    emit(OpCode.CALLCC, node.procReg, 0);
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "TailCallCC": {
-                    inst.push(OpCode.CALLCC, node.procReg, 1);
+                    emit(OpCode.CALLCC, node.procReg, 1);
                     break;
                 }
                 case "Raise": {
-                    inst.push(OpCode.RAISE, node.objReg, node.continuable ? 1 : 0);
-                    if (node.continuable && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    emit(OpCode.RAISE, node.objReg, node.continuable ? 1 : 0);
+                    if (node.continuable && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "CallEC":
                 case "CallCatch": {
-                    if (node.t === "CallEC") inst.push(OpCode.CALLEC, node.procReg, node.tokReg);
-                    else inst.push(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
-                    inst.push(OpCode.CALLRT, rtIdx("%end-escape"), node.tokReg, node.tokReg, 1);
+                    if (node.t === "CallEC") emit(OpCode.CALLEC, node.procReg, node.tokReg);
+                    else emit(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
+                    emit(OpCode.CALLRT, rtIdx("%end-escape"), node.tokReg, node.tokReg, 1);
                     break;
                 }
                 case "CoYield": {
-                    inst.push(OpCode.COYIELD, node.valReg);
-                    if (node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    emit(OpCode.COYIELD, node.valReg);
+                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "CoResume": {
-                    inst.push(OpCode.CORESUME, node.coReg, node.listReg, node.isTail ? 1 : 0);
-                    if (!node.isTail && node.destReg !== undefined) inst.push(OpCode.MOVEACC, node.destReg);
+                    emit(OpCode.CORESUME, node.coReg, node.listReg, node.isTail ? 1 : 0);
+                    if (!node.isTail && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
                     break;
                 }
                 case "RtCall": {
-                    inst.push(OpCode.CALLRT, node.rtIdx, node.destReg, node.startReg, node.nargs);
+                    emit(OpCode.CALLRT, node.rtIdx, node.destReg, node.startReg, node.nargs);
                     break;
                 }
                 case "Pos": {

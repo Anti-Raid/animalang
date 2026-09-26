@@ -8,7 +8,9 @@ import { ByteCode, AnimaVM, AotCompiler, OpCode } from './bytecode-rvm/vm';
 import { Closure, INSTRUCTION_LENGTHS, rtIdx } from './bytecode-rvm/exec';
 import { Anima } from './anima';
 import { impl, implAot, implDebug, implAotDebug } from './bytecode-rvm/meta';
-import { dumpFull, readFull, BYTECODE_VERSION } from './bytecode-rvm/utils';
+import { dumpFull, readFull, BYTECODE_VERSION, stringifyInst } from './bytecode-rvm/utils';
+import { OPCODES } from './bytecode-rvm/opcodes';
+import { arityMessage, bindArgs, closureArity, restValue } from './bytecode-rvm/arity';
 import { hostTail } from './bytecode-rvm/exec';
 import { IProcedure } from './common';
 import { hostError } from './errors';
@@ -233,7 +235,7 @@ describe('Anima', () => {
             expect(() => run("(let ((f third)) (f '(1 2)))")).toThrow("third: list is too short");
             expect(run("(let ((f <)) (f 1 2))")).toBe("#t");
             expect(() => run("(+ 1 \"a\")")).toThrow("+ requires numbers, but received string");
-            expect(() => run("(-)")).toThrow("%- requires at least 1 arguments, got 0");
+            expect(() => run("(-)")).toThrow("%-: expected at least 1 args, got 0");
             expect(() => run("(< \"a\")")).toThrow("< requires numbers, but received string");
             expect(() => run("(modulo 1 2 3)")).toThrow("modulo: expected exactly 2 args, got 3");
             expect(() => run("(/ 1 0)")).toThrow("division by zero");
@@ -725,7 +727,7 @@ describe('Anima', () => {
             expect(() => run(`(define (fw-ap f . xs) (%apply-multi f xs)) (fw-ap + 1 2)`)).toThrow(/must be a list/)
             // a self tail call rebinds the rest array
             expect(run(`(define (fw-loop n . xs) (if (= n 0) (%apply %+ xs) (fw-loop (- n 1) n 1))) (fw-loop 3)`)).toBe("2")
-            expect(() => run(`(define (fw-one . xs) (%apply %car xs)) (fw-one 1 2)`)).toThrow("car requires 1 arguments, got 2")
+            expect(() => run(`(define (fw-one . xs) (%apply %car xs)) (fw-one 1 2)`)).toThrow("%car: expected exactly 1 args, got 2")
 
             const bc = evaluator.compileRaw(`(define (fw-t . xs) (%apply %+ xs))`) as ByteCode
             const fn = bc.constants.find((c: any) => c instanceof Closure)!
@@ -955,7 +957,7 @@ describe('Anima', () => {
             expect(run(`(if #f (car) 'fine)`)).toBe("fine")
             expect(() => run(`(apply car '(1 2))`)).toThrow("car: expected exactly 1 args, got 2")
             expect(() => run(`(apply vector-append '(1))`)).toThrow("vector-append requires all arguments to be vectors")
-            expect(() => run(`(apply table-ref '(1))`)).toThrow("%table-ref requires 2 to 3 arguments, got 1")
+            expect(() => run(`(apply table-ref '(1))`)).toThrow("%table-ref: expected 2 to 3 args, got 1")
             // the builtins' intrinsics are at the same positions in every instance
             expect(createScheme(vmImpl).intrinsics.byName("%car")!.pos).toBe(evaluator.intrinsics.byName("%car")!.pos)
         })
@@ -2161,7 +2163,7 @@ describe('Anima', () => {
         it('%first-value truncates multiple values to the first (Lua)', () => {
             expect(run(`(list (%first-value (values 1 2 3)) (%first-value 5) (%first-value (values)))`)).toBe("(1 5 <#void>)")
             expect(run(`(define (two) (values 10 20)) (define (fv-sum) (+ (%first-value (two)) 1)) (fv-sum)`)).toBe("11")
-            expect(() => run(`(%first-value)`)).toThrow("%first-value requires 1 arguments")
+            expect(() => run(`(%first-value)`)).toThrow("%first-value: expected exactly 1 args, got 0")
         })
 
         it('compiles without closures', () => {
@@ -2335,6 +2337,76 @@ describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s
         expect(err.animaTraceback).toBe("x\nstack traceback:\n  t.anima:1:13 in g\n  t.anima:1:31 in top-level");
     });
 });
+
+describe("Opcode spec", () => {
+    it("describes every opcode, and instruction lengths follow from it", () => {
+        const ops = Object.values(OpCode).filter((v): v is OpCode => typeof v === "number")
+        // the enum (in exec.ts, for the interpreter) and the spec list the same opcodes in the same order
+        expect(OPCODES.map(spec => spec.name)).toEqual(ops.map(op => OpCode[op]))
+        for (const op of ops) {
+            expect(INSTRUCTION_LENGTHS[op], OpCode[op]).toBe(1 + OPCODES[op].operands.length)
+            // a tail call's `tail` operand says whether the next instruction starts a block
+            expect(OPCODES[op].split === "nonTail", OpCode[op]).toBe(OPCODES[op].operands.some(([, kind]) => kind === "tail"))
+        }
+    })
+
+    it("disassembles from the spec", () => {
+        const anima = createScheme(impl)
+        const bc = anima.compileRaw(`
+            (define (ds-ap f . xs) (%apply-multi f xs))
+            (define (ds-sum . xs) (%apply %+ xs))
+            (let-values (((a . b) (values 1 2))) (if a (car b) (ds-ap ds-sum 1 '(2))))`) as ByteCode
+        const lines = stringifyInst(bc)
+        const sum = stringifyInst(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-sum").tmpl.code)
+        const ap = stringifyInst(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-ap").tmpl.code)
+        expect(lines).toContain("0000: LOADCONST   dst=r1, const=c.fn(f . xs)")
+        expect(lines.some(line => /UNPACK +src=r\d+, start=r\d+, count=1, flags=rest\|strict/.test(line))).toBe(true)
+        expect(lines.some(line => /CALLINT +pos=%car, /.test(line))).toBe(true)
+        expect(lines.some(line => /LOADCONST +dst=r\d+, const=\(2\)$/.test(line))).toBe(true)
+        expect(lines.some(line => /CALL +proc=r\d+, start=r\d+, nargs=3, tail=tail$/.test(line))).toBe(true)
+        expect(sum.some(line => /APPLYINTR +pos=%\+, dst=r\d+, start=r\d+, nargs=1$/.test(line))).toBe(true)
+        expect(ap.some(line => /APPLY +proc=r\d+, start=r\d+, nargs=1, tail=tail\|rest-array\|multi$/.test(line))).toBe(true)
+        // ips count by the spec's lengths
+        const ips = lines.filter(line => /^\d{4}:/.test(line)).map(line => +line.slice(0, 4))
+        for (let i = 1; i < ips.length; i++) expect(ips[i] - ips[i - 1]).toBe(INSTRUCTION_LENGTHS[bc.inst[ips[i - 1]] as OpCode])
+    })
+
+})
+
+describe("Argument binding", () => {
+    it("binds positionals and a rest list or array, in place over the argument window too", () => {
+        const list = closureArity(2, "list")
+        expect(list).toEqual({ min: 2, max: Infinity, rest: "list" })
+        const fresh: any[] = []
+        bindArgs(list, fresh, ["x", "a", "b", "c", "d"], 1, 4)
+        expect(fresh.slice(0, 2)).toEqual(["a", "b"])
+        expect(new ASTStringifier().stringify(fresh[2])).toBe('("c" "d")')
+        // a self tail call: the window overlaps the parameters it is bound to
+        const regs = ["p0", "p1", "p2", "a", "b", "c"]
+        bindArgs(closureArity(2, "array"), regs, regs, 1, 5)
+        expect(regs.slice(0, 3)).toEqual(["p1", "p2", ["a", "b", "c"]])
+        const exact = ["p0", "p1", "x", "y"]
+        bindArgs(closureArity(2, "none"), exact, exact, 2, 2)
+        expect(exact).toEqual(["x", "y", "x", "y"])
+        // an owned argument array can be the rest array itself; otherwise it is copied
+        const args = [1, 2]
+        expect(restValue("array", args, 0, 2, true)).toBe(args)
+        expect(restValue("array", args, 0, 2)).not.toBe(args)
+        expect(restValue("list", args, 2, 2)).toBe(null)
+    })
+
+    it("gives closures and intrinsics one arity message", () => {
+        expect(arityMessage("f", 2, 2, 1)).toBe("f: expected exactly 2 args, got 1")
+        expect(arityMessage("f", 1, Infinity, 0)).toBe("f: expected at least 1 args, got 0")
+        expect(arityMessage("f", 2, 3, 4)).toBe("f: expected 2 to 3 args, got 4")
+        const anima = createScheme(impl)
+        const tmpl = (anima.compileRaw("(define (ab-f a . r) r)") as ByteCode).constants.find((c: any) => c instanceof Closure)!.tmpl
+        expect(tmpl.arity).toEqual({ min: 1, max: Infinity, rest: "list" })
+        expect(() => anima.evaluateRaw(anima.compileRaw("(define (ab-g a b) a) (ab-g 1)"))).toThrow("ab-g: expected exactly 2 args, got 1")
+        expect(() => anima.evaluateRaw(anima.compileRaw("(%apply %car '(1 2))"))).toThrow("%car: expected exactly 1 args, got 2")
+        expect(() => anima.compileRaw("(%car 1 2)")).toThrow("%car: expected exactly 1 args, got 2")
+    })
+})
 
 describe("Table internals", () => {
     it('border() is always a valid border and contents match a plain Map under random edits', () => {

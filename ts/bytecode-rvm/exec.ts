@@ -26,108 +26,56 @@ import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markOwn, ma
 import { RUNTIME_INLINES } from "./inline";
 import { hostError } from "../errors";
 import type { Intrinsics, Intrinsic } from "./intrinsics";
+import { arityMessage, closureArity, fitsArity, checkArity, restList, bindArgs, type Arity } from "./arity";
+import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS, NO_REG, APPLY_TAIL, APPLY_REST, APPLY_MULTI, UNPACK_REST, UNPACK_STRICT, basicBlockStarts } from "./opcodes";
 
 
-// Operands are u32s; reg[x] = register x, constant = a constant-pool index, ip = an instruction index.
-// Non-tail CALL/APPLY/CALLCC/CORESUME/COYIELD leave their result in the accumulator, read by a following MOVEACC.
+export { INSTRUCTION_LENGTHS, NO_REG, APPLY_TAIL, APPLY_REST, APPLY_MULTI, UNPACK_REST, UNPACK_STRICT } from "./opcodes";
+
+// The opcodes, whose operands and meaning OPCODES (opcodes.ts) describes, in the same order. Declared here because the
+// interpreter switches over them: esbuild only inlines an enum's values in the file that declares it
 export enum OpCode {
-    LOADCONST,   // dst constant       reg[dst] = constants[constant]
-    LOADU32,     // dst n              reg[dst] = n (a small non-negative integer)
-    LOADUPVAR,   // dst i unbox        reg[dst] = upvars[i] (its box's value if unbox)
-    SETUPVAR,    // src i box          upvars[i] = reg[src] (in a new box if box)
-    LOADGLOBAL,  // dst constant       reg[dst] = global named constants[constant]
-    SETGLOBAL,   // src constant       global named constants[constant] = reg[src]
-    IF,          // cond elseIp        jump to elseIp if reg[cond] is false
-    ELSE,        // endIp              end of the then branch: jump past the else branch
-    ENDIF,       //                    marks the end of an if (for structured AOT code)
-    CALL,        // proc start n tail  call reg[proc] on reg[start .. start+n)
-    RETURN,      // src                return reg[src] from the function
-    NEWCLOSURE,  // dst constant       reg[dst] = closure of the template constants[constant], capturing its upvars
-    BOX,         // dst src            reg[dst] = new box holding reg[src]
-    UNBOX,       // dst src            reg[dst] = value of the box reg[src]
-    SETBOX,      // box src            the box reg[box] now holds reg[src]
-    MOVE,        // dst src            reg[dst] = reg[src]
-    CALLCC,      // proc tail          call reg[proc] with the current continuation
-    APPLY,       // proc start n tail  like CALL, with the last argument a list spread into the arguments
-    MOVEACC,     // dst                reg[dst] = accumulator (the last call's result)
-    COYIELD,     // val                yield reg[val] (already packed multiple values) from the running coroutine
-    CALLRT,      // rt dst start n     reg[dst] = RUNTIME[rt] applied to reg[start .. start+n)
-    CORESUME,    // co list tail       resume coroutine reg[co] with the values in the list reg[list]
-    BLOCK,       // endIp              start of a %block ending at endIp (for structured AOT code)
-    LOOP,        // endIp              start of a %loop ending at endIp; its body starts after this
-    ENDLOOP,     // headIp             end of a %loop's body: jump back to headIp
-    JUMP,        // target             an %escape: jump to target (the end of a %block)
-    UNPACK,      // src start n flags  spread reg[src]'s multiple values over reg[start .. start+n) (+ rest list; see UNPACK_*)
-    SETMARK,     // key val            set continuation mark reg[key] = reg[val] on the current frame
-    MARKSAVE,    // dst                reg[dst], reg[dst+1] = current marks and logical frame, then start a new logical frame
-    MARKRESTORE, // src                marks and logical frame = reg[src], reg[src+1]
-    CURMARKS,    // dst                reg[dst] = the current continuation marks, as a mark set
-    CALLEC,      // proc tok           reg[tok] = a new escape continuation; call reg[proc] with it
-    CALLCATCH,   // proc tok pre       reg[tok] = a new catch token; call reg[proc] with it as the innermost exception handler
-                 //                    (reg[pre], unless pre is NO_REG, runs on the error before unwinding)
-    RAISE,       // obj continuable    deliver reg[obj] to the innermost exception handler
-    CURSTACK,    // skip               a snapshot of the current stack, minus its innermost skip frames
-    CALLHOST,    // pos start n tail   call the non-leaf intrinsic at pos in the code's table on reg[start .. start+n); a
-                 //                    HostTail result is called in its place
-    CALLINT,     // pos dst start n    reg[dst] = the leaf intrinsic at pos in the code's table applied to reg[start .. start+n)
-    APPLYINT,    // pos dst start n    like CALLINT, with the last argument a list spread into the arguments (count checked here)
-    ELSEIF,      // cond elseIp        like IF, for a later condition of the same chain (IF ... ELSE end; ELSEIF ... ELSE end; ... ENDIF)
-    APPLYINTR,   // pos dst start n    like APPLYINT, with the last argument a forwarded rest array (see ClosureTemplate.restArray)
+    LOADCONST,
+    LOADU32,
+    LOADUPVAR,
+    SETUPVAR,
+    LOADGLOBAL,
+    SETGLOBAL,
+    IF,
+    ELSE,
+    ENDIF,
+    CALL,
+    RETURN,
+    NEWCLOSURE,
+    BOX,
+    UNBOX,
+    SETBOX,
+    MOVE,
+    CALLCC,
+    APPLY,
+    MOVEACC,
+    COYIELD,
+    CALLRT,
+    CORESUME,
+    BLOCK,
+    LOOP,
+    ENDLOOP,
+    JUMP,
+    UNPACK,
+    SETMARK,
+    MARKSAVE,
+    MARKRESTORE,
+    CURMARKS,
+    CALLEC,
+    CALLCATCH,
+    RAISE,
+    CURSTACK,
+    CALLHOST,
+    CALLINT,
+    APPLYINT,
+    ELSEIF,
+    APPLYINTR,
 }
-
-export const INSTRUCTION_LENGTHS: Record<OpCode, number> = {
-    [OpCode.ENDIF]: 1,
-    [OpCode.ELSE]: 2,
-    [OpCode.RETURN]: 2,
-    [OpCode.LOADCONST]: 3,
-    [OpCode.LOADU32]: 3,
-    [OpCode.LOADGLOBAL]: 3,
-    [OpCode.SETGLOBAL]: 3,
-    [OpCode.IF]: 3,
-    [OpCode.CALLCC]: 3,
-    [OpCode.NEWCLOSURE]: 3,
-    [OpCode.BOX]: 3,
-    [OpCode.UNBOX]: 3,
-    [OpCode.SETBOX]: 3,
-    [OpCode.MOVE]: 3,
-    [OpCode.SETUPVAR]: 4,
-    [OpCode.LOADUPVAR]: 4,
-    [OpCode.CALL]: 5,
-    [OpCode.APPLY]: 5,
-    [OpCode.MOVEACC]: 2,
-    [OpCode.COYIELD]: 2,
-    [OpCode.CALLRT]: 5,
-    [OpCode.CORESUME]: 4,
-    [OpCode.BLOCK]: 2,
-    [OpCode.LOOP]: 2,
-    [OpCode.ENDLOOP]: 2,
-    [OpCode.JUMP]: 2,
-    [OpCode.UNPACK]: 5,
-    [OpCode.SETMARK]: 3,
-    [OpCode.MARKSAVE]: 2,
-    [OpCode.MARKRESTORE]: 2,
-    [OpCode.CURMARKS]: 2,
-    [OpCode.CALLEC]: 3,
-    [OpCode.CALLCATCH]: 4,
-    [OpCode.RAISE]: 3,
-    [OpCode.CURSTACK]: 2,
-    [OpCode.CALLHOST]: 5,
-    [OpCode.CALLINT]: 5,
-    [OpCode.APPLYINT]: 5,
-    [OpCode.ELSEIF]: 3,
-    [OpCode.APPLYINTR]: 5,
-};
-
-// APPLY's last operand
-export const APPLY_TAIL = 1;
-// the last argument register holds a forwarded rest array (see ClosureTemplate.restArray), not a list
-export const APPLY_REST = 2;
-// with APPLY_REST, for %apply-multi: the rest array's own last element is a list, spread too
-export const APPLY_MULTI = 4;
-
-// UNPACK flags
-export const UNPACK_REST = 1;
-export const UNPACK_STRICT = 2;
 
 // the values of `val` for UNPACK: checks the count when strict; missing values read as undefined (<#void>)
 export const unpackForBinding = (val: any, count: number, flags: number): any[] => {
@@ -206,8 +154,7 @@ export class ByteCode implements AbstractByteCode {
         if (moved.size > 0) {
             const inst = SHARED_INSTS.has(this.inst) ? this.inst.slice() : this.inst;
             for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) {
-                const op = inst[ip];
-                if (op === OpCode.CALLINT || op === OpCode.CALLHOST || op === OpCode.APPLYINT || op === OpCode.APPLYINTR) inst[ip + 1] = moved.get(inst[ip + 1]) ?? inst[ip + 1];
+                for (const off of INTRINSIC_OPERANDS[inst[ip]]) inst[ip + off] = moved.get(inst[ip + off]) ?? inst[ip + off];
             }
             this.inst = inst;
         }
@@ -254,11 +201,10 @@ export class ByteCode implements AbstractByteCode {
         SHARED_INSTS.add(this.inst);
         copy.bind(table);
         copy.constants = this.constants.map(c => {
-            if (c instanceof ClosureTemplate) return new ClosureTemplate(c.params, c.remParams, c.code.fresh(copies, table), c.upvarLocs, c.name, c.restArray);
+            if (c instanceof ClosureTemplate) return c.withCode(c.code.fresh(copies, table));
             // a closure with no upvars (made once, when compiled) is shared by the copies, unless it must be bound
             if (c instanceof Closure && !c.tmpl.code.runsWith(table)) {
-                const tmpl = c.tmpl;
-                return Closure.fromTemplate(new ClosureTemplate(tmpl.params, tmpl.remParams, tmpl.code.fresh(copies, table), tmpl.upvarLocs, tmpl.name, tmpl.restArray), c.debugName);
+                return Closure.fromTemplate(c.tmpl.withCode(c.tmpl.code.fresh(copies, table)), c.debugName);
             }
             return c;
         });
@@ -322,6 +268,9 @@ export class ClosureTemplate implements SerializableBytecode {
     code: ByteCode;
     upvarLocs: UpVarLoc[]; // what upvars do we need to capture
 
+    // how it binds its arguments: every call binds them through this (see bindArgs)
+    readonly arity: Arity;
+
     // `restArray`: the rest parameter is only ever spread back into a call (the compiler's analysis proves it), so it is
     // bound to a plain array of the rest arguments rather than a list, and only APPLY / APPLYINTR ever read it
     constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null, public restArray: boolean = false) {
@@ -329,6 +278,12 @@ export class ClosureTemplate implements SerializableBytecode {
         this.remParams = remParams;
         this.code = code;
         this.upvarLocs = upvarLocs;
+        this.arity = closureArity(params.length, remParams === null ? "none" : restArray ? "array" : "list");
+    }
+
+    // the same template running other code
+    withCode(code: ByteCode): ClosureTemplate {
+        return new ClosureTemplate(this.params, this.remParams, code, this.upvarLocs, this.name, this.restArray);
     }
 
     dump(bs: BS) {
@@ -584,7 +539,6 @@ export class CatchToken extends EscapeContinuation {
     }
 }
 
-export const NO_REG = 0xFFFFFFFF;
 
 // the value of a caught error, as handlers see it
 const caughtValue = (err: any): any =>
@@ -850,32 +804,12 @@ export class VMExecutor {
     }
 
     public createClosureArg(closure: Closure, nargs: number, args: any[], startOffset: number): any[] {
-        const template = closure.tmpl;
-        const arity = template.params.length;
-        if (template.remParams !== null) {
-            if (nargs < arity) {
-                throw hostError(`${closure.debugName}: expected at least ${arity} args, got ${nargs}`);
-            }
-        } else {
-            if (nargs !== arity) {
-                throw hostError(`${closure.debugName}: expected exactly ${arity} args, got ${nargs}`);
-            }
-        }
-
-        const closureRegs: any[] = createRegs(template.code.numReg);
-        for (let i = 0; i < arity; i++) {
-            closureRegs[i] = args[startOffset + i];
-        }
-
-        if (template.restArray) {
-            closureRegs[arity] = args.slice(startOffset + arity, startOffset + nargs);
-        } else if (template.remParams !== null) {
-            let restList: any = null;
-            for (let i = nargs - 1; i >= arity; i--) {
-                restList = new Cons(args[startOffset + i], restList);
-            }
-            closureRegs[arity] = restList;
-        }
+        const arity = closure.tmpl.arity;
+        if (nargs < arity.min || nargs > arity.max) checkArity(closure.debugName ?? "lambda", arity, nargs);
+        const closureRegs: any[] = createRegs(closure.tmpl.code.numReg);
+        // bindArgs, with its common case inline: this runs on every call
+        if (arity.rest === "none") for (let i = 0; i < nargs; i++) closureRegs[i] = args[startOffset + i];
+        else bindArgs(arity, closureRegs, args, startOffset, nargs);
         return closureRegs;
     }
 
@@ -896,10 +830,8 @@ export class VMExecutor {
         const code = proc.tmpl.code;
         const fn = code.directFn!;
         const numPos = code.directRestArity;
-        let rest: Cons | any[] | null = null;
         // `args` is always a fresh array the caller gives up, so a rest array with no positional params can be it
-        if (proc.tmpl.restArray) rest = numPos === 0 ? args : args.slice(numPos);
-        else for (let i = args.length - 1; i >= numPos; i--) rest = new Cons(args[i], rest);
+        const rest = proc.tmpl.arity.rest === "array" ? (numPos === 0 ? args : args.slice(numPos)) : restList(args, numPos, args.length);
         // spreading into the call is slow, so the common arities are called directly
         switch (numPos) {
             case 0: return fn(ctx, proc, this, depth, marks, mframe, rest);
@@ -1288,11 +1220,6 @@ export class HostTail {
 export const hostTail = (proc: any, ...args: any[]): HostTail => new HostTail(proc, args);
 
 // an intrinsic's argument count checked at run time (for APPLYINT, whose count the compiler cannot know)
-export const arityMessage = (name: string, min: number, max: number, nargs: number): string => {
-    const expected = min === max ? `${min}` : max === Infinity ? `at least ${min}` : `${min} to ${max}`;
-    return `${name} requires ${expected} arguments, got ${nargs}`;
-};
-
 const applyIntrinsic = (fn: (regs: any[], start: number, nargs: number) => any, name: string, min: number, max: number, args: any[]): any => {
     if (args.length < min || args.length > max) throw hostError(arityMessage(name, min, max, args.length));
     return fn(args, 0, args.length);
@@ -1457,23 +1384,11 @@ export class BytecodeInterpreter {
 
                         // self tail call: rebind the params in place and jump back to the start
                         if (isTail && proc === frame.closure && !frame.isShared(ctx)) {
-                            const tmpl = proc.tmpl;
-                            const numPos = tmpl.params.length;
-                            if (tmpl.remParams !== null ? nargs >= numPos : nargs === numPos) {
-                                let restList: any = null;
-                                if (tmpl.restArray) {
-                                    restList = regs.slice(startReg + numPos, startReg + nargs);
-                                } else if (tmpl.remParams !== null) {
-                                    for (let i = nargs - 1; i >= numPos; i--) {
-                                        restList = new Cons(regs[startReg + i], restList);
-                                    }
-                                }
-                                for (let i = 0; i < numPos; i++) {
-                                    regs[i] = regs[startReg + i];
-                                }
-                                if (tmpl.remParams !== null) {
-                                    regs[numPos] = restList;
-                                }
+                            const arity = proc.tmpl.arity;
+                            if (nargs >= arity.min && nargs <= arity.max) {
+                                // bindArgs, with its common case inline: V8 does not inline calls into this loop
+                                if (arity.rest === "none") for (let i = 0; i < nargs; i++) regs[i] = regs[startReg + i];
+                                else bindArgs(arity, regs, regs, startReg, nargs);
                                 ip = 0;
                                 break;
                             }
@@ -1670,7 +1585,7 @@ type AotTerm = { at?: number } & (
     | { k: "Branch"; cond: number; then: number; else: number; elseif: boolean }
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
-    | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; numPos: number; hasRest: boolean; restArray: boolean }
+    | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; arity: Arity }
     | { k: "Apply"; proc: number; isTail: boolean; flags: number; start: number; nargs: number; resume: number }
     | { k: "CallCC"; proc: number; isTail: boolean; resume: number }
     | { k: "CallEC"; proc: number; tok: number; resume: number }
@@ -1743,8 +1658,8 @@ export class AotCompiler {
         code.resumeFn = resume;
         if (direct !== null && tmpl !== undefined) {
             code.directFn = direct;
-            if (tmpl.remParams === null) code.directArity = tmpl.params.length;
-            else code.directRestArity = tmpl.params.length;
+            if (tmpl.arity.rest === "none") code.directArity = tmpl.arity.min;
+            else code.directRestArity = tmpl.arity.min;
         }
         return resume;
     }
@@ -1791,7 +1706,7 @@ export class AotCompiler {
         let direct = "null";
         if (tmpl !== undefined) {
             const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps);
-            out.emitFunction(tmpl.params.length + (tmpl.remParams !== null ? 1 : 0), tmpl.remParams !== null);
+            out.emitFunction(tmpl.arity);
             direct = out.toString();
         }
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
@@ -1810,57 +1725,9 @@ export class AotCompiler {
         return ips;
     }
 
-    public static findBasicBlocks(inst: Uint32Array): number[] {
-        const blocks = new Set<number>([0]);
-        let ip = 0;
-        while (ip < inst.length) {
-            const opcode: OpCode = inst[ip];
-            const nextIp = ip + (INSTRUCTION_LENGTHS[opcode] ?? 1);
-
-            switch (opcode) {
-                case OpCode.IF:
-                case OpCode.ELSEIF:
-                    blocks.add(nextIp);
-                    blocks.add(inst[ip + 2]);
-                    break;
-                case OpCode.ELSE:
-                    blocks.add(inst[ip + 1]);
-                    break;
-                case OpCode.BLOCK:
-                case OpCode.LOOP:
-                case OpCode.ENDLOOP:
-                case OpCode.JUMP:
-                    blocks.add(nextIp);
-                    blocks.add(inst[ip + 1]);
-                    break;
-                case OpCode.COYIELD:
-                case OpCode.CALLEC:
-                case OpCode.CALLCATCH:
-                case OpCode.RAISE:
-                case OpCode.CURSTACK:
-                    blocks.add(nextIp);
-                    break;
-                case OpCode.CALL:
-                    if (inst[nextIp - 1] === 0) blocks.add(nextIp);
-                    break;
-                case OpCode.APPLY:
-                    if ((inst[nextIp - 1] & APPLY_TAIL) === 0) blocks.add(nextIp);
-                    break;
-                case OpCode.CALLCC:
-                case OpCode.CORESUME:
-                case OpCode.CALLHOST:
-                    if (inst[nextIp - 1] === 0) blocks.add(nextIp);
-                    break;
-            }
-
-            ip = nextIp;
-        }
-        return Array.from(blocks).sort((a, b) => a - b);
-    }
-
     public static buildAot(code: ByteCode, tmpl?: ClosureTemplate): AotBlock[] {
         const inst = code.inst;
-        const starts = this.findBasicBlocks(inst);
+        const starts = basicBlockStarts(inst);
         const blocks: AotBlock[] = [];
 
         for (let b = 0; b < starts.length; b++) {
@@ -1944,11 +1811,8 @@ export class AotCompiler {
                             term = { k: "Call", proc: procIdx, start, nargs, resume: ip };
                             break;
                         }
-                        const numPos = tmpl ? tmpl.params.length : -1;
-                        const hasRest = tmpl ? tmpl.remParams !== null : false;
-                        const arityFits = tmpl !== undefined && (hasRest ? nargs >= numPos : nargs === numPos);
-                        term = arityFits
-                            ? { k: "MaybeSelfTailCall", proc: procIdx, start, nargs, ip, numPos, hasRest, restArray: tmpl.restArray }
+                        term = tmpl !== undefined && fitsArity(tmpl.arity, nargs)
+                            ? { k: "MaybeSelfTailCall", proc: procIdx, start, nargs, ip, arity: tmpl.arity }
                             : { k: "TailCall", proc: procIdx, start, nargs, ip };
                         break;
                     }
@@ -2090,7 +1954,7 @@ class Liveness {
             }
             const term = block.term;
             if (term.k === "MaybeSelfTailCall") {
-                for (let i = 0; i < term.numPos + (term.hasRest ? 1 : 0); i++) written.add(i);
+                for (let i = 0; i < term.arity.min + (term.arity.rest === "none" ? 0 : 1); i++) written.add(i);
             }
             if (term.k === "CallEC" || term.k === "CallCatch") written.add(term.tok);
         }
@@ -2254,7 +2118,7 @@ abstract class FunctionEmitter extends CodeEmitter {
         }
     }
 
-    abstract emitFunction(arity: number): void;
+    abstract emitFunction(arity: Arity): void;
 
     protected abstract emitTerm(term: AotTerm, next: number): void;
 
@@ -2311,17 +2175,16 @@ abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected selfMoves(term: Extract<AotTerm, { k: "MaybeSelfTailCall" }>): string {
+        // as bindArgs, over registers held in js variables: the rest value first, then the positionals, moving down
+        const { min, rest } = term.arity;
+        const restRegs = Array.from({ length: term.nargs - min }, (_, i) => `r${term.start + min + i}`);
         const moves: string[] = [];
-        if (term.restArray) {
-            moves.push(`const rest = [${Array.from({ length: term.nargs - term.numPos }, (_, i) => `r${term.start + term.numPos + i}`).join(", ")}];`);
-        } else if (term.hasRest) {
-            moves.push(`let rest = null;`);
-            for (let i = term.nargs - 1; i >= term.numPos; i--) moves.push(`rest = new Cons(r${term.start + i}, rest);`);
-        }
-        for (let i = 0; i < term.numPos; i++) {
+        if (rest === "array") moves.push(`const rest = [${restRegs.join(", ")}];`);
+        if (rest === "list") moves.push(`const rest = ${restRegs.reduceRight((tail, reg) => `new Cons(${reg}, ${tail})`, "null")};`);
+        for (let i = 0; i < min; i++) {
             if (term.start + i !== i) moves.push(`r${i} = r${term.start + i};`);
         }
-        if (term.hasRest) moves.push(`r${term.numPos} = rest;`);
+        if (rest !== "none") moves.push(`r${min} = rest;`);
         return moves.join("\n");
     }
 
@@ -2705,8 +2568,10 @@ class DirectEmitter extends FunctionEmitter {
         return `${fn}(${withRuntime ? "ctx, executor, " : ""}[${this.argList(start, nargs)}], 0, ${nargs})`;
     }
 
-    emitFunction(arity: number, hasRest: boolean = false): void {
-        this.#selfArity = hasRest ? -1 : arity;
+    // the direct entry takes the parameters' values (the rest parameter's last) as js arguments
+    emitFunction(closureArity: Arity): void {
+        this.#selfArity = closureArity.rest === "none" ? closureArity.min : -1;
+        const arity = closureArity.min + (closureArity.rest === "none" ? 0 : 1);
         const params = Array.from({ length: arity }, (_, i) => `, a${i}`).join("");
         const locals = Array.from({ length: this.numReg }, (_, i) => i < arity ? `r${i} = a${i}` : `r${i}`);
         const allRegs = Array.from({ length: this.numReg }, (_, i) => `r${i}`).join(", ");

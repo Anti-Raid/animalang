@@ -1,8 +1,15 @@
-import { BS, BSReader, type SerializableBytecode } from "../common"
-import { APPLY_MULTI, APPLY_REST, APPLY_TAIL, ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
+import { ASTStringifier, BS, BSReader, type SerializableBytecode } from "../common"
+import { ByteCode, Closure, ClosureTemplate, OpCode, RUNTIME } from "./exec"
+import { INSTRUCTION_LENGTHS, NO_REG, OPCODES, type OpSpec, type OperandKind } from "./opcodes"
 import type { Intrinsics } from "./intrinsics"
 
 const intrinsicName = (code: ByteCode, pos: number): string => code.intrinsics.find(used => used.pos === pos)?.name ?? `#${pos}`
+
+const STRINGIFIER = new ASTStringifier()
+
+// (a, b . rest)
+const paramsToString = (tmpl: ClosureTemplate): string =>
+    `(${[tmpl.params.map(p => constToString(p)).join(", "), tmpl.remParams === null ? "" : `. ${constToString(tmpl.remParams)}`].filter(part => part !== "").join(" ")})`
 
 const constToString = (s: any): string => {
     if (s === null) {
@@ -27,201 +34,46 @@ const constToString = (s: any): string => {
         }
         return `(${r.join(' ')})`
     } else if (s instanceof ClosureTemplate) {
-        return `fn(${s.params.map(x => constToString(x)).join(', ')}${s.remParams ? ` . ${constToString(s.remParams)}` : ""})`
+        return `fn${paramsToString(s)}`
     } else if (s instanceof Closure) {
-        return `c.fn(${s.tmpl.params.map(x => constToString(x)).join(', ')}${s.tmpl.remParams ? ` . ${constToString(s.tmpl.remParams)}` : ""})`
+        return `c.fn${paramsToString(s.tmpl)}`
     } else {
-        return `<unknown:${s}>`
+        return STRINGIFIER.stringify(s)
     }
 }
 
-const stringifyInst = (inst: ByteCode): string[] => {
-    let ops: string[] = [];
-    let idx = 0;
-
-    const padOp = (name: string) => name.padEnd(20, ' ');
-
-    while (idx < inst.inst.length) {
-        const lineNum = idx.toString().padStart(4, '0');
-        const opcode: OpCode = inst.inst[idx];
-        let line = `${lineNum}: `;
-
-        switch (opcode) {
-            case OpCode.RETURN:
-                line += `${padOp("RETURN")} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.LOADCONST: {
-                const dest = inst.inst[idx + 1];
-                const constIdx = inst.inst[idx + 2];
-                const valStr = inst.constants ? constToString(inst.constants[constIdx]) : `[idx ${constIdx}]`;
-                line += `${padOp("LOADCONST")} r${dest}, const(${valStr})`;
-                idx += 3;
-                break;
-            }
-
-            case OpCode.LOADU32:
-                line += `${padOp("LOADU32")} r${inst.inst[idx + 1]}, ${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-
-            case OpCode.MOVE:
-            case OpCode.BOX:
-            case OpCode.UNBOX:
-            case OpCode.SETBOX:
-                line += `${padOp(OpCode[opcode])} dest=r${inst.inst[idx + 1]}, src=r${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-
-            case OpCode.LOADUPVAR:
-                line += `${padOp("LOADUPVAR")} r${inst.inst[idx + 1]}, upvar(${inst.inst[idx + 2]}) andUnbox=${inst.inst[idx + 3]}`;
-                idx += 4;
-                break;
-                
-            case OpCode.SETUPVAR:
-                line += `${padOp("SETUPVAR")} r${inst.inst[idx + 1]}, upvar(${inst.inst[idx + 2]}) andBox=${inst.inst[idx + 3]}`;
-                idx += 4;
-                break;
-
-            case OpCode.LOADGLOBAL:
-            case OpCode.SETGLOBAL: {
-                line += `${padOp(OpCode[opcode])} r${inst.inst[idx + 1]}, global(${constToString(inst.constants[inst.inst[idx + 2]])})`;
-                idx += 3;
-                break;
-            }
-
-            case OpCode.NEWCLOSURE:
-                ops.push(`${lineNum}: ${padOp("NEWCLOSURE")} r${inst.inst[idx + 1]}, tmpl(${inst.inst[idx + 2]}), closure=${constToString(inst.constants[inst.inst[idx + 2]])}`)
-                const childLines = stringifyInst(inst.constants[inst.inst[idx + 2]].code)
-                childLines.forEach(l => ops.push(`\t${l}`));
-                idx += 3;
-                continue
-
-            case OpCode.IF:
-            case OpCode.ELSEIF:
-                line += `${padOp(inst.inst[idx] === OpCode.IF ? "IF" : "ELSEIF")} r${inst.inst[idx + 1]}, else=#${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-
-            case OpCode.ELSE:
-                line += `${padOp("ELSE")} end=#${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.ENDIF:
-                line += `${padOp("ENDIF")}`;
-                idx += 1;
-                break;
-
-            case OpCode.CALL:
-            case OpCode.APPLY: {
-                const proc = inst.inst[idx + 1];
-                const procStr = `r${proc}`;
-                const flags = inst.inst[idx + 4];
-                const flagStr = opcode === OpCode.CALL
-                    ? (flags ? ", tail" : "")
-                    : `${flags & APPLY_TAIL ? ", tail" : ""}${flags & APPLY_REST ? ", rest-array" : ""}${flags & APPLY_MULTI ? ", multi" : ""}`;
-                line += `${padOp(OpCode[opcode])} ${procStr}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${flagStr}`;
-                idx += 5;
-                break;
-            }
-
-            case OpCode.MOVEACC:
-                line += `${padOp("MOVEACC")} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.CALLCC:
-                line += `${padOp("CALLCC")} proc=r${inst.inst[idx + 1]}${inst.inst[idx + 2] ? ", tail" : ""}`;
-                idx += 3;
-                break;
-
-            case OpCode.COYIELD:
-                line += `${padOp("COYIELD")} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.CORESUME:
-                line += `${padOp("CORESUME")} co=r${inst.inst[idx + 1]}, args=r${inst.inst[idx + 2]}${inst.inst[idx + 3] ? ", tail" : ""}`;
-                idx += 4;
-                break;
-
-            case OpCode.SETMARK:
-                line += `${padOp("SETMARK")} key=r${inst.inst[idx + 1]}, value=r${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-
-            case OpCode.CALLEC:
-                line += `${padOp("CALLEC")} proc=r${inst.inst[idx + 1]}, tok=r${inst.inst[idx + 2]}`;
-                idx += 3;
-                break;
-
-            case OpCode.CALLCATCH:
-                line += `${padOp("CALLCATCH")} proc=r${inst.inst[idx + 1]}, tok=r${inst.inst[idx + 2]}${inst.inst[idx + 3] === 0xFFFFFFFF ? "" : `, pre=r${inst.inst[idx + 3]}`}`;
-                idx += 4;
-                break;
-
-            case OpCode.CURSTACK:
-                line += `${padOp("CURSTACK")} skip=${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.RAISE:
-                line += `${padOp("RAISE")} r${inst.inst[idx + 1]}${inst.inst[idx + 2] ? ", continuable" : ""}`;
-                idx += 3;
-                break;
-
-            case OpCode.MARKSAVE:
-            case OpCode.MARKRESTORE:
-            case OpCode.CURMARKS:
-                line += `${padOp(OpCode[opcode])} r${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.UNPACK:
-                line += `${padOp("UNPACK")} r${inst.inst[idx + 1]} -> start=r${inst.inst[idx + 2]}, count=${inst.inst[idx + 3]}, flags=${inst.inst[idx + 4]}`;
-                idx += 5;
-                break;
-
-            case OpCode.BLOCK:
-            case OpCode.LOOP:
-                line += `${padOp(OpCode[opcode])} end=${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.ENDLOOP:
-            case OpCode.JUMP:
-                line += `${padOp(OpCode[opcode])} ${inst.inst[idx + 1]}`;
-                idx += 2;
-                break;
-
-            case OpCode.CALLHOST:
-                line += `${padOp("CALLHOST")} ${intrinsicName(inst, inst.inst[idx + 1])}, start=r${inst.inst[idx + 2]}, nargs=${inst.inst[idx + 3]}${inst.inst[idx + 4] ? ", tail" : ""}`;
-                idx += 5;
-                break;
-
-            case OpCode.CALLRT:
-                line += `${padOp("CALLRT")} ${RUNTIME[inst.inst[idx + 1]].name}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
-                idx += 5;
-                break;
-
-            case OpCode.CALLINT:
-            case OpCode.APPLYINT:
-            case OpCode.APPLYINTR:
-                line += `${padOp(OpCode[opcode])} ${intrinsicName(inst, inst.inst[idx + 1])}, dest=r${inst.inst[idx + 2]}, start=r${inst.inst[idx + 3]}, nargs=${inst.inst[idx + 4]}`;
-                idx += 5;
-                break;
-
-            default:
-                let _: never = opcode
+const operandToString = (code: ByteCode, spec: OpSpec, kind: OperandKind, value: number): string => {
+    switch (kind) {
+        case "reg": return `r${value}`
+        case "optreg": return value === NO_REG ? "-" : `r${value}`
+        case "const": return constToString(code.constants[value])
+        case "u32": case "bool": return `${value}`
+        case "upvar": return `upvar(${value})`
+        case "ip": return `#${value}`
+        case "intrinsic": return intrinsicName(code, value)
+        case "runtime": return RUNTIME[value]?.name ?? `#${value}`
+        case "tail": case "flags": {
+            const names = (spec.bits ?? []).filter((_, bit) => (value & (1 << bit)) !== 0)
+            return names.length === 0 ? "-" : names.join("|")
         }
-        
-        ops.push(line);
     }
-    
-    return ops
 }
+
+// one line per instruction, `ip: NAME operand=value, ...`; the code of a NEWCLOSURE's template follows it, indented
+const stringifyInst = (code: ByteCode): string[] => {
+    const lines: string[] = []
+    for (let ip = 0; ip < code.inst.length; ip += INSTRUCTION_LENGTHS[code.inst[ip] as OpCode]) {
+        const op = code.inst[ip] as OpCode
+        const spec = OPCODES[op]
+        if (spec === undefined) throw new Error(`unknown opcode ${op} at ${ip}`)
+        const operands = spec.operands.map(([name, kind], i) => `${name}=${operandToString(code, spec, kind, code.inst[ip + 1 + i])}`)
+        lines.push(`${ip.toString().padStart(4, "0")}: ${spec.name.padEnd(12, " ")}${operands.join(", ")}`.trimEnd())
+        if (op === OpCode.NEWCLOSURE) for (const line of stringifyInst(code.constants[code.inst[ip + 2]].code)) lines.push(`\t${line}`)
+    }
+    return lines
+}
+
+export { stringifyInst }
 
 export const deepPrint = (bc: ByteCode) => {
     console.log(stringifyInst(bc).join("\n"))
