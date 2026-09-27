@@ -1705,6 +1705,22 @@ describe('Anima', () => {
             expect(run(`(call/cc (lambda (k) (set! k (lambda (x) (* x 2))) (k 21)))`)).toBe("42")
         })
 
+        it('regressions found in a sweep', () => {
+            // the host can call a case-lambda
+            const f = evaluator.evaluateRaw(evaluator.compileRaw(`(case-lambda ((x) (* x 10)) ((x y) (+ x y)))`))
+            expect([evaluator.evaluateClosure(f, [4]), evaluator.evaluateClosure(f, [1, 2])]).toEqual([40, 3])
+            expect(() => evaluator.evaluateClosure(f, [])).toThrow("no clause takes 0 args")
+            // a pre of #f is no pre
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (list 'h r)) #f)`)).toBe("(h x)")
+            // messages show any value, symbols and lists too
+            expect(() => run(`(car 'sym)`)).toThrow("car: expected a pair but got sym")
+            expect(() => run(`(cadr '(1))`)).toThrow("cadr: list is too short")
+            expect(() => run(`(vector-ref (vector 1) 'k)`)).toThrow("vector-ref: index k out of bounds")
+            expect(() => run(`(apply + 1 '(2 . 3))`)).toThrow("apply: last argument must be a list but got (2 . 3)")
+            // an error while delivering another reaches the host worded
+            expect(() => run(`(%catch (lambda () (raise 'x)) (lambda (r) r) 5)`)).toThrow("Attempted to call a non-procedure: 5")
+        })
+
         it('call-with-continuation-barrier stops re-entry but not escapes', () => {
             expect(run(`(call-with-continuation-barrier (lambda () 5))`)).toBe("5")
             expect(run(`(+ 1 (call/cc (lambda (k) (call-with-continuation-barrier (lambda () (k 1))))))`)).toBe("2")

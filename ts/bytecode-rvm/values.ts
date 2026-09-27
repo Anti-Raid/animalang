@@ -197,9 +197,13 @@ export class EscapeContinuation extends IProcedure {
 // `guarded`: an error raised while `pre` runs comes to this %catch too, as Msg.ErrorInHandler; while it runs, the handler
 // in effect is a copy of the token for that (`of` the token itself, `inPre`)
 export class CatchToken extends EscapeContinuation {
-    constructor(ctxId: number, wind: WindPoint | null, code: ByteCode, reg: number, public readonly pre: any = null,
+    // a pre of #f or <#void> is none (e.g. xpcall with no handler)
+    public readonly pre: any;
+
+    constructor(ctxId: number, wind: WindPoint | null, code: ByteCode, reg: number, pre: any = null,
         public readonly guarded: boolean = false, readonly of: CatchToken | null = null) {
         super(ctxId, wind, code, reg);
+        this.pre = pre === false || pre === undefined ? null : pre;
     }
 
     get inPre(): boolean {

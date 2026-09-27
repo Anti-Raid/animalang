@@ -81,7 +81,7 @@ const cxrPaths = (depth: number): string[] => depth === 0 ? [""] : cxrPaths(dept
 const cxr = (name: string, path: string): SchemeBuiltin => builtin(name, 1, 1, (regs, start) => {
     let val = regs[start];
     for (let i = path.length - 1; i >= 0; i--) {
-        if (!(val instanceof Cons)) throw hostError(val === null ? `${name}: list is too short` : `${name}: expected a pair but got ${val}`);
+        if (!(val instanceof Cons)) throw hostError(val === null ? `${name}: list is too short` : `${name}: expected a pair but got ${new ASTStringifier().stringify(val)}`);
         val = path[i] === "a" ? val.car : val.cdr;
     }
     return val;
@@ -111,7 +111,7 @@ const requireVector = (name: string, val: any): any[] => {
 };
 
 const vectorIndex = (name: string, vec: any[], k: any): number => {
-    if (typeof k !== "number" || !Number.isInteger(k) || k < 0 || k >= vec.length) throw hostError(`${name}: index ${k} out of bounds for vector of length ${vec.length}`);
+    if (typeof k !== "number" || !Number.isInteger(k) || k < 0 || k >= vec.length) throw hostError(`${name}: index ${new ASTStringifier().stringify(k)} out of bounds for vector of length ${vec.length}`);
     return k;
 };
 
@@ -482,7 +482,7 @@ const INLINE_DEPS = { Cons, MCons, Table, IProcedure, ErrorObject, ContinuationM
 const spreadList = (lst: any, into: any[] = []): any[] => {
     let p = lst;
     for (; p instanceof Cons; p = p.cdr) into.push(p.car);
-    if (p !== null) throw hostError(`apply: last argument must be a list but got ${String(lst)}`);
+    if (p !== null) throw hostError(`apply: last argument must be a list but got ${new ASTStringifier().stringify(lst)}`);
     return into;
 };
 

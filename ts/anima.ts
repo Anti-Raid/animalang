@@ -1,5 +1,6 @@
 import { Env, CORE_LAMBDA } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
+import type { CaseLambda } from "./bytecode-rvm/bytecode"
 import { newIntrinsics } from "./bytecode-rvm/core"
 import { Compiler } from "./bytecode-rvm/compiler"
 import { AnimaVM } from "./bytecode-rvm/vm"
@@ -76,7 +77,7 @@ export class Anima {
         return this.#vm.evaluateRaw(code, this.#scope)
     }
 
-    public evaluateClosure(code: Closure, args: any[]): any {
+    public evaluateClosure(code: Closure | CaseLambda, args: any[]): any {
         return this.#vm.evaluateClosure(code, this.#scope, args)
     }
 

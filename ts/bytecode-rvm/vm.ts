@@ -2,6 +2,7 @@ import { ErrorObject, Env, VMError, unpackValues, type SourcePos } from "../comm
 import { type ExecutionMode, OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 import { Intrinsics } from "./intrinsics";
 import { newIntrinsics } from "./core";
+import { CaseLambda } from "./bytecode";
 
 export {
     CodeEmitter,
@@ -47,7 +48,8 @@ export class AnimaVM {
         return this.#run(ctx, this.executor.newFrame(ctx, topClosure, createRegs(code.numReg), null));
     }
 
-    public evaluateClosure(code: Closure, scope: Env, args: any[]): any {
+    public evaluateClosure(code: Closure | CaseLambda, scope: Env, args: any[]): any {
+        if (code instanceof CaseLambda) code = this.#entry(() => (code as CaseLambda).select(args.length));
         const ctx = new ExecutionContext(this, scope);
         const cargs = this.executor.createClosureArg(code, args.length, args, 0);
         return this.#run(ctx, this.executor.newFrame(ctx, code, cargs, null));
@@ -80,11 +82,22 @@ export class AnimaVM {
         return formatTraceback(frameInfos(co.frame), msg, this.intrinsics.format);
     }
 
-    #run(ctx: ExecutionContext, frame: Frame): any {
-        if (this.mode === "aot") {
-            AotCompiler.compileAll(frame.code, frame.closure.tmpl);
-            return AotCompiler.run(ctx, frame, this.executor);
+    // an error that leaves for the host is worded, whatever path it took out
+    #entry<T>(run: () => T): T {
+        try {
+            return run();
+        } catch (err) {
+            throw this.message(err);
         }
-        return BytecodeInterpreter.run(ctx, frame, this.executor);
+    }
+
+    #run(ctx: ExecutionContext, frame: Frame): any {
+        return this.#entry(() => {
+            if (this.mode === "aot") {
+                AotCompiler.compileAll(frame.code, frame.closure.tmpl);
+                return AotCompiler.run(ctx, frame, this.executor);
+            }
+            return BytecodeInterpreter.run(ctx, frame, this.executor);
+        });
     }
 }
