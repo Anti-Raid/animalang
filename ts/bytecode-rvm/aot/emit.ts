@@ -202,7 +202,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
 
     protected directGuard(proc: string, nargs: string): string {
-        return `${proc} instanceof Closure && ${proc}.tmpl.code.directArity === ${nargs}${this.depthCheck}`;
+        return `${proc} instanceof Closure && (${proc}.tmpl.code.directArity === ${nargs} || ${proc}.tmpl.code.directPad)${this.depthCheck}`;
     }
 
     protected restGuard(proc: string, nargs: string): string {
@@ -211,14 +211,16 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     protected selfMoves(term: Extract<AotTerm, { k: "MaybeSelfTailCall" }>): string {
         // as bindArgs, over registers held in js variables: the rest value first, then the positionals, moving down
-        const { min, rest } = term.arity;
-        const restRegs = Array.from({ length: term.nargs - min }, (_, i) => `r${term.start + min + i}`);
+        // a padded closure's missing parameters are <#void>, its extra arguments dropped unless it has a rest parameter
+        const { params: min, rest } = term.arity;
+        const restRegs = Array.from({ length: Math.max(term.nargs - min, 0) }, (_, i) => `r${term.start + min + i}`);
         const moves: string[] = [];
         if (rest === "array") moves.push(`const rest = [${restRegs.join(", ")}];`);
         if (rest === "packed") moves.push(`const rest = ${this.intrinsicCall(term.restPos, term.start + min, term.nargs - min)};`);
-        for (let i = 0; i < min; i++) {
+        for (let i = 0; i < Math.min(min, term.nargs); i++) {
             if (term.start + i !== i) moves.push(`r${i} = r${term.start + i};`);
         }
+        for (let i = term.nargs; i < min; i++) moves.push(`r${i} = undefined;`);
         if (rest !== "none") moves.push(`r${min} = rest;`);
         return moves.join("\n");
     }
@@ -571,8 +573,8 @@ export class DirectEmitter extends FunctionEmitter {
 
     // the direct entry takes the parameters' values (the rest parameter's last) as js arguments
     emitFunction(closureArity: Arity): void {
-        this.#selfArity = closureArity.rest === "none" ? closureArity.min : -1;
-        const arity = closureArity.min + (closureArity.rest === "none" ? 0 : 1);
+        this.#selfArity = closureArity.rest === "none" ? closureArity.params : -1;
+        const arity = closureArity.params + (closureArity.rest === "none" ? 0 : 1);
         const params = Array.from({ length: arity }, (_, i) => `, a${i}`).join("");
         const locals = Array.from({ length: this.numReg }, (_, i) => i < arity ? `r${i} = a${i}` : `r${i}`);
         const allRegs = Array.from({ length: this.numReg }, (_, i) => `r${i}`).join(", ");
@@ -771,6 +773,7 @@ export class DirectEmitter extends FunctionEmitter {
                 const val = executor.callDirectRest(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
                 return val;
             }
+            if (${proc} instanceof Closure && ${proc}.tmpl.arity.pad) return executor.callPadded(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
             if (${proc} instanceof CaseLambda) {
                 const clause = ${proc}.select(${nargs});
                 if (${this.directGuard("clause", `${nargs}`)}) return clause.tmpl.code.directFn(ctx, clause, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
@@ -789,6 +792,8 @@ export class DirectEmitter extends FunctionEmitter {
                 ${done} executor.callDirect(ctx, proc, args, depth + 1, marks, ${frameArg});
             } else if (${this.restGuard("proc", "args.length")}) {
                 ${done} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${frameArg});
+            } else if (proc instanceof Closure && proc.tmpl.arity.pad) {
+                ${done} executor.callPadded(ctx, proc, args, depth + 1, marks, ${frameArg});
             } else if (proc instanceof CaseLambda) {
                 ${done} executor.callCase(ctx, proc, args, depth + 1, marks, ${frameArg});
             } else {
@@ -809,6 +814,8 @@ export class DirectEmitter extends FunctionEmitter {
                     acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
                 } else if (${this.restGuard("proc", `${nargs}`)}) {
                     acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
+                } else if (proc instanceof Closure && proc.tmpl.arity.pad) {
+                    acc = executor.callPadded(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
                 } else if (proc instanceof CaseLambda) {
                     const clause = proc.select(${nargs});
                     acc = ${this.directGuard("clause", `${nargs}`)}

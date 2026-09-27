@@ -15,6 +15,8 @@ export const OP_QUOTE  = Symbol.for("quote");
 export const OP_AND      = Symbol.for("and");
 export const OP_OR       = Symbol.for("or");
 export const OP_AT = Symbol.for("%at");
+// (%case-lambda (%lambda formals body ...) ...): case-lambda's clauses, which toCore makes one %lambda of
+export const OP_CASE_LAMBDA = Symbol.for("%case-lambda");
 
 // keywords code cannot bind
 export const SCHEME_SPECIAL_FORMS: readonly symbol[] = [
@@ -36,6 +38,7 @@ export const SCHEME_SPECIAL_FORMS: readonly symbol[] = [
     Symbol.for("let-values"),
     Symbol.for("let*-values"),
     OP_AT,
+    OP_CASE_LAMBDA,
     ...["when", "unless", "case", "do", "=>", "define-values", "delay", "delay-force", "parameterize", "case-lambda", "reset", "shift", "quasiquote", "unquote", "unquote-splicing"].map(name => Symbol.for(name)),
 ];
 

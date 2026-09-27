@@ -16,7 +16,6 @@ import {
     CORE_LETREC,
     CORE_LET_STAR,
     CORE_WITH_MARK,
-    CORE_CASE_LAMBDA,
     CORE_CATCH,
     OP_RAISE,
     OP_CURRENT_MARKS,
@@ -27,7 +26,7 @@ import { Cons } from "../list";
 import { toCore } from "../core";
 import { schemeFormat } from "../messages";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
-import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
+import { OP_CASE_LAMBDA, OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
 import { SCHEME_ALIASES } from "../builtins";
 import type { Closure } from "../../bytecode-rvm/exec";
 
@@ -558,9 +557,9 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     evaluator.registerTransform(Symbol.for("case-lambda"), (evaluator, expr, orig) => {
         const clauses = toArray(expr);
         if (clauses.length === 0 || clauses.some(c => !(c instanceof Cons) || !(c.cdr instanceof Cons))) throw new Error("case-lambda must be of form (case-lambda (formals body ...) ...)");
-        return { expanded: cons(CORE_CASE_LAMBDA, fromArray(clauses.map(c => cons(OP_LAMBDA, c)))), state: TransformState.Recurse };
+        return { expanded: cons(OP_CASE_LAMBDA, fromArray(clauses.map(c => cons(OP_LAMBDA, c)))), state: TransformState.Recurse };
     });
-    evaluator.registerTransform(CORE_CASE_LAMBDA, (evaluator, expr, orig) => ({ expanded: orig, state: TransformState.DoChildren }));
+    evaluator.registerTransform(OP_CASE_LAMBDA, (evaluator, expr, orig) => ({ expanded: orig, state: TransformState.DoChildren }));
 
     // (reset e ...) and (shift k e ...) under the default prompt tag: shift aborts to the reset with a thunk that runs
     // its body, where k reinstates the continuation up to the reset, itself inside a reset

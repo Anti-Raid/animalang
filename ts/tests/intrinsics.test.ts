@@ -158,6 +158,39 @@ describe('Anima', () => {
             expect(() => other.evaluateRaw(other.compileRaw("(raise 'boom)"))).toThrow("<v>")
         })
 
+        it('pads the arguments of a padded clause (Lua)', () => {
+            const S = Symbol.for
+            const L = (options: string[], params: string[], rest: string | null, ...body: any[]) => [S("%lambda"), [options.map(S), params.map(S), rest === null ? null : S(rest), ...body]]
+            const list = (...xs: any[]) => [S("%list"), ...xs]
+            const q = (x: any) => [S("%quote"), x]
+            // core forms, straight to the compiler (compileRawAst would read them as Scheme data)
+            const compile = (ast: any) => evaluator.compiler.compile(ast)
+            const run = (ast: any) => s.stringify(evaluator.evaluateRaw(compile(ast)))
+            const f = L(["pad"], ["a", "b"], null, list(S("a"), S("b")))
+            // missing ones are <#void>, extra ones dropped: bound locally, globally, and applied
+            expect(run([S("%let"), [[S("f"), f]], list([S("f"), 1], [S("f"), 1, 2], [S("f"), 1, 2, 3], [S("f")])])).toBe("((1 <#void>) (1 2) (1 2) (<#void> <#void>))")
+            expect(run([S("%begin"), [S("%define-global"), S("pf"), f], list([S("pf"), 1], [S("pf"), 1, 2, 3], [S("%apply"), S("pf"), [S("%quote"), [7]]])])).toBe("((1 <#void>) (1 2) (7 <#void>))")
+            // with a rest parameter, extra ones go to it
+            const r = L(["pad"], ["a"], "r", list(S("a"), S("r")))
+            expect(run([S("%let"), [[S("r"), r]], list([S("r")], [S("r"), 1, 2, 3])])).toBe("((<#void> ()) (1 (2 3)))")
+            // a self tail call with fewer arguments pads them too
+            const loop = L(["pad"], ["n", "acc"], null, [S("%if"), [S("="), S("n"), 0], S("acc"), [S("g"), [S("-"), S("n"), 1]]])
+            expect(run([S("%letrec"), [[S("g"), loop]], [S("g"), 3, q(S("x"))]])).toBe("<#void>")
+            // deep, past direct code's depth, with an extra argument each time
+            const deep = L(["pad"], ["n"], null, [S("%if"), [S("="), S("n"), 0], 0, [S("+"), 1, [S("h"), [S("-"), S("n"), 1], q(S("extra"))]]])
+            expect(run([S("%begin"), [S("%define-global"), S("h"), deep], [S("h"), 3000]])).toBe("3000")
+            // a padded last clause takes the counts no clause before it does
+            const two = [S("%lambda"), [[], [S("a")], null, q(S("one"))], [[S("pad")], [S("a"), S("b")], null, list(S("a"), S("b"))]]
+            expect(run([S("%begin"), [S("%define-global"), S("t2"), two], list([S("t2"), 1], [S("t2")], [S("t2"), 1, 2, 3])])).toBe("(one (<#void> <#void>) (1 2))")
+            expect(run([S("%let"), [[S("t3"), two]], list([S("t3"), 1], [S("t3")], [S("t3"), 1, 2, 3])])).toBe("(one (<#void> <#void>) (1 2))")
+            expect(() => compile([S("%lambda"), [[S("pad")], [], null, 1], [[], [], null, 2]])).toThrow("a clause after a padded one would never run")
+            expect(() => compile([S("%lambda"), [[S("nope")], [], null, 1]])).toThrow("unknown clause option nope")
+            // it survives serialization, and the host can call it
+            const bc = compile(f)
+            const loaded = evaluator.evaluateRaw(readFull(dumpFull(bc), evaluator.intrinsics) as ByteCode)
+            expect(s.stringify(evaluator.evaluateClosure(loaded, [5]))).toBe("(5 <#void>)")
+        })
+
         it('has no language without a front end', () => {
             const bare = new Anima(vmImpl)
             expect(bare.intrinsics.byName("%car")).toBeUndefined()
@@ -165,9 +198,9 @@ describe('Anima', () => {
             const ifForm = [Symbol.for("%if"), false, 1, [Symbol.for("%values"), 2, 3]]
             expect(s.stringify(bare.evaluateRaw(bare.compileRawAst(ifForm)))).toBe("(values 2 3)")
             // its sequences are arrays: rest parameters, and what %apply spreads
-            const restForm = [[Symbol.for("%lambda"), [], Symbol.for("r"), Symbol.for("r")], 1, 2]
+            const restForm = [[Symbol.for("%lambda"), [[], [], Symbol.for("r"), Symbol.for("r")]], 1, 2]
             expect(bare.evaluateRaw(bare.compileRawAst(restForm))).toEqual([1, 2])
-            const applyForm = [Symbol.for("%apply"), [Symbol.for("%lambda"), [Symbol.for("a")], Symbol.for("r"), Symbol.for("r")], 1, [Symbol.for("%quote"), [2, 3]]]
+            const applyForm = [Symbol.for("%apply"), [Symbol.for("%lambda"), [[], [Symbol.for("a")], Symbol.for("r"), Symbol.for("r")]], 1, [Symbol.for("%quote"), [2, 3]]]
             expect(bare.evaluateRaw(bare.compileRawAst(applyForm))).toEqual([2, 3])
             // values print neutrally, unless the front end has its own printer
             // nor wording: without a formatter, a message is its op's name, and the host reads the op and its arguments
@@ -317,7 +350,7 @@ describe("Control operations", () => {
 describe("Argument binding", () => {
     it("binds positionals and a packed or array rest, in place over the argument window too", () => {
         const packed = closureArity(2, "packed")
-        expect(packed).toEqual({ min: 2, max: Infinity, rest: "packed" })
+        expect(packed).toEqual({ min: 2, max: Infinity, rest: "packed", params: 2, pad: false })
         const fresh: any[] = []
         bindArgs(packed, fresh, ["x", "a", "b", "c", "d"], 1, 4, (regs, start, nargs) => regs.slice(start, start + nargs).join("+"))
         expect(fresh).toEqual(["a", "b", "c+d"])
@@ -337,7 +370,7 @@ describe("Argument binding", () => {
         expect(arityMessage("f", 2, 3, 4)).toBe("f: expected 2 to 3 args, got 4")
         const anima = createScheme(impl)
         const tmpl = (anima.compileRaw("(define (ab-f a . r) r)") as ByteCode).constants.find((c: any) => c instanceof Closure)!.tmpl
-        expect(tmpl.arity).toEqual({ min: 1, max: Infinity, rest: "packed" })
+        expect(tmpl.arity).toEqual({ min: 1, max: Infinity, rest: "packed", params: 1, pad: false })
         expect(() => anima.evaluateRaw(anima.compileRaw("(define (ab-g a b) a) (ab-g 1)"))).toThrow("ab-g: expected exactly 2 args, got 1")
         expect(() => anima.evaluateRaw(anima.compileRaw("(apply %car '(1 2))"))).toThrow("%car: expected exactly 1 args, got 2")
         expect(() => anima.compileRaw("(%car 1 2)")).toThrow("%car: expected exactly 1 args, got 2")

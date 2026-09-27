@@ -21,6 +21,7 @@ import { AnalysisScope, VariableMetadata } from "./scope";
 
 const OP_APPLY = Symbol.for("%apply");
 import { CORE_FORMS } from "./core";
+import { bodyOf, clausesOf, isSingleLambda, paramsOf, restOf } from "./lambda";
 import type { Intrinsics } from "./intrinsics";
 
 // Analyzes the core forms (arrays, see compiler.ts) to handle scoping prior to actual compilation. This lets us avoid
@@ -30,7 +31,7 @@ import type { Intrinsics } from "./intrinsics";
 const subExprs = (e: any[]): any[] => {
     switch (e[0]) {
         case CORE_QUOTE: return [];
-        case CORE_LAMBDA: return e.slice(3);
+        case CORE_LAMBDA: return clausesOf(e).flatMap(bodyOf);
         case CORE_LET: case CORE_LET_STAR: case CORE_LETREC: return [...e[1].map((b: any[]) => b[1]), ...e.slice(2)];
         case CORE_LET_VALUES: case CORE_LET_VALUES_STRICT: return [...e[1].map((c: any[]) => c[2]), ...e.slice(2)];
         case CORE_SET: case OP_DEFINE_GLOBAL: return [e[2]];
@@ -51,7 +52,7 @@ const lambdaMentions = (e: any, names: ReadonlySet<symbol>): boolean =>
 // (or its own) init mentions it, or earlier inits may have run the %letrec's lambdas, whose nested closures could then
 // have copied it. Inits that mention a lambda's name, or a value whose init did, may run them
 const lateValues = (bindings: [symbol, any][]): symbol[] => {
-    const isLambda = (init: any) => Array.isArray(init) && init[0] === CORE_LAMBDA;
+    const isLambda = isSingleLambda;
     const runsGroup = new Set<symbol>(bindings.filter(([, init]) => isLambda(init)).map(([name]) => name));
     const values = bindings.filter(([, init]) => !isLambda(init));
     const late: symbol[] = [];
@@ -96,16 +97,19 @@ export class AstAnalysis {
         switch (op) {
             case CORE_QUOTE:
                 return; // don't touch quoted
+            // each clause is a function of its own
             case CORE_LAMBDA: {
-                const lambdaScope = new AnalysisScope(scope);
-                for (const p of ast[1]) lambdaScope.define(p);
-                const rest: symbol | null = ast[2];
-                if (rest !== null) {
-                    lambdaScope.define(rest);
-                    lambdaScope.getVarinfo(rest)!.isRestParam = true;
+                for (const c of clausesOf(ast)) {
+                    const lambdaScope = new AnalysisScope(scope);
+                    for (const p of paramsOf(c)) lambdaScope.define(p);
+                    const rest = restOf(c);
+                    if (rest !== null) {
+                        lambdaScope.define(rest);
+                        lambdaScope.getVarinfo(rest)!.isRestParam = true;
+                    }
+                    this.scopeMap.set(c, lambdaScope);
+                    for (const e of bodyOf(c)) this.visit(e, lambdaScope);
                 }
-                this.scopeMap.set(ast, lambdaScope);
-                for (const e of ast.slice(3)) this.visit(e, lambdaScope);
                 return;
             }
             case CORE_SET: {
@@ -241,9 +245,11 @@ class CallLiveness {
             case CORE_QUOTE:
                 return out;
             case CORE_LAMBDA: {
-                // a separate function: its own locals, and no escapes into ours
-                const lambdaScope = this.scopeMap.get(ast);
-                if (lambdaScope !== undefined) this.#seq(ast.slice(3), lambdaScope, new Set(), new Map());
+                // separate functions: their own locals, and no escapes into ours
+                for (const c of clausesOf(ast)) {
+                    const lambdaScope = this.scopeMap.get(c);
+                    if (lambdaScope !== undefined) this.#seq(bodyOf(c), lambdaScope, new Set(), new Map());
+                }
                 return out;
             }
             // (%if c1 e1 c2 e2 ... [else]): each ci runs after the ones before it, then its branch or the rest of the chain

@@ -1,8 +1,9 @@
-import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_CASE_LAMBDA, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
+import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { liftLambdas } from "./lift";
+import { PAD, bodyOf, clausesOf, isPadded, isSingleLambda, optionsOf, paramsOf, restOf } from "./lambda";
 import { corePos } from "./exec";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
@@ -125,9 +126,6 @@ export class Compiler {
                     return
                 case CORE_SET:
                     this.#compileSet(expr, opts)
-                    return
-                case CORE_CASE_LAMBDA:
-                    this.#compileCaseLambda(expr, opts, name)
                     return
                 case CORE_LAMBDA:
                     this.#compileLambda(expr, opts, name)
@@ -277,25 +275,32 @@ export class Compiler {
         }
     }
 
-    // [%case-lambda, [%lambda ...] ...]: the clauses' closures, in a block, made into one procedure (%make-case-lambda)
-    #compileCaseLambda(expr: any[], opts: CmpOpts, name?: string) {
-        const clauses = expr.slice(1)
-        if (clauses.length === 0 || clauses.some(c => !Array.isArray(c) || c[0] !== CORE_LAMBDA)) throw new VMError(Msg.CaseLambdaForm, [])
+    // [%lambda, clause ...]: one clause is a closure; several are their closures, made in a block, then one procedure
+    // that runs the first taking the call's count (%make-case-lambda)
+    #compileLambda(expr: any[], opts: CmpOpts, name?: string) {
+        const clauses = clausesOf(expr)
+        const wellFormed = (c: any) => Array.isArray(c) && Array.isArray(c[0]) && c[0].every((o: any) => typeof o === "symbol")
+            && Array.isArray(c[1]) && (c[2] === null || typeof c[2] === "symbol")
+        if (clauses.length === 0 || !clauses.every(wellFormed)) throw new VMError(Msg.LambdaForm, [])
+        for (const c of clauses) for (const o of optionsOf(c)) if (o !== PAD) throw new VMError(Msg.LambdaOption, [o])
+        // a padded clause takes any count, so none after it would ever run
+        const padded = clauses.findIndex(isPadded)
+        if (padded !== -1 && padded < clauses.length - 1) throw new VMError(Msg.UnreachableClause, [])
+        if (clauses.length === 1) return this.#compileClause(clauses[0], opts, name)
         const startReg = opts.scope.regAlloc.allocBlock(clauses.length)
-        clauses.forEach((clause, i) => this.#compile(clause, { ...opts, destReg: startReg + i, isTail: false, name }))
+        clauses.forEach((c, i) => this.#compileClause(c, { ...opts, destReg: opts.destReg === undefined ? undefined : startReg + i, isTail: false }, name))
         this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%make-case-lambda"), destReg, startReg, nargs: clauses.length }))
         opts.scope.regAlloc.freeBlock(startReg, clauses.length)
     }
 
-    // [%lambda, params, rest, body ...]: params an array of symbols, rest a symbol or null
-    #compileLambda(expr: any[], opts: CmpOpts, name?: string) {
+    // [options, params, rest, body ...]: params an array of symbols, rest a symbol or null
+    #compileClause(clause: any[], opts: CmpOpts, name?: string) {
         const lambdaScope = new CompilerScope(opts.scope)
-        const ascope = opts.analyzer.scopeMap.get(expr)
-        if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
+        const ascope = opts.analyzer.scopeMap.get(clause)
+        if (!ascope) throw new Error(`internal error: could not find ascope for clause ${clause}`)
 
-        const params: symbol[] = expr[1]
-        const remParams: symbol | null = expr[2]
-        if (!Array.isArray(params) || (remParams !== null && typeof remParams !== "symbol")) throw new VMError(Msg.LambdaForm, [])
+        const params: symbol[] = paramsOf(clause)
+        const remParams: symbol | null = restOf(clause)
         const seen = new Set<symbol>()
         for (const p of params) ensureCanBind(p, seen, "lambda")
         if (remParams !== null) ensureCanBind(remParams, seen, "lambda")
@@ -324,13 +329,13 @@ export class Compiler {
 
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
-        this.#compile(bodyExpr(expr.slice(3)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
+        this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
         const rest = remParams === null || ascope.getVarinfo(remParams)!.forwardsRest || this.intrinsics.pack === undefined ? "array" : "packed"
-        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, rest);
+        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, rest, isPadded(clause));
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
     }
 
@@ -704,7 +709,7 @@ export class Compiler {
         const ascope = opts.analyzer.scopeMap.get(expr)
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
         const bindings: [symbol, any][] = expr[1]
-        const isLambda = bindings.map(([, init]) => Array.isArray(init) && init[0] === CORE_LAMBDA)
+        const isLambda = bindings.map(([, init]) => isSingleLambda(init))
 
         opts.scope.enterBlock()
         const seen = new Set<symbol>()

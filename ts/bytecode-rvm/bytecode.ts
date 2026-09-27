@@ -32,6 +32,9 @@ export class ByteCode implements SerializableBytecode {
     public directFn: DirectFn | null = null;
     public directArity: number = -1;
     public directRestArity: number = -1;
+    // a padded closure with no rest parameter: its direct entry takes any count (JS fills missing arguments with
+    // undefined, <#void>, and ignores extra ones)
+    public directPad: boolean = false;
     // how often a direct call of this function ended in a suspend for call/cc, a continuation, a yield or a resume (see
     // resumeSuspend)
     public controlSuspends: number = 0;
@@ -214,17 +217,17 @@ export class ClosureTemplate implements SerializableBytecode {
     // how it binds its arguments: every call binds them through this (see bindArgs)
     readonly arity: Arity;
 
-    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null, public rest: RestKind = "array") {
+    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null, public rest: RestKind = "array", public pad: boolean = false) {
         this.params = params;
         this.remParams = remParams;
         this.code = code;
         this.upvarLocs = upvarLocs;
-        this.arity = closureArity(params.length, remParams === null ? "none" : rest);
+        this.arity = closureArity(params.length, remParams === null ? "none" : rest, pad);
     }
 
     // the same template running other code
     withCode(code: ByteCode): ClosureTemplate {
-        return new ClosureTemplate(this.params, this.remParams, code, this.upvarLocs, this.name, this.rest);
+        return new ClosureTemplate(this.params, this.remParams, code, this.upvarLocs, this.name, this.rest, this.pad);
     }
 
     dump(bs: BS) {
@@ -234,6 +237,7 @@ export class ClosureTemplate implements SerializableBytecode {
         bs.writeValue(this.upvarLocs);
         bs.writeValue(this.name);
         bs.writeValue(this.rest);
+        bs.writeValue(this.pad);
     }
 
     static register(bsr: BSReader) {
@@ -244,7 +248,8 @@ export class ClosureTemplate implements SerializableBytecode {
             const upvarLocs = bsr.readArray() as UpVarLoc[];
             const name = bsr.read() as string | null;
             const rest = bsr.read() as RestKind;
-            return new ClosureTemplate(params, remParams, code, upvarLocs, name, rest);
+            const pad = bsr.read() as boolean;
+            return new ClosureTemplate(params, remParams, code, upvarLocs, name, rest, pad);
         });
     }
 }
@@ -288,7 +293,7 @@ export class Closure extends IProcedure implements SerializableBytecode {
 
 
 
-// what (%case-lambda ...) makes: a call runs the first clause whose arity fits
+// what a %lambda of several clauses makes: a call runs the first clause whose arity fits
 export class CaseLambda extends IProcedure {
     constructor(readonly clauses: readonly Closure[], debugName: string = clauses[0]?.debugName ?? "case-lambda") {
         super(debugName);

@@ -302,7 +302,7 @@ export class IR {
                 }
                 case "NewClosure": {
                     const closureBc = this.lower(node.template.code, node.template.numRegs, node.template.rest === "packed")
-                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name, node.template.rest)
+                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name, node.template.rest, node.template.pad)
                     if(ct.upvarLocs.length === 0) {
                         // We can just directly push the template as a raw constant in the pool
                         const cidx = cpool.mutPush(Closure.fromTemplate(ct))
@@ -374,7 +374,7 @@ export class ClosureTemplateIR {
     numRegs: number;
     upvarLocs: UpVarLoc[] // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public rest: RestKind = "array") {
+    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public rest: RestKind = "array", public pad: boolean = false) {
         this.params = params
         this.remParams = remParams
         this.code = code

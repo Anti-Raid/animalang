@@ -51,7 +51,7 @@ export enum Msg {
     ExpectedClosure, ExpectedFinally, ExpectedCoroutine, CannotResume, CannotClose, YieldOutside, YieldClosing,
     EmptyForm, IfArgs, QuoteArgs, FormArgs, LambdaForm, SetTarget, EscapeNoBlock, EscapeFromLambda,
     BadSyntax, ParamNotSymbol, DuplicateParam, CannotBindBuiltin, CannotBindIntrinsic, IntrinsicAsValue, ApplyNonLeaf,
-    NoClause, CaseLambdaForm, BarrierReentry, NoPrompt, ErrorInHandler, CatchGuard,
+    NoClause, LambdaOption, UnreachableClause, BarrierReentry, NoPrompt, ErrorInHandler, CatchGuard,
 }
 
 export type Formatter = (op: Msg, args: readonly any[], fmt: Formatter, at: SourcePos | null) => string;
@@ -138,8 +138,6 @@ export const CORE_LET_VALUES = Symbol.for("%let-values");
 export const CORE_LET_VALUES_STRICT = Symbol.for("%let-values/strict");
 export const CORE_LETREC = Symbol.for("%letrec");
 export const CORE_LET_STAR = Symbol.for("%let*");
-// (%case-lambda (%lambda ...) ...): a procedure that runs the first clause whose arity fits the call
-export const CORE_CASE_LAMBDA = Symbol.for("%case-lambda");
 // (%with-mark key value body): body runs with a continuation mark; (%current-marks): the current continuation's marks
 export const CORE_WITH_MARK = Symbol.for("%with-mark");
 export const CORE_CATCH = Symbol.for("%catch");
@@ -171,7 +169,6 @@ export const SPECIAL_FORMS = new Set([
     CORE_LET_VALUES_STRICT,
     CORE_LETREC,
     CORE_LET_STAR,
-    CORE_CASE_LAMBDA,
     CORE_WITH_MARK,
     CORE_CATCH,
     OP_CURRENT_MARKS,

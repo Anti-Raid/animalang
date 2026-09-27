@@ -104,7 +104,7 @@ export class Anima {
 
     // without a front end, `args` is the lambda's parameters (an array of symbols) and `bast` its body, a core form
     compileAstToClosure(bast: any, args: any, globals: Env): Closure {
-        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : [CORE_LAMBDA, args, null, bast]
+        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : [CORE_LAMBDA, [[], args, null, bast]]
         const bc = this.compileRawAst(ast)
         return this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
     }

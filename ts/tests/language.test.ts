@@ -1660,7 +1660,9 @@ describe('Anima', () => {
             expect(run(`(let ((g (case-lambda ((a) a) ((a b) b)))) (list (g 1) (g 1 2)))`)).toBe("(1 2)")
             expect(run(`(let* ((x 5) (g (case-lambda ((a) (+ a x)) (() x))) (y (g 1)) (g (lambda (z) 'other))) (list y (g 9)))`)).toBe("(6 other)")
             // a call no clause takes is left to fail as it would
-            expect(() => run(`(let ((h (case-lambda ((a) a)))) (h 1 2))`)).toThrow("no clause takes 2 args")
+            expect(() => run(`(let ((h (case-lambda ((a) a) ((a b c) a)))) (h 1 2))`)).toThrow("no clause takes 2 args")
+            // one clause is a plain closure
+            expect(() => run(`(let ((h (case-lambda ((a) a)))) (h 1 2))`)).toThrow("h: expected exactly 1 args, got 2")
             // shadowed, it is not the case-lambda
             expect(run(`(let ((g (case-lambda ((a) 'clause)))) ((lambda (g) (g 1)) (lambda (x) 'shadow)))`)).toBe("shadow")
             // assigned, it is left alone

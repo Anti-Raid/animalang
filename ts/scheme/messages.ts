@@ -49,7 +49,7 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.IfArgs: return `%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else]), but got ${a[0]} arguments`;
         case Msg.QuoteArgs: return `quote must be in format ["quote", expr] but have ${a[0]} arguments`;
         case Msg.FormArgs: return `${a[0]} requires ${a[1]}, got ${a[2]}`;
-        case Msg.LambdaForm: return "%lambda must be of form [%lambda, [param ...], rest-or-null, body ...]";
+        case Msg.LambdaForm: return "%lambda must be of form [%lambda, [options, [param ...], rest-or-null, body ...] ...]";
         case Msg.SetTarget: return `set!: ${name(a[0])} is not a symbol`;
         case Msg.EscapeNoBlock: return `%escape: no enclosing block named ${String(a[0].description)}`;
         case Msg.EscapeFromLambda: return `%escape: cannot escape to block ${String(a[0].description)} from inside a lambda`;
@@ -62,9 +62,10 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.ErrorInHandler: return `error in error handling: ${a[0] instanceof ErrorObject ? a[0].error?.message ?? show(fmt, at, a[0]) : show(fmt, at, a[0])}`;
         case Msg.CatchGuard: return "%catch: guarded must be #t or #f";
         case Msg.NoPrompt: return `no continuation prompt tagged ${show(fmt, at, a[0])}`;
+        case Msg.LambdaOption: return `%lambda: unknown clause option ${name(a[0])}`;
+        case Msg.UnreachableClause: return "%lambda: a clause after a padded one would never run";
         case Msg.BarrierReentry: return "cannot re-enter a continuation barrier";
         case Msg.NoClause: return `${a[0]}: no clause takes ${a[1]} args`;
-        case Msg.CaseLambdaForm: return "%case-lambda clauses must be %lambda forms";
         case Msg.ApplyNonLeaf: return `%apply: ${a[0]} is not a leaf intrinsic, so it cannot be applied`;
         default: {
             const unworded: never = op;

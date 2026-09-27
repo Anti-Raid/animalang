@@ -6,14 +6,18 @@ import { Msg, vmError } from "../common";
 // array, or "packed" into the sequence of the table's pack intrinsic (ByteCode.restPos)
 export type RestKind = "none" | "array" | "packed";
 
+// `params`: how many positional parameters; `pad`: missing ones are <#void> and extra arguments are dropped (or go to
+// the rest parameter), so any count is taken (min 0, max ∞)
 export type Arity = {
     readonly min: number,
     readonly max: number,
     readonly rest: RestKind,
+    readonly params: number,
+    readonly pad: boolean,
 };
 
-export const closureArity = (params: number, rest: RestKind): Arity =>
-    ({ min: params, max: rest === "none" ? params : Infinity, rest });
+export const closureArity = (params: number, rest: RestKind, pad: boolean = false): Arity =>
+    ({ min: pad ? 0 : params, max: pad || rest !== "none" ? Infinity : params, rest, params, pad });
 
 export const fitsArity = (arity: { readonly min: number, readonly max: number }, nargs: number): boolean =>
     nargs >= arity.min && nargs <= arity.max;
@@ -28,12 +32,13 @@ export const checkArity = (name: string, arity: { readonly min: number, readonly
 // positionals move down (start >= 0), so the window is never overwritten before it is read. Every call runs this, so
 // the common case (no rest parameter) is kept to the copy loop
 export const bindArgs = (arity: Arity, dst: any[], src: readonly any[], start: number, nargs: number, pack: IntrinsicFn | null): void => {
-    const min = arity.min;
-    if (arity.rest === "none") {
-        for (let i = 0; i < min; i++) dst[i] = src[start + i];
+    const n = arity.params;
+    if (arity.rest === "none" && !arity.pad) {
+        for (let i = 0; i < n; i++) dst[i] = src[start + i];
         return;
     }
-    const rest = pack !== null ? pack(src as any[], start + min, nargs - min) : src.slice(start + min, start + nargs);
-    for (let i = 0; i < min; i++) dst[i] = src[start + i];
-    dst[min] = rest;
+    const extra = Math.max(nargs - n, 0);
+    const rest = arity.rest === "none" ? undefined : pack !== null ? pack(src as any[], start + n, extra) : src.slice(start + n, start + n + extra);
+    for (let i = 0; i < n; i++) dst[i] = i < nargs ? src[start + i] : undefined;
+    if (arity.rest !== "none") dst[n] = rest;
 };

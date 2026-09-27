@@ -45,7 +45,7 @@ export class Liveness {
             }
             const term = block.term;
             if (term.k === "MaybeSelfTailCall") {
-                for (let i = 0; i < term.arity.min + (term.arity.rest === "none" ? 0 : 1); i++) written.add(i);
+                for (let i = 0; i < term.arity.params + (term.arity.rest === "none" ? 0 : 1); i++) written.add(i);
             }
             if (term.k === "CallEC" || term.k === "CallCatch") written.add(term.tok);
         }

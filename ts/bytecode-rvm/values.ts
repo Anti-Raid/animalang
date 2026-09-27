@@ -174,6 +174,7 @@ export const countControlSuspend = (code: ByteCode): void => {
     if (++code.controlSuspends === DIRECT_SUSPEND_LIMIT) {
         code.directArity = -1;
         code.directRestArity = -1;
+        code.directPad = false;
     }
 };
 

@@ -108,8 +108,9 @@ export class AotCompiler {
         code.resumeFn = resume;
         if (direct !== null && tmpl !== undefined) {
             code.directFn = direct;
-            if (tmpl.arity.rest === "none") code.directArity = tmpl.arity.min;
-            else code.directRestArity = tmpl.arity.min;
+            if (tmpl.arity.rest === "none") code.directArity = tmpl.arity.params;
+            else code.directRestArity = tmpl.arity.params;
+            code.directPad = tmpl.arity.pad && tmpl.arity.rest === "none";
         }
         return resume;
     }

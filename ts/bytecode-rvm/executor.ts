@@ -184,7 +184,7 @@ export class VMExecutor {
         if (nargs < arity.min || nargs > arity.max) checkArity(closure.debugName ?? "lambda", arity, nargs);
         const closureRegs: any[] = createRegs(closure.tmpl.code.numReg);
         // bindArgs, with its common case inline: this runs on every call
-        if (arity.rest === "none") for (let i = 0; i < nargs; i++) closureRegs[i] = args[startOffset + i];
+        if (arity.rest === "none" && !arity.pad) for (let i = 0; i < nargs; i++) closureRegs[i] = args[startOffset + i];
         else bindArgs(arity, closureRegs, args, startOffset, nargs, closure.tmpl.code.pack);
         return closureRegs;
     }
@@ -202,9 +202,26 @@ export class VMExecutor {
         return fn(ctx, proc, this, depth, marks, mframe, ...args);
     }
 
+    // a call of a padded closure from direct code with another count than its parameters': the arguments padded with
+    // <#void> or cut to them, to its direct entry, else heap frames. `args` is a new array the caller gives up
+    public callPadded(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
+        const code = proc.tmpl.code;
+        const n = proc.tmpl.arity.params;
+        if (depth < MAX_JS_DEPTH && (code.directArity !== -1 || code.directRestArity !== -1)) {
+            while (args.length < n) args.push(undefined);
+            if (code.directArity !== -1) {
+                args.length = n;
+                return this.callDirect(ctx, proc, args, depth, marks, mframe);
+            }
+            return this.callDirectRest(ctx, proc, args, depth, marks, mframe);
+        }
+        throw Suspend.invoke(proc, args);
+    }
+
     // a call of a case-lambda from direct code: its clause's direct entry, else heap frames
     public callCase(ctx: ExecutionContext, proc: CaseLambda, args: any[], depth: number, marks: any, mframe: number): any {
         const clause = proc.select(args.length);
+        if (clause.tmpl.arity.pad) return this.callPadded(ctx, clause, args, depth, marks, mframe);
         const code = clause.tmpl.code;
         if (depth < MAX_JS_DEPTH) {
             if (code.directArity === args.length) return this.callDirect(ctx, clause, args, depth, marks, mframe);

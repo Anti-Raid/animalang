@@ -216,7 +216,7 @@ export class BytecodeInterpreter {
                             const arity = proc.tmpl.arity;
                             if (nargs >= arity.min && nargs <= arity.max) {
                                 // bindArgs, with its common case inline: V8 does not inline calls into this loop
-                                if (arity.rest === "none") for (let i = 0; i < nargs; i++) regs[i] = regs[startReg + i];
+                                if (arity.rest === "none" && !arity.pad) for (let i = 0; i < nargs; i++) regs[i] = regs[startReg + i];
                                 else bindArgs(arity, regs, regs, startReg, nargs, proc.tmpl.code.pack);
                                 ip = 0;
                                 break;
