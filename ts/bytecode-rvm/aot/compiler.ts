@@ -125,7 +125,8 @@ export class AotCompiler {
         for (let i = 0; i < a.length; i++) {
             const x = a[i], y = b[i];
             // name and bounds are written into the source of APPLYINT (IntApply / IntApplyRest)
-            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max) return false;
+            // and what they return, which the type facts rely on
+            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max || x.returns !== y.returns) return false;
             const dx = Object.entries(x.deps), dy = y.deps;
             if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
         }
@@ -133,7 +134,7 @@ export class AotCompiler {
     }
 
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max }; });
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns }; });
         let variants = this.#sources.get(code.inst);
         let factory = variants?.find(v => this.#sameUses(v.uses, uses))?.factory;
         if (factory === undefined) {
@@ -153,11 +154,11 @@ export class AotCompiler {
         if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
         const blocks = this.buildAot(code, tmpl);
         const usedDeps = new Set<string>();
-        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps);
+        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps, code.constants);
         resume.emitFunction();
         let direct = "null";
         if (tmpl !== undefined) {
-            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps);
+            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps, code.constants);
             out.emitFunction(tmpl.arity);
             direct = out.toString();
         }

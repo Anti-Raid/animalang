@@ -2,8 +2,8 @@ import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect } from 'vitest';
 import { createScheme } from '../scheme';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from '../bytecode-rvm/vm';
-import { CORE_INTRINSICS, corePos } from '../bytecode-rvm/exec';
-import { implAot } from '../bytecode-rvm/meta';
+import { CORE_INTRINSICS, Closure, corePos } from '../bytecode-rvm/exec';
+import { impl, implAot } from '../bytecode-rvm/meta';
 
 describe("JIT Compiler Runtime Compilation & Execution", () => {
     const animaScope = () => {
@@ -88,6 +88,35 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const scope = animaScope();
         expect(vm.evaluateRaw(bc, scope)).toBe(777);
         expect(scope.get(mySym)).toBe(777);
+    });
+
+    it("drops the type checks of what it knows to be numbers, and of number parameters in a version for them", () => {
+        const anima = createScheme(implAot);
+        const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)));
+        const source = (src: string) => {
+            const bc = anima.compileRaw(src) as ByteCode;
+            const fn = bc.constants.find((c: any) => c instanceof Closure)!;
+            const all = AotCompiler.generateSource(fn.tmpl.code, fn.tmpl);
+            return all.slice(all.indexOf("direct: function"));
+        };
+        // a loop over numbers it computes itself: no checks in the version for number parameters
+        const mandel = "(define (mandel cr ci) (let loop ((zr 0.0) (zi 0.0) (i 0)) (if (or (= i 50) (> (+ (* zr zr) (* zi zi)) 4.0)) i (loop (+ (- (* zr zr) (* zi zi)) cr) (+ (* 2.0 zr zi) ci) (+ i 1)))))";
+        const src = source(mandel);
+        expect(src).toContain('let spec = typeof r0 === "number" && typeof r1 === "number";');
+        const special = src.slice(src.indexOf("if (spec) {"), src.indexOf("return undefined;"));
+        expect(special).not.toContain("typeof");
+        // the same results as the interpreter, which has no type facts
+        const interp = createScheme(impl);
+        const grid = `${mandel} (let yl ((y 0) (acc '())) (if (= y 8) acc (yl (+ y 1) (cons (mandel (- (/ y 4) 1.5) (- (/ y 8) 0.5)) acc))))`;
+        expect(run(grid)).toBe(new ASTStringifier().stringify(interp.evaluateRaw(interp.compileRaw(grid))));
+        expect(run(`${mandel} (list (mandel 0.0 0.0) (mandel 2.0 2.0))`)).toBe("(50 1)");
+        // anything else takes the checked version, with its errors
+        expect(() => run(`${mandel} (mandel 'x 0)`)).toThrow("requires numbers");
+        // a self tail call checks again: here a number parameter becomes a symbol, which the checks must see
+        expect(run("(define (k a) (if (number? a) (if (> a 0) (k (- a 1)) (k 'end)) a)) (k 5)")).toBe("end");
+        expect(run("(define (k2 a b) (if (= b 0) a (k2 (if (= b 1) 'sym (+ a 1)) (- b 1)))) (list (k2 0 3) (k2 1.5 2))")).toBe("(sym sym)");
+        // a boolean it knows needs no truthiness test
+        expect(source("(define (p a b) (if (< a b) 1 2))")).toContain("if (r");
     });
 
     it("deoptimizes cleanly to interpreter on unhandled opcodes", () => {

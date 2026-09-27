@@ -4,6 +4,7 @@
 
 
 import { Liveness, windowRegs } from "./liveness";
+import { blockFacts, transfer, type Facts } from "./facts";
 import { MAX_STRUCTURED_NESTING, STRUCTURE_MISMATCH } from "./types";
 import type { AotBlock, AotInst, AotTerm } from "./types";
 import type { Arity } from "../arity";
@@ -120,9 +121,28 @@ export abstract class FunctionEmitter extends CodeEmitter {
         // the table the code is bound to: its intrinsics are the hoisted locals I<pos>, their deps D<slot>
         protected readonly table: Intrinsics | null = null,
         // the deps' locals the inline templates used (shared by the emitters of one function)
-        readonly usedDeps: Set<string> = new Set()
+        readonly usedDeps: Set<string> = new Set(),
+        // the code's constants, for the type facts of the ones it loads
+        protected readonly constants: readonly any[] = [],
     ) {
         super();
+    }
+
+    // what is known of the registers at the instruction being emitted (see facts.ts): set at each block's start
+    protected facts: Facts = new Map();
+
+    protected startBlock(facts: Facts | undefined): void {
+        this.facts = new Map(facts ?? []);
+    }
+
+    protected emitInstWithFacts(inst: AotInst): void {
+        this.emitInst(inst);
+        transfer(inst, this.facts, this.table, this.constants);
+    }
+
+    // a branch's condition: a known boolean as it is
+    protected truthy(reg: number): string {
+        return this.facts.get(reg) === "boolean" ? `r${reg}` : `isTruthy(r${reg})`;
     }
 
     // debug code only: statement recording the exact position of the op about to run
@@ -179,7 +199,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
         for (let i = 0; i < this.blocks.length; i++) {
             const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.inst.length;
             this.emit(`case ${this.blocks[i].start}: {`);
-            for (const inst of this.blocks[i].insts) this.emitInst(inst);
+            this.startBlock(undefined);
+            for (const inst of this.blocks[i].insts) this.emitInstWithFacts(inst);
             this.emitTerm(this.blocks[i].term, next);
             this.emit(`}`);
         }
@@ -196,8 +217,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected branch(term: Extract<AotTerm, { k: "Branch" }>, next: number): string {
-        if (term.then === next) return `if (!isTruthy(r${term.cond})) { ${this.jump(term.else, -1)} }`;
-        return `ip = isTruthy(r${term.cond}) ? ${term.then} : ${term.else}; continue top;`;
+        if (term.then === next) return `if (!${this.truthy(term.cond)}) { ${this.jump(term.else, -1)} }`;
+        return `ip = ${this.truthy(term.cond)} ? ${term.then} : ${term.else}; continue top;`;
     }
 
 
@@ -308,7 +329,12 @@ export abstract class FunctionEmitter extends CodeEmitter {
         const entry = this.table!.entries[pos];
         const direct = this.windowCall(`I${pos}`, start, nargs, entry.context);
         if (entry.inline === undefined) return direct;
-        const inlined = entry.inline(windowRegs(start, nargs).map(r => `r${r}`), this.windowCall(`RT[${pos}]`, start, nargs, entry.context), "tmp", inlineDeps(entry, this.usedDeps));
+        const regs = windowRegs(start, nargs);
+        const known = regs.map(r => this.facts.get(r) === "number");
+        // a declared result is also what the slow path gives, said so V8 keeps it unboxed through the template's branches
+        const slow = this.windowCall(`RT[${pos}]`, start, nargs, entry.context);
+        const typedSlow = entry.returns === "number" ? `+${slow}` : entry.returns === "boolean" ? `!!${slow}` : slow;
+        const inlined = entry.inline(regs.map(r => `r${r}`), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known);
         return inlined ?? direct;
     }
 
@@ -324,8 +350,8 @@ export class ResumeEmitter extends FunctionEmitter {
     protected readonly mframeVar = "frame.mframe";
     readonly #liveness: Liveness;
 
-    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false, table: Intrinsics | null = null, usedDeps: Set<string> = new Set()) {
-        super(blocks, inst, numReg, debug, table, usedDeps);
+    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false, table: Intrinsics | null = null, usedDeps: Set<string> = new Set(), constants: readonly any[] = []) {
+        super(blocks, inst, numReg, debug, table, usedDeps, constants);
         this.#liveness = new Liveness(blocks, numReg);
     }
     // follows jumps through empty blocks (left by loops and blocks) to where control really goes, saving dispatches
@@ -557,6 +583,41 @@ export class DirectEmitter extends FunctionEmitter {
     protected readonly mframeVar = "mframe";
     // this function's own arity, when a call to its own closure can call it by name (no rest parameter)
     #selfArity = -1;
+    // it is only entered at its start, so what is known at each block's start holds for the whole function
+    #entryFacts: Map<number, Facts> | null = null;
+    protected get entryFacts(): Map<number, Facts> {
+        return this.#entryFacts ??= blockFacts(this.blocks, this.table, this.constants, this.#seed);
+    }
+    // in the version for number parameters, what it knows on entry; and the check that picks that version, made again
+    // on every self tail call (its new arguments may not be numbers)
+    #seed: Facts | null = null;
+    #specCheck: string | null = null;
+
+    // the positional parameters some intrinsic with a declared result reads: a version knowing them to be numbers can
+    // drop their checks, which cost most in hot loops over the floats computed from them
+    #numericParams(params: number): number[] {
+        const read = new Set<number>();
+        for (const block of this.blocks) {
+            for (const x of block.insts) {
+                if ((x.k === "IntCall" || x.k === "IntApply") && this.table?.entries[x.pos]?.returns !== undefined) {
+                    for (const r of windowRegs(x.start, x.nargs)) read.add(r);
+                }
+            }
+        }
+        // and the registers moved into those (a parameter is usually copied to a temporary first)
+        for (let grew = true; grew;) {
+            grew = false;
+            for (const block of this.blocks) {
+                for (const x of block.insts) {
+                    if (x.k === "Move" && read.has(x.dst) && !read.has(x.src)) {
+                        read.add(x.src);
+                        grew = true;
+                    }
+                }
+            }
+        }
+        return Array.from({ length: params }, (_, i) => i).filter(i => read.has(i));
+    }
     protected readonly endOfCode = "return undefined;";
 
     protected recordIp(): string {
@@ -583,12 +644,23 @@ export class DirectEmitter extends FunctionEmitter {
                 const upvars = closure.upvars;
                 let ip = 0, rip = 0, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
+        `);
+        const numeric = this.debug ? [] : this.#numericParams(closureArity.params);
+        this.#specCheck = numeric.length > 0 ? numeric.map(i => `typeof r${i} === "number"`).join(" && ") : null;
+        const structured = this.#structuredBody();
+        const special = structured !== null && this.#specCheck !== null ? this.#structuredBody(new Map(numeric.map(i => [i, "number"]))) : null;
+        if (special === null) this.#specCheck = null;
+        this.emit(`
+                ${special !== null ? `let spec = ${this.#specCheck};` : ""}
                 try {
         `);
-        const structured = this.#structuredBody();
         if (structured !== null) {
             this.emit(`
                     top: for (;;) {
+                        ${special !== null ? `if (spec) {
+                            ${special}
+                            return undefined;
+                        }` : ""}
                         ${structured}
                         return undefined;
                     }
@@ -627,9 +699,11 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     // direct-entry code never resumes mid-function, so compiled `if`s (IF c else ... ELSE end, else: ... ENDIF, end:) can be emitted as nested js if/else
-    #structuredBody(): string | null {
-        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug, this.table, this.usedDeps);
+    #structuredBody(seed: Facts | null = null): string | null {
+        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
         body.#selfArity = this.#selfArity;
+        body.#seed = seed;
+        body.#specCheck = this.#specCheck;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {
             body.#walk(index, 0, this.inst.length);
@@ -679,7 +753,8 @@ export class DirectEmitter extends FunctionEmitter {
         while (i < blocks.length && blocks[i].start < stop) {
             const block = blocks[i];
             const next = i + 1 < blocks.length ? blocks[i + 1].start : inst.length;
-            for (const x of block.insts) this.emitInst(x);
+            this.startBlock(this.entryFacts.get(block.start));
+            for (const x of block.insts) this.emitInstWithFacts(x);
             const term = block.term;
             if (term.k === "Branch") {
                 const elseIp = term.else;
@@ -690,7 +765,7 @@ export class DirectEmitter extends FunctionEmitter {
                 if (term.elseif) {
                     const chain = this.#chains.get(endIp);
                     if (chain === undefined) throw STRUCTURE_MISMATCH;
-                    this.emit(`if (isTruthy(r${term.cond})) {`);
+                    this.emit(`if (${this.truthy(term.cond)}) {`);
                     this.#walk(index, term.then, elseIp - 2);
                     this.emit(`break ${chain}; }`);
                     i = index.get(elseIp);
@@ -702,14 +777,14 @@ export class DirectEmitter extends FunctionEmitter {
                     const chain = `C${block.start}`;
                     this.#chains.set(endIp, chain);
                     this.emit(`${chain}: {`);
-                    this.emit(`if (isTruthy(r${term.cond})) {`);
+                    this.emit(`if (${this.truthy(term.cond)}) {`);
                     this.#walk(index, term.then, elseIp - 2);
                     this.emit(`break ${chain}; }`);
                     this.#walk(index, elseIp, endIp - 1);
                     this.emit(`}`);
                     this.#chains.delete(endIp);
                 } else {
-                    this.emit(`if (isTruthy(r${term.cond})) {`);
+                    this.emit(`if (${this.truthy(term.cond)}) {`);
                     this.#walk(index, term.then, elseIp - 2);
                     this.emit(`} else {`);
                     this.#walk(index, elseIp, endIp - 1);
@@ -908,6 +983,7 @@ export class DirectEmitter extends FunctionEmitter {
                         if (proc === closure) {
                             ${this.selfMoves(term)}
                             ip = 0;
+                            ${this.#specCheck !== null ? `spec = ${this.#specCheck};` : ""}
                             continue top;
                         }
                         ${this.#tailCall("proc", term.start, term.nargs)}

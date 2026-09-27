@@ -14,27 +14,33 @@ export type SchemeBuiltin = {
     readonly max: number,
     readonly fn: IntrinsicFn,
     readonly inline?: InlineFn,
+    // what it always returns (or else throws), for the AOT compiler's type facts
+    readonly returns?: "number" | "boolean",
 }
 
 const builtin = (name: string, min: number, max: number, fn: IntrinsicFn, inline?: InlineFn): SchemeBuiltin => ({ name, min, max, fn, inline });
 
 // --- AOT templates (see InlineFn): each falls back to the builtin itself, so its errors are unchanged ---
 
-const allNumbers = (args: string[]) => args.map(a => `typeof ${a} === "number"`).join(" && ");
+// the checks that the arguments not already known to be numbers are
+const numberChecks = (args: string[], known: readonly boolean[]) => args.filter((_, i) => !known[i]).map(a => `typeof ${a} === "number"`);
+
+// `value` when every check holds, else `slow`; no check at all when every argument is known
+const guarded = (checks: string[], value: string, slow: string) => checks.length === 0 ? `(${value})` : `(${checks.join(" && ")} ? ${value} : ${slow})`;
 
 // (op a b c) => ((a op b) op c) when every argument is a number; `unary` handles a single argument
-const foldInline = (op: string, empty: string | null, unary: (a: string) => string, divisors = false): InlineFn => (args, slow) => {
+const foldInline = (op: string, empty: string | null, unary: (a: string) => string, divisors = false): InlineFn => (args, slow, _tmp, _d, known) => {
     if (args.length === 0) return empty;
-    const nonZero = divisors ? (args.length === 1 ? args : args.slice(1)).map(d => ` && ${d} !== 0`).join("") : "";
+    const nonZero = divisors ? (args.length === 1 ? args : args.slice(1)).map(d => `${d} !== 0`) : [];
     const value = args.length === 1 ? unary(args[0]) : args.slice(1).reduce((acc, b) => `(${acc} ${op} ${b})`, args[0]);
-    return `(${allNumbers(args)}${nonZero} ? ${value} : ${slow})`;
+    return guarded([...numberChecks(args, known), ...nonZero], value, slow);
 };
 
 // (op a b c) => a op b && b op c when every argument is a number
-const chainInline = (op: string): InlineFn => (args, slow) => {
+const chainInline = (op: string): InlineFn => (args, slow, _tmp, _d, known) => {
     if (args.length === 0) return null;
     const tests = args.slice(1).map((b, i) => `${args[i]} ${op} ${b}`);
-    return `(${allNumbers(args)} ? ${tests.length > 0 ? tests.join(" && ") : "true"} : ${slow})`;
+    return guarded(numberChecks(args, known), tests.length > 0 ? tests.join(" && ") : "true", slow);
 };
 
 // a one-argument operation; the argument is always a register name, so it may be repeated freely
@@ -116,7 +122,7 @@ const vectorIndex = (name: string, vec: any[], k: any): number => {
 };
 
 const predicate = (name: string, test: (val: any) => boolean, inline?: (a: string, slow: string, d: Readonly<Record<string, string>>) => string): SchemeBuiltin =>
-    builtin(name, 1, 1, (regs, start) => test(regs[start]), inline && unaryInline(inline));
+    ({ ...builtin(name, 1, 1, (regs, start) => test(regs[start]), inline && unaryInline(inline)), returns: "boolean" });
 
 // a one-argument operation on a table
 const onTable = (name: string, op: (tbl: Table) => any, inline?: (t: string) => string): SchemeBuiltin =>
@@ -475,6 +481,14 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     onTable("table-border", tbl => tbl.border(), t => `${t}.border()`),
 ];
 
+// what the other builtins always return (the predicates declare theirs)
+const RETURNS: Readonly<Record<string, "number" | "boolean">> = {
+    "+": "number", "-": "number", "*": "number", "/": "number", "modulo": "number", "remainder": "number",
+    "length": "number", "vector-length": "number",
+    "=": "boolean", "<": "boolean", "<=": "boolean", ">": "boolean", ">=": "boolean",
+    "not": "boolean", "eq?": "boolean", "eqv?": "boolean", "equal?": "boolean",
+};
+
 // what the templates may refer to
 const INLINE_DEPS = { Cons, MCons, Table, IProcedure, ErrorObject, ContinuationMarkSet, MISSING: MISSING_KEY };
 
@@ -490,8 +504,8 @@ const spreadList = (lst: any, into: any[] = []): any[] => {
 // the same positions in every instance). Lists are the table's sequences: rest parameters are lists (%list packs them),
 // and %spread makes the array %apply takes of one
 export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
-    for (const { name, min, max, fn, inline } of SCHEME_BUILTINS) {
-        intrinsics.register(`%${name}`, fn, { args: [min, max], leaf: true, inline, deps: inline === undefined ? undefined : INLINE_DEPS });
+    for (const { name, min, max, fn, inline, returns } of SCHEME_BUILTINS) {
+        intrinsics.register(`%${name}`, fn, { args: [min, max], leaf: true, inline, deps: inline === undefined ? undefined : INLINE_DEPS, returns: returns ?? RETURNS[name] });
     }
     intrinsics.register("%list", (regs, start, nargs) => {
         let tail: Cons | null = null;

@@ -118,7 +118,7 @@ export class ByteCode implements SerializableBytecode {
             const theirs: Intrinsic | undefined = table.entries[pos];
             // a table copied from this code's (or from the same base) holds the very same entry
             if (theirs !== mine) {
-                if (theirs === undefined || theirs.name !== mine.name || theirs.fn !== mine.fn || theirs.leaf !== mine.leaf || theirs.inline !== mine.inline) return false;
+                if (theirs === undefined || theirs.name !== mine.name || theirs.fn !== mine.fn || theirs.leaf !== mine.leaf || theirs.inline !== mine.inline || theirs.returns !== mine.returns) return false;
                 for (const dep in mine.deps) if (theirs.deps[dep] !== mine.deps[dep]) return false;
                 for (const dep in theirs.deps) if (!(dep in mine.deps)) return false;
             }

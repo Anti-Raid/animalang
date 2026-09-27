@@ -41,4 +41,4 @@ export const STRUCTURE_MISMATCH = Symbol("structure mismatch");
 export const MAX_STRUCTURED_NESTING = 250;
 
 // what generated source depends on in an intrinsic it calls (not its function, so a cached source keeps none alive)
-export type SourceUse = Pick<Intrinsic, "pos" | "inline" | "deps" | "name" | "min" | "max">;
+export type SourceUse = Pick<Intrinsic, "pos" | "inline" | "deps" | "name" | "min" | "max" | "returns">;

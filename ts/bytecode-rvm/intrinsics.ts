@@ -2,7 +2,8 @@ import { Msg, opName, type Formatter } from "../common";
 // AOT inlining: given the js expressions of the arguments and of a call to the operation itself (the fallback, which
 // reports errors), returns a js expression computing the result, or null to always make the call. `tmp` names a scratch
 // variable the expression may assign; `d` maps each declared dep to the local variable holding it
-export type InlineFn = (args: string[], slow: string, tmp: string, d: Readonly<Record<string, string>>) => string | null;
+// `known`: for each argument, whether it is certainly a number (see aot/facts.ts), so the template may skip checking it
+export type InlineFn = (args: string[], slow: string, tmp: string, d: Readonly<Record<string, string>>, known: readonly boolean[]) => string | null;
 
 // Reads only regs[start .. start+nargs), and never writes to regs or keeps it: in the interpreter it is the caller's live
 // register file. A non-leaf may return hostTail(proc, ...args) instead of a value. `ctx` and `executor` (the running
@@ -31,6 +32,8 @@ export type IntrinsicOptions = {
     sequence?: "pack" | "spread",
     // returns a new array nothing else holds, which %apply may then call with as it is (as a spread intrinsic does)
     fresh?: boolean,
+    // what it always returns (or else it throws), for the AOT compiler's type facts
+    returns?: "number" | "boolean",
 }
 
 export type Intrinsic = {
@@ -43,6 +46,7 @@ export type Intrinsic = {
     readonly context: boolean,
     readonly tail: boolean,
     readonly fresh: boolean,
+    readonly returns: "number" | "boolean" | undefined,
     readonly inline: InlineFn | undefined,
     // the local variable holding each dep in generated code (D<slot> for DEPS[slot])
     readonly deps: Readonly<Record<string, string>>,
@@ -115,7 +119,7 @@ export class Intrinsics {
             deps[dep] = `D${slot}`
         }
         const entry: Intrinsic = Object.freeze({
-            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", inline: options.inline, deps: Object.freeze(deps),
+            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, inline: options.inline, deps: Object.freeze(deps),
         })
         this.entries.push(entry)
         this.fns.push(fn)
