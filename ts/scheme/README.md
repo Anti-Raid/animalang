@@ -60,7 +60,13 @@ Builtins, like every name the prelude exports, cannot be rebound.
 - `coroutine-create coroutine-resume coroutine-yield coroutine-status coroutine-close coroutine-raise`: aliases of the matching `%` operations; as values, generated wrappers (and for resume and yield, prelude procedures that pass on their rest arguments).
 - `values`, `call-with-values`: `(values a b)` is a `MultipleValues` object, `(values x)` is just `x` and `(values)` is zero values. `call-with-values` is a prelude procedure built on `%values->array`, except that a direct call whose producer and consumer are literal lambdas is rewritten to `receive`, binding the values without a list. `receive`, `let-values` (parallel binding) and `let*-values` are macros built on it. Multiple values reaching a single-value context stay a `MultipleValues` object and print as `(values a b)`.
 - `dynamic-wind` is an alias of `(%dynamic-wind before thunk after)`.
+- Continuation marks follow Racket: `with-continuation-mark`, `current-continuation-marks`, `continuation-mark-set-first` (`#f` means the current continuation; direct calls are rewritten to `%marks-first`), `continuation-mark-set->list` and `continuation-mark-set?`.
+- `with-exception-handler` sets the handlers mark (`(%handler-key)`) to `(%push-handler handler outer)` while its thunk runs.
 - Exceptions (see the exception model in `../bytecode-rvm/README.md`): `raise` / `raise-continuable` are `%raise` (direct calls are rewritten); the prelude keeps procedures of those names for use as values. `try` / `try-catch` are `%catch`, with the catch procedure running after unwinding like Racket's `with-handlers`. `(pcall f arg ...)` evaluates `f` and the arguments, then returns `(values #t result ...)` or `(values #f err)` (`%values-cons` prepends to the result values). `guard` escapes with `%call/ec` and re-raises with `raise-continuable` through a full continuation when no clause matches. Luau's `xpcall(f, h)` is `%catch` with `h` as `pre`.
+
+### Printing and source positions
+- The VM has no wording of its own (see messages in `../bytecode-rvm/README.md`): Scheme's is `schemeFormat` (`messages.ts`), its table's formatter, which words every `Msg` and prints values as Scheme data (`printer.ts`, `ASTStringifier`), so messages and tracebacks show `#t`, `()` and `#(1 2)`. The transformer's own binding checks are worded by it too.
+- The reader records the position of every list form, and `%at` overrides it. The syntax transformer carries positions through macro expansion (an expansion inherits its macro call's position), and `toCore` onto the core forms.
 
 ### `debug-frames` / `debug-traceback`
 - A direct call is rewritten by the syntax transformer, at compile time, so the prelude procedure is never called and the snapshot is taken in the calling function itself (its first frame):
@@ -68,8 +74,8 @@ Builtins, like every name the prelude exports, cannot be rebound.
   (debug-traceback "here" 2)   ; what you write
   (%debug-traceback (%current-stack) (vector "here" 2))   ; what the compiler receives
   ```
-  `debug-frames` is rewritten the same way, with `vector->list` of the frames the VM returns.
+  `debug-frames` is rewritten the same way, with `vector->list` of the frames the VM returns. `(debug-traceback co)` traces another coroutine.
 - A use as a value (e.g. `(define tb debug-traceback)`, then `(tb "here")`) has no call site to rewrite, so it calls the prelude procedure, which takes the snapshot in its own frame and skips it:
   ```scheme
-  (define $debug-traceback (lambda args (%debug-traceback (%current-stack 1) args)))
+  (define $debug-traceback (lambda args (%debug-traceback (%current-stack 1) (%list->vector args))))
   ```

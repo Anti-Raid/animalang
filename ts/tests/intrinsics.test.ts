@@ -1,4 +1,6 @@
-import { ASTStringifier } from '../common';
+import { ASTStringifier } from '../scheme/printer';
+import { Msg, VMError, type Formatter } from '../common';
+import { schemeFormat } from '../scheme/messages';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
@@ -10,7 +12,7 @@ import { Anima } from '../anima';
 import { impl, implAot } from '../bytecode-rvm/meta';
 import { dumpFull, readFull, stringifyInst } from '../bytecode-rvm/utils';
 import { OPCODES } from '../bytecode-rvm/opcodes';
-import { arityMessage, bindArgs, closureArity } from '../bytecode-rvm/arity';
+import { bindArgs, closureArity } from '../bytecode-rvm/arity';
 import { CORE_FORMS, hasCore, newIntrinsics } from '../bytecode-rvm/core';
 import { readdirSync, readFileSync } from 'fs';
 import { registerTestIntrinsics } from './helpers';
@@ -127,6 +129,35 @@ describe('Anima', () => {
             expect(createScheme(vmImpl).intrinsics.byName("%car")!.pos).toBe(evaluator.intrinsics.byName("%car")!.pos)
         })
 
+        it('words its messages through the table\'s formatter', () => {
+            const lua = createScheme(vmImpl)
+            const base = lua.intrinsics.format
+            const luaFormat: Formatter = (op, args, fmt, at) => {
+                const where = at === null ? "" : `${at.file}:${at.line}: `
+                if (op === Msg.NonProcedure) return `${where}attempt to call a ${typeof args[0]} value`
+                if (op === Msg.Arity) return `bad argument count to '${args[0]}'`
+                if (op === Msg.TracebackHeader) return `${args[0]}\nstack traceback (lua):`
+                return base(op, args, fmt, at)
+            }
+            lua.intrinsics.setFormatter(luaFormat)
+            const run = (src: string) => lua.evaluateRaw(lua.compileRaw(src))
+            // with where it happened (a tail call leaves no frame to tell)
+            expect(() => run("(+ 1 (5 1))")).toThrow(/:1: attempt to call a number value$/)
+            // Anima code that catches it sees the same message
+            expect(run("(try (lambda () (+ 1 (5 1))) (lambda (e) (error-message e)))")).toMatch(/:1: attempt to call a number value$/)
+            expect(() => run("(define (fm-f a) a) (fm-f)")).toThrow("bad argument count to 'fm-f'")
+            expect(() => run("(apply %car '(1 2))")).toThrow("bad argument count to '%car'")
+            // compile-time messages too
+            expect(() => lua.compileRaw("(%car 1 2)")).toThrow("bad argument count to '%car'")
+            expect(run(`(debug-traceback "m")`)).toMatch(/^m\nstack traceback \(lua\):\n/)
+
+            // a formatter that only words values: every message shows them its way
+            const other = createScheme(vmImpl)
+            other.intrinsics.setFormatter((op, args, fmt, at) => op === Msg.Value ? "<v>" : schemeFormat(op, args, fmt, at))
+            expect(() => other.evaluateRaw(other.compileRaw("(5 1)"))).toThrow("Attempted to call a non-procedure: <v>")
+            expect(() => other.evaluateRaw(other.compileRaw("(raise 'boom)"))).toThrow("<v>")
+        })
+
         it('has no language without a front end', () => {
             const bare = new Anima(vmImpl)
             expect(bare.intrinsics.byName("%car")).toBeUndefined()
@@ -138,6 +169,15 @@ describe('Anima', () => {
             expect(bare.evaluateRaw(bare.compileRawAst(restForm))).toEqual([1, 2])
             const applyForm = [Symbol.for("%apply"), [Symbol.for("%lambda"), [Symbol.for("a")], Symbol.for("r"), Symbol.for("r")], 1, [Symbol.for("%quote"), [2, 3]]]
             expect(bare.evaluateRaw(bare.compileRawAst(applyForm))).toEqual([2, 3])
+            // values print neutrally, unless the front end has its own printer
+            // nor wording: without a formatter, a message is its op's name, and the host reads the op and its arguments
+            expect(evaluator.intrinsics.print([true, null, Symbol.for("a"), "s"])).toBe('#(#t () a "s")')
+            expect(bare.intrinsics.print([true])).toBe("Value")
+            let thrown: any
+            try { bare.evaluateRaw(bare.compileRawAst([Symbol.for("%values"), [5, 1]])) } catch (err) { thrown = err }
+            expect(thrown).toBeInstanceOf(VMError)
+            expect([thrown.message, thrown.op, thrown.args]).toEqual(["NonProcedure", Msg.NonProcedure, [5]])
+            expect(() => bare.compileRawAst([])).toThrow("EmptyForm")
             // a front end has one pack and one spread
             expect(() => evaluator.registerIntrinsic("%my-pack", () => null, { leaf: true, sequence: "pack" })).toThrow("already has a sequence pack")
             expect(() => bare.registerIntrinsic("%my-spread", () => null, { sequence: "spread" })).toThrow("must be a leaf")
@@ -291,6 +331,7 @@ describe("Argument binding", () => {
     })
 
     it("gives closures and intrinsics one arity message", () => {
+        const arityMessage = (...args: any[]) => schemeFormat(Msg.Arity, args, schemeFormat, null)
         expect(arityMessage("f", 2, 2, 1)).toBe("f: expected exactly 2 args, got 1")
         expect(arityMessage("f", 1, Infinity, 0)).toBe("f: expected at least 1 args, got 0")
         expect(arityMessage("f", 2, 3, 4)).toBe("f: expected 2 to 3 args, got 4")

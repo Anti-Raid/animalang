@@ -1,4 +1,4 @@
-import { ASTStringifier } from '../common';
+import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';

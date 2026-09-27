@@ -1,4 +1,5 @@
-import { ASTStringifier, MissingVarError, Env } from '../common';
+import { MissingVarError, Env } from '../common';
+import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
 import { ByteCode, AnimaVM, OpCode } from '../bytecode-rvm/vm';

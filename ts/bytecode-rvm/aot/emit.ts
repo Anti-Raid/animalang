@@ -246,7 +246,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
                             const val = ctx.scope.lookup(CONSTANTS[${inst.sym}], MISSING);
                             if (val === MISSING) {
                                 ${this.recordIp(inst.ip)}
-                                throw new MissingVarError("Variable '" + String(CONSTANTS[${inst.sym}]) + "' is not defined in the current scope.");
+                                throw new MissingVarError(CONSTANTS[${inst.sym}]);
                             }
                             ctx.scope.watch();
                             cache.scope = ctx.scope;

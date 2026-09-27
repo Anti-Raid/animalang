@@ -1,4 +1,4 @@
-import { ASTStringifier } from '../common';
+import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
 import { ByteCode } from '../bytecode-rvm/vm';
@@ -194,7 +194,7 @@ describe('Anima', () => {
                         (with-exception-handler
                             (lambda (err) (k (error-message err)))
                             (lambda () undefined-variable-xyz))))
-            `)).toContain("Variable 'Symbol(undefined-variable-xyz)' is not defined");
+            `)).toContain("Variable 'undefined-variable-xyz' is not defined");
         });
 
         it('supports raise-continuable where handler returns to call site', () => {

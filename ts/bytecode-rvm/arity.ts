@@ -1,5 +1,5 @@
 import type { IntrinsicFn } from "./intrinsics";
-import { hostError } from "../errors";
+import { Msg, vmError } from "../common";
 
 // How a procedure takes its arguments, for closures and intrinsics alike: between `min` and `max` of them. A closure's
 // first `min` arguments are its positional parameters; with a `rest` parameter, the others are bound to it, as a plain
@@ -19,13 +19,8 @@ export const fitsArity = (arity: { readonly min: number, readonly max: number },
     nargs >= arity.min && nargs <= arity.max;
 
 // the one message for a wrong argument count, whatever was called
-export const arityMessage = (name: string, min: number, max: number, nargs: number): string => {
-    const expected = min === max ? `exactly ${min}` : max === Infinity ? `at least ${min}` : `${min} to ${max}`;
-    return `${name}: expected ${expected} args, got ${nargs}`;
-};
-
 export const checkArity = (name: string, arity: { readonly min: number, readonly max: number }, nargs: number): void => {
-    if (nargs < arity.min || nargs > arity.max) throw hostError(arityMessage(name, arity.min, arity.max, nargs));
+    if (nargs < arity.min || nargs > arity.max) throw vmError(Msg.Arity, name, arity.min, arity.max, nargs);
 };
 
 // binds the arguments src[start .. start+nargs) (the count already checked) to a closure's parameter registers

@@ -1,10 +1,8 @@
 // The VM's own operations as intrinsics (CORE_INTRINSICS, the start of every table), and the control requests the control
 // operations (and host intrinsics' HostTail) return for the VM to carry out at the call
-import { ASTStringifier, ErrorObject, MultipleValues, packValues, unpackValues } from "../common";
-import { hostError } from "../errors";
+import { ErrorObject, Msg, MultipleValues, packValues, unpackValues, vmError } from "../common";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markValues } from "../marks";
 import type { Marks } from "../marks";
-import { arityMessage } from "./arity";
 import type { Closure } from "./bytecode";
 import type { VMExecutor } from "./executor";
 import { Intrinsics } from "./intrinsics";
@@ -23,16 +21,16 @@ export const debugTarget = (ctx: ExecutionContext, regs: readonly any[], start: 
     return { frames, args };
 };
 
-export const tracebackMessage = (msg: any): string | undefined => {
+export const tracebackMessage = (msg: any, print: (v: any) => string): string | undefined => {
     if (msg === undefined) return undefined;
     if (typeof msg === "string") return msg;
     if (msg instanceof ErrorObject) return msg.error instanceof Error ? msg.error.message : String(msg.error);
     if (msg instanceof Error) return msg.message;
-    return new ASTStringifier().stringify(msg);
+    return print(msg);
 };
 
 export const markSetArg = (who: string, set: any): Marks => {
-    if (!(set instanceof ContinuationMarkSet)) throw hostError(`${who}: expected a continuation mark set`);
+    if (!(set instanceof ContinuationMarkSet)) throw vmError(Msg.ExpectedMarkSet, who);
     return set.marks;
 };
 
@@ -207,15 +205,15 @@ export class StackRequest extends ControlRequest {
 
 // argument checks of the control operations, shared by their intrinsics and their AOT code (CONTROL_AOT)
 export const raiseContinuable = (flag: any): boolean => {
-    if (typeof flag !== "boolean") throw hostError("%raise: continuable must be #t or #f");
+    if (typeof flag !== "boolean") throw vmError(Msg.BadContinuable);
     return flag;
 };
 export const stackSkip = (skip: any): number => {
-    if (!Number.isInteger(skip) || skip < 0) throw hostError("%current-stack: expected a count of frames to skip");
+    if (!Number.isInteger(skip) || skip < 0) throw vmError(Msg.BadStackSkip);
     return skip;
 };
 export const arrayArg = (who: string, val: any): any[] => {
-    if (!Array.isArray(val)) throw hostError(`${who}: expected an array but got ${new ASTStringifier().stringify(val)}`);
+    if (!Array.isArray(val)) throw vmError(Msg.ExpectedArray, who, val);
     return val;
 };
 // the arguments of an %apply: the window's leading values, then the elements of its last, an array. Always a new array,
@@ -275,7 +273,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         const { frames, args } = debugTarget(ctx, regs, start);
         const msg = typeof args[0] === "number" ? undefined : args.shift();
         const level = typeof args[0] === "number" ? args[0] : 0;
-        return formatTraceback(frames.slice(level), tracebackMessage(msg));
+        return formatTraceback(frames.slice(level), tracebackMessage(msg, v => ctx!.vm.print(v)), ctx!.vm.intrinsics.format);
     }, { context: true });
     // Lua's truncation of multiple values to one: the first value, or <#void> for none
     core("%first-value", [1, 1], (regs, start) => {
@@ -321,6 +319,6 @@ export const corePos = (name: string): number => {
 
 // an intrinsic's argument count checked at run time (for APPLYINT, whose count the compiler cannot know)
 export const applyIntrinsic = (fn: IntrinsicFn, name: string, min: number, max: number, args: any[], ctx: ExecutionContext, executor: VMExecutor): any => {
-    if (args.length < min || args.length > max) throw hostError(arityMessage(name, min, max, args.length));
+    if (args.length < min || args.length > max) throw vmError(Msg.Arity, name, min, max, args.length);
     return fn(args, 0, args.length, ctx, executor);
 };

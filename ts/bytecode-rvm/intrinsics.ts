@@ -1,3 +1,4 @@
+import { Msg, opName, type Formatter } from "../common";
 // AOT inlining: given the js expressions of the arguments and of a call to the operation itself (the fallback, which
 // reports errors), returns a js expression computing the result, or null to always make the call. `tmp` names a scratch
 // variable the expression may assign; `d` maps each declared dep to the local variable holding it
@@ -65,6 +66,8 @@ export class Intrinsics {
     readonly reserved = new Map<symbol, "special form" | "builtin">()
     #pack: Intrinsic | undefined
     #spread: Intrinsic | undefined
+    // how the VM's and the compiler's messages are worded (see Msg): the front end's formatter, if it sets one
+    #format: Formatter = opName
 
     // `base`: a table to start from (its entries at the same positions, and its reserved names)
     // made from a base table (every table but the core operations' own)
@@ -80,6 +83,7 @@ export class Intrinsics {
         for (const [sym, kind] of base.reserved) this.reserved.set(sym, kind)
         this.#pack = base.#pack
         this.#spread = base.#spread
+        this.#format = base.#format
     }
 
     get frozen(): boolean {
@@ -119,6 +123,20 @@ export class Intrinsics {
         if (options.sequence === "pack") this.#pack = entry
         if (options.sequence === "spread") this.#spread = entry
         return entry
+    }
+
+    get format(): Formatter {
+        return this.#format
+    }
+
+    print(v: any): string {
+        return this.#format(Msg.Value, [v], this.#format, null)
+    }
+
+    setFormatter(format: Formatter): this {
+        if (this.#frozen) throw new Error("cannot set the formatter: the intrinsics are frozen")
+        this.#format = format
+        return this
     }
 
     get pack(): Intrinsic | undefined {

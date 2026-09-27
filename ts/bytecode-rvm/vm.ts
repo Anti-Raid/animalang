@@ -1,4 +1,4 @@
-import { ASTStringifier, ErrorObject, Env, unpackValues } from "../common";
+import { ErrorObject, Env, VMError, unpackValues, type SourcePos } from "../common";
 import { type ExecutionMode, OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 import { Intrinsics } from "./intrinsics";
 import { newIntrinsics } from "./core";
@@ -28,6 +28,19 @@ export class AnimaVM {
         this.executor = new VMExecutor(this);
     }
 
+    print(v: any): string {
+        return this.intrinsics.print(v);
+    }
+
+    // the error's message as this VM's front end words it
+    message<E>(err: E, at: SourcePos | null = null): E {
+        if (err instanceof VMError) {
+            err.at ??= at;
+            err.format(this.intrinsics.format);
+        }
+        return err;
+    }
+
     public evaluateRaw(code: ByteCode, scope: Env): any {
         const ctx = new ExecutionContext(this, scope);
         const topClosure = new Closure(new ClosureTemplate([], null, code, []), [], "top-level");
@@ -45,9 +58,9 @@ export class AnimaVM {
             const values = unpackValues(this.executor.coResumeNested(null, co, args, raising));
             return { done: co.status === "dead", value: values[0], values };
         } catch (err) {
-            if (!(err instanceof ReRaise)) throw err;
+            if (!(err instanceof ReRaise)) throw this.message(err);
             const val = err.value instanceof ErrorObject ? err.value.error : err.value;
-            throw val instanceof Error ? val : new Error(new ASTStringifier().stringify(val));
+            throw val instanceof Error ? val : new Error(this.print(val));
         }
     }
 
@@ -55,16 +68,16 @@ export class AnimaVM {
         try {
             this.executor.coClose(null, co);
         } catch (err) {
-            if (!(err instanceof ReRaise)) throw err;
+            if (!(err instanceof ReRaise)) throw this.message(err);
             const val = err.value instanceof ErrorObject ? err.value.error : err.value;
-            throw val instanceof Error ? val : new Error(new ASTStringifier().stringify(val));
+            throw val instanceof Error ? val : new Error(this.print(val));
         }
     }
 
     // stack traceback of a suspended coroutine (empty if it has not started or is dead)
     public traceback(co: Coroutine, msg?: string): string {
         if (!(co instanceof Coroutine)) throw new Error("traceback: expected a coroutine");
-        return formatTraceback(frameInfos(co.frame), msg);
+        return formatTraceback(frameInfos(co.frame), msg, this.intrinsics.format);
     }
 
     #run(ctx: ExecutionContext, frame: Frame): any {

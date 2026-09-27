@@ -1,7 +1,6 @@
 // VMExecutor: calls, returns, continuations, dynamic-wind, exception delivery and coroutines, and the driver loop that
 // runs heap frames through the interpreter or AOT code
-import { Env, ErrorObject, IProcedure, UnhandledError, packValues } from "../common";
-import { hostError } from "../errors";
+import { Env, ErrorObject, IProcedure, Msg, UnhandledError, VMError, packValues, vmError } from "../common";
 import { Caught, EXCEPTION_HANDLERS, Handlers, markFirst, markSet } from "../marks";
 import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
@@ -11,7 +10,7 @@ import type { VMHost } from "./bytecode";
 import { CORE_INTRINSICS, corePos, tracebackMessage } from "./coreops";
 import { BytecodeInterpreter, OpCode } from "./interpreter";
 import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
-import { CatchToken, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, ReRaise, VMContinuation, WindPoint, caughtValue, computeWindTransition, countControlSuspend, formatTraceback, frameInfos } from "./values";
+import { CatchToken, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, ReRaise, VMContinuation, WindPoint, caughtValue, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos } from "./values";
 import type { Suspend } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
@@ -20,7 +19,7 @@ import type { Suspend } from "./values";
 // finally thunk (in its register 1): it leaves the thunk's wind and calls it, then returns the procedure's value
 export let helpers: { handlerReturned: Closure, escapeWith: Closure, coroutineFinally: Closure } | null = null;
 export const raiseHelpers = () => helpers ??= {
-    handlerReturned: helperClosure(1, [new ErrorObject(hostError("handler returned on non-continuable exception"))], [
+    handlerReturned: helperClosure(1, [new ErrorObject(vmError(Msg.HandlerReturned))], [
         OpCode.LOADCONST, 0, 0,
         OpCode.CALLHOST, corePos("%raise"), 0, 1, 0,
         OpCode.RETURN, 0,
@@ -87,24 +86,24 @@ export class VMExecutor {
 
         if (proc instanceof VMContinuation) {
             if (proc.ctxId !== ctx.id) {
-                throw hostError("Cannot invoke a continuation across execution/FFI boundary");
+                throw vmError(Msg.ContinuationBoundary);
             }
-            if (nargs !== 1) throw hostError(`continuation expected exactly 1 argument, but received ${nargs}`);
+            if (nargs !== 1) throw vmError(Msg.ContinuationArgs, nargs);
 
             return this.#jumpTo(ctx, proc.frame, proc.wind, callerArgs[startReg]);
         }
 
         if (proc instanceof EscapeContinuation) {
             if (proc.ctxId !== ctx.id) {
-                throw hostError("Cannot invoke an escape continuation across execution/FFI boundary");
+                throw vmError(Msg.EscapeBoundary);
             }
-            if (nargs !== 1) throw hostError(`escape continuation expected exactly 1 argument, but received ${nargs}`);
+            if (nargs !== 1) throw vmError(Msg.EscapeArgs, nargs);
             const target = proc.target(callerFrame);
-            if (target === null) throw hostError("escape continuation invoked outside of its dynamic extent");
+            if (target === null) throw vmError(Msg.EscapeOutsideExtent);
             return this.#jumpTo(ctx, target, proc.wind, callerArgs[startReg]);
         }
 
-        throw hostError(`Attempted to call a non-procedure: ${String(proc)}`);
+        throw vmError(Msg.NonProcedure, proc);
     }
 
     #jumpTo(ctx: ExecutionContext, frame: Frame | null, wind: WindPoint | null, val: any): Frame | null {
@@ -217,7 +216,7 @@ export class VMExecutor {
             return this.invoke(ctx, proc, frame, [], 0, 0, false);
         } catch (err) {
             if (err instanceof EscapedError) throw err;
-            ctx.acc = new Caught(caughtValue(err));
+            ctx.acc = new Caught(caughtValue(err, this.vm));
             return frame;
         }
     }
@@ -251,7 +250,7 @@ export class VMExecutor {
                     return this.newFrame(ctx, action.thunk, pregs, null);
                 }
 
-                throw hostError(`Attempted to call a non-procedure in dynamic-wind: ${String(action.thunk)}`);
+                throw vmError(Msg.NonProcedureWind, action.thunk);
             }
 
             ctx.pendingWind = null;
@@ -268,6 +267,7 @@ export class VMExecutor {
     // `marks`/`mframe`: where the error happened, when that is not `frame` (a tail call that left no frame)
     public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any, marks?: Marks, mframe: number = 0): Frame | null {
         if (err instanceof EscapedError) throw err;
+        if (err instanceof VMError) this.vm.message(err, errorPos(frame));
         if (err instanceof UnhandledError) {
             const co = ctx.coroutine;
             if (co !== null && co.closing) throw err;
@@ -285,18 +285,19 @@ export class VMExecutor {
                 if (resumer.ctx.barrier) throw new ReRaise(error);
                 return this.handleHostException(resumer.ctx, resumer.frame, new ReRaise(error, resumer.marks, resumer.mframe));
             }
-            const out = err.error instanceof Error ? err.error : new Error(String(err.error));
+            const out = err.error instanceof Error ? err.error : new Error(this.vm.intrinsics.format(Msg.Unhandled, [err.error], this.vm.intrinsics.format, null));
             if (err.traceback !== undefined && (out as any).animaTraceback === undefined) (out as any).animaTraceback = err.traceback;
             throw out;
         }
-        if (err instanceof ReRaise && err.marks !== undefined) return this.raise(ctx, frame, caughtValue(err), false, err.marks, err.mframe);
-        return this.raise(ctx, frame, caughtValue(err), false, marks, mframe);
+        if (err instanceof ReRaise && err.marks !== undefined) return this.raise(ctx, frame, caughtValue(err, this.vm), false, err.marks, err.mframe);
+        return this.raise(ctx, frame, caughtValue(err, this.vm), false, marks, mframe);
     }
 
     // Delivers `obj` to the innermost exception handler seen from `frame` (or `marks`, where a tail call left no frame):
     // a catch token is escaped to (after its pre-unwind handler, if any); a handler procedure is called with the outer
     // handlers installed, and if it returns, that is the value of a continuable raise, else a secondary error for them
     public raise(ctx: ExecutionContext, frame: Frame | null, obj: any, continuable: boolean, marks: Marks = frame?.marks ?? null, mframe: number = frame?.mframe ?? 0): Frame | null {
+        if (obj instanceof ErrorObject) this.vm.message(obj.error);
         const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
         if (!(handlers instanceof Handlers)) return this.#unhandled(ctx, frame, obj);
         const handler = handlers.handler;
@@ -307,7 +308,7 @@ export class VMExecutor {
                 return this.invoke(ctx, handler.pre, escape, [obj], 0, 1, false);
             }
             const target = handler.target(frame);
-            if (target === null) throw hostError("catch invoked outside of its dynamic extent");
+            if (target === null) throw vmError(Msg.CatchOutsideExtent);
             return this.#jumpTo(ctx, target, handler.wind, new Caught(obj));
         }
         if (continuable) return this.invoke(ctx, handler, frame, [obj], 0, 1, false, outer, mframe + 1);
@@ -316,10 +317,10 @@ export class VMExecutor {
     }
 
     #unhandled(ctx: ExecutionContext, frame: Frame | null, obj: any): Frame | null {
-        const traceback = formatTraceback(frameInfos(frame), tracebackMessage(obj));
+        const traceback = formatTraceback(frameInfos(frame), tracebackMessage(obj, v => this.vm.print(v)), this.vm.intrinsics.format);
         const err = obj instanceof ErrorObject ? obj.error : obj;
         if (err instanceof Error && (err as any).animaTraceback === undefined) (err as any).animaTraceback = traceback;
-        return this.handleHostException(ctx, frame, new UnhandledError(err, traceback));
+        return this.handleHostException(ctx, frame, new UnhandledError(err, traceback, this.vm.intrinsics.format));
     }
 
     public resumeSuspend(ctx: ExecutionContext, sig: Suspend): Frame | null {
@@ -344,16 +345,16 @@ export class VMExecutor {
         // the body runs as the coroutine's first frame, so it must be Anima code: a closure (builtins used as values are
         // closures too), not a continuation
         if (!(proc instanceof Closure)) {
-            throw hostError(`coroutine-create: expected a closure but got ${String(proc)}`);
+            throw vmError(Msg.ExpectedClosure, "coroutine-create", proc);
         }
         if (fin !== null && !(fin instanceof IProcedure)) {
-            throw hostError(`coroutine-create: expected a finally procedure but got ${String(fin)}`);
+            throw vmError(Msg.ExpectedFinally, "coroutine-create", fin);
         }
         return new Coroutine(proc, ctx.vm, ctx.scope, fin);
     }
 
     public coStatus(co: any): symbol {
-        if (!(co instanceof Coroutine)) throw hostError(`coroutine-status: expected a coroutine but got ${String(co)}`);
+        if (!(co instanceof Coroutine)) throw vmError(Msg.ExpectedCoroutine, "coroutine-status", co);
         return Symbol.for(co.status);
     }
 
@@ -367,8 +368,8 @@ export class VMExecutor {
         raising: boolean = false
     ): Frame | null {
         const who = raising ? "coroutine-raise" : "coroutine-resume";
-        if (!(co instanceof Coroutine)) throw hostError(`${who}: expected a coroutine but got ${String(co)}`);
-        if (co.status !== "suspended") throw hostError(`${who}: cannot resume a ${co.status} coroutine`);
+        if (!(co instanceof Coroutine)) throw vmError(Msg.ExpectedCoroutine, who, co);
+        if (co.status !== "suspended") throw vmError(Msg.CannotResume, who, co.status);
 
         co.resumer = { ctx, frame: resumeTo, marks, mframe };
         // a coroutine resuming another keeps its frames where they can be traced while it waits
@@ -418,8 +419,8 @@ export class VMExecutor {
 
     public coYield(ctx: ExecutionContext, frame: Frame, val: any): Frame | null {
         const co = ctx.coroutine;
-        if (co === null) throw hostError("coroutine-yield: not inside a coroutine (or across a host call boundary)");
-        if (co.closing) throw hostError("coroutine-yield: cannot yield while a coroutine is closing");
+        if (co === null) throw vmError(Msg.YieldOutside);
+        if (co.closing) throw vmError(Msg.YieldClosing);
         co.frame = frame;
         co.status = "suspended";
         return this.#returnToResumer(co, val);
@@ -428,9 +429,9 @@ export class VMExecutor {
     // starts or continues a coroutine inside the current driver loop; `resumeTo` is where its yields and final value go
 
     public coClose(ctx: ExecutionContext | null, co: any): void {
-        if (!(co instanceof Coroutine)) throw hostError(`coroutine-close: expected a coroutine but got ${String(co)}`);
+        if (!(co instanceof Coroutine)) throw vmError(Msg.ExpectedCoroutine, "coroutine-close", co);
         if (co.status === "dead") return;
-        if (co.status !== "suspended") throw hostError(`coroutine-close: cannot close a ${co.status} coroutine`);
+        if (co.status !== "suspended") throw vmError(Msg.CannotClose, "coroutine-close", co.status);
 
         co.frame = null;
         if (co.ctx.wind === null) {

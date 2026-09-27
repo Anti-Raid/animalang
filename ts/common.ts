@@ -40,9 +40,63 @@ export const isDeepEqual = (a: any, b: any): boolean => {
     return false;
 }
 
-export class MissingVarError extends Error {
-    constructor(message: string) {
-        super(message);
+// What the VM and the compiler report, by op (Msg[op] names it), with its arguments. The VM words none of them: the front
+// end (or the host embedding the VM) does, through its table's formatter (Intrinsics.setFormatter); `fmt` is the
+// installed formatter (so a message shows values through its Msg.Value), and `at` where it happened, when known
+export enum Msg {
+    Value, Unhandled, TracebackHeader, TracebackFrame,
+    MissingVar, NonProcedure, NonProcedureWind, Arity, ExpectedArray, ValuesCount,
+    ContinuationBoundary, EscapeBoundary, ContinuationArgs, EscapeArgs, EscapeOutsideExtent, CatchOutsideExtent,
+    HandlerReturned, BadContinuable, BadStackSkip, ExpectedMarkSet,
+    ExpectedClosure, ExpectedFinally, ExpectedCoroutine, CannotResume, CannotClose, YieldOutside, YieldClosing,
+    EmptyForm, IfArgs, QuoteArgs, FormArgs, LambdaForm, SetTarget, EscapeNoBlock, EscapeFromLambda,
+    BadSyntax, ParamNotSymbol, DuplicateParam, CannotBindBuiltin, CannotBindIntrinsic, IntrinsicAsValue, ApplyNonLeaf,
+}
+
+export type Formatter = (op: Msg, args: readonly any[], fmt: Formatter, at: SourcePos | null) => string;
+
+// what a message is without a formatter: the op's name alone (a front end or host embedding the VM sets its own)
+export const opName: Formatter = op => Msg[op];
+
+// An error the VM or compiler reports: its message is worded when it is delivered (Anima code catching it, or the host
+// getting it), by the formatter of the table the code runs with
+export class VMError extends Error {
+    at: SourcePos | null = null;
+    #text: string | undefined;
+
+    constructor(readonly op: Msg, readonly args: readonly any[]) {
+        super();
+    }
+
+    // @ts-ignore: an accessor over Error's own message
+    get message(): string {
+        return this.#text ??= opName(this.op, this.args, opName, this.at);
+    }
+
+    set message(text: string) {
+        this.#text = text;
+    }
+
+    format(fmt: Formatter): this {
+        this.#text = fmt(this.op, this.args, fmt, this.at);
+        return this;
+    }
+}
+
+// a VMError without a JS stack trace (see hostError)
+export const vmError = (op: Msg, ...args: any[]): VMError => {
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    try {
+        return new VMError(op, args);
+    } finally {
+        Error.stackTraceLimit = limit;
+    }
+};
+
+export class MissingVarError extends VMError {
+    constructor(sym: symbol) {
+        super(Msg.MissingVar, [sym]);
         this.name = 'MissingVarError';
     }
 }
@@ -52,8 +106,8 @@ export class ErrorObject {
 }
 
 export class UnhandledError extends Error {
-    constructor(public readonly error: any, public readonly traceback?: string) {
-        super(error instanceof Error ? error.message : String(error));
+    constructor(public readonly error: any, public readonly traceback?: string, fmt: Formatter = opName) {
+        super(fmt(Msg.Unhandled, [error], fmt, null));
     }
 }
 
@@ -145,75 +199,6 @@ export class IProcedure {
     constructor(public debugName?: string) {}
 }
 
-export class ASTStringifier {
-    constructor() {}
-
-    public stringify(ast: any): string {
-        // Booleans+number
-        if (typeof ast === "number") {
-            if (ast === Infinity) return "+inf.0";
-            if (ast === -Infinity) return "-inf.0";
-            if (Number.isNaN(ast)) return "+nan.0";
-            return String(ast);
-        } else if (typeof ast === "boolean") {
-            return ast ? "#t" : "#f"
-        }
-
-        // String
-        if (typeof ast === "string") {
-            return JSON.stringify(ast);
-        }
-
-        // Symbol
-        if (typeof ast === "symbol") {
-            return /*Symbol.keyFor(ast)*/ ast.description || ast.toString();
-        }
-
-        // Lists
-        if (ast === null) return "()";
-
-        if (isDatum(ast)) return ast.stringify(v => this.stringify(v));
-
-        // Vectors
-        if (Array.isArray(ast)) {
-            const parts = ast.map(x => this.stringify(x));
-            return `#(${parts.join(" ")})`;
-        }
-
-        // Tables
-        if (ast instanceof Table) {
-            const parts: string[] = [];
-            for (const [k, v] of ast.entries()) {
-                parts.push(`${this.stringify(k)} ${this.stringify(v)}`);
-            }
-            return `{${parts.join(" ")}}`;
-        }
-
-        // Procs
-        if (ast instanceof IProcedure) {
-            return `<procedure>`;
-        }
-
-        if (ast instanceof MultipleValues) {
-            return `(values${ast.values.map(v => " " + this.stringify(v)).join("")})`;
-        }
-
-        if (ast instanceof OpaqueValue) {
-            return `<${ast.typeName}>`;
-        }
-
-        // Errors
-        if (ast instanceof ErrorObject) {
-            return `<error: ${ast.error?.message}>`
-        }
-
-        // Undefined
-        if (ast === undefined) return `<#void>`
-
-        throw new Error(`Cannot stringify unknown AST node: ${JSON.stringify(ast)}`);
-    }
-}
-
 // Normalizes an expression
 export const normalizeExpr = (expr: any): any =>{
     if (isDatum(expr)) return expr.copy(normalizeExpr);
@@ -224,20 +209,12 @@ export const normalizeExpr = (expr: any): any =>{
 }
 
 export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxCtx: string) => {
-    if(typeof param !== "symbol") {
-        throw new Error(`${syntaxCtx} parameter must be a symbol, but received ${typeof param}: ${String(param)}`);
-    }
-    
+    if (typeof param !== "symbol") throw new VMError(Msg.ParamNotSymbol, [syntaxCtx, param]);
     if (seen) {
-        if (seen.has(param)) {
-            throw new Error(`${syntaxCtx} parameter is a duplicate parameter name: ${String(param)}`);
-        }
+        if (seen.has(param)) throw new VMError(Msg.DuplicateParam, [syntaxCtx, param]);
         seen.add(param)
     }
-
-    if (SPECIAL_FORMS.has(param)) {
-        throw new Error(`${String(param)}: bad syntax`)
-    }
+    if (SPECIAL_FORMS.has(param)) throw new VMError(Msg.BadSyntax, [param]);
 }
 
 /**

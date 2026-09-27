@@ -104,7 +104,7 @@ export class BytecodeInterpreter {
                         const varname = constants[inst[ip++]] as symbol;
                         const val = ctx.scope.lookup(varname, MISSING);
                         if (val === MISSING) {
-                            throw new MissingVarError(`Variable '${String(varname)}' is not defined in the current scope.`);
+                            throw new MissingVarError(varname);
                         }
                         regs[destReg] = val;
                         break;

@@ -1,10 +1,10 @@
 // The built package (dist/), through its public API only: catches what only breaks once bundled (module order, inlined
 // enums, what the entry exports). The sources' own tests are in ts/tests/
 import { describe, it, expect } from 'vitest';
-import { createScheme, implRvm, implRvmAot, hostTailFrom, dumpFull, readFull, Table, common } from 'animalang';
+import { createScheme, implRvm, implRvmAot, hostTailFrom, dumpFull, readFull, Table, ASTStringifier } from 'animalang';
 import type { ByteCode } from 'animalang';
 
-const s = new common.ASTStringifier();
+const s = new ASTStringifier();
 
 describe.each([["interp", implRvm], ["aot", implRvmAot]] as const)("dist %s", (_mode, options) => {
     const instance = () => {

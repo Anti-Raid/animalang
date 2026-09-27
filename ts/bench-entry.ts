@@ -3,7 +3,8 @@
 // extra (see intrinsics.bench.ts)
 export { createScheme } from "./scheme";
 export { impl, implAot, type AnimaOptions } from "./bytecode-rvm/meta";
-export { ASTStringifier, IProcedure } from "./common";
+export { IProcedure } from "./common";
+export { ASTStringifier } from "./scheme/printer";
 export { hostTailFrom, type ByteCode } from "./bytecode-rvm/exec";
 export { dumpFull, readFull } from "./bytecode-rvm/utils";
 export type { Anima } from "./anima";

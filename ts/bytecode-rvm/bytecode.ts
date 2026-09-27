@@ -12,7 +12,7 @@ import type { ExecutionContext, Frame } from "./values";
 export type ExecutionMode = "interp" | "aot";
 
 // what the executor needs of the VM it runs for (AnimaVM)
-export type VMHost = { readonly mode: ExecutionMode };
+export type VMHost = { readonly mode: ExecutionMode, readonly intrinsics: Intrinsics, print(v: any): string, message<E>(err: E, at?: SourcePos | null): E };
 
 export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecutor) => Frame | null;
 

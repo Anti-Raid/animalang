@@ -1,7 +1,8 @@
 // The transformer's output (core forms as Scheme lists) as the compiler's input: core forms as arrays (see
 // bytecode-rvm/README.md). Quoted data stays Scheme data; a vector literal, being an array, is quoted
-import { ASTStringifier, CORE_BLOCK, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
+import { CORE_BLOCK, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
 import { Cons } from "./list";
+import { ASTStringifier } from "./printer";
 
 const toArr = (x: any): any[] => x instanceof Cons ? x.toArray() : [];
 

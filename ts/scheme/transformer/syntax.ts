@@ -1,5 +1,6 @@
 import {
-    ensureCanBind,
+    ensureCanBind as ensureCanBindCore,
+    VMError,
     OP_DEFINE_GLOBAL,
     CORE_IF,
     CORE_LAMBDA,
@@ -23,12 +24,21 @@ import {
 } from "../../common";
 import { Cons } from "../list";
 import { toCore } from "../core";
+import { schemeFormat } from "../messages";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
 import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
 import { SCHEME_ALIASES } from "../builtins";
 import type { Closure } from "../../bytecode-rvm/exec";
 
 const OP_APPLY = Symbol.for("apply");
+
+const ensureCanBind = (param: any, seen: Set<symbol> | undefined, ctx: string) => {
+    try {
+        ensureCanBindCore(param, seen, ctx);
+    } catch (err) {
+        throw err instanceof VMError ? err.format(schemeFormat) : err;
+    }
+};
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
 const cdr = (p: any) => (p instanceof Cons ? p.cdr : null);

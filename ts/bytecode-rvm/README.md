@@ -110,7 +110,7 @@ Besides the core forms, the compiler directly recognizes the following low-level
 Rest parameters and `%apply` use arrays unless the table has its own sequences: an intrinsic registered with `sequence: "pack"` makes one of an argument window, and one with `sequence: "spread"` makes the array `%apply` takes of one. A rest parameter (and a `%let-values` rest variable) is then packed: the closure's `rest` is `"packed"`, and its code records the pack intrinsic's position (`ByteCode.restPos`), which binding a call uses (`bindArgs`) and AOT code for a self tail call inlines.
 
 ### The exception model
-- **One handler list.** The handlers in effect are a continuation mark under the key `(%handler-key)` returns: a `Handlers` list (`%push-handler`), innermost first, whose entries are handler procedures (from `with-exception-handler`, which is just that mark) and catch tokens (from `%catch`). It follows frames, so escapes, continuations and re-entry restore it without `dynamic-wind`; a coroutine starts with none, and an error escaping it is raised again in its resumer, with the marks of the code that resumed it.
+- **One handler list.** The handlers in effect are a continuation mark under the key `(%handler-key)` returns: a `Handlers` list (`%push-handler`), innermost first, whose entries are handler procedures (which a front end installs by setting that mark) and catch tokens (from `%catch`). It follows frames, so escapes, continuations and re-entry restore it without `dynamic-wind`; a coroutine starts with none, and an error escaping it is raised again in its resumer, with the marks of the code that resumed it.
 - **Delivery** (the VM's `executor.raise`, for `%raise` and for host errors alike) looks at the head of the list:
   1. empty: unhandled; the VM builds the traceback from its frames and throws to the host;
   2. a catch token: its `pre` runs if it has one, then the VM escapes to its `%catch` with the value wrapped in a `Caught`;
@@ -241,20 +241,31 @@ A non-tail resume from direct code instead runs the coroutine in a nested driver
 
 ## Debugging
 
-- **Names**: a lambda is named after what it is bound to (`define`, `set!`, `let`), else `lambda@file:line`. A front end can rename the procedures it exports.
-- **Source positions**: the reader records the position of every list form, and `%at` overrides it. The syntax transformer carries positions through macro expansion (an expansion inherits its macro call's position). The compiler emits `Pos` IR nodes, which lower into `ByteCode.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
-- **Tracebacks**: `(debug-frames [co] [level])` and `(debug-traceback [co] [msg] [level])` take a snapshot of the stack in the calling function: the syntax transformer rewrites a direct call to `(%debug-traceback (%current-stack) (vector args ...))` (see `%debug-frames` / `%debug-traceback`), so the caller itself is its first frame. A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. `(debug-traceback co)` traces another coroutine: a suspended one from where it yielded, a normal one (waiting on a coroutine it resumed) from where it resumed it, and an unstarted or dead one as empty. The host can get a coroutine's traceback with `Anima.traceback(co)`.
+- **Names**: a lambda is named after what it is bound to (`%define-global`, `%set!`, a binding form), else `lambda@file:line`. A front end can rename the procedures it exports.
+- **Source positions**: a front end attaches positions to the forms it produces (`SOURCE_POS`). The compiler emits `Pos` IR nodes, which lower into `ByteCode.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
+- **Tracebacks**: `%debug-frames` / `%debug-traceback` describe a snapshot `(%current-stack)` takes in the function that calls it, so written in the caller itself, that function is the first frame. A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. Given a coroutine, they trace it instead: a suspended one from where it yielded, a normal one (waiting on a coroutine it resumed) from where it resumed it, and an unstarted or dead one as empty. The host can get a coroutine's traceback with `Anima.traceback(co)`.
 - **Unhandled errors**: the VM builds a traceback from the raising frame before giving up, and it is attached to the JS error as `animaTraceback`. For an error that escaped a coroutine, the coroutine's traceback is kept.
 - **Debug mode** (`implDebug` / `implAotDebug`, i.e. `new Compiler(true)`): the compiled `ByteCode` is flagged `debug`, and interpreter and AOT code for it
   - record every tail call in a continuation mark on the frame it replaces (the last 16 callees, repeats collapsed to `name xN`), which tracebacks show on that frame as `(tail calls: ...)`; as a mark it travels with continuations and coroutines;
   - track the exact position of the last operation (`frame.posIp`, or `dip` in direct code), so errors inside inlined intrinsics report the right position.
   Debug and non-debug code can run side by side (code compiled without debug, such as a prelude, stays out of the tail history), but there is only one set of compiled AOT functions per `ByteCode`.
 
+## Messages
+
+Every message the VM and the compiler report is an op (`Msg` in `common.ts`) with arguments, e.g. `Msg.NonProcedure` with the value called, or `Msg.Arity` with the name, bounds and count. The VM words none of them and prints no values: whoever uses it (a front end, a transpiler emitting core forms, a host embedding the VM) sets a formatter on its table, e.g. for Lua 5.1's errors:
+
+```ts
+table.setFormatter((op, args, fmt, at) => op === Msg.NonProcedure ? `${at?.file}:${at?.line}: attempt to call a ${typeof args[0]} value` : ...)
+```
+
+- `fmt` is the installed formatter, so a message shows values through its `Msg.Value` (and a front end's own data prints itself, `Datum.stringify`); `at` is where it happened, when known. Without a formatter a message is the op's name (`Msg[op]`, e.g. `NonProcedure`), and the host reads `op` and `args` from the `VMError`. Scheme's wording is `schemeFormat` (`scheme/messages.ts`), which a formatter can fall back on for the ops it does not word itself.
+- Errors are thrown as `VMError`s (`vmError(op, ...args)`, without a JS stack trace) and worded when delivered: by the executor (`handleHostException`, with the position of the frame it happened in) before Anima code or the host sees them, and by the compiler for its own errors (with the position of the innermost form that has one). Helpers deep in the runtime need no table, and AOT source does not depend on the formatter. Until delivered, a `VMError`'s message is its op's name.
+- Tracebacks are `Msg.TracebackHeader` and a `Msg.TracebackFrame` per frame, so their layout is the front end's too, as is the message of an unhandled non-`Error` value (`Msg.Unhandled`).
+- Messages about the host's own use of the API (registering intrinsics, loading bytecode) and internal errors are plain English `Error`s.
+
 ## Continuation marks
 
 Marks are an immutable list, newest first, of `(key, value, frame)` entries, where `frame` numbers the logical frame the mark belongs to. Direct functions take the list and their logical frame as arguments (`direct$(ctx, closure, executor, depth, marks, mframe, ...args)`): a non-tail call passes `mframe + 1`, a tail call passes `mframe` unchanged, so the callee continues its caller's frame, as in Racket. Heap frames keep them in `frame.marks` / `frame.mframe`, so `call/cc` and coroutines capture them with the frames. `%with-mark` in tail position replaces the current frame's entry for its key; otherwise the compiler saves the marks in registers (`MARKSAVE`), starts a new logical frame and puts them back after the body (`MARKRESTORE`), also on an `%escape` out of it. Setting a mark allocates one list node; code that uses no marks only pays for passing the two arguments (about 5% on call-bound code such as fib).
-
-The library follows Racket: `with-continuation-mark`, `current-continuation-marks`, `continuation-mark-set-first` (`#f` means the current continuation; direct calls are rewritten to `%marks-first`), `continuation-mark-set->list` and `continuation-mark-set?`.
 
 ## Bytecode serialization
 

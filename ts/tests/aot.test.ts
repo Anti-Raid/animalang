@@ -1,4 +1,4 @@
-import { ASTStringifier } from '../common';
+import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect } from 'vitest';
 import { createScheme } from '../scheme';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from '../bytecode-rvm/vm';

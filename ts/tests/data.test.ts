@@ -1,4 +1,5 @@
-import { ASTStringifier, isDeepEqual, Table, BS, BSReader } from '../common';
+import { isDeepEqual, Table, BS, BSReader } from '../common';
+import { ASTStringifier } from '../scheme/printer';
 import { ASPParseError } from '../scheme/reader';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';

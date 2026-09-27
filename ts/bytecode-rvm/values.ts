@@ -1,8 +1,7 @@
 // The VM's runtime values and state: frames, execution contexts, wind points, continuations, coroutines, catch tokens,
 // stack snapshots, and Suspend (how direct code hands control to heap frames)
-import { ErrorObject, IProcedure, OpaqueValue, formatPos, unpackValues } from "../common";
-import type { Env, SourcePos } from "../common";
-import { hostError } from "../errors";
+import { ErrorObject, IProcedure, Msg, OpaqueValue, unpackValues, vmError } from "../common";
+import type { Env, Formatter, SourcePos } from "../common";
 import { Caught, EXCEPTION_HANDLERS, Handlers, TAIL_TRAIL, markFirst, markOwn } from "../marks";
 import type { Marks, TailTrail } from "../marks";
 import type { ByteCode, Closure, VMHost } from "./bytecode";
@@ -13,7 +12,7 @@ import { UNPACK_REST, UNPACK_STRICT } from "./opcodes";
 export const unpackForBinding = (val: any, count: number, flags: number): any[] => {
     const vals = unpackValues(val);
     if ((flags & UNPACK_STRICT) !== 0 && ((flags & UNPACK_REST) !== 0 ? vals.length < count : vals.length !== count)) {
-        throw hostError(`let-values: expected ${(flags & UNPACK_REST) !== 0 ? "at least " : ""}${count} value${count === 1 ? "" : "s"} but got ${vals.length}`);
+        throw vmError(Msg.ValuesCount, count, (flags & UNPACK_REST) !== 0, vals.length);
     }
     return vals;
 };
@@ -186,8 +185,11 @@ export class CatchToken extends EscapeContinuation {
 
 
 // the value of a caught error, as handlers see it
-export const caughtValue = (err: any): any =>
-    err instanceof ReRaise ? (err.value instanceof Error ? new ErrorObject(err.value) : err.value) : err instanceof ErrorObject ? err : new ErrorObject(err);
+export const caughtValue = (err: any, vm: VMHost): any => {
+    const val = err instanceof ReRaise ? (err.value instanceof Error ? new ErrorObject(err.value) : err.value) : err instanceof ErrorObject ? err : new ErrorObject(err);
+    if (val instanceof ErrorObject) vm.message(val.error);
+    return val;
+};
 
 // what a direct-mode %catch whose token is `tok` takes from an exception passing through it, or null to let it go on:
 // its own escapes, and errors whose innermost handler is `tok` (so nothing else would see them) and which leave no
@@ -197,12 +199,12 @@ export const catchHere = (e: any, tok: CatchToken, ctx: ExecutionContext): any =
     if (e instanceof Suspend && e.escape === tok) return e.escapeVal;
     // a pre-unwind handler has to run first, in heap code
     if (tok.pre !== null) return null;
-    if (!(e instanceof Suspend)) return e instanceof EscapedError ? null : new Caught(caughtValue(e));
+    if (!(e instanceof Suspend)) return e instanceof EscapedError ? null : new Caught(caughtValue(e, ctx.vm));
     if (e.action !== null) return null;
     const marks = e.marks !== undefined ? e.marks : e.innermost !== null ? e.innermost.marks : undefined;
     if (marks === undefined) return null;
     const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
-    return handlers instanceof Handlers && handlers.handler === tok ? new Caught(caughtValue(e.error)) : null;
+    return handlers instanceof Handlers && handlers.handler === tok ? new Caught(caughtValue(e.error, ctx.vm)) : null;
 };
 
 export class Frame {
@@ -356,9 +358,13 @@ export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] 
     return out;
 };
 
-export const formatTraceback = (frames: FrameInfo[], msg?: string): string => {
-    const tails = (t: TailTrail | null) => t === null || t.length === 0 ? "" :
-        ` (tail calls: ${t.map(c => c.count > 1 ? `${c.name} x${c.count}` : c.name).reverse().join(" <- ")})`;
-    const lines = frames.map(f => `\n  ${formatPos(f.pos)} in ${f.name}${tails(f.tails)}`).join("");
-    return `${msg !== undefined ? msg + "\n" : ""}stack traceback:${lines}`;
+export const formatTraceback = (frames: FrameInfo[], msg: string | undefined, fmt: Formatter): string =>
+    [fmt(Msg.TracebackHeader, [msg], fmt, null), ...frames.map(f => fmt(Msg.TracebackFrame, [f.name, f.pos, f.tails], fmt, f.pos))].join("\n");
+
+// where an error in `frame` happened
+export const errorPos = (frame: Frame | null): SourcePos | null => {
+    for (let f = frame; f !== null; f = f.parent) {
+        if (!f.code.internal) return f.code.positionAt(Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0));
+    }
+    return null;
 };

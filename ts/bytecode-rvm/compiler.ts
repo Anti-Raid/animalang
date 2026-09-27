@@ -1,10 +1,9 @@
-import { ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
+import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { liftLambdas } from "./lift";
 import { corePos } from "./exec";
-import { arityMessage } from "./arity";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
@@ -51,6 +50,15 @@ export class Compiler {
     }
 
     compile(trExpr: any, debug: boolean = this.debug) {
+        try {
+            return this.#compileTop(trExpr, debug)
+        } catch (err) {
+            if (err instanceof VMError) err.format(this.intrinsics.format)
+            throw err
+        }
+    }
+
+    #compileTop(trExpr: any, debug: boolean) {
         trExpr = liftLambdas(trExpr)
         // Step 1 is to analyze our variables so we know what to box and what not to box
         let analyzer = new AstAnalysis(this.intrinsics)
@@ -82,12 +90,17 @@ export class Compiler {
             opts.nodes.push({t: "LoadValue", constant: expr, destReg: opts.destReg})
             return
         }
-        if (expr.length === 0) throw new Error("bad syntax: an empty form")
+        if (expr.length === 0) throw new VMError(Msg.EmptyForm, [])
 
         const pos = SOURCE_POS.get(expr)
         if (pos !== undefined && pos !== opts.pos) {
             opts.nodes.push({ t: "Pos", pos })
-            this.#compileForm(expr, { ...opts, pos })
+            try {
+                this.#compileForm(expr, { ...opts, pos })
+            } catch (err) {
+                if (err instanceof VMError) err.at ??= pos
+                throw err
+            }
             if (opts.pos !== undefined) opts.nodes.push({ t: "Pos", pos: opts.pos })
             return
         }
@@ -203,7 +216,7 @@ export class Compiler {
     #compileIfCall(expr: any[], opts: CmpOpts) {
         const args = expr.slice(1)
         if (args.length < 2) {
-            throw new Error(`%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else]), but got ${args.length} arguments`)
+            throw new VMError(Msg.IfArgs, [args.length])
         }
         const endLabel = new JumpLabel()
         for (let i = 0; i + 1 < args.length; i += 2) {
@@ -223,7 +236,7 @@ export class Compiler {
 
     #compileQuote(expr: any[], opts: CmpOpts) {
         if (expr.length !== 2) {
-            throw new Error(`quote must be in format ["quote", expr] but have ${expr.length-1} arguments`)
+            throw new VMError(Msg.QuoteArgs, [expr.length - 1])
         }
         if (opts.destReg === undefined) return
         opts.nodes.push({t: "LoadValue", constant: normalizeExpr(expr[1]), destReg: opts.destReg})
@@ -247,7 +260,7 @@ export class Compiler {
 
     #compileSet(expr: any[], opts: CmpOpts) {
         const [, sym, val] = expr;
-        if (typeof sym !== "symbol") throw new Error(`set!: ${String(sym)} is not a symbol`)
+        if (typeof sym !== "symbol") throw new VMError(Msg.SetTarget, [sym])
         this.#ensureNotIntrinsic(sym, "set!")
 
         // We need to compile the second arg first and leave it on a temp reg
@@ -269,7 +282,7 @@ export class Compiler {
 
         const params: symbol[] = expr[1]
         const remParams: symbol | null = expr[2]
-        if (!Array.isArray(params) || (remParams !== null && typeof remParams !== "symbol")) throw new Error("%lambda must be of form [%lambda, [param ...], rest-or-null, body ...]")
+        if (!Array.isArray(params) || (remParams !== null && typeof remParams !== "symbol")) throw new VMError(Msg.LambdaForm, [])
         const seen = new Set<symbol>()
         for (const p of params) ensureCanBind(p, seen, "lambda")
         if (remParams !== null) ensureCanBind(remParams, seen, "lambda")
@@ -366,9 +379,9 @@ export class Compiler {
         const name: symbol = expr[1]
         let target = opts.blocks
         while (target !== undefined && target.name !== name) target = target.parent
-        if (target === undefined) throw new Error(`%escape: no enclosing block named ${String(name.description)}`)
+        if (target === undefined) throw new VMError(Msg.EscapeNoBlock, [name])
         if (target.fnDepth !== (opts.fnDepth ?? 0)) {
-            throw new Error(`%escape: cannot escape to block ${String(name.description)} from inside a lambda`)
+            throw new VMError(Msg.EscapeFromLambda, [name])
         }
         // the value is computed as if it were the block's own value: into its register, in its tail position
         const valueOpts = { ...opts, destReg: target.destReg, isTail: target.isTail }
@@ -427,7 +440,7 @@ export class Compiler {
 
     #compileDynamicWind(expr: any[], opts: CmpOpts) {
         if (expr.length !== 4) {
-            throw new Error(`%dynamic-wind requires 3 arguments (before, thunk, after), got ${expr.length - 1}`);
+            throw new VMError(Msg.FormArgs, ["%dynamic-wind", "3 arguments (before, thunk, after)", expr.length - 1]);
         }
         // before and after are adjacent so they form the argument window of the wind runtime call
         const block = opts.scope.regAlloc.allocBlock(3);
@@ -449,7 +462,7 @@ export class Compiler {
     // always a non-tail call: the escape continuation is deactivated when it returns
     #compileCallEC(expr: any[], opts: CmpOpts) {
         if (expr.length !== 2) {
-            throw new Error(`%call/ec requires 1 argument, got ${expr.length - 1}`);
+            throw new VMError(Msg.FormArgs, ["%call/ec", "1 argument", expr.length - 1]);
         }
         const procReg = opts.scope.allocTemp();
         const tokReg = opts.scope.allocTemp();
@@ -464,7 +477,7 @@ export class Compiler {
     // first, and runs on the error before unwinding
     #compileCatch(expr: any[], opts: CmpOpts) {
         if (expr.length !== 3 && expr.length !== 4) {
-            throw new Error(`%catch requires 2 or 3 arguments (thunk, handler, pre), got ${expr.length - 1}`);
+            throw new VMError(Msg.FormArgs, ["%catch", "2 or 3 arguments (thunk, handler, pre)", expr.length - 1]);
         }
         const procReg = opts.scope.allocTemp();
         const tokReg = opts.scope.allocTemp();
@@ -501,7 +514,7 @@ export class Compiler {
 
     #compileRuntimeOp(expr: any[], opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {
         const nargs = expr.length - 1
-        if (nargs < minArgs || nargs > maxArgs) throw new Error(arityMessage(String(expr[0].description), minArgs, maxArgs, nargs))
+        if (nargs < minArgs || nargs > maxArgs) throw new VMError(Msg.Arity, [String(expr[0].description), minArgs, maxArgs, nargs])
         const startReg = opts.scope.regAlloc.allocBlock(nargs)
         for (let i = 0; i < nargs; i++) this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false })
         emit(startReg, nargs, opts.destReg)
@@ -530,14 +543,14 @@ export class Compiler {
     #ensureNotIntrinsic(sym: any, syntaxCtx: string) {
         if (typeof sym !== "symbol") return
         const reserved = this.intrinsics.reserved.get(sym)
-        if (reserved === "special form") throw new Error(`${String(sym)}: bad syntax`)
-        if (reserved === "builtin") throw new Error(`${syntaxCtx}: cannot bind builtin ${Symbol.keyFor(sym)}`)
-        if (this.#isIntrinsic(sym)) throw new Error(`${syntaxCtx}: cannot bind ${String(sym.description)}, which is an intrinsic`)
+        if (reserved === "special form") throw new VMError(Msg.BadSyntax, [sym])
+        if (reserved === "builtin") throw new VMError(Msg.CannotBindBuiltin, [syntaxCtx, sym])
+        if (this.#isIntrinsic(sym)) throw new VMError(Msg.CannotBindIntrinsic, [syntaxCtx, sym])
     }
 
     #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
         if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
-            throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
+            throw new VMError(Msg.IntrinsicAsValue, [procExpr]);
         }
         const procReg = opts.scope.allocTemp();
         this.#compile(procExpr, { ...opts, destReg: procReg, isTail: false });
@@ -546,7 +559,7 @@ export class Compiler {
 
     #compileApply(expr: any[], opts: CmpOpts) {
         if (expr.length < 3) {
-            throw new Error(`%apply requires at least 2 arguments (proc, ...args, args-lst), got ${expr.length - 1}`);
+            throw new VMError(Msg.FormArgs, ["%apply", "at least 2 arguments (proc, ...args, array)", expr.length - 1]);
         }
         const procExpr = expr[1];
         const argExprs = expr.slice(2);
@@ -569,7 +582,7 @@ export class Compiler {
     // applying a procedure is a call of the core operation %apply-array (or %apply-fresh) over [proc, arg ..., array]
     #compileApplyCall(procExpr: any, argExprs: any[], opts: CmpOpts, op: string) {
         if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
-            throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
+            throw new VMError(Msg.IntrinsicAsValue, [procExpr]);
         }
         const nargs = 1 + argExprs.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
@@ -581,7 +594,7 @@ export class Compiler {
 
     // (%apply %intrinsic arg ... lst): the argument count is only known at run time, so APPLYINT checks it there
     #compileApplyIntrinsic(intrinsic: Intrinsic, argExprs: any[], opts: CmpOpts) {
-        if (!intrinsic.leaf) throw new Error(`%apply: ${intrinsic.name} is not a leaf intrinsic, so it cannot be applied`);
+        if (!intrinsic.leaf) throw new VMError(Msg.ApplyNonLeaf, [intrinsic.name]);
         const nargs = argExprs.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
         argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + i, isTail: false }));

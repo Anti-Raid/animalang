@@ -9,6 +9,7 @@ export { Table } from './table';
 export { Env } from './env';
 export { ASP, ASPParseError, ASPTokenError } from './scheme/reader';
 export { Cons } from './scheme/list';
+export { ASTStringifier } from './scheme/printer';
 
 export * as common from './common'
 export { isTruthy, ErrorObject } from './common'

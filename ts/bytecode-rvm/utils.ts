@@ -1,44 +1,30 @@
-import { ASTStringifier, BS, BSReader, type SerializableBytecode } from "../common"
+import { BS, BSReader, isDatum, type SerializableBytecode } from "../common"
 import { ByteCode, Closure, ClosureTemplate, OpCode } from "./exec"
 import { INSTRUCTION_LENGTHS, NO_REG, OPCODES, type OpSpec, type OperandKind } from "./opcodes"
 import type { Intrinsics } from "./intrinsics"
 
 const intrinsicName = (code: ByteCode, pos: number): string => code.intrinsics.find(used => used.pos === pos)?.name ?? `#${pos}`
 
-const STRINGIFIER = new ASTStringifier()
 
 // (a, b . rest)
 const paramsToString = (tmpl: ClosureTemplate): string =>
     `(${[tmpl.params.map(p => constToString(p)).join(", "), tmpl.remParams === null ? "" : `. ${constToString(tmpl.remParams)}`].filter(part => part !== "").join(" ")})`
 
 const constToString = (s: any): string => {
-    if (s === null) {
-        return "()"
-    } else if (typeof s === "symbol") {
+    if (typeof s === "symbol") {
         return `${s.description || String(s)}`
     } else if (typeof s === "string") {
         return `"${s.toString()}"`
-    } else if (typeof s === "number") {
-        if (s === Infinity) return "+inf.0";
-        if (s === -Infinity) return "-inf.0";
-        if (Number.isNaN(s)) return "+nan.0";
-        return `${s}`
-    } else if (typeof s === "boolean") {
-        return `<${s}>`
-    } else if (typeof s === "undefined") {
-        return `#<void>`
     } else if (Array.isArray(s)) {
-        const r = []
-        for(const elem of s) {
-            r.push(constToString(elem))
-        }
-        return `(${r.join(' ')})`
+        return `[${s.map(constToString).join(", ")}]`
+    } else if (isDatum(s)) {
+        return s.stringify(constToString)
     } else if (s instanceof ClosureTemplate) {
         return `fn${paramsToString(s)}`
     } else if (s instanceof Closure) {
         return `c.fn${paramsToString(s.tmpl)}`
     } else {
-        return STRINGIFIER.stringify(s)
+        return String(s)
     }
 }
 
