@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -125,6 +125,9 @@ export class Compiler {
                     return
                 case CORE_LETREC:
                     this.#compileLetrec(expr, opts)
+                    return
+                case CORE_LET_STAR:
+                    this.#compileLetStar(expr, opts)
                     return
                 case CORE_LET:
                     this.#compileLet(expr, opts)
@@ -649,6 +652,29 @@ export class Compiler {
     }
 
     // (%let ((x init) ...) body ...): inits are evaluated in the outer scope, then bound in a block of this function
+    // (%let* ((name init) ...) body ...): each init runs with the names before it bound, then its name is bound; all in
+    // one block of the current function, as nested %lets would be, without the nesting
+    #compileLetStar(expr: Cons, opts: CmpOpts) {
+        const bindings = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
+        opts.scope.enterBlock()
+        let ascope = opts.ascope
+        for (const binding of bindings) {
+            const sym = binding.car
+            ensureCanBind(sym, undefined, "let*")
+            this.#ensureNotIntrinsic(sym, "let*")
+            const reg = opts.scope.allocTemp()
+            this.#compile(binding.cdr.car, { ...opts, ascope, destReg: reg, isTail: false, name: sym.description })
+            ascope = opts.analyzer.scopeMap.get(binding)!
+            const inf = ascope.getVarinfo(sym)
+            if (!inf) throw new Error("Could not fetch varinfo")
+            const destReg = opts.scope.addLocal(sym)
+            opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: reg, destReg })
+            opts.scope.freeTemp(reg)
+        }
+        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope: opts.analyzer.scopeMap.get(expr)! })
+        opts.scope.exitBlock()
+    }
+
     #compileLet(expr: Cons, opts: CmpOpts) {
         const ascope = opts.analyzer.scopeMap.get(expr)
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)

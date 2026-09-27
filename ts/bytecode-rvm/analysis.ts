@@ -8,6 +8,7 @@ import {
   CORE_LET_VALUES,
   CORE_LET_VALUES_STRICT,
   CORE_LETREC,
+  CORE_LET_STAR,
   CORE_IF,
   CORE_BEGIN,
   CORE_LOOP,
@@ -136,6 +137,21 @@ export class AstAnalysis {
                     this.visit(curr.car, letScope);
                     curr = curr.cdr;
                 }
+                return;
+            }
+            // (%let* ((name init) ...) body ...): each init sees the names before it. The bindings share a scope
+            // (recorded under each clause), and a new one starts only for a name already visible, so a name bound twice is
+            // two variables while a long %let* of distinct names does not make lookups walk a scope per binding
+            case CORE_LET_STAR: {
+                let inner = new AnalysisScope(scope, false);
+                for (let clause: any = ast.cdr.car; clause instanceof Cons; clause = clause.cdr) {
+                    this.visit(clause.car.cdr.car, inner);
+                    if (inner.getVarinfo(clause.car.car) !== null) inner = new AnalysisScope(inner, false);
+                    inner.define(clause.car.car);
+                    this.scopeMap.set(clause.car, inner);
+                }
+                this.scopeMap.set(ast, inner);
+                for (let curr: any = ast.cdr.cdr; curr instanceof Cons; curr = curr.cdr) this.visit(curr.car, inner);
                 return;
             }
             // (%letrec ((name init) ...) body ...): like %let, but the names are visible in the inits
@@ -298,6 +314,15 @@ class CallLiveness {
             }
             case OP_DEFINE_GLOBAL:
                 return this.expr(ast.cdr.cdr.car, scope, out, blocks);
+            case CORE_LET_STAR: {
+                const clauses: Cons[] = ast.cdr.car === null ? [] : ast.cdr.car.toArray();
+                let live = new Set(this.#seq(ast.cdr.cdr, this.scopeMap.get(ast)!, out, blocks));
+                for (let i = clauses.length - 1; i >= 0; i--) {
+                    for (const meta of this.#bound(this.scopeMap.get(clauses[i])!, [clauses[i].car])) live.delete(meta);
+                    live = this.expr(clauses[i].cdr.car, i === 0 ? scope : this.scopeMap.get(clauses[i - 1])!, live, blocks);
+                }
+                return live;
+            }
             // the lambdas are made first; then each other init runs, in order, and its name is set after it
             case CORE_LETREC: {
                 const letScope = this.scopeMap.get(ast)!;

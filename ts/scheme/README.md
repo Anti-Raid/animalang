@@ -27,7 +27,8 @@ Each surface form lowers to a core form:
 | `cond` | one flat `(%if <c1> <e1> <c2> <e2> ... [<else>])`, however many clauses |
 | `quote`, `'datum` | `(%quote <datum>)` |
 | `lambda` | `(%lambda <params> <body> ...)` |
-| `let`, `let*` (nested), and any immediately applied lambda `((lambda (p ...) body) arg ...)` | `(%let ((<symbol> <init>) ...) <body> ...)` |
+| `let`, and any immediately applied lambda `((lambda (p ...) body) arg ...)` | `(%let ((<symbol> <init>) ...) <body> ...)` |
+| `let*` | `(%let* ((<symbol> <init>) ...) <body> ...)` |
 | `letrec`, `letrec*`, internal `define`s, and named `let`s that are not loops (`(let ((t init) ...) (%letrec ((name (lambda ...))) (name t ...)))`, so the procedure is only ever called and can be lifted) | `(%letrec ((<symbol> <init>) ...) <body> ...)` |
 | `receive`, `let-values`, `let*-values` (nested) | `(%let-values/strict ((<formals> <expr>) ...) <body> ...)` |
 | `set!` | `(%set! <symbol> <expr>)` |

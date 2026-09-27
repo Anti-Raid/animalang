@@ -1472,6 +1472,23 @@ describe('Anima', () => {
             expect(() => run(`(define (lk5) (define (h x) x) (h)) (lk5)`)).toThrow()
         })
 
+        it('binds let* sequentially in one form', () => {
+            expect(run(`(let* ((a 1) (b (+ a 1)) (a (* b 10))) (list a b))`)).toBe("(20 2)")
+            expect(run(`(let* () 5)`)).toBe("5")
+            // an init naming a global that a later binding shadows still means the global
+            expect(run(`(define ls-g 5) (let* ((a ls-g) (ls-g 10) (b ls-g)) (list a ls-g b))`)).toBe("(5 10 10)")
+            expect(run(`(define ls-h 3) (define (ls-fwd) (let* ((a (lambda () ls-h)) (ls-h 9)) (list (a) ls-h))) (ls-fwd)`)).toBe("(3 9)")
+            expect(run(`(define (ls-cap n) (let* ((a n) (f (lambda () a)) (a 0)) (list (f) a))) (ls-cap 7)`)).toBe("(7 0)")
+            // a helper defined in a let* body is still lifted, and sees the let*'s names
+            expect(run(`(define (ls-lift n) (let* ((k (* n 2))) (define (h x) (+ k x)) (h 1))) (ls-lift 3)`)).toBe("7")
+        })
+
+        it('compiles very long let*s', () => {
+            const n = 5000
+            const binds = Array.from({ length: n }, (_, i) => `(x${i} ${i === 0 ? 1 : `(+ x${i - 1} 1)`})`).join(" ")
+            expect(run(`(define (ls-long) (let* (${binds}) x${n - 1})) (ls-long)`)).toBe(String(n))
+        })
+
         it('keeps letrec semantics when the values are not all lambdas, or a name is assigned', () => {
             expect(run(`(letrec ((x 1) (f (lambda () x))) (f))`)).toBe("1")
             expect(run(`(letrec ((f (lambda () 1)) (g (lambda () (f)))) (set! f (lambda () 2)) (g))`)).toBe("2")

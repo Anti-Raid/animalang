@@ -13,6 +13,7 @@ import {
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
     CORE_LETREC,
+    CORE_LET_STAR,
     CORE_WITH_MARK,
     CORE_CATCH,
     OP_RAISE,
@@ -186,6 +187,13 @@ const namedLetAsLoop = (evaluator: MacroEvaluator, name: symbol, params: symbol[
                 return keepPos(list(CORE_SET, e.cdr.car, rw(e.cdr.cdr.car, false, blocks)), e);
             case OP_DEFINE_GLOBAL:
                 return keepPos(list(op, e.cdr.car, rw(e.cdr.cdr.car, false, blocks)), e);
+            case CORE_LET_STAR: {
+                // each init sees the names before it: once one is the loop's, the rest are left alone
+                const bindings = toArray(e.cdr.car);
+                const at = bindings.findIndex(b => b.car === name);
+                const newBindings = bindings.map((b, i) => at !== -1 && i > at ? b : list(b.car, rw(b.cdr.car, false, blocks)));
+                return keepPos(cons(op, cons(fromArray(newBindings), at !== -1 ? e.cdr.cdr : seq(e.cdr.cdr, tail, blocks))), e);
+            }
             case CORE_LETREC: {
                 // the names are in scope in the inits (lambdas) too
                 const bindings = toArray(e.cdr.car);
@@ -444,29 +452,17 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
     evaluator.registerTransform(OP_LETSTAR, (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`let*: bad syntax`);
-        const bindingsCons = expr.car;
-        const body = expr.cdr;
+        letBindings("let*", expr.car);
+        return { expanded: cons(CORE_LET_STAR, expr), state: TransformState.Recurse };
+    });
 
-        if (bindingsCons !== null && !(bindingsCons instanceof Cons)) {
-            throw new Error(`let* bindings must be a list of form ((var expr)...)`);
-        }
-
-        // No bindings
-        if (bindingsCons === null) {
-            return { expanded: cons(CORE_LET, cons(null, body)), state: TransformState.Recurse };
-        }
-
-        const bindings = toArray(bindingsCons);
-        let currentExpr = body; 
-        for (let i = bindings.length - 1; i >= 0; i--) {
-            const binding = bindings[i];
-            if (!(binding instanceof Cons) || !(binding.cdr instanceof Cons) || binding.cdr.cdr !== null) {
-                throw new Error(`let* binding bad syntax`);
-            }
-            if (typeof binding.car !== "symbol") throw new Error("let* binding name must be a symbol");
-            currentExpr = list(cons(CORE_LET, cons(list(list(binding.car, binding.cdr.car)), currentExpr)));
-        }
-        return { expanded: currentExpr.car, state: TransformState.Recurse };
+    evaluator.registerTransform(CORE_LET_STAR, (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`let* bad syntax`);
+        const bindings = letBindings("let*", expr.car);
+        return lowerBody(evaluator, expr.cdr, "let*", (body, done) => {
+            const inits = bindings.map(([name, init]) => list(name, done ? evaluator.transform(init) : init));
+            return cons(CORE_LET_STAR, cons(fromArray(inits), body));
+        });
     });
 
     // %letrec runs the inits in order, so letrec and letrec* are the same
