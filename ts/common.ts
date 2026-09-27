@@ -108,6 +108,7 @@ export const CORE_LET = Symbol.for("%let");
 // ones are dropped unless formals has a rest variable (Lua); %let-values/strict raises an error instead
 export const CORE_LET_VALUES = Symbol.for("%let-values");
 export const CORE_LET_VALUES_STRICT = Symbol.for("%let-values/strict");
+export const CORE_LETREC = Symbol.for("%letrec");
 // (%with-mark key value body): body runs with a continuation mark; (%current-marks): the current continuation's marks
 export const CORE_WITH_MARK = Symbol.for("%with-mark");
 export const CORE_CATCH = Symbol.for("%catch");
@@ -137,6 +138,7 @@ export const SPECIAL_FORMS = new Set([
     CORE_LET,
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
+    CORE_LETREC,
     CORE_WITH_MARK,
     CORE_CATCH,
     OP_CURRENT_MARKS,

@@ -7,6 +7,7 @@ import {
   CORE_LET,
   CORE_LET_VALUES,
   CORE_LET_VALUES_STRICT,
+  CORE_LETREC,
   CORE_IF,
   CORE_BEGIN,
   CORE_LOOP,
@@ -25,6 +26,35 @@ import { CORE_FORMS } from "./core";
 import type { Intrinsics } from "./intrinsics";
 
 // Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
+
+const mentions = (e: any, names: ReadonlySet<symbol>): boolean =>
+    typeof e === "symbol" ? names.has(e) : e instanceof Cons && e.car !== CORE_QUOTE && (mentions(e.car, names) || mentions(e.cdr, names));
+
+// whether e makes a closure that mentions one of names
+const lambdaMentions = (e: any, names: ReadonlySet<symbol>): boolean =>
+    e instanceof Cons && e.car !== CORE_QUOTE && (e.car === CORE_LAMBDA ? mentions(e.cdr.cdr, names) : lambdaMentions(e.car, names) || lambdaMentions(e.cdr, names));
+
+// The %letrec names that are not lambdas but may be copied into a closure before their init has run, so they must be
+// treated as assigned (a box when captured) rather than filled into closures once known: a closure made by an earlier
+// (or its own) init mentions it, or earlier inits may have run the %letrec's lambdas, whose nested closures could then
+// have copied it. Inits that mention a lambda's name, or a value whose init did, may run them
+const lateValues = (bindings: Cons[]): symbol[] => {
+    const isLambda = (init: any) => init instanceof Cons && init.car === CORE_LAMBDA;
+    const runsGroup = new Set<symbol>(bindings.filter(b => isLambda(b.cdr.car)).map(b => b.car));
+    const values = bindings.filter(b => !isLambda(b.cdr.car));
+    const late: symbol[] = [];
+    let groupMayHaveRun = false;
+    values.forEach((b, i) => {
+        if (mentions(b.cdr.car, runsGroup)) {
+            groupMayHaveRun = true;
+            runsGroup.add(b.car);
+        }
+        const self = new Set([b.car]);
+        if (groupMayHaveRun || values.slice(0, i + 1).some(v => lambdaMentions(v.cdr.car, self))) late.push(b.car);
+    });
+    return late;
+};
+
 export class AstAnalysis {
     scopeMap = new WeakMap<object, AnalysisScope>();
 
@@ -106,6 +136,17 @@ export class AstAnalysis {
                     this.visit(curr.car, letScope);
                     curr = curr.cdr;
                 }
+                return;
+            }
+            // (%letrec ((name init) ...) body ...): like %let, but the names are visible in the inits
+            case CORE_LETREC: {
+                const letScope = new AnalysisScope(scope, false);
+                const bindings: Cons[] = ast.cdr.car === null ? [] : ast.cdr.car.toArray();
+                for (const b of bindings) letScope.define(b.car);
+                for (const b of bindings) this.visit(b.cdr.car, letScope);
+                this.scopeMap.set(ast, letScope);
+                for (let curr: any = ast.cdr.cdr; curr instanceof Cons; curr = curr.cdr) this.visit(curr.car, letScope);
+                for (const name of lateValues(bindings)) letScope.getVarinfo(name)!.mutable = true;
                 return;
             }
             // (%let-values ((formals expr) ...) body ...): like %let, binding every variable in each formals
@@ -257,6 +298,18 @@ class CallLiveness {
             }
             case OP_DEFINE_GLOBAL:
                 return this.expr(ast.cdr.cdr.car, scope, out, blocks);
+            // the lambdas are made first; then each other init runs, in order, and its name is set after it
+            case CORE_LETREC: {
+                const letScope = this.scopeMap.get(ast)!;
+                const clauses: Cons[] = ast.cdr.car === null ? [] : ast.cdr.car.toArray();
+                let live = new Set(this.#seq(ast.cdr.cdr, letScope, out, blocks));
+                for (let i = clauses.length - 1; i >= 0; i--) {
+                    for (const meta of this.#bound(letScope, [clauses[i].car])) live.delete(meta);
+                    live = this.expr(clauses[i].cdr.car, letScope, live, blocks);
+                }
+                for (const meta of this.#bound(letScope, clauses.map(c => c.car))) live.delete(meta);
+                return live;
+            }
             case CORE_LET:
             case CORE_LET_VALUES:
             case CORE_LET_VALUES_STRICT: {

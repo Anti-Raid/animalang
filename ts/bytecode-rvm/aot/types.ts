@@ -9,6 +9,7 @@ export type AotInst = { at?: number } & (
     | { k: "LoadInt"; dst: number; value: number }
     | { k: "LoadUpvar"; dst: number; idx: number; unbox: boolean }
     | { k: "SetUpvar"; src: number; idx: number; box: boolean }
+    | { k: "FixUpvar"; clo: number; idx: number; src: number }
     | { k: "LoadGlobal"; dst: number; sym: number; ip: number }
     | { k: "SetGlobal"; src: number; sym: number }
     | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }

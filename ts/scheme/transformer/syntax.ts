@@ -12,6 +12,7 @@ import {
     CORE_LET,
     CORE_LET_VALUES,
     CORE_LET_VALUES_STRICT,
+    CORE_LETREC,
     CORE_WITH_MARK,
     CORE_CATCH,
     OP_RAISE,
@@ -21,7 +22,7 @@ import {
     Cons
 } from "../../common";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
-import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
+import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
 import { SCHEME_ALIASES } from "../builtins";
 import type { Closure } from "../../bytecode-rvm/exec";
 
@@ -185,6 +186,13 @@ const namedLetAsLoop = (evaluator: MacroEvaluator, name: symbol, params: symbol[
                 return keepPos(list(CORE_SET, e.cdr.car, rw(e.cdr.cdr.car, false, blocks)), e);
             case OP_DEFINE_GLOBAL:
                 return keepPos(list(op, e.cdr.car, rw(e.cdr.cdr.car, false, blocks)), e);
+            case CORE_LETREC: {
+                // the names are in scope in the inits (lambdas) too
+                const bindings = toArray(e.cdr.car);
+                if (bindings.some(b => b.car === name)) return e;
+                const newBindings = bindings.map(b => list(b.car, rw(b.cdr.car, false, blocks)));
+                return keepPos(cons(op, cons(fromArray(newBindings), seq(e.cdr.cdr, tail, blocks))), e);
+            }
             case CORE_LET:
             case CORE_LET_VALUES:
             case CORE_LET_VALUES_STRICT: {
@@ -310,6 +318,15 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return lowerBody(evaluator, expr.cdr, "let", (body, done) => {
             const inits = bindings.map(([name, init]) => list(name, done ? evaluator.transform(init) : init));
             return cons(CORE_LET, cons(fromArray(inits), body));
+        });
+    });
+
+    evaluator.registerTransform(CORE_LETREC, (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`letrec bad syntax`);
+        const bindings = letBindings("letrec", expr.car);
+        return lowerBody(evaluator, expr.cdr, "letrec", (body, done) => {
+            const inits = bindings.map(([name, init]) => list(name, done ? evaluator.transform(init) : init));
+            return cons(CORE_LETREC, cons(fromArray(inits), body));
         });
     });
 
@@ -452,32 +469,14 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: currentExpr.car, state: TransformState.Recurse };
     });
 
-    evaluator.registerTransform(OP_LETREC, (evaluator, expr, orig) => {
-        if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`letrec: bad syntax`);
-        const bindingsCons = expr.car;
-        const body = expr.cdr;
-
-        if (bindingsCons !== null && !(bindingsCons instanceof Cons)) {
-            throw new Error(`letrec bindings must be a list of form ((var expr)...)`);
-        }
-
-        const bindings = toArray(bindingsCons);
-        const params: symbol[] = [];
-        const setExprs: any[] = [];  
-
-        for (const binding of bindings) {
-            if (!(binding instanceof Cons) || !(binding.cdr instanceof Cons) || binding.cdr.cdr !== null) {
-                throw new Error(`letrec binding bad syntax`);
-            }
-
-            if (typeof binding.car !== "symbol") throw new Error("letrec binding name must be a symbol");
-            params.push(binding.car);
-            setExprs.push(list(OP_SET, binding.car, binding.cdr.car)); 
-        }
-
-        const allBody = fromArray([...setExprs, ...toArray(body)]);
-        return { expanded: cons(CORE_LET, cons(fromArray(params.map(p => list(p, undefined))), allBody)), state: TransformState.Recurse };
-    });
+    // %letrec runs the inits in order, so letrec and letrec* are the same
+    for (const [op, form] of [[OP_LETREC, "letrec"], [OP_LETREC_STAR, "letrec*"]] as const) {
+        evaluator.registerTransform(op, (evaluator, expr, orig) => {
+            if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`${form}: bad syntax`);
+            letBindings(form, expr.car);
+            return { expanded: cons(CORE_LETREC, expr), state: TransformState.Recurse };
+        });
+    }
 
     evaluator.registerTransform(OP_DEFINE, (evaluator, expr, orig) => {
         const normalized = normalizeDefine(orig);

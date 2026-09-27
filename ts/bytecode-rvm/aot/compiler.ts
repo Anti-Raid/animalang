@@ -208,6 +208,9 @@ export class AotCompiler {
                     case OpCode.SETUPVAR:
                         insts.push({ k: "SetUpvar", src: inst[ip++], idx: inst[ip++], box: inst[ip++] !== 0 });
                         break;
+                    case OpCode.FIXUPVAR:
+                        insts.push({ k: "FixUpvar", clo: inst[ip++], idx: inst[ip++], src: inst[ip++] });
+                        break;
                     case OpCode.LOADGLOBAL:
                         insts.push({ k: "LoadGlobal", dst: inst[ip++], sym: inst[ip++], ip: opIp });
                         break;

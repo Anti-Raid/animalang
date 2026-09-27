@@ -30,6 +30,12 @@ export type Node = {
     upvarIdx: number,
     andBox: boolean
 } | {
+    // reg[closureReg].upvars[upvarIdx] = reg[srcReg]
+    t: "FixUpvar",
+    closureReg: number,
+    upvarIdx: number,
+    srcReg: number
+} | {
     t: "LoadGlobal",
     destReg: number,
     sym: symbol
@@ -209,6 +215,10 @@ export class IR {
                 }
                 case "SetUpvar": {
                     emit(OpCode.SETUPVAR, node.srcReg, node.upvarIdx, node.andBox ? 1 : 0)
+                    break
+                }
+                case "FixUpvar": {
+                    emit(OpCode.FIXUPVAR, node.closureReg, node.upvarIdx, node.srcReg)
                     break
                 }
                 case "LoadGlobal": {

@@ -241,6 +241,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`r${inst.dst} = upvars[${inst.idx}]${inst.unbox ? ".val" : ""};`);
             case "SetUpvar":
                 return this.emit(`upvars[${inst.idx}] = ${inst.box ? `new Box(r${inst.src})` : `r${inst.src}`};`);
+            case "FixUpvar":
+                return this.emit(`r${inst.clo}.upvars[${inst.idx}] = r${inst.src};`);
             case "LoadGlobal":
                 return this.emit(`
                     {

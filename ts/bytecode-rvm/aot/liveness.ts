@@ -57,6 +57,7 @@ export class Liveness {
             case "Move": case "Box": case "Unbox": return [inst.src];
             case "SetBox": return [inst.dst, inst.src];
             case "SetUpvar": case "SetGlobal": return [inst.src];
+            case "FixUpvar": return [inst.clo, inst.src];
             case "NewClosure": return inst.captures.filter(c => c.local).map(c => c.index);
             case "IntCall": case "IntApply": case "IntApplyRest": return windowRegs(inst.start, inst.nargs);
             case "Unpack": return [inst.src];

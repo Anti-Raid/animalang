@@ -48,6 +48,7 @@ export enum OpCode {
     ELSEIF,
     APPLYINTR,
     CALLCTX,
+    FIXUPVAR,
 }
 
 
@@ -85,6 +86,12 @@ export class BytecodeInterpreter {
                         const upvarIdx = inst[ip++];
                         const andUnbox = inst[ip++];
                         regs[destReg] = andUnbox ? (frame.upvars[upvarIdx] as Box).val : frame.upvars[upvarIdx];
+                        break;
+                    }
+                    case OpCode.FIXUPVAR: {
+                        const cloReg = inst[ip++];
+                        const upvarIdx = inst[ip++];
+                        regs[cloReg].upvars[upvarIdx] = regs[inst[ip++]];
                         break;
                     }
                     case OpCode.SETUPVAR: {

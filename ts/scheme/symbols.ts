@@ -7,6 +7,7 @@ export const OP_LAMBDA = Symbol.for("lambda");
 export const OP_LET    = Symbol.for("let");
 export const OP_LETSTAR = Symbol.for("let*")
 export const OP_LETREC = Symbol.for("letrec")
+export const OP_LETREC_STAR = Symbol.for("letrec*")
 export const OP_IF     = Symbol.for("if");
 export const OP_COND   = Symbol.for("cond");
 export const OP_ELSE   = Symbol.for("else"); // part of cond but not a special form
@@ -24,6 +25,7 @@ export const SCHEME_SPECIAL_FORMS: readonly symbol[] = [
     OP_LET,
     OP_LETSTAR,
     OP_LETREC,
+    OP_LETREC_STAR,
     OP_IF,
     OP_COND,
     OP_ELSE,

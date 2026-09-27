@@ -1,4 +1,4 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
+import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -120,6 +120,9 @@ export class Compiler {
                     return
                 case CORE_LAMBDA:
                     this.#compileLambda(expr, opts, name)
+                    return
+                case CORE_LETREC:
+                    this.#compileLetrec(expr, opts)
                     return
                 case CORE_LET:
                     this.#compileLet(expr, opts)
@@ -670,6 +673,69 @@ export class Compiler {
         this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope })
         opts.scope.exitBlock()
         for (const reg of initRegs) opts.scope.freeTemp(reg)
+    }
+
+    // (%letrec ((name init) ...) body ...): the names are bound first, so the inits can refer to any of them. The lambdas
+    // are made first, all at once; the other inits then run in order. A name that is never assigned holds its value
+    // directly, and the upvars captured before it existed are filled in once it does (FIXUPVAR); an assigned name (or
+    // one a closure may copy before its init has run, see lateValues) is a box
+    #compileLetrec(expr: Cons, opts: CmpOpts) {
+        const ascope = opts.analyzer.scopeMap.get(expr)
+        if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
+        const bindings = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
+        const isLambda = bindings.map(b => b.cdr.car instanceof Cons && b.cdr.car.car === CORE_LAMBDA)
+
+        opts.scope.enterBlock()
+        const seen = new Set<symbol>()
+        const regs: number[] = []
+        const boxed: boolean[] = []
+        for (let i = 0; i < bindings.length; i++) {
+            const sym = bindings[i].car
+            ensureCanBind(sym, seen, "letrec")
+            this.#ensureNotIntrinsic(sym, "letrec")
+            const inf = ascope.getVarinfo(sym)
+            if (!inf) throw new Error("Could not fetch varinfo")
+            const reg = opts.scope.addLocal(sym)
+            regs.push(reg)
+            boxed.push(inf.isBoxed)
+            if (inf.isBoxed || !isLambda[i]) opts.nodes.push({ t: "LoadValue", constant: undefined, destReg: reg })
+            if (inf.isBoxed) opts.nodes.push({ t: "Box", srcReg: reg, destReg: reg })
+        }
+
+        // every closure made here, with what it captured, so a name can be filled into them once its value exists
+        const made: { reg: number, captures: readonly { index: number, local: boolean }[] }[] = []
+        const temps: number[] = []
+        const fillIn = (reg: number) => {
+            for (const closure of made) {
+                closure.captures.forEach((c, j) => {
+                    if (c.local && c.index === reg) opts.nodes.push({ t: "FixUpvar", closureReg: closure.reg, upvarIdx: j, srcReg: reg })
+                })
+            }
+        }
+        const compileInit = (i: number) => {
+            const dest = boxed[i] ? opts.scope.allocTemp() : regs[i]
+            if (boxed[i]) temps.push(dest)
+            const before = opts.nodes.length
+            this.#compile(bindings[i].cdr.car, { ...opts, ascope, destReg: dest, isTail: false, name: bindings[i].car.description })
+            if (boxed[i]) opts.nodes.push({ t: "SetBox", destReg: regs[i], srcReg: dest })
+            return { dest, closure: opts.nodes.slice(before).reverse().find(n => n.t === "NewClosure") }
+        }
+
+        for (let i = 0; i < bindings.length; i++) {
+            if (!isLambda[i]) continue
+            const { dest, closure } = compileInit(i)
+            made.push({ reg: dest, captures: closure?.t === "NewClosure" ? closure.template.upvarLocs : [] })
+        }
+        for (let i = 0; i < bindings.length; i++) if (isLambda[i] && !boxed[i]) fillIn(regs[i])
+        for (let i = 0; i < bindings.length; i++) {
+            if (isLambda[i]) continue
+            compileInit(i)
+            if (!boxed[i]) fillIn(regs[i])
+        }
+        for (const reg of temps) opts.scope.freeTemp(reg)
+
+        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope })
+        opts.scope.exitBlock()
     }
 
     #getVar(varname: symbol, opts: CmpOpts, destReg?: number): Node[] {

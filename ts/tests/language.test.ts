@@ -1370,8 +1370,10 @@ describe('Anima', () => {
 
         it('does not box variables that are only read inside a let', () => {
             expect(boxesIn(`(lambda (n) (let ((x 1)) (let* ((y (+ x n))) (+ x y n))))`)).toBe(0)
-            // captured by a real lambda: boxed
-            expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (+ x n))))`)).toBe(2)
+            // captured by a real lambda but never assigned: copied into the closure, not boxed
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (+ x n))))`)).toBe(0)
+            // captured and assigned (here inside the closure): boxed, so every sharer sees the assignment
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (set! x n) x)))`)).toBe(1)
             // assigned but never read after a call: a plain register
             expect(boxesIn(`(lambda (n) (let ((x 1)) (set! x n) x))`)).toBe(0)
             expect(boxesIn(`(lambda (f) (let ((x 1)) (f) (set! x 2) x))`)).toBe(0)
@@ -1381,6 +1383,61 @@ describe('Anima', () => {
             expect(boxesIn(`(lambda (f n) (let ((i 0)) (%block d (%loop (%if (= i n) (%escape d i) (%begin)) (f) (set! i (+ i 1))))))`)).toBe(1)
             // ... but with no calls in the loop it stays a register
             expect(boxesIn(`(lambda (n) (let ((i 0) (s 0)) (%block d (%loop (%if (= i n) (%escape d s) (%begin)) (set! s (+ s i)) (set! i (+ i 1))))))`)).toBe(0)
+        })
+
+        it('copies never-assigned variables into closures, one binding per iteration or call', () => {
+            expect(run(`(let loop ((i 0) (fs '())) (if (= i 3) (map (lambda (f) (f)) fs) (loop (+ i 1) (cons (lambda () i) fs))))`)).toBe("(2 1 0)")
+            expect(run(`(define (cap-collect n acc) (if (= n 0) acc (cap-collect (- n 1) (cons (lambda () n) acc)))) (map (lambda (f) (f)) (cap-collect 3 '()))`)).toBe("(1 2 3)")
+            expect(run(`(define (cap-adder x) (lambda (y) (+ x y))) (list ((cap-adder 1) 10) ((cap-adder 2) 10))`)).toBe("(11 12)")
+            expect(run(`(define (cap-counter) (let ((c 0)) (lambda () (set! c (+ c 1)) c))) (define cap-c (cap-counter)) (cap-c) (cap-c)`)).toBe("2")
+        })
+
+        it('binds letrecs of lambdas with %letrec, without boxes', () => {
+            expect(run(`(define (lr-parity n) (define (ev? k) (if (= k 0) #t (od? (- k 1)))) (define (od? k) (if (= k 0) #f (ev? (- k 1)))) (list (ev? n) (od? n))) (lr-parity 10)`)).toBe("(#t #f)")
+            expect(run(`(define (lr-deep n) (define (ev? k) (if (= k 0) #t (od? (- k 1)))) (define (od? k) (if (= k 0) #f (ev? (- k 1)))) (ev? n)) (lr-deep 100001)`)).toBe("#f")
+            expect(boxesIn(`(lambda (n) (letrec ((f (lambda (k) (if (= k 0) 0 (g (- k 1))))) (g (lambda (k) (f k)))) (f n)))`)).toBe(0)
+            expect(boxesIn(`(lambda (n) (define (f k) (if (= k 0) n (f (- k 1)))) (f n))`)).toBe(0)
+            // closures escaping the letrec keep their siblings, and capture outer variables too
+            expect(run(`(define (lr-pair) (letrec ((get (lambda () (other))) (other (lambda () 'me))) get)) ((lr-pair))`)).toBe("me")
+            expect(run(`(define (lr-outer z) (letrec ((f (lambda () (+ z (g)))) (g (lambda () z))) (f))) (lr-outer 3)`)).toBe("6")
+            expect(run(`(define (lr-fns) (letrec ((a (lambda () (list 'a (b)))) (b (lambda () 'b)) (c (lambda () (a)))) (list a b c))) (map (lambda (f) (f)) (lr-fns))`)).toBe("((a b) b (a b))")
+        })
+
+        it('binds values and lambdas together, filling values into closures once known', () => {
+            expect(run(`(define (lrv-add k) (define base 10) (define (add x) (+ base x)) (add k)) (lrv-add 5)`)).toBe("15")
+            expect(boxesIn(`(lambda (k) (define base 10) (define (add x) (+ base x)) (add k))`)).toBe(0)
+            // a helper defined before the value it reads
+            expect(run(`(define (lrv-fwd) (define (get) b) (define b 7) (get)) (lrv-fwd)`)).toBe("7")
+            expect(boxesIn(`(lambda () (define (get) b) (define b 7) (get))`)).toBe(0)
+            // a value computed with an earlier lambda
+            expect(run(`(define (lrv-sq) (define (sq x) (* x x)) (define nine (sq 3)) (list nine (sq 2))) (lrv-sq)`)).toBe("(9 4)")
+        })
+
+        it('boxes a letrec value that a closure may copy before it exists', () => {
+            // made by an earlier init
+            expect(run(`(define (lrv-early) (define a (list (lambda () b))) (define b 3) ((car a))) (lrv-early)`)).toBe("3")
+            // made by one of the letrec's lambdas, run by an earlier init
+            expect(run(`(define (lrv-mk) (define (mk) (lambda () b)) (define a (mk)) (define b 2) (a)) (lrv-mk)`)).toBe("2")
+            expect(boxesIn(`(lambda () (define (mk) (lambda () b)) (define a (mk)) (define b 2) (a))`)).toBe(1)
+            // its own init
+            expect(run(`(letrec ((x (list (lambda () x)))) (eq? ((car x)) x))`)).toBe("#t")
+        })
+
+        it('supports letrec*: each init sees the earlier values', () => {
+            expect(run(`(letrec* ((a 1) (b (+ a 1)) (f (lambda () (list a b (g)))) (g (lambda () 'g))) (f))`)).toBe("(1 2 g)")
+            expect(run(`(define lrs-log '()) (letrec* ((x (begin (set! lrs-log (cons 'x lrs-log)) 1)) (y (begin (set! lrs-log (cons 'y lrs-log)) (+ x 1)))) (list y lrs-log))`)).toBe("(2 (y x))")
+            expect(() => run(`(define (lrs-bad) (letrec* 1 2))`)).toThrow("letrec*")
+        })
+
+        it('runs letrec values in order, and lets them be assigned', () => {
+            expect(run(`(define lrv-log '()) (letrec ((a (begin (set! lrv-log (cons 'a lrv-log)) 1)) (b (begin (set! lrv-log (cons 'b lrv-log)) 2))) (list a b lrv-log))`)).toBe("(1 2 (b a))")
+            expect(run(`(letrec ((x 1) (f (lambda () x))) (set! x 5) (f))`)).toBe("5")
+        })
+
+        it('keeps letrec semantics when the values are not all lambdas, or a name is assigned', () => {
+            expect(run(`(letrec ((x 1) (f (lambda () x))) (f))`)).toBe("1")
+            expect(run(`(letrec ((f (lambda () 1)) (g (lambda () (f)))) (set! f (lambda () 2)) (g))`)).toBe("2")
+            expect(boxesIn(`(lambda () (letrec ((f (lambda () 1)) (g (lambda () (f)))) (set! f (lambda () 2)) (g)))`)).toBe(1)
         })
 
         it('keeps location semantics for assigned variables across continuations', () => {
