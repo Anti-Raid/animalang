@@ -2,7 +2,7 @@ import { ConstPool, type SourcePos } from "../common";
 import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, corePos, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import type { RestKind } from "./arity";
-import { OPCODES } from "./opcodes";
+import { CATCH_GUARDED, OPCODES } from "./opcodes";
 
 let nextLabelId = 0;
 
@@ -100,6 +100,7 @@ export type Node = {
     procReg: number,
     tokReg: number,
     preReg?: number,
+    guarded?: boolean,
     destReg?: number
 } | {
     // start of a %block whose escapes jump to `end`
@@ -331,7 +332,7 @@ export class IR {
                 case "CallEC":
                 case "CallCatch": {
                     if (node.t === "CallEC") emit(OpCode.CALLEC, node.procReg, node.tokReg);
-                    else emit(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
+                    else emit(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG, node.guarded ? CATCH_GUARDED : 0);
                     if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
                     emit(OpCode.CALLINT, use(corePos("%end-escape")), node.tokReg, node.tokReg, 1);
                     break;

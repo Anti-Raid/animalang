@@ -13,6 +13,8 @@ export const TAIL = 1;
 // UNPACK flags
 export const UNPACK_REST = 1;
 export const UNPACK_STRICT = 2;
+// CALLCATCH flags
+export const CATCH_GUARDED = 1;
 
 export type OperandKind =
     | "reg"       // a register
@@ -71,8 +73,8 @@ export const OPCODES: readonly OpSpec[] = Object.freeze([
     { name: "CURMARKS", operands: [["dst", "reg"]], doc: "reg[dst] = the current continuation marks, as a mark set" },
     { name: "CALLEC", operands: [["proc", "reg"], ["tok", "reg"]], split: "always", doc: "reg[tok] = a new escape continuation; call reg[proc] with it" },
     { name: "CALLCATCH",
-        operands: [["proc", "reg"], ["tok", "reg"], ["pre", "optreg"]], split: "always",
-        doc: "reg[tok] = a new catch token; call reg[proc] with it as the innermost exception handler (reg[pre], if any, runs on the error before unwinding)",
+        operands: [["proc", "reg"], ["tok", "reg"], ["pre", "optreg"], ["flags", "flags"]], split: "always", bits: ["guarded"],
+        doc: "reg[tok] = a new catch token; call reg[proc] with it as the innermost exception handler (reg[pre], if any, runs on the error before unwinding; guarded: an error in it comes to this catch too)",
     },
     { name: "CALLHOST",
         operands: [["pos", "intrinsic"], ["start", "reg"], ["nargs", "u32"], ["tail", "tail"]], ...TAIL_CALL,

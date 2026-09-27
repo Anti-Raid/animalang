@@ -841,7 +841,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (orig.length !== 3) throw new Error(`${name} must be of form (${name} thunk handler)`);
     });
     evaluator.registerTransform(CORE_CATCH, lowerTo(CORE_CATCH, orig => {
-        if (orig.length !== 3 && orig.length !== 4) throw new Error("%catch must be of form (%catch thunk handler [pre])");
+        if (orig.length < 3 || orig.length > 5) throw new Error("%catch must be of form (%catch thunk handler [pre [guarded]])");
     }));
     evaluator.registerTransform(Symbol.for("raise-continuable"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length !== 2) throw new Error("raise-continuable takes 1 argument");

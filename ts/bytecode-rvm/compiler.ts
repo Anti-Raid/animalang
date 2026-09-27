@@ -489,16 +489,18 @@ export class Compiler {
     // handler expression is evaluated and called with the error (in tail position if the %catch is); pre is evaluated
     // first, and runs on the error before unwinding
     #compileCatch(expr: any[], opts: CmpOpts) {
-        if (expr.length !== 3 && expr.length !== 4) {
-            throw new VMError(Msg.FormArgs, ["%catch", "2 or 3 arguments (thunk, handler, pre)", expr.length - 1]);
+        if (expr.length < 3 || expr.length > 5) {
+            throw new VMError(Msg.FormArgs, ["%catch", "2 to 4 arguments (thunk, handler, pre, guarded)", expr.length - 1]);
         }
+        if (expr.length === 5 && typeof expr[4] !== "boolean") throw new VMError(Msg.CatchGuard, []);
+        const guarded = expr[4] === true;
         const procReg = opts.scope.allocTemp();
         const tokReg = opts.scope.allocTemp();
         const resReg = opts.scope.allocTemp();
-        const preReg = expr.length === 4 ? opts.scope.allocTemp() : undefined;
+        const preReg = expr.length >= 4 ? opts.scope.allocTemp() : undefined;
         this.#compile(expr[1], { ...opts, destReg: procReg, isTail: false });
         if (preReg !== undefined) this.#compile(expr[3], { ...opts, destReg: preReg, isTail: false });
-        opts.nodes.push({ t: "CallCatch", procReg, tokReg, preReg, destReg: resReg });
+        opts.nodes.push({ t: "CallCatch", procReg, tokReg, preReg, guarded, destReg: resReg });
         if (preReg !== undefined) opts.scope.freeTemp(preReg);
         opts.scope.freeTemp(tokReg);
         opts.scope.freeTemp(procReg);

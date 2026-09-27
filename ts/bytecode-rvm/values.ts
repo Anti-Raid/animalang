@@ -194,9 +194,28 @@ export class EscapeContinuation extends IProcedure {
 }
 
 // the handler a %catch installs: raising to it escapes to the %catch with the error wrapped in a Caught
+// `guarded`: an error raised while `pre` runs comes to this %catch too, as Msg.ErrorInHandler; while it runs, the handler
+// in effect is a copy of the token for that (`of` the token itself, `inPre`)
 export class CatchToken extends EscapeContinuation {
-    constructor(ctxId: number, wind: WindPoint | null, code: ByteCode, reg: number, public readonly pre: any = null) {
+    constructor(ctxId: number, wind: WindPoint | null, code: ByteCode, reg: number, public readonly pre: any = null,
+        public readonly guarded: boolean = false, readonly of: CatchToken | null = null) {
         super(ctxId, wind, code, reg);
+    }
+
+    get inPre(): boolean {
+        return this.of !== null;
+    }
+
+    forPre(): CatchToken {
+        return new CatchToken(this.ctxId, this.wind, this.code, this.reg, null, false, this);
+    }
+
+    target(from: Frame | null): Frame | null {
+        const tok = this.of ?? this;
+        for (let f = from; f !== null; f = f.parent) {
+            if (f.code === this.code && f.regs[this.reg] === tok) return f;
+        }
+        return null;
     }
 }
 

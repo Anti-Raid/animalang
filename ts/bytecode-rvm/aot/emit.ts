@@ -478,7 +478,7 @@ export class ResumeEmitter extends FunctionEmitter {
                 `);
             case "CallCatch":
                 return this.emit(`
-                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, frame.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}`});
+                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, frame.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}${term.guarded ? ", true" : ""}`});
                     frame.ip = ${term.resume};
                     ${this.#spills(live.spillsFor(term.resume, [term.tok]))}
                     return executor.callCatch(ctx, r${term.proc}, frame, r${term.tok});
@@ -852,7 +852,7 @@ export class DirectEmitter extends FunctionEmitter {
                 `);
             case "CallCatch":
                 return this.emit(`
-                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, closure.tmpl.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}`});
+                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, closure.tmpl.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}${term.guarded ? ", true" : ""}`});
                     try {
                         const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(r${term.tok}, markFirst(marks, EXCEPTION_HANDLERS, null)));
                         ${this.#call(term.proc, 0, 0, term.resume, "handlers")}

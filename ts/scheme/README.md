@@ -33,7 +33,7 @@ Each surface form lowers to a core form:
 | `receive`, `let-values`, `let*-values` (nested) | `(%let-values/strict ((<formals> <expr>) ...) <body> ...)` |
 | `set!` | `(%set! <symbol> <expr>)` |
 | `with-continuation-mark` | `(%with-mark <key> <value> <body>)` |
-| `try`, `try-catch`, `pcall`, Luau `pcall`/`xpcall` | `(%catch <thunk> <handler> [<pre>])` |
+| `try`, `try-catch`, `pcall`, Luau `pcall`/`xpcall` | `(%catch <thunk> <handler> [<pre> [<guarded>]])`; Luau's `xpcall(f, h)` is `h` as a guarded `pre` |
 | `define` at top level (after `(define (f ...) ...)` becomes a lambda) | `(%define-global <symbol> <expr>)` |
 
 Internal `define`s in a body become a `letrec`. `let`, `let*`, `letrec`, named `let`, `cond`, `and`, `or`, `guard`, `receive`, `let-values` and `let*-values` are pure surface syntax built from the core forms (for example `let` becomes `%let`, which binds variables in the current function instead of calling a lambda).

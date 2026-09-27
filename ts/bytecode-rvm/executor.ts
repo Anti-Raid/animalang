@@ -404,12 +404,14 @@ export class VMExecutor {
         const outer = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, handlers.outer);
         if (handler instanceof CatchToken) {
             if (handler.pre !== null) {
-                const escape = new Frame(raiseHelpers().escapeWith, [handler, undefined, undefined], 0, frame, ctx, outer, mframe + 1);
+                const preMarks = handler.guarded ? markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(handler.forPre(), handlers.outer)) : outer;
+                const escape = new Frame(raiseHelpers().escapeWith, [handler, undefined, undefined], 0, frame, ctx, preMarks, mframe + 1);
                 return this.invoke(ctx, handler.pre, escape, [obj], 0, 1, false);
             }
             const target = handler.target(frame);
             if (target === null) throw vmError(Msg.CatchOutsideExtent);
-            return this.#jumpTo(ctx, target, mapWind(target, handler.wind), new Caught(obj));
+            const val = handler.inPre ? new ErrorObject(this.vm.message(vmError(Msg.ErrorInHandler, obj), errorPos(frame))) : obj;
+            return this.#jumpTo(ctx, target, mapWind(target, handler.wind), new Caught(val));
         }
         if (continuable) return this.invoke(ctx, handler, frame, [obj], 0, 1, false, outer, mframe + 1);
         const returned = new Frame(raiseHelpers().handlerReturned, [undefined], 0, frame, ctx, outer, mframe + 1);

@@ -1,4 +1,6 @@
 import { ASTStringifier } from '../scheme/printer';
+import { Msg } from '../common';
+import { stringifyInst } from '../bytecode-rvm/utils';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
 import { ByteCode } from '../bytecode-rvm/vm';
@@ -111,6 +113,31 @@ describe('Anima', () => {
     });
 
     describe('The exception model (%raise / %catch)', () => {
+        it('a guarded %catch catches errors in its pre too (xpcall)', () => {
+            const xp = (thunk: string, pre: string, guarded = "#t") => `(%catch ${thunk} (lambda (r) (list 'handled r)) ${pre} ${guarded})`
+            // pre's value is what the handler gets; no error, no pre
+            expect(run(xp(`(lambda () (raise 'x))`, `(lambda (e) (list 'pre e))`))).toBe("(handled (pre x))")
+            expect(run(xp(`(lambda () 7)`, `(lambda (e) 'never)`))).toBe("7")
+            // an error in pre comes to the same %catch, as an error object
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (list (error-object? r) (error-object-message r))) (lambda (e) (raise 'again)) #t)`)).toBe('(#t "error in error handling: again")')
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (error-object-message r)) (lambda (e) (car 1)) #t)`)).toMatch(/^"error in error handling: car: expected a pair/)
+            // unguarded, it goes to the handlers outside
+            expect(run(`(%catch (lambda () ${xp(`(lambda () (raise 'x))`, `(lambda (e) (raise 'again))`, "#f")}) (lambda (r) (list 'outer r)))`)).toBe("(outer again)")
+            // pre's own handlers still come first
+            expect(run(xp(`(lambda () (raise 'x))`, `(lambda (e) (try (lambda () (raise 'y)) (lambda (e2) 'recovered)))`))).toBe("(handled recovered)")
+            // in any mode, from inside calls and in tail position
+            expect(run(`(define (deep n) (if (= n 0) (raise 'bottom) (+ 1 (deep (- n 1))))) ${xp(`(lambda () (deep 50))`, `(lambda (e) (raise 'bad))`)}`)).toMatch(/^\(handled <error: error in error handling: bad>\)$/)
+            expect(() => evaluator.compileRaw(`(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) 5)`)).toThrow("%catch: guarded must be #t or #f")
+        })
+
+        it('words an error in a guarded pre through the formatter', () => {
+            const base = evaluator.intrinsics.format
+            evaluator.intrinsics.setFormatter((op, args, fmt, at) => op === Msg.ErrorInHandler ? "error in error handling" : base(op, args, fmt, at))
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (error-object-message r)) (lambda (e) (raise 'again)) #t)`)).toBe('"error in error handling"')
+            const bc = evaluator.compileRaw(`(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) #t)`) as ByteCode
+            expect(stringifyInst(bc).some(line => /CALLCATCH +proc=r\d+, tok=r\d+, pre=r\d+, flags=guarded$/.test(line))).toBe(true)
+        })
+
         it('delivers %raise to handlers, continuable or not', () => {
             expect(run(`(with-exception-handler (lambda (e) (* e 2)) (lambda () (+ 1 (%raise 20 #t))))`)).toBe("41")
             expect(run(`(%catch (lambda () (with-exception-handler (lambda (e) 'ignored) (lambda () (%raise 'x)))) (lambda (e) (error-message e)))`)).toBe('"handler returned on non-continuable exception"')

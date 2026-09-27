@@ -1,4 +1,4 @@
-import { Msg, formatPos, type Formatter, type SourcePos } from "../common";
+import { ErrorObject, Msg, formatPos, type Formatter, type SourcePos } from "../common";
 import { ASTStringifier } from "./printer";
 
 const PRINTER = new ASTStringifier();
@@ -59,6 +59,8 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.CannotBindBuiltin: return `${a[0]}: cannot bind builtin ${Symbol.keyFor(a[1])}`;
         case Msg.CannotBindIntrinsic: return `${a[0]}: cannot bind ${String(a[1].description)}, which is an intrinsic`;
         case Msg.IntrinsicAsValue: return `${String(a[0].description)} is an intrinsic and cannot be used as a procedure value`;
+        case Msg.ErrorInHandler: return `error in error handling: ${a[0] instanceof ErrorObject ? a[0].error?.message ?? show(fmt, at, a[0]) : show(fmt, at, a[0])}`;
+        case Msg.CatchGuard: return "%catch: guarded must be #t or #f";
         case Msg.NoPrompt: return `no continuation prompt tagged ${show(fmt, at, a[0])}`;
         case Msg.BarrierReentry: return "cannot re-enter a continuation barrier";
         case Msg.NoClause: return `${a[0]}: no clause takes ${a[1]} args`;

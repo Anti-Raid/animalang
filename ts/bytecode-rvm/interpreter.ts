@@ -7,7 +7,7 @@ import { Closure } from "./bytecode";
 import type { ClosureTemplate } from "./bytecode";
 import { ControlRequest, applyArgs, applyIntrinsic, arrayArg } from "./coreops";
 import type { VMExecutor } from "./executor";
-import { NO_REG, UNPACK_REST } from "./opcodes";
+import { CATCH_GUARDED, NO_REG, UNPACK_REST } from "./opcodes";
 import { Box, CatchToken, EscapeContinuation, MISSING, restValues, tailName, unpackForBinding } from "./values";
 import type { ExecutionContext, Frame } from "./values";
 // The opcodes, whose operands and meaning OPCODES (opcodes.ts) describes, in the same order. Declared here because the
@@ -264,7 +264,8 @@ export class BytecodeInterpreter {
                         const procReg = inst[ip++];
                         const tokReg = inst[ip++];
                         const preReg = inst[ip++];
-                        const tok = regs[tokReg] = new CatchToken(ctx.id, ctx.wind, frame.code, tokReg, preReg === NO_REG ? null : regs[preReg]);
+                        const flags = inst[ip++];
+                        const tok = regs[tokReg] = new CatchToken(ctx.id, ctx.wind, frame.code, tokReg, preReg === NO_REG ? null : regs[preReg], (flags & CATCH_GUARDED) !== 0);
                         frame.ip = ip;
                         return executor.callCatch(ctx, regs[procReg], frame, tok);
                     }

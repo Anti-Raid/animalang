@@ -10,7 +10,7 @@ import type { ByteCode, DirectFn, ResumeFn } from "../bytecode";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { OpCode } from "../interpreter";
-import { INSTRUCTION_LENGTHS, basicBlockStarts } from "../opcodes";
+import { CATCH_GUARDED, INSTRUCTION_LENGTHS, basicBlockStarts } from "../opcodes";
 import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
@@ -303,7 +303,9 @@ export class AotCompiler {
                     case OpCode.CALLCATCH: {
                         const proc = inst[ip++];
                         const tok = inst[ip++];
-                        term = { k: "CallCatch", proc, tok, pre: inst[ip++], resume: ip };
+                        const pre = inst[ip++];
+                        const guarded = (inst[ip++] & CATCH_GUARDED) !== 0;
+                        term = { k: "CallCatch", proc, tok, pre, guarded, resume: ip };
                         break;
                     }
                     case OpCode.CALLHOST: {
