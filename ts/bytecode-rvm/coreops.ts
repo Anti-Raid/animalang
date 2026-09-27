@@ -1,13 +1,13 @@
 // The VM's own operations as intrinsics (CORE_INTRINSICS, the start of every table), and the control requests the control
 // operations (and host intrinsics' HostTail) return for the VM to carry out at the call
 import { ErrorObject, Msg, MultipleValues, packValues, unpackValues, vmError } from "../common";
-import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markValues } from "../marks";
+import { BARRIER, Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markValues } from "../marks";
 import type { Marks } from "../marks";
-import type { Closure } from "./bytecode";
+import { CaseLambda, type Closure } from "./bytecode";
 import type { VMExecutor } from "./executor";
 import { Intrinsics } from "./intrinsics";
 import type { InlineFn, IntrinsicFn, IntrinsicOptions } from "./intrinsics";
-import { Coroutine, DIRECT_SUSPEND_LIMIT, MAX_NESTED_RESUMES, StackSnapshot, Suspend, WindPoint, formatTraceback, frameInfos } from "./values";
+import { Aborted, Coroutine, DIRECT_SUSPEND_LIMIT, formatTraceback, frameInfos, MAX_NESTED_RESUMES, StackSnapshot, Suspend, WindPoint } from "./values";
 import type { ExecutionContext, Frame } from "./values";
 // (%debug-frames k args) / (%debug-traceback k args): args is ([coroutine] [msg] [level]), k the caller's continuation
 // the frames %debug-frames / %debug-traceback describe: the stack snapshot they are given, or a coroutine's
@@ -106,6 +106,78 @@ export class CallCCRequest extends ControlRequest {
 
     direct(): any {
         throw Suspend.callCC(this.proc);
+    }
+}
+
+// (%call-with-prompt tag thunk handler)
+export class PromptRequest extends ControlRequest {
+    tag: any = undefined;
+    thunk: any = undefined;
+    handler: any = undefined;
+
+    static readonly #reused = new PromptRequest();
+    static of(tag: any, thunk: any, handler: any): PromptRequest {
+        const r = PromptRequest.#reused;
+        r.tag = tag;
+        r.thunk = thunk;
+        r.handler = handler;
+        return r;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
+        return executor.callPrompt(ctx, frame, isTail, this.tag, this.thunk, this.handler);
+    }
+
+    direct(): any {
+        throw Suspend.prompt(this.tag, this.thunk, this.handler);
+    }
+}
+
+// (%call/comp proc tag)
+export class ComposableRequest extends ControlRequest {
+    proc: any = undefined;
+    tag: any = undefined;
+
+    static readonly #reused = new ComposableRequest();
+    static of(proc: any, tag: any): ComposableRequest {
+        const r = ComposableRequest.#reused;
+        r.proc = proc;
+        r.tag = tag;
+        return r;
+    }
+
+    get tailProc(): any {
+        return this.proc;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
+        return executor.callComposable(ctx, this.proc, this.tag, frame, isTail);
+    }
+
+    direct(): any {
+        throw Suspend.callComposable(this.proc, this.tag);
+    }
+}
+
+// (%abort tag values)
+export class AbortRequest extends ControlRequest {
+    tag: any = undefined;
+    values: any[] = [];
+
+    static readonly #reused = new AbortRequest();
+    static of(tag: any, values: any[]): AbortRequest {
+        const r = AbortRequest.#reused;
+        r.tag = tag;
+        r.values = values;
+        return r;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
+        return executor.abort(ctx, frame, this.tag, this.values);
+    }
+
+    direct(): any {
+        throw Suspend.abort(this.tag, this.values);
     }
 }
 
@@ -235,7 +307,7 @@ export const unaryInline = (inline: (a: string, d: Readonly<Record<string, strin
 // ExecutionContext and VMExecutor
 export const CORE_INTRINSICS: Intrinsics = (() => {
     const table = new Intrinsics();
-    const deps = { MultipleValues, WindPoint, Caught, EXCEPTION_HANDLERS, Handlers };
+    const deps = { MultipleValues, WindPoint, Caught, EXCEPTION_HANDLERS, Handlers, BARRIER };
     const core = (name: string, args: [number, number], fn: IntrinsicFn, options: Omit<IntrinsicOptions, "args" | "deps"> = {}) =>
         table.register(name, fn, { args, leaf: true, ...options, deps: options.inline === undefined ? undefined : deps });
     // (%coroutine-create proc [finally]): finally is a thunk run when the coroutine, once started, is left for good
@@ -254,6 +326,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%caught-value", [1, 1], (regs, start) => regs[start].error, { inline: unaryInline(v => `${v}.error`) });
     core("%make-caught", [1, 1], (regs, start) => new Caught(regs[start]), { inline: unaryInline((v, d) => `new ${d.Caught}(${v})`) });
     core("%handler-key", [0, 0], () => EXCEPTION_HANDLERS, { inline: (args, slow, tmp, d) => d.EXCEPTION_HANDLERS });
+    core("%barrier-key", [0, 0], () => BARRIER, { inline: (args, slow, tmp, d) => d.BARRIER });
     // (%push-handler handler handlers): the handlers mark with handler innermost
     core("%push-handler", [2, 2], (regs, start) => new Handlers(regs[start], regs[start + 1]), {
         inline: ([h, outer], slow, tmp, d) => `(${outer} === null || ${outer} instanceof ${d.Handlers} ? new ${d.Handlers}(${h}, ${outer}) : ${slow})`,
@@ -262,6 +335,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         const vals = regs[start + 1];
         return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
     }, { inline: ([x, v], slow, tmp, d) => `(${v} instanceof ${d.MultipleValues} ? new ${d.MultipleValues}([${x}, ...${v}.values]) : new ${d.MultipleValues}([${x}, ${v}]))` });
+    core("%make-case-lambda", [1, Infinity], (regs, start, nargs) => new CaseLambda(regs.slice(start, start + nargs)));
     core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)));
     core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
     core("%debug-frames", [2, 2], (regs, start, nargs, ctx) => {
@@ -300,6 +374,15 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     control("%coroutine-raise", [2, 2], (regs, start) => ResumeRequest.of(regs[start], [regs[start + 1]], true));
     control("%raise", [1, 2], (regs, start, nargs) => RaiseRequest.of(regs[start], nargs === 2 ? raiseContinuable(regs[start + 1]) : false), false);
     control("%current-stack", [0, 1], (regs, start, nargs) => StackRequest.of(nargs === 1 ? stackSkip(regs[start]) : 0), false);
+    // delimited continuations: a prompt's body gives its value to %prompt-finish, or an abort to it an Aborted, whose
+    // values its handler is then called with
+    control("%call-with-prompt", [3, 3], (regs, start) => PromptRequest.of(regs[start], regs[start + 1], regs[start + 2]));
+    control("%call/comp", [2, 2], (regs, start) => ComposableRequest.of(regs[start], regs[start + 1]));
+    control("%abort", [2, 2], (regs, start) => AbortRequest.of(regs[start], arrayArg("%abort", regs[start + 1]).slice()));
+    core("%prompt-finish", [2, 2], (regs, start) => {
+        const res = regs[start + 1];
+        return res instanceof Aborted ? new HostTail(regs[start], res.values) : res;
+    }, { leaf: false });
     // (%apply proc arg ... array) compiles to these: %apply-fresh when the array is a new one nothing else holds
     control("%apply-array", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], applyArgs(regs, start + 1, nargs - 1)));
     control("%apply-fresh", [2, 2], (regs, start) => new HostTail(regs[start], arrayArg("%apply", regs[start + 1])));

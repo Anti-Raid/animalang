@@ -561,7 +561,9 @@ describe('Anima', () => {
         })
 
         it('rejects escapes that leave a lambda or name no block', () => {
-            expect(() => run(`(%block k (map (lambda (x) (%escape k x)) '(1)))`)).toThrow("cannot escape to block k from inside a lambda")
+            expect(() => run(`(%block k (apply (lambda (x) (%escape k x)) '(1)))`)).toThrow("cannot escape to block k from inside a lambda")
+            // map inlines a literal lambda, so escaping from its body is fine
+            expect(run(`(%block k (map (lambda (x) (%escape k (* x 10))) '(1 2)))`)).toBe("10")
             expect(() => run(`(%escape nope 1)`)).toThrow("no enclosing block named nope")
             expect(() => run(`(%block 5 1)`)).toThrow("%block requires a block name symbol")
             // a let is an inlined lambda, so escaping through it is fine

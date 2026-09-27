@@ -23,30 +23,41 @@ export const STD_PRELUDE = `
         (lambda (proc . lst)
             (%apply proc (%apply %apply-args (%spread lst)))))
 
+    ;; iterative, so long lists need no deep recursion; the result is built reversed, then copied in order (reversing it
+    ;; in place would change a list a continuation captured inside f still holds)
     (set! map-proc
         (lambda (f list1 . more)
             (if (null? more)
-                (let loop ((lst list1))
+                (let loop ((lst list1) (acc '()))
                     (if (null? lst)
-                        '()
-                        (cons (f (car lst)) (loop (cdr lst)))))
-                (let loop ((lists (cons list1 more)))
-                    (let check ((lsts lists))
-                        (if (null? lsts)
-                            (cons (apply-proc f (let get-cars ((lsts lists))
-                                                  (if (null? lsts)
-                                                      '()
-                                                      (cons (car (car lsts)) (get-cars (cdr lsts))))))
-                                  (loop (let get-cdrs ((lsts lists))
-                                          (if (null? lsts)
-                                              '()
-                                              (cons (cdr (car lsts)) (get-cdrs (cdr lsts)))))))
-                            (if (null? (car lsts))
-                                '()
-                                (check (cdr lsts)))))))))
+                        (reverse acc)
+                        (loop (cdr lst) (cons (f (car lst)) acc))))
+                (let loop ((lists (cons list1 more)) (acc '()))
+                    (let ((cars (%map-cars lists)))
+                        (if cars
+                            (loop (%map-cdrs lists) (cons (%apply f cars) acc))
+                            (reverse acc)))))))
 
     (%define-global $apply apply-proc)
     (%define-global $map map-proc))
+
+(define ($for-each f list1 . more)
+    (if (null? more)
+        (let loop ((lst list1))
+            (unless (null? lst)
+                (f (car lst))
+                (loop (cdr lst))))
+        (let loop ((lists (cons list1 more)))
+            (let ((cars (%map-cars lists)))
+                (when cars
+                    (%apply f cars)
+                    (loop (%map-cdrs lists)))))))
+
+(define ($filter pred lst)
+    (let loop ((lst lst) (acc '()))
+        (if (null? lst)
+            (reverse acc)
+            (loop (cdr lst) (if (pred (car lst)) (cons (car lst) acc) acc)))))
 
 (define $current-continuation-marks
     (lambda () (%current-marks)))
@@ -75,6 +86,45 @@ export const STD_PRELUDE = `
             (thunk))))
 (%define-global $try (lambda (thunk catch-proc) (%catch thunk catch-proc)))
 (%define-global $try-catch $try)
+;; R7RS promises: forcing a delay-force chain replaces each promise's state with the next one's (sharing its box), so
+;; the chain is forced in a loop, in constant space
+(define ($force p)
+    (if (promise? p)
+        (let loop ()
+            (if (%promise-done? p)
+                (%promise-value p)
+                (let ((next ((%promise-value p))))
+                    (unless (%promise-done? p) (%promise-update! next p))
+                    (loop))))
+        p))
+
+;; R7RS parameters: a parameter's value is a continuation mark under its key (parameterize sets it), else its initial
+;; value; the converter applies to both
+(define ($make-parameter value . converter)
+    (let* ((convert (if (null? converter) #f (car converter)))
+           (key (%parameter-key-new convert))
+           (init (if convert (convert value) value)))
+        (%parameter-bind! (lambda () (%marks-first (%current-marks) key init)) key)))
+
+;; the thunk runs under the barrier, not in tail position, so its continuation is inside it
+(define ($call-with-continuation-barrier thunk)
+    (%apply %values (%values->array (with-continuation-mark (%barrier-key) (vector) (thunk)))))
+
+;; Racket's delimited continuations over the VM's prompts (%call-with-prompt, %call/comp, %abort). A prompt's default
+;; handler takes a thunk and calls it in tail position
+(define ($call-with-continuation-prompt proc . rest)
+    (let* ((tag (if (null? rest) (default-continuation-prompt-tag) (car rest)))
+           (more (if (null? rest) '() (cdr rest)))
+           (handler (if (or (null? more) (not (car more))) (lambda (thunk) (thunk)) (car more)))
+           (args (if (null? more) '() (cdr more))))
+        (%call-with-prompt tag (lambda () (apply proc args)) handler)))
+
+(define ($abort-current-continuation tag . vals)
+    (%abort tag (%spread vals)))
+
+(define ($call-with-composable-continuation proc . tag)
+    (%call/comp proc (if (null? tag) (default-continuation-prompt-tag) (car tag))))
+
 (%define-global $pcall (lambda (f . args) (%catch (lambda () (%values-cons #t (apply f args))) (lambda (e) (values #f e)))))
 `
 

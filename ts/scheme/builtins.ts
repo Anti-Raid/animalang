@@ -1,5 +1,6 @@
-import { ErrorObject, IProcedure, isDeepEqual, isTruthy, symGen, Table } from "../common";
-import { Cons } from "./list";
+import { ErrorObject, IProcedure, OpaqueValue, isDeepEqual, isTruthy, symGen, Table } from "../common";
+import { ASTStringifier } from "./printer";
+import { Cons, MCons } from "./list";
 import { ContinuationMarkSet } from "../marks";
 import { hostError } from "../errors";
 import type { InlineFn, IntrinsicFn, Intrinsics } from "../bytecode-rvm/intrinsics";
@@ -123,6 +124,67 @@ const onTable = (name: string, op: (tbl: Table) => any, inline?: (t: string) => 
 
 const MISSING_KEY = Symbol("missing key");
 
+// (delay e) / (delay-force e) / (make-promise v): R7RS promises. A promise holds a box, which delay-force's forcing
+// shares between the promises of a chain (see $force in the prelude), so a long chain is forced in constant space
+export class SchemePromise extends OpaqueValue {
+    constructor(public box: { done: boolean, value: any }) {
+        super();
+    }
+
+    get typeName() {
+        return "promise";
+    }
+}
+
+// the continuation-mark key of a parameter (make-parameter), with its converter (or #f)
+export class ParameterKey extends OpaqueValue {
+    constructor(readonly converter: any) {
+        super();
+    }
+
+    get typeName() {
+        return "parameter";
+    }
+}
+
+const PARAMETERS = new WeakMap<object, ParameterKey>();
+
+export class PromptTag extends OpaqueValue {
+    constructor(readonly name: any) {
+        super();
+    }
+
+    get typeName() {
+        return "continuation-prompt-tag";
+    }
+}
+
+const DEFAULT_PROMPT_TAG = new PromptTag(Symbol.for("default"));
+
+// (error message irritant ...): its message shows the irritants, error-object-message is the message alone
+export class SchemeError extends Error {
+    constructor(readonly errorMessage: any, readonly irritants: any[]) {
+        const printer = new ASTStringifier();
+        const text = typeof errorMessage === "string" ? errorMessage : printer.stringify(errorMessage);
+        super(irritants.length === 0 ? text : `${text} ${irritants.map(i => printer.stringify(i)).join(" ")}`);
+    }
+}
+
+const schemeError = (message: any, irritants: any[]): SchemeError => {
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    try {
+        return new SchemeError(message, irritants);
+    } finally {
+        Error.stackTraceLimit = limit;
+    }
+};
+
+const errorObject = (name: string, val: any): any => {
+    if (!(val instanceof ErrorObject)) throw hostError(`${name}: expected an error object`);
+    return val.error;
+};
+
 export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     // arithmetic and comparison
     builtin("+", 0, Infinity, (regs, start, nargs) => {
@@ -176,6 +238,18 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
 
     // lists
     builtin("cons", 2, 2, (regs, start) => Cons.pair(regs[start], regs[start + 1]), (args, _slow, _tmp, d) => args.length === 2 ? `${d.Cons}.pair(${args[0]}, ${args[1]})` : null),
+    // (cons* a ... tail): the pairs of a ... in front of tail, whose length is read once for all of them
+    builtin("cons*", 1, Infinity, (regs, start, nargs) => {
+        let tail = regs[start + nargs - 1];
+        const rest = Cons.lengthOf(tail);
+        for (let i = nargs - 2; i >= 0; i--) tail = new Cons(regs[start + i], tail, rest + nargs - 1 - i);
+        return tail;
+    }, (args, _slow, tmp, d) => {
+        const tail = args[args.length - 1];
+        if (args.length === 1) return tail;
+        const pairs = args.slice(0, -1).reduceRight((acc, arg, i) => `new ${d.Cons}(${arg}, ${acc}, ${tmp} + ${args.length - 1 - i})`, tail);
+        return `(${tmp} = ${d.Cons}.lengthOf(${tail}), ${pairs})`;
+    }),
     cxr("car", "a"),
     cxr("cdr", "d"),
     ...[2, 3, 4].flatMap(depth => cxrPaths(depth)).map(path => cxr(`c${path}r`, path)),
@@ -186,7 +260,20 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     // predicates
     predicate("null?", val => val === null, a => `${a} === null`),
     predicate("pair?", val => val instanceof Cons, (a, _slow, d) => `${a} instanceof ${d.Cons}`),
-    predicate("list?", val => val === null || (val instanceof Cons && !val.isImproper() && !val.isCyclic()), (a, _slow, d) => `(${a} === null || (${a} instanceof ${d.Cons} && !${a}.isImproper() && !${a}.isCyclic()))`),
+    predicate("list?", val => val === null || (val instanceof Cons && val.length >= 0), (a, _slow, d) => `(${a} === null || (${a} instanceof ${d.Cons} && ${a}.length >= 0))`),
+    // mutable pairs (Racket's): not pairs, and not lists
+    builtin("mcons", 2, 2, (regs, start) => new MCons(regs[start], regs[start + 1]), (args, _slow, _tmp, d) => args.length === 2 ? `new ${d.MCons}(${args[0]}, ${args[1]})` : null),
+    predicate("mpair?", val => val instanceof MCons, (a, _slow, d) => `${a} instanceof ${d.MCons}`),
+    ...(["car", "cdr"] as const).map(field => builtin(`m${field}`, 1, 1, (regs, start) => {
+        const p = regs[start];
+        if (!(p instanceof MCons)) throw hostError(`m${field}: expected a mutable pair but got ${new ASTStringifier().stringify(p)}`);
+        return p[field];
+    }, unaryInline((a, slow, d) => `(${a} instanceof ${d.MCons} ? ${a}.${field} : ${slow})`))),
+    ...(["car", "cdr"] as const).map(field => builtin(`set-m${field}!`, 2, 2, (regs, start) => {
+        const p = regs[start];
+        if (!(p instanceof MCons)) throw hostError(`set-m${field}!: expected a mutable pair but got ${new ASTStringifier().stringify(p)}`);
+        p[field] = regs[start + 1];
+    })),
     predicate("number?", val => typeof val === "number", a => `typeof ${a} === "number"`),
     predicate("integer?", val => typeof val === "number" && Number.isInteger(val), a => `Number.isInteger(${a})`),
     predicate("positive?", val => typeof val === "number" && val > 0, a => `(typeof ${a} === "number" && ${a} > 0)`),
@@ -220,15 +307,13 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
         while (curr.cdr instanceof Cons) curr = curr.cdr;
         return curr.cdr === null ? curr.car : curr.cdr;
     }),
+    // a list's length is known from when it was made (see Cons)
     builtin("length", 1, 1, (regs, start) => {
         const val = regs[start];
         if (val === null) return 0;
-        if (val instanceof Cons) {
-            if (val.isCyclic()) throw hostError("length: circular list has no length");
-            return val.isImproper() ? val.toArray().length : val.length;
-        }
+        if (val instanceof Cons) return val.length >= 0 ? val.length : val.toArray().length;
         return typeof val === "string" ? val.length : 0;
-    }),
+    }, unaryInline((a, slow, d) => `(${a} === null ? 0 : ${a} instanceof ${d.Cons} && ${a}.length >= 0 ? ${a}.length : ${slow})`)),
     builtin("member", 2, 2, (regs, start) => {
         const list = regs[start], item = regs[start + 1];
         if (list === null) return false;
@@ -236,13 +321,23 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
         for (let s: any = list; s instanceof Cons; s = s.cdr) if (isDeepEqual(s.car, item)) return s;
         return false;
     }),
+    // (append list ... x): copies of the lists, then x itself (which may be anything)
+    builtin("append", 0, Infinity, (regs, start, nargs) => {
+        if (nargs === 0) return null;
+        let result = regs[start + nargs - 1];
+        for (let i = start + nargs - 2; i >= start; i--) {
+            const lst = regs[i];
+            if (lst === null) continue;
+            if (!(lst instanceof Cons) || lst.length < 0) throw hostError(`append: expected a list but got ${new ASTStringifier().stringify(lst)}`);
+            result = Cons.copyOnto(lst, result);
+        }
+        return result;
+    }),
     builtin("reverse", 1, 1, (regs, start) => {
-        let lst = regs[start];
-        if (lst instanceof Cons && lst.isCyclic()) throw hostError("reverse: circular list");
-        let out: Cons | null = null;
-        for (; lst instanceof Cons; lst = lst.cdr) out = new Cons(lst.car, out);
-        if (lst !== null) throw hostError("reverse requires a proper list");
-        return out;
+        const lst = regs[start];
+        if (lst === null) return null;
+        if (!(lst instanceof Cons) || lst.length < 0) throw hostError("reverse requires a proper list");
+        return Cons.reverse(lst);
     }),
     builtin("contains?", 2, 2, (regs, start) => {
         const list = regs[start], item = regs[start + 1];
@@ -256,9 +351,23 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
         console.log(regs[start]);
         return undefined;
     }),
-    builtin("error", 1, 1, (regs, start) => {
-        throw hostError(regs[start]);
+    builtin("error", 1, Infinity, (regs, start, nargs) => {
+        throw schemeError(regs[start], regs.slice(start + 1, start + nargs));
     }),
+    predicate("error-object?", val => val instanceof ErrorObject, (a, _slow, d) => `${a} instanceof ${d.ErrorObject}`),
+    builtin("error-object-message", 1, 1, (regs, start) => {
+        const err = errorObject("error-object-message", regs[start]);
+        return err instanceof SchemeError ? err.errorMessage : err instanceof Error ? err.message : err;
+    }),
+    builtin("error-object-irritants", 1, 1, (regs, start) => {
+        const err = errorObject("error-object-irritants", regs[start]);
+        return Cons.fromArray(err instanceof SchemeError ? err.irritants : []);
+    }),
+    predicate("promise?", val => val instanceof SchemePromise),
+    builtin("make-continuation-prompt-tag", 0, 1, (regs, start, nargs) => new PromptTag(nargs === 1 ? regs[start] : false)),
+    builtin("default-continuation-prompt-tag", 0, 0, () => DEFAULT_PROMPT_TAG),
+    predicate("continuation-prompt-tag?", val => val instanceof PromptTag),
+    builtin("make-promise", 1, 1, (regs, start) => regs[start] instanceof SchemePromise ? regs[start] : new SchemePromise({ done: true, value: regs[start] })),
     builtin("make-error-object", 1, 1, (regs, start) => new ErrorObject(regs[start])),
     builtin("error-message", 1, 1, (regs, start) => {
         if (!(regs[start] instanceof ErrorObject)) throw hostError("error-message requires the first argument to be an instance of ErrorObject");
@@ -298,7 +407,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     builtin("list->vector", 1, 1, (regs, start) => {
         const lst = regs[start];
         if (lst === null) return [];
-        if (lst instanceof Cons && !lst.isImproper() && !lst.isCyclic()) return lst.toArray();
+        if (lst instanceof Cons && lst.length >= 0) return lst.toArray();
         throw hostError("list->vector requires a proper list");
     }),
     builtin("vector-fill!", 2, 2, (regs, start) => {
@@ -367,7 +476,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
 ];
 
 // what the templates may refer to
-const INLINE_DEPS = { Cons, Table, IProcedure, ErrorObject, ContinuationMarkSet, MISSING: MISSING_KEY };
+const INLINE_DEPS = { Cons, MCons, Table, IProcedure, ErrorObject, ContinuationMarkSet, MISSING: MISSING_KEY };
 
 // (apply proc arg ... lst): the elements of lst, as the VM's %apply takes them
 const spreadList = (lst: any, into: any[] = []): any[] => {
@@ -386,10 +495,52 @@ export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
     }
     intrinsics.register("%list", (regs, start, nargs) => {
         let tail: Cons | null = null;
-        for (let i = start + nargs - 1; i >= start; i--) tail = new Cons(regs[i], tail);
+        for (let i = start + nargs - 1; i >= start; i--) tail = new Cons(regs[i], tail, start + nargs - i);
         return tail;
-    }, { leaf: true, sequence: "pack", inline: (args, _slow, _tmp, d) => args.reduceRight((tail, arg) => `new ${d.Cons}(${arg}, ${tail})`, "null"), deps: INLINE_DEPS });
+    }, { leaf: true, sequence: "pack", inline: (args, _slow, _tmp, d) => args.reduceRight((tail, arg, i) => `new ${d.Cons}(${arg}, ${tail}, ${args.length - i})`, "null"), deps: INLINE_DEPS });
     intrinsics.register("%spread", (regs, start) => spreadList(regs[start]), { args: [1, 1], leaf: true, sequence: "spread" });
+    // promises: (%make-lazy thunk) is (delay-force (thunk)); see $force in the prelude
+    intrinsics.register("%make-lazy", (regs, start) => new SchemePromise({ done: false, value: regs[start] }), { args: [1, 1], leaf: true });
+    intrinsics.register("%promise-done?", (regs, start) => regs[start].box.done, { args: [1, 1], leaf: true });
+    intrinsics.register("%promise-value", (regs, start) => regs[start].box.value, { args: [1, 1], leaf: true });
+    // (%promise-update! new old): old takes new's state, and they share old's box from then on
+    intrinsics.register("%promise-update!", (regs, start) => {
+        const next = regs[start], old = regs[start + 1];
+        if (!(next instanceof SchemePromise)) throw hostError("delay-force: the expression must give a promise");
+        old.box.done = next.box.done;
+        old.box.value = next.box.value;
+        next.box = old.box;
+    }, { args: [2, 2], leaf: true });
+    // parameters: (%parameter-key-new converter), (%parameter-bind! proc key) (returns proc), and for parameterize
+    // (%parameter-key p) and (%parameter-converter key)
+    intrinsics.register("%parameter-key-new", (regs, start) => new ParameterKey(regs[start]), { args: [1, 1], leaf: true });
+    intrinsics.register("%parameter-bind!", (regs, start) => {
+        PARAMETERS.set(regs[start], regs[start + 1]);
+        return regs[start];
+    }, { args: [2, 2], leaf: true });
+    intrinsics.register("%parameter-key", (regs, start) => {
+        const key = PARAMETERS.get(regs[start]);
+        if (key === undefined) throw hostError(`parameterize: not a parameter: ${new ASTStringifier().stringify(regs[start])}`);
+        return key;
+    }, { args: [1, 1], leaf: true });
+    intrinsics.register("%parameter-converter", (regs, start) => regs[start].converter, { args: [1, 1], leaf: true });
+    // map / for-each over several lists: (%map-cars lists) is an array of their cars, or #f once one has ended;
+    // (%map-cdrs lists) the list of their cdrs
+    intrinsics.register("%map-cars", (regs, start) => {
+        const cars: any[] = [];
+        for (let p = regs[start]; p instanceof Cons; p = p.cdr) {
+            const lst = p.car;
+            if (lst === null) return false;
+            if (!(lst instanceof Cons)) throw hostError(`map: expected a list but got ${new ASTStringifier().stringify(lst)}`);
+            cars.push(lst.car);
+        }
+        return cars;
+    }, { args: [1, 1], leaf: true, fresh: true });
+    intrinsics.register("%map-cdrs", (regs, start) => {
+        const cdrs: any[] = [];
+        for (let p = regs[start]; p instanceof Cons; p = p.cdr) cdrs.push(p.car.cdr);
+        return Cons.fromArray(cdrs);
+    }, { args: [1, 1], leaf: true });
     // (%apply-args arg ... lst): the arguments of (apply proc arg ... lst)
     intrinsics.register("%apply-args", (regs, start, nargs) => spreadList(regs[start + nargs - 1], regs.slice(start, start + nargs - 1)), { args: [1, Infinity], leaf: true, fresh: true });
 };

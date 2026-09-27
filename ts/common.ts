@@ -51,6 +51,7 @@ export enum Msg {
     ExpectedClosure, ExpectedFinally, ExpectedCoroutine, CannotResume, CannotClose, YieldOutside, YieldClosing,
     EmptyForm, IfArgs, QuoteArgs, FormArgs, LambdaForm, SetTarget, EscapeNoBlock, EscapeFromLambda,
     BadSyntax, ParamNotSymbol, DuplicateParam, CannotBindBuiltin, CannotBindIntrinsic, IntrinsicAsValue, ApplyNonLeaf,
+    NoClause, CaseLambdaForm, BarrierReentry, NoPrompt,
 }
 
 export type Formatter = (op: Msg, args: readonly any[], fmt: Formatter, at: SourcePos | null) => string;
@@ -77,7 +78,12 @@ export class VMError extends Error {
         this.#text = text;
     }
 
+    #formatter: Formatter | null = null;
+
+    // words the message with `fmt`, once
     format(fmt: Formatter): this {
+        if (this.#formatter === fmt) return this;
+        this.#formatter = fmt;
         this.#text = fmt(this.op, this.args, fmt, this.at);
         return this;
     }
@@ -132,6 +138,8 @@ export const CORE_LET_VALUES = Symbol.for("%let-values");
 export const CORE_LET_VALUES_STRICT = Symbol.for("%let-values/strict");
 export const CORE_LETREC = Symbol.for("%letrec");
 export const CORE_LET_STAR = Symbol.for("%let*");
+// (%case-lambda (%lambda ...) ...): a procedure that runs the first clause whose arity fits the call
+export const CORE_CASE_LAMBDA = Symbol.for("%case-lambda");
 // (%with-mark key value body): body runs with a continuation mark; (%current-marks): the current continuation's marks
 export const CORE_WITH_MARK = Symbol.for("%with-mark");
 export const CORE_CATCH = Symbol.for("%catch");
@@ -163,6 +171,7 @@ export const SPECIAL_FORMS = new Set([
     CORE_LET_VALUES_STRICT,
     CORE_LETREC,
     CORE_LET_STAR,
+    CORE_CASE_LAMBDA,
     CORE_WITH_MARK,
     CORE_CATCH,
     OP_CURRENT_MARKS,
@@ -180,7 +189,7 @@ export const unpackValues = (val: any): any[] => val instanceof MultipleValues ?
 
 export const DATUM = Symbol("datum");
 
-// a front end's own kind of data (e.g. Scheme's pairs): how it is compared, printed, copied and serialized. Marked by a
+// a front end's own kind of data (e.g. a list type): how it is compared, printed, copied and serialized. Marked by a
 // property rather than a base class, as V8 does not inline a derived class's constructor
 export interface Datum extends SerializableBytecode {
     readonly [DATUM]: true;

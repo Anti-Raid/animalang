@@ -1,23 +1,22 @@
 // VMExecutor: calls, returns, continuations, dynamic-wind, exception delivery and coroutines, and the driver loop that
 // runs heap frames through the interpreter or AOT code
 import { Env, ErrorObject, IProcedure, Msg, UnhandledError, VMError, packValues, vmError } from "../common";
-import { Caught, EXCEPTION_HANDLERS, Handlers, markFirst, markSet } from "../marks";
+import { BARRIER, Caught, EXCEPTION_HANDLERS, Handlers, MarkEntry, markFirst, markSet, reentersBarrier } from "../marks";
 import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
 import { bindArgs, checkArity } from "./arity";
-import { ByteCode, Closure, ClosureTemplate, createRegs } from "./bytecode";
+import { ByteCode, CaseLambda, Closure, ClosureTemplate, createRegs } from "./bytecode";
 import type { VMHost } from "./bytecode";
 import { CORE_INTRINSICS, corePos, tracebackMessage } from "./coreops";
 import { BytecodeInterpreter, OpCode } from "./interpreter";
 import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
-import { CatchToken, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, ReRaise, VMContinuation, WindPoint, caughtValue, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos } from "./values";
-import type { Suspend } from "./values";
+import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
 // register 0 with what a pre-unwind handler returned. `coroutineFinally` is under the procedure of a coroutine with a
 // finally thunk (in its register 1): it leaves the thunk's wind and calls it, then returns the procedure's value
-export let helpers: { handlerReturned: Closure, escapeWith: Closure, coroutineFinally: Closure } | null = null;
+export let helpers: { handlerReturned: Closure, escapeWith: Closure, prompt: Closure, coroutineFinally: Closure } | null = null;
 export const raiseHelpers = () => helpers ??= {
     handlerReturned: helperClosure(1, [new ErrorObject(vmError(Msg.HandlerReturned))], [
         OpCode.LOADCONST, 0, 0,
@@ -29,6 +28,13 @@ export const raiseHelpers = () => helpers ??= {
         OpCode.CALLINT, corePos("%make-caught"), 2, 1, 1,
         OpCode.CALL, 0, 2, 1, 1,
     ]),
+    // a prompt (%call-with-prompt): r0 the tag, r1 the body thunk, r2 the handler, r4 the wind it was installed in. The
+    // body's value, or what an abort to it hands it (an Aborted), goes to %prompt-finish, in tail position
+    prompt: helperClosure(5, [], [
+        OpCode.CALL, 1, 3, 0, 0,
+        OpCode.MOVEACC, 3,
+        OpCode.CALLHOST, corePos("%prompt-finish"), 2, 2, 1,
+    ], "prompt"),
     coroutineFinally: helperClosure(3, [], [
         OpCode.MOVEACC, 0,
         OpCode.CALLCTX, corePos("%end-wind"), 2, 0, 0,
@@ -73,6 +79,7 @@ export class VMExecutor {
     ): Frame | null {
         const returnTo = (isTail && callerFrame !== null) ? callerFrame.parent : callerFrame;
 
+        if (proc instanceof CaseLambda) proc = proc.select(nargs);
         if (proc instanceof Closure) {
             const pregs = this.createClosureArg(proc, nargs, callerArgs, startReg);
             if (marks !== undefined) return this.newFrame(ctx, proc, pregs, returnTo, marks, mframe);
@@ -84,11 +91,19 @@ export class VMExecutor {
             return this.newFrame(ctx, proc, pregs, returnTo, callerFrame.marks, isTail ? callerFrame.mframe : callerFrame.mframe + 1);
         }
 
+        if (proc instanceof ComposableContinuation) {
+            const val = nargs === 1 ? callerArgs[startReg] : packValues(callerArgs.slice(startReg, startReg + nargs));
+            if (marks !== undefined) return this.#compose(ctx, proc, returnTo, marks, mframe, val);
+            if (callerFrame === null) return this.#compose(ctx, proc, null, null, 0, val);
+            return this.#compose(ctx, proc, returnTo, callerFrame.marks, isTail ? callerFrame.mframe : callerFrame.mframe + 1, val);
+        }
+
         if (proc instanceof VMContinuation) {
             if (proc.ctxId !== ctx.id) {
                 throw vmError(Msg.ContinuationBoundary);
             }
             if (nargs !== 1) throw vmError(Msg.ContinuationArgs, nargs);
+            if (proc.frame !== null && reentersBarrier(proc.frame.marks, marks ?? callerFrame?.marks ?? null)) throw vmError(Msg.BarrierReentry);
 
             return this.#jumpTo(ctx, proc.frame, proc.wind, callerArgs[startReg]);
         }
@@ -100,7 +115,7 @@ export class VMExecutor {
             if (nargs !== 1) throw vmError(Msg.EscapeArgs, nargs);
             const target = proc.target(callerFrame);
             if (target === null) throw vmError(Msg.EscapeOutsideExtent);
-            return this.#jumpTo(ctx, target, proc.wind, callerArgs[startReg]);
+            return this.#jumpTo(ctx, target, mapWind(target, proc.wind), callerArgs[startReg]);
         }
 
         throw vmError(Msg.NonProcedure, proc);
@@ -187,6 +202,17 @@ export class VMExecutor {
         return fn(ctx, proc, this, depth, marks, mframe, ...args);
     }
 
+    // a call of a case-lambda from direct code: its clause's direct entry, else heap frames
+    public callCase(ctx: ExecutionContext, proc: CaseLambda, args: any[], depth: number, marks: any, mframe: number): any {
+        const clause = proc.select(args.length);
+        const code = clause.tmpl.code;
+        if (depth < MAX_JS_DEPTH) {
+            if (code.directArity === args.length) return this.callDirect(ctx, clause, args, depth, marks, mframe);
+            if (code.directRestArity !== -1 && args.length >= code.directRestArity) return this.callDirectRest(ctx, clause, args, depth, marks, mframe);
+        }
+        throw Suspend.invoke(clause, args);
+    }
+
     public callDirectRest(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
         const code = proc.tmpl.code;
         const fn = code.directFn!;
@@ -226,6 +252,80 @@ export class VMExecutor {
         target?.share(ctx);
         const k = new VMContinuation(target, ctx.id, ctx.wind);
         return this.invoke(ctx, proc, frame, [k], 0, 1, isTail, marks, mframe);
+    }
+
+    // --- delimited continuations ---
+
+    // runs `thunk` under a prompt tagged `tag` (see raiseHelpers().prompt), returning to `frame` (its caller for a tail call)
+    public callPrompt(ctx: ExecutionContext, frame: Frame, isTail: boolean, tag: any, thunk: any, handler: any, marks?: Marks, mframe?: number): Frame | null {
+        const regs = [tag, thunk, handler, undefined, ctx.wind];
+        const returnTo = isTail ? frame.parent : frame;
+        if (marks !== undefined) return this.newFrame(ctx, raiseHelpers().prompt, regs, returnTo, marks, mframe);
+        return this.newFrame(ctx, raiseHelpers().prompt, regs, returnTo, frame.marks, isTail ? frame.mframe : frame.mframe + 1);
+    }
+
+    #prompt(from: Frame | null, tag: any): Frame {
+        const code = raiseHelpers().prompt.tmpl.code;
+        for (let f = from; f !== null; f = f.parent) if (f.code === code && f.regs[0] === tag) return f;
+        throw vmError(Msg.NoPrompt, tag);
+    }
+
+    // calls `proc` with the continuation up to the nearest prompt tagged `tag`, as a procedure that runs it on top of
+    // whatever continuation calls it. The frames are shared from then on (as call/cc shares them), so they stay as captured
+    public callComposable(ctx: ExecutionContext, proc: any, tag: any, frame: Frame, isTail: boolean, marks?: Marks, mframe?: number): Frame | null {
+        const target = isTail ? frame.parent : frame;
+        const prompt = this.#prompt(target, tag);
+        const frames: Frame[] = [];
+        for (let f = target; f !== prompt; f = f!.parent) frames.push(f!);
+        const promptWind = mapWind(prompt, prompt.regs[4]);
+        const winds: WindPoint[] = [];
+        for (let w = ctx.wind; w !== promptWind && w !== null; w = w.parent) winds.push(w);
+        target?.share(ctx);
+        const k = new ComposableContinuation(frames, winds, promptWind, prompt.mframe + 1);
+        return this.invoke(ctx, proc, frame, [k], 0, 1, isTail, marks, mframe);
+    }
+
+    // unwinds to the nearest prompt tagged `tag` (running dynamic-wind after-thunks), which calls its handler with `values`
+    public abort(ctx: ExecutionContext, frame: Frame | null, tag: any, values: any[]): Frame | null {
+        const prompt = this.#prompt(frame, tag);
+        return this.#jumpTo(ctx, prompt, mapWind(prompt, prompt.regs[4]), new Aborted(values));
+    }
+
+    // runs a composable continuation's frames, copied, on top of `returnTo`: their marks and logical frames moved onto
+    // `marks` and `base`, and the wind points entered since the prompt entered again, as copies on top of the current ones
+    #compose(ctx: ExecutionContext, k: ComposableContinuation, returnTo: Frame | null, marks: Marks, base: number, val: any): Frame | null {
+        const shift = base - k.base;
+        const winds = new Map<WindPoint | null, WindPoint | null>([[k.promptWind, ctx.wind]]);
+        let wind = ctx.wind;
+        for (let i = k.winds.length - 1; i >= 0; i--) {
+            wind = new WindPoint(wind, k.winds[i].before, k.winds[i].after);
+            winds.set(k.winds[i], wind);
+        }
+        const moved = new Map<Marks, Marks>();
+        const move = (m: Marks): Marks => {
+            if (m === null || m.frame < k.base) return marks;
+            let out = moved.get(m);
+            if (out === undefined) {
+                if (m.key === BARRIER) throw vmError(Msg.BarrierReentry);
+                out = new MarkEntry(m.key, m.value, m.frame + shift, move(m.next));
+                moved.set(m, out);
+            }
+            return out;
+        };
+        let parent = returnTo;
+        for (let i = k.frames.length - 1; i >= 0; i--) {
+            const f = k.frames[i];
+            const copy = new Frame(f.closure, f.regs.slice(), f.ip, parent, ctx, move(f.marks), f.mframe + shift);
+            copy.posIp = f.posIp;
+            if (f.winds === null) {
+                copy.winds = winds;
+            } else {
+                copy.winds = new Map(winds);
+                for (const [orig, mid] of f.winds) copy.winds.set(orig, winds.has(mid) ? winds.get(mid)! : mid);
+            }
+            parent = copy;
+        }
+        return this.#jumpTo(ctx, parent, wind, val);
     }
 
     public advanceWindTransition(ctx: ExecutionContext): Frame | null {
@@ -309,7 +409,7 @@ export class VMExecutor {
             }
             const target = handler.target(frame);
             if (target === null) throw vmError(Msg.CatchOutsideExtent);
-            return this.#jumpTo(ctx, target, handler.wind, new Caught(obj));
+            return this.#jumpTo(ctx, target, mapWind(target, handler.wind), new Caught(obj));
         }
         if (continuable) return this.invoke(ctx, handler, frame, [obj], 0, 1, false, outer, mframe + 1);
         const returned = new Frame(raiseHelpers().handlerReturned, [undefined], 0, frame, ctx, outer, mframe + 1);

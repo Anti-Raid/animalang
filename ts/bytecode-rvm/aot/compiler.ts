@@ -5,7 +5,7 @@ import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, m
 import { DirectEmitter, ResumeEmitter } from "./emit";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
-import { Closure, ClosureTemplate, SHARED_INSTS } from "../bytecode";
+import { CaseLambda, Closure, ClosureTemplate, SHARED_INSTS } from "../bytecode";
 import type { ByteCode, DirectFn, ResumeFn } from "../bytecode";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
@@ -27,6 +27,7 @@ export const JIT_DEPS = {
     Box,
     MissingVarError,
     Closure,
+    CaseLambda,
     WindPoint,
     applyArgs,
     arrayArg,

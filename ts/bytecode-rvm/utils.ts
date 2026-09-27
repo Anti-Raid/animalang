@@ -75,7 +75,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 24
+export const BYTECODE_VERSION = 25
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

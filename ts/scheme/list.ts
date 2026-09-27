@@ -1,150 +1,102 @@
-import { hostError } from "../errors";
 import { BSReader, DATUM, type BS, type Datum } from "../common";
 
+// the length of an improper list: negative however many pairs are put in front of it (a small integer, so lengths stay
+// unboxed)
+export const IMPROPER = -(2 ** 30);
+
+// An immutable pair. It knows its list's length from when it is made: the number of pairs to a () tail, or a negative
+// number when the tail is anything else (an improper list). Being immutable, a list is never circular
 export class Cons implements Datum {
-    public car: any;
-    public cdr: any;
+    public readonly length: number;
 
-    private _cachedLength: number = -3;
+    // `length`: given by code that knows it (building a list back to front), so it is not worked out from cdr
+    constructor(public readonly car: any, public readonly cdr: any, length?: number) {
+        this.length = length !== undefined ? length : cdr === null ? 1 : cdr instanceof Cons ? cdr.length + 1 : IMPROPER;
+    }
 
-    private static globalEpoch: symbol = Symbol();
-    private _lastValidEpoch: symbol | null = null;
-
-    constructor(car: any, cdr: any) {
-        this.car = car;
-        this.cdr = cdr;
+    // the length a list with `tail` after its pairs adds to their count
+    public static lengthOf(tail: any): number {
+        return tail === null ? 0 : tail instanceof Cons ? tail.length : IMPROPER;
     }
 
     public static pair(car: any, cdr: any): Cons {
         return new Cons(car, cdr);
     }
 
-    public setCar(newCar: any): void {
-        this.car = newCar;
-    }
-
-    public setCdr(newCdr: any): void {
-        this.cdr = newCdr;
-        // deoptimization note: we need to invalidate all of our lengths due to mutation
-        Cons.globalEpoch = Symbol(); 
-    }
-
-    // Returns length or -1 for improper list or -2 for cyclic list
-    public get length(): number {
-        // Fast path: if no set-cdr! has happened anywhere in the VM, return cached
-        if (this._lastValidEpoch === Cons.globalEpoch && this._cachedLength !== -3) {
-            return this._cachedLength;
-        }
-
-        // Slow path: recompute length (O(N)), then cache it
-        //
-        // We use tortoise-hare cycle detection here to handle cyclic lists caused by use of set-cdr!
-        let count = 0;
-        let slow: any = this;
-        let fast: any = this;
-
-        while (fast instanceof Cons) {
-            count++;
-            fast = fast.cdr;
-
-            // Move slow once every two iterations
-            if ((count & 1) === 0) {
-                slow = slow.cdr;
-            }
-
-            // Cycle detected
-            if (fast === slow) {
-                this._cachedLength = -2;
-                this._lastValidEpoch = Cons.globalEpoch;
-                return this._cachedLength;
-            }
-        }
-
-        // fast must end in null for a proper list; non-null means improper
-        this._cachedLength = (fast === null) ? count : -1;        
-        this._lastValidEpoch = Cons.globalEpoch;
-        return this._cachedLength;
-    }
-
     public isImproper(): boolean {
-        return this.length === -1;
+        return this.length < 0;
     }
 
     public isCyclic(): boolean {
-        return this.length === -2;
+        return false;
     }
 
     public toDottedArray(): { elements: any[]; rest: any } {
-        if (this.isCyclic()) throw hostError("cannot convert circular list");
         const elements: any[] = [];
         let curr: any = this;
-        while (curr instanceof Cons) {
-            elements.push(curr.car);
-            curr = curr.cdr;
-        }
+        for (; curr instanceof Cons; curr = curr.cdr) elements.push(curr.car);
         return { elements, rest: curr };
     }
 
     public toArray(): any[] {
-        if (this.isCyclic()) throw hostError("cannot convert circular list to array");
-        const elements: any[] = [];
+        if (this.length < 0) return this.toDottedArray().elements;
+        const elements = new Array(this.length);
         let curr: any = this;
-        while (curr instanceof Cons) {
-            elements.push(curr.car);
-            curr = curr.cdr;
-        }
+        for (let i = 0; i < elements.length; i++, curr = curr.cdr) elements[i] = curr.car;
         return elements;
     }
 
-    public static list(...items: any[]): Cons | null {
-        let tail: any = null;
-        for (let i = items.length - 1; i >= 0; i--) {
-            tail = new Cons(items[i], tail);
+    // a copy of the proper list `lst` in front of `tail`, made front to back in one pass: each pair is linked to the next
+    // before the list is returned, so it is never seen incomplete
+    public static copyOnto(lst: Cons, tail: any): Cons {
+        const rest = tail === null ? 0 : tail instanceof Cons ? tail.length : IMPROPER;
+        let remaining = lst.length;
+        const head: any = new Cons(lst.car, null, remaining + rest);
+        let last = head;
+        for (let p = lst.cdr; p instanceof Cons; p = p.cdr) {
+            const cell: any = new Cons(p.car, null, --remaining + rest);
+            last.cdr = cell;
+            last = cell;
         }
-        return tail;
+        last.cdr = tail;
+        return head;
+    }
+
+    // the proper list `lst` reversed; each pair's length is known from the count, so it is set rather than computed
+    public static reverse(lst: Cons): Cons {
+        let out: any = null;
+        let n = 0;
+        for (let p: any = lst; p instanceof Cons; p = p.cdr) out = new Cons(p.car, out, ++n);
+        return out;
+    }
+
+    public static list(...items: any[]): Cons | null {
+        return Cons.fromArray(items);
     }
 
     public static fromArray(arr: any[], offset: number = 0): Cons | null {
-        if (offset >= arr.length) return null;
         let tail: any = null;
-        for (let i = arr.length - 1; i >= offset; i--) {
-            tail = new Cons(arr[i], tail);
-        }
+        for (let i = arr.length - 1; i >= offset; i--) tail = new Cons(arr[i], tail, arr.length - i);
         return tail;
     }
 
     public includes(elem: any): boolean {
-        for (const e of this) {
-            if (e === elem) {
-                return true;
-            }
-        }
+        for (let curr: any = this; curr instanceof Cons; curr = curr.cdr) if (curr.car === elem) return true;
         return false;
     }
 
     public get(idx: number): any {
         if (idx < 0) return undefined;
         let curr: any = this;
-        let i = 0;
-        while (curr instanceof Cons) {
-            if (i === idx) return curr.car;
-            curr = curr.cdr;
-            i++;
-        }
+        for (let i = 0; curr instanceof Cons; curr = curr.cdr, i++) if (i === idx) return curr.car;
         return undefined;
     }
 
-    // Iterable support for for..of
+    // the elements, then (as the iterator's return value) the tail: () for a proper list
     public *[Symbol.iterator](): Generator<any, any, unknown> {
-        if (this.isCyclic()) {
-            throw hostError("cannot iterate circular list");
-        }
         let curr: any = this;
-        while (curr instanceof Cons) {
-            yield curr.car;
-            curr = curr.cdr;
-        }
-        return curr; // done: true, value: tail (null if proper, atom if improper)
+        for (; curr instanceof Cons; curr = curr.cdr) yield curr.car;
+        return curr;
     }
 
     get [DATUM](): true {
@@ -165,24 +117,12 @@ export class Cons implements Datum {
     }
 
     equals(other: any, equal: (a: any, b: any) => boolean): boolean {
-        if (!(other instanceof Cons)) return false;
-        const len = this.length;
-        if (len !== other.length) return false;
-        if (len !== -2) {
-            let pa: any = this, pb: any = other;
-            for (; pa instanceof Cons && pb instanceof Cons; pa = pa.cdr, pb = pb.cdr) {
-                if (!equal(pa.car, pb.car)) return false;
-            }
-            return equal(pa, pb);
+        if (!(other instanceof Cons) || other.length !== this.length) return false;
+        let pa: any = this, pb: any = other;
+        for (; pa instanceof Cons && pb instanceof Cons; pa = pa.cdr, pb = pb.cdr) {
+            if (!equal(pa.car, pb.car)) return false;
         }
-        const iterA = this[Symbol.iterator]();
-        const iterB = other[Symbol.iterator]();
-        while (true) {
-            const nextA = iterA.next();
-            const nextB = iterB.next();
-            if (nextA.done) return equal(nextA.value, nextB.value);
-            if (!equal(nextA.value, nextB.value)) return false;
-        }
+        return equal(pa, pb);
     }
 
     stringify(stringify: (v: any) => string): string {
@@ -209,3 +149,53 @@ BSReader.registerType("Cons", r => {
     for (let i = count - 1; i >= 0; i--) tail = new Cons(cars[i], tail);
     return tail;
 });
+
+// the pairs being printed or compared right now: mutable pairs can be circular
+const PRINTING = new Set<MCons>();
+const COMPARING = new Map<MCons, Set<MCons>>();
+
+// A mutable pair (Racket's mcons): not a list, and never a constant
+export class MCons implements Datum {
+    constructor(public car: any, public cdr: any) {}
+
+    get [DATUM](): true {
+        return true;
+    }
+
+    get bsid() {
+        return "MCons";
+    }
+
+    dump(): void {
+        throw new Error("a mutable pair cannot be serialized");
+    }
+
+    // equal contents; a pair of pairs met again while comparing them is taken as equal (so circular ones compare)
+    equals(other: any, equal: (a: any, b: any) => boolean): boolean {
+        if (!(other instanceof MCons)) return false;
+        let seen = COMPARING.get(this);
+        if (seen?.has(other)) return true;
+        if (seen === undefined) COMPARING.set(this, seen = new Set());
+        seen.add(other);
+        try {
+            return equal(this.car, other.car) && equal(this.cdr, other.cdr);
+        } finally {
+            seen.delete(other);
+            if (seen.size === 0) COMPARING.delete(this);
+        }
+    }
+
+    stringify(stringify: (v: any) => string): string {
+        if (PRINTING.has(this)) return "#<cycle>";
+        PRINTING.add(this);
+        try {
+            return `(mcons ${stringify(this.car)} ${stringify(this.cdr)})`;
+        } finally {
+            PRINTING.delete(this);
+        }
+    }
+
+    copy(): MCons {
+        return this;
+    }
+}

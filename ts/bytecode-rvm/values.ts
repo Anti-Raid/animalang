@@ -141,6 +141,23 @@ export class ReRaise {
     constructor(public readonly value: any, public readonly marks: Marks | undefined = undefined, public readonly mframe: number = 0) {}
 }
 
+// the wind an escape to `frame` unwinds to, for a token that recorded `wind`
+export const mapWind = (frame: Frame, wind: WindPoint | null): WindPoint | null =>
+    frame.winds !== null && frame.winds.has(wind) ? frame.winds.get(wind)! : wind;
+
+// what (%call/comp proc tag) captures: the frames up to the nearest prompt with the tag (innermost first), the wind
+// points entered since the prompt (innermost first), the prompt's wind, and the logical frame the frames start at
+export class ComposableContinuation extends IProcedure {
+    constructor(readonly frames: Frame[], readonly winds: WindPoint[], readonly promptWind: WindPoint | null, readonly base: number) {
+        super("composable continuation");
+    }
+}
+
+// what an abort hands its prompt (see PROMPT)
+export class Aborted {
+    constructor(readonly values: any[]) {}
+}
+
 export class VMContinuation extends IProcedure {
     constructor(
         public frame: Frame | null,
@@ -211,6 +228,9 @@ export class Frame {
     public code: ByteCode;
     public upvars: any[];
     public epoch: number;
+    // in a frame a composable continuation reinstated: the wind points it copied, by the originals the frame's escape
+    // continuations and catch tokens still hold (see mapWind)
+    public winds: Map<WindPoint | null, WindPoint | null> | null = null;
     // exact position of the last instruction run, when debug code knows it better than ip
     public posIp: number = -1;
 
@@ -234,7 +254,9 @@ export class Frame {
     }
 
     thaw(ctx: ExecutionContext): Frame {
-        return new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx, this.marks, this.mframe);
+        const copy = new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx, this.marks, this.mframe);
+        copy.winds = this.winds;
+        return copy;
     }
 
     share(ctx: ExecutionContext): this {
@@ -288,7 +310,7 @@ export class Suspend {
 
     static invoke(proc: any, args: any[]) {
         const escape = proc instanceof EscapeContinuation;
-        const sig = new Suspend((ctx, executor, caller, sig) => executor.invoke(ctx, proc, caller, args, 0, args.length, false, sig.marks, sig.mframe), undefined, escape || proc instanceof VMContinuation);
+        const sig = new Suspend((ctx, executor, caller, sig) => executor.invoke(ctx, proc, caller, args, 0, args.length, false, sig.marks, sig.mframe), undefined, escape || proc instanceof VMContinuation || proc instanceof ComposableContinuation);
         if (escape && args.length === 1) {
             sig.escape = proc;
             sig.escapeVal = args[0];
@@ -312,6 +334,18 @@ export class Suspend {
     // doing it is better off on heap frames, where a snapshot needs no rebuilding, so it counts like a control transfer
     static stack(skip: number) {
         return new Suspend((ctx, executor, caller) => executor.setRetVal(ctx, caller, new StackSnapshot(frameInfos(caller, skip))), undefined, true);
+    }
+
+    static prompt(tag: any, thunk: any, handler: any) {
+        return new Suspend((ctx, executor, caller, sig) => executor.callPrompt(ctx, caller, false, tag, thunk, handler, sig.marks, sig.mframe), undefined, true);
+    }
+
+    static callComposable(proc: any, tag: any) {
+        return new Suspend((ctx, executor, caller, sig) => executor.callComposable(ctx, proc, tag, caller, false, sig.marks, sig.mframe), undefined, true);
+    }
+
+    static abort(tag: any, values: any[]) {
+        return new Suspend((ctx, executor, caller) => executor.abort(ctx, caller, tag, values), undefined, true);
     }
 
     static callCC(proc: any) {

@@ -3,7 +3,7 @@
 // so it captures nothing and compiles to a constant closure: none is made each time the %letrec runs. The variables
 // passed include the lifted lambdas it calls (itself too, if it recurses), which it receives as values, and those its
 // callees need. A free variable that is assigned anywhere stops the lifting (a copy would miss the assignments)
-import { CORE_BLOCK, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
+import { CORE_BLOCK, CORE_CASE_LAMBDA, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
 
 const keepPos = <T>(to: T, from: any): T => {
     const pos = SOURCE_POS.get(from);
@@ -138,8 +138,130 @@ const rewrite = (e: any, map: ReadonlyMap<symbol, symbol>, extra: ReadonlyMap<an
 
 const isLambdaExpr = (e: any): boolean => Array.isArray(e) && e[0] === CORE_LAMBDA;
 
+// `e` with the calls in `map` calling the name given for them instead
+const replaceCalls = (e: any, map: ReadonlyMap<any[], symbol>): any => {
+    if (!Array.isArray(e) || map.size === 0) return e;
+    const p = parts(e);
+    const next = p.exprs.map(([x]) => replaceCalls(x, map));
+    const to = map.get(e);
+    if (to !== undefined) next[0] = to;
+    return p.rebuild(next);
+};
+
+const MAKE_CASE_LAMBDA = Symbol.for("%make-case-lambda");
+
+// A %case-lambda bound by a %let, %let* or %letrec to a name never assigned: each clause gets a name of its own (in a
+// %letrec, so lifting applies to it), and every call of the name with a count a clause takes calls that clause. The
+// procedure itself is only made (from the clauses, %make-case-lambda) if the name is still used some other way
+const splitCaseLambdas = (ast: any, assigned: ReadonlySet<symbol>): any => {
+    const isCandidate = (b: [symbol, any]) => Array.isArray(b[1]) && b[1][0] === CORE_CASE_LAMBDA && !assigned.has(b[0])
+        && b[1].slice(1).every((c: any) => Array.isArray(c) && c[0] === CORE_LAMBDA);
+    // the clauses of `name`'s case-lambda, the calls in `within` resolved to them, and whether the procedure is still needed
+    const split = (name: symbol, caseLambda: any[], within: any[]) => {
+        const clauses: any[][] = caseLambda.slice(1);
+        const names = clauses.map(() => Symbol(name.description));
+        const uses = within.reduce((u, x) => usesOf(x, name, new Set(), new Set(), u), { calls: [], other: false } as Uses);
+        const map = new Map<any[], symbol>();
+        let needed = uses.other;
+        for (const { node } of uses.calls) {
+            const i = clauses.findIndex(c => arityAccepts(c, node.length - 1));
+            if (i === -1) needed = true;
+            else map.set(node, names[i]);
+        }
+        const bindings: [symbol, any][] = clauses.map((c, i) => [names[i], c]);
+        const procedure: [symbol, any][] = needed ? [[name, [MAKE_CASE_LAMBDA, ...names]]] : [];
+        return { bindings, procedure, map };
+    };
+    // `e`, a %let, %let* or %letrec whose inits and body are already done, with its candidates split
+    const splitIn = (e: any[]): any[] => {
+        const op = e[0];
+        const bindings: [symbol, any][] = e[1];
+        const at = bindings.findIndex(isCandidate);
+        if (at === -1) return e;
+        const [name, caseLambda] = bindings[at];
+        const body = e.slice(2);
+        // where the name is in scope: every init of a %letrec, the later ones of a %let* (up to one binding it again, whose
+        // init still sees it), and the body
+        const again = op === CORE_LET_STAR ? bindings.findIndex((b, i) => i > at && b[0] === name) : -1;
+        const within = op === CORE_LETREC ? [...bindings.map(b => b[1]), ...body]
+            : op === CORE_LET_STAR ? (again === -1 ? [...bindings.slice(at + 1).map(b => b[1]), ...body] : bindings.slice(at + 1, again + 1).map(b => b[1]))
+            : body;
+        const { bindings: clauses, procedure, map } = split(name, caseLambda, within);
+        const fix = (x: any) => replaceCalls(x, map);
+        if (op === CORE_LETREC) {
+            const rest = bindings.filter((_, i) => i !== at).map(b => keepPos([b[0], fix(b[1])], b));
+            const own = clauses.map(([n, c]) => [n, fix(c)] as [symbol, any]);
+            return splitIn(keepPos([CORE_LETREC, [...rest.slice(0, at), ...own, ...procedure, ...rest.slice(at)], ...body.map(fix)], e));
+        }
+        if (op === CORE_LET) {
+            const rest = [...bindings.slice(0, at), ...procedure, ...bindings.slice(at + 1)];
+            return keepPos([CORE_LETREC, clauses, splitIn([CORE_LET, rest, ...body.map(fix)])], e);
+        }
+        const after = [...procedure, ...bindings.slice(at + 1).map(b => keepPos([b[0], fix(b[1])], b))];
+        const inner = [CORE_LETREC, clauses, splitIn([CORE_LET_STAR, after, ...body.map(fix)])];
+        return keepPos(at === 0 ? inner : [CORE_LET_STAR, bindings.slice(0, at), inner], e);
+    };
+    const walk = (e: any): any => {
+        if (!Array.isArray(e)) return e;
+        const p = parts(e);
+        const done = p.rebuild(p.exprs.map(([x]) => walk(x)));
+        return done[0] === CORE_LET || done[0] === CORE_LETREC || done[0] === CORE_LET_STAR ? splitIn(done) : done;
+    };
+    return walk(ast);
+};
+
+const CALL_EC = Symbol.for("%call/ec");
+const CALL_CC = Symbol.for("%call/cc");
+const VALUES = Symbol.for("%values");
+
+// (%call/ec (%lambda (k) body ...)) or the same with %call/cc, where k is never assigned and only ever called in the
+// body itself (not in a lambda inside it, nor passed on or kept as a value): k can then only be called while the call is
+// still running, so every call of it is an escape out of the body, whichever continuation it is. The body becomes a
+// %block and each (k v ...) an %escape to it, a jump. A continuation captured in the body and resumed later resumes the
+// frame the block is in, so an escape there still lands where k would return to
+const blockEscapes = (ast: any, assigned: ReadonlySet<symbol>): any => {
+    // whether every unshadowed use of k in e is a call outside any lambda
+    const onlyCalled = (e: any, k: symbol, bound: ReadonlySet<symbol>, inLambda: boolean): boolean => {
+        if (e === k) return false;
+        if (!Array.isArray(e)) return true;
+        const nested = inLambda || e[0] === CORE_LAMBDA || e[0] === CORE_CASE_LAMBDA;
+        let i = 0;
+        for (const [x, around] of withBounds(parts(e), bound)) {
+            const operator = i++ === 0 && x === k && e[0] === k && !FORMS.has(e[0]);
+            if (around.has(k)) continue;
+            if (operator ? nested : !onlyCalled(x, k, around, nested)) return false;
+        }
+        return true;
+    };
+    const toEscapes = (e: any, k: symbol, label: symbol, bound: ReadonlySet<symbol>): any => {
+        if (!Array.isArray(e)) return e;
+        const p = parts(e);
+        const next: any[] = [];
+        for (const [x, around] of withBounds(p, bound)) next.push(around.has(k) ? x : toEscapes(x, k, label, around));
+        if (e[0] !== k || FORMS.has(e[0]) || bound.has(k)) return p.rebuild(next);
+        const args = next.slice(1);
+        return keepPos([CORE_ESCAPE, label, args.length === 1 ? args[0] : [VALUES, ...args]], e);
+    };
+    const walk = (e: any): any => {
+        if (!Array.isArray(e)) return e;
+        const p = parts(e);
+        const done = p.rebuild(p.exprs.map(([x]) => walk(x)));
+        if ((done[0] !== CALL_EC && done[0] !== CALL_CC) || done.length !== 2) return done;
+        const proc = done[1];
+        if (!Array.isArray(proc) || proc[0] !== CORE_LAMBDA || proc[1].length !== 1 || proc[2] !== null) return done;
+        const k: symbol = proc[1][0];
+        const body = proc.slice(3);
+        if (assigned.has(k) || !body.every((x: any) => onlyCalled(x, k, new Set(), false))) return done;
+        const label = Symbol(k.description);
+        return keepPos([CORE_BLOCK, label, ...body.map((x: any) => toEscapes(x, k, label, new Set()))], done);
+    };
+    return walk(ast);
+};
+
 export const liftLambdas = (ast: any): any => {
     const assigned = assignedNames(ast);
+    ast = blockEscapes(ast, assigned);
+    ast = splitCaseLambdas(ast, assigned);
 
     // `scope`: the local names bound around `e`. `unsafe`: those that may not have their value yet when code there runs
     // (%letrec values), which a copy would miss, so they cannot be passed

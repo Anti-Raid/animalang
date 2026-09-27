@@ -1,5 +1,5 @@
 // Compiled code: ByteCode (instructions, constants, the intrinsics it is bound to, serialization) and closures
-import { IProcedure } from "../common";
+import { IProcedure, Msg, vmError } from "../common";
 import type { BS, BSReader, SerializableBytecode, SourcePos } from "../common";
 import { closureArity } from "./arity";
 import type { Arity, RestKind } from "./arity";
@@ -287,6 +287,21 @@ export class Closure extends IProcedure implements SerializableBytecode {
 }
 
 
+
+// what (%case-lambda ...) makes: a call runs the first clause whose arity fits
+export class CaseLambda extends IProcedure {
+    constructor(readonly clauses: readonly Closure[], debugName: string = clauses[0]?.debugName ?? "case-lambda") {
+        super(debugName);
+    }
+
+    select(nargs: number): Closure {
+        for (const clause of this.clauses) {
+            const arity = clause.tmpl.arity;
+            if (nargs >= arity.min && nargs <= arity.max) return clause;
+        }
+        throw vmError(Msg.NoClause, this.debugName, nargs);
+    }
+}
 
 export const createRegs = (numRegs: number) => {
     const regs: any[] = [];

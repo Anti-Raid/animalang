@@ -1,4 +1,4 @@
-import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
+import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_CASE_LAMBDA, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -125,6 +125,9 @@ export class Compiler {
                     return
                 case CORE_SET:
                     this.#compileSet(expr, opts)
+                    return
+                case CORE_CASE_LAMBDA:
+                    this.#compileCaseLambda(expr, opts, name)
                     return
                 case CORE_LAMBDA:
                     this.#compileLambda(expr, opts, name)
@@ -272,6 +275,16 @@ export class Compiler {
         if (opts.destReg !== undefined) {
             opts.nodes.push({t: "LoadValue", destReg: opts.destReg, constant: undefined})
         }
+    }
+
+    // [%case-lambda, [%lambda ...] ...]: the clauses' closures, in a block, made into one procedure (%make-case-lambda)
+    #compileCaseLambda(expr: any[], opts: CmpOpts, name?: string) {
+        const clauses = expr.slice(1)
+        if (clauses.length === 0 || clauses.some(c => !Array.isArray(c) || c[0] !== CORE_LAMBDA)) throw new VMError(Msg.CaseLambdaForm, [])
+        const startReg = opts.scope.regAlloc.allocBlock(clauses.length)
+        clauses.forEach((clause, i) => this.#compile(clause, { ...opts, destReg: startReg + i, isTail: false, name }))
+        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%make-case-lambda"), destReg, startReg, nargs: clauses.length }))
+        opts.scope.regAlloc.freeBlock(startReg, clauses.length)
     }
 
     // [%lambda, params, rest, body ...]: params an array of symbols, rest a symbol or null

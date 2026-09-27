@@ -1,16 +1,17 @@
-import { Msg, formatPos, type Formatter } from "../common";
+import { Msg, formatPos, type Formatter, type SourcePos } from "../common";
 import { ASTStringifier } from "./printer";
 
 const PRINTER = new ASTStringifier();
 
+const show = (fmt: Formatter, at: SourcePos | null, x: any): string => fmt(Msg.Value, [x], fmt, at);
+const name = (x: any): string => typeof x === "symbol" ? x.description ?? String(x) : String(x);
+
 // how Scheme words the VM's and the compiler's messages (see Msg), and shows values in them
 export const schemeFormat: Formatter = (op, args, fmt, at) => {
-    const v = (x: any) => fmt(Msg.Value, [x], fmt, at);
     const a = args;
-    const name = (x: any) => typeof x === "symbol" ? x.description ?? String(x) : String(x);
     switch (op) {
         case Msg.Value: return PRINTER.stringify(a[0]);
-        case Msg.Unhandled: return a[0] instanceof Error ? a[0].message : v(a[0]);
+        case Msg.Unhandled: return a[0] instanceof Error ? a[0].message : show(fmt, at, a[0]);
         case Msg.TracebackHeader: return `${a[0] !== undefined ? String(a[0]) + "\n" : ""}stack traceback:`;
         case Msg.TracebackFrame: {
             const tails: { name: string, count: number }[] | null = a[2];
@@ -18,14 +19,14 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
             return `  ${formatPos(a[1])} in ${a[0]}${trail}`;
         }
         case Msg.MissingVar: return `Variable '${name(a[0])}' is not defined in the current scope.`;
-        case Msg.NonProcedure: return `Attempted to call a non-procedure: ${v(a[0])}`;
-        case Msg.NonProcedureWind: return `Attempted to call a non-procedure in dynamic-wind: ${v(a[0])}`;
+        case Msg.NonProcedure: return `Attempted to call a non-procedure: ${show(fmt, at, a[0])}`;
+        case Msg.NonProcedureWind: return `Attempted to call a non-procedure in dynamic-wind: ${show(fmt, at, a[0])}`;
         case Msg.Arity: {
             const [name, min, max, nargs] = a;
             const expected = min === max ? `exactly ${min}` : max === Infinity ? `at least ${min}` : `${min} to ${max}`;
             return `${name}: expected ${expected} args, got ${nargs}`;
         }
-        case Msg.ExpectedArray: return `${a[0]}: expected an array but got ${v(a[1])}`;
+        case Msg.ExpectedArray: return `${a[0]}: expected an array but got ${show(fmt, at, a[1])}`;
         case Msg.ValuesCount: return `let-values: expected ${a[1] ? "at least " : ""}${a[0]} value${a[0] === 1 ? "" : "s"} but got ${a[2]}`;
         case Msg.ContinuationBoundary: return "Cannot invoke a continuation across execution/FFI boundary";
         case Msg.EscapeBoundary: return "Cannot invoke an escape continuation across execution/FFI boundary";
@@ -34,12 +35,12 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.EscapeOutsideExtent: return "escape continuation invoked outside of its dynamic extent";
         case Msg.CatchOutsideExtent: return "catch invoked outside of its dynamic extent";
         case Msg.HandlerReturned: return "handler returned on non-continuable exception";
-        case Msg.BadContinuable: return `%raise: continuable must be ${v(true)} or ${v(false)}`;
+        case Msg.BadContinuable: return `%raise: continuable must be ${show(fmt, at, true)} or ${show(fmt, at, false)}`;
         case Msg.BadStackSkip: return "%current-stack: expected a count of frames to skip";
         case Msg.ExpectedMarkSet: return `${a[0]}: expected a continuation mark set`;
-        case Msg.ExpectedClosure: return `${a[0]}: expected a closure but got ${v(a[1])}`;
-        case Msg.ExpectedFinally: return `${a[0]}: expected a finally procedure but got ${v(a[1])}`;
-        case Msg.ExpectedCoroutine: return `${a[0]}: expected a coroutine but got ${v(a[1])}`;
+        case Msg.ExpectedClosure: return `${a[0]}: expected a closure but got ${show(fmt, at, a[1])}`;
+        case Msg.ExpectedFinally: return `${a[0]}: expected a finally procedure but got ${show(fmt, at, a[1])}`;
+        case Msg.ExpectedCoroutine: return `${a[0]}: expected a coroutine but got ${show(fmt, at, a[1])}`;
         case Msg.CannotResume: return `${a[0]}: cannot resume a ${a[1]} coroutine`;
         case Msg.CannotClose: return `${a[0]}: cannot close a ${a[1]} coroutine`;
         case Msg.YieldOutside: return "coroutine-yield: not inside a coroutine (or across a host call boundary)";
@@ -58,6 +59,10 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.CannotBindBuiltin: return `${a[0]}: cannot bind builtin ${Symbol.keyFor(a[1])}`;
         case Msg.CannotBindIntrinsic: return `${a[0]}: cannot bind ${String(a[1].description)}, which is an intrinsic`;
         case Msg.IntrinsicAsValue: return `${String(a[0].description)} is an intrinsic and cannot be used as a procedure value`;
+        case Msg.NoPrompt: return `no continuation prompt tagged ${show(fmt, at, a[0])}`;
+        case Msg.BarrierReentry: return "cannot re-enter a continuation barrier";
+        case Msg.NoClause: return `${a[0]}: no clause takes ${a[1]} args`;
+        case Msg.CaseLambdaForm: return "%case-lambda clauses must be %lambda forms";
         case Msg.ApplyNonLeaf: return `%apply: ${a[0]} is not a leaf intrinsic, so it cannot be applied`;
         default: {
             const unworded: never = op;

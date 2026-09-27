@@ -16,6 +16,7 @@ import {
     CORE_LETREC,
     CORE_LET_STAR,
     CORE_WITH_MARK,
+    CORE_CASE_LAMBDA,
     CORE_CATCH,
     OP_RAISE,
     OP_CURRENT_MARKS,
@@ -98,6 +99,29 @@ const normalizeDefine = (stmt: any): any => {
     throw new Error(`define syntax error`);
 };
 
+const OP_DEFINE_VALUES = Symbol.for("define-values");
+const OP_ARROW = Symbol.for("=>");
+
+// (define-values formals expr): the values go into a hidden vector, then each variable is defined from it, so in a body
+// they are letrec* bindings in order like any define
+const defineValues = (orig: any): any[] => {
+    if (!(orig instanceof Cons) || orig.length !== 3) throw new Error("define-values must be of form (define-values formals expr)");
+    const formals = orig.cdr.car;
+    const names: any[] = [];
+    let rest: any = formals;
+    for (; rest instanceof Cons; rest = rest.cdr) names.push(rest.car);
+    if (rest !== null && typeof rest !== "symbol") throw new Error("define-values: bad formals");
+    const all = rest === null ? names : [...names, rest];
+    const temps = all.map(() => Symbol("value"));
+    let tempFormals: any = rest === null ? null : temps[temps.length - 1];
+    for (let i = names.length - 1; i >= 0; i--) tempFormals = cons(temps[i], tempFormals);
+    const vec = Symbol("values");
+    return [
+        list(OP_DEFINE, vec, list(Symbol.for("receive"), tempFormals, orig.cdr.cdr.car, cons(Symbol.for("vector"), fromArray(temps)))),
+        ...all.map((name, i) => list(OP_DEFINE, name, list(Symbol.for("vector-ref"), vec, i))),
+    ];
+};
+
 // a body (of a lambda or let) with internal defines gets them as a letrec; `build(body, done)` makes the form around
 // it, `done` saying whether the body is already transformed (otherwise the result is transformed again)
 const lowerBody = (evaluator: MacroEvaluator, rawBody: any, form: string, build: (body: any, done: boolean) => any): TransformResult => {
@@ -106,7 +130,7 @@ const lowerBody = (evaluator: MacroEvaluator, rawBody: any, form: string, build:
 
     const defines: any[] = [];
     const body: any[] = [];
-    for (const stmt of toArray(flat)) {
+    for (const stmt of toArray(flat).flatMap(stmt => stmt instanceof Cons && stmt.car === OP_DEFINE_VALUES ? defineValues(stmt) : [stmt])) {
         if (stmt instanceof Cons && stmt.car === OP_DEFINE) {
             const normalizedStmt = normalizeDefine(stmt);
             defines.push(list(normalizedStmt.cdr.car, normalizedStmt.cdr.cdr.car));
@@ -237,8 +261,17 @@ const namedLetAsLoop = (evaluator: MacroEvaluator, name: symbol, params: symbol[
         if (op === name) {
             const args = toArray(e.cdr);
             if (!tail || args.length !== params.length) throw NOT_A_LOOP;
-            const sets = args.map((a, i) => list(CORE_SET, carriers[i], rw(a, false, blocks)));
-            return keepPos(cons(CORE_BEGIN, fromArray([...sets, list(CORE_ESCAPE, next)])), e);
+            // every value is computed before any carrier is assigned (the last one first, from its value, the others from
+            // temporaries), so no carrier is assigned before a call and read after it: it needs no box, and a continuation
+            // captured in the loop keeps each iteration's values, as a named let's fresh bindings would
+            const vals = args.map(a => rw(a, false, blocks));
+            const temps = vals.slice(0, -1).map(() => Symbol("arg"));
+            const sets = [
+                ...(vals.length > 0 ? [list(CORE_SET, carriers[vals.length - 1], vals[vals.length - 1])] : []),
+                ...temps.map((t, i) => list(CORE_SET, carriers[i], t)),
+            ];
+            const jump = cons(CORE_BEGIN, fromArray([...sets, list(CORE_ESCAPE, next)]));
+            return keepPos(temps.length === 0 ? jump : list(CORE_LET, fromArray(temps.map((t, i) => list(t, vals[i]))), jump), e);
         }
         // a call or intrinsic: operator and operands are all values
         return keepPos(fromArray(toArray(e).map(x => rw(x, false, blocks))), e);
@@ -395,6 +428,29 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     evaluator.registerTransform(OP_COND, (evaluator, expr, orig) => {
         if (expr === null) return { expanded: undefined, state: TransformState.ReturnImm };
 
+        // (test => proc) and (test) clauses need the test's value: those conds nest, from the last clause back
+        if (toArray(expr).some(clause => clause instanceof Cons && (clause.cdr === null || cadr(clause) === OP_ARROW))) {
+            const clauses = toArray(expr);
+            let tail: any = undefined;
+            for (let i = clauses.length - 1; i >= 0; i--) {
+                const clause = clauses[i];
+                if (!(clause instanceof Cons)) throw new Error("cond clause must be a list: (test expr ...), (test => proc) or (test)");
+                if (clause.car === OP_ELSE) {
+                    if (i !== clauses.length - 1) throw new Error("else must be the final clause in a cond statement");
+                    tail = wrapMulti(clause.cdr);
+                } else if (clause.cdr === null) {
+                    tail = list(OP_OR, clause.car, tail);
+                } else if (cadr(clause) === OP_ARROW) {
+                    if (cddr(clause) === null || cddr(clause).cdr !== null) throw new Error("cond: expected (test => proc)");
+                    const t = Symbol("test");
+                    tail = list(OP_LET, list(list(t, clause.car)), list(CORE_IF, t, list(car(cddr(clause)), t), tail));
+                } else {
+                    tail = list(CORE_IF, clause.car, wrapMulti(clause.cdr), tail);
+                }
+            }
+            return { expanded: tail, state: TransformState.Recurse };
+        }
+
         // one flat (%if c1 e1 c2 e2 ... [else]), however many clauses
         const clauses = toArray(expr);
         const args: any[] = [];
@@ -494,6 +550,131 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             expanded: list(OP_DEFINE_GLOBAL, sym, val),
             state: TransformState.Recurse
         };
+    });
+
+    evaluator.registerTransform(OP_DEFINE_VALUES, (evaluator, expr, orig) => ({ expanded: cons(OP_BEGIN, fromArray(defineValues(orig))), state: TransformState.Recurse }));
+
+    // (case-lambda (formals body ...) ...)
+    evaluator.registerTransform(Symbol.for("case-lambda"), (evaluator, expr, orig) => {
+        const clauses = toArray(expr);
+        if (clauses.length === 0 || clauses.some(c => !(c instanceof Cons) || !(c.cdr instanceof Cons))) throw new Error("case-lambda must be of form (case-lambda (formals body ...) ...)");
+        return { expanded: cons(CORE_CASE_LAMBDA, fromArray(clauses.map(c => cons(OP_LAMBDA, c)))), state: TransformState.Recurse };
+    });
+    evaluator.registerTransform(CORE_CASE_LAMBDA, (evaluator, expr, orig) => ({ expanded: orig, state: TransformState.DoChildren }));
+
+    // (reset e ...) and (shift k e ...) under the default prompt tag: shift aborts to the reset with a thunk that runs
+    // its body, where k reinstates the continuation up to the reset, itself inside a reset
+    const defaultTag = () => list(Symbol.for("default-continuation-prompt-tag"));
+    evaluator.registerTransform(Symbol.for("reset"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 2) throw new Error("reset must be of form (reset expr ...)");
+        const thunk = Symbol("thunk");
+        return { expanded: list(Symbol.for("%call-with-prompt"), defaultTag(), cons(OP_LAMBDA, cons(null, expr)), list(OP_LAMBDA, list(thunk), list(thunk))), state: TransformState.Recurse };
+    });
+    evaluator.registerTransform(Symbol.for("shift"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3 || typeof expr.car !== "symbol") throw new Error("shift must be of form (shift k expr ...)");
+        const k = Symbol("k"), vals = Symbol("vals");
+        const reinstate = list(OP_LAMBDA, vals, list(Symbol.for("reset"), list(Symbol.for("apply"), k, vals)));
+        const body = list(OP_LAMBDA, null, cons(OP_LET, cons(list(list(expr.car, reinstate)), expr.cdr)));
+        const capture = list(OP_LAMBDA, list(k), list(Symbol.for("%abort"), defaultTag(), list(Symbol.for("vector"), body)));
+        return { expanded: list(Symbol.for("%call/comp"), capture, defaultTag()), state: TransformState.Recurse };
+    });
+
+    // (map (lambda (x) body ...) lst), and the same with for-each and filter: a loop with the body inline, as the prelude's
+    // procedures run it (the result built reversed, then copied in order), with no closure made or called
+    const inlineOver = (name: string, loop: (l: symbol, acc: symbol, elem: symbol, body: any, next: symbol) => any) =>
+        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
+            const f = car(expr);
+            const oneParam = f instanceof Cons && f.car === OP_LAMBDA && f.cdr instanceof Cons && f.cdr.car instanceof Cons
+                && typeof f.cdr.car.car === "symbol" && f.cdr.car.cdr === null && f.cdr.cdr instanceof Cons;
+            if (!(orig instanceof Cons) || orig.length !== 3 || !oneParam) return { expanded: orig, state: TransformState.DoChildren };
+            const l = Symbol("list"), acc = Symbol("acc"), next = Symbol("loop");
+            const body = cons(OP_LET, cons(null, f.cdr.cdr));
+            return { expanded: list(OP_LET, next, list(list(l, cadr(expr)), list(acc, null)), loop(l, acc, f.cdr.car.car, body, next)), state: TransformState.Recurse };
+        });
+    const step = (l: symbol, elem: symbol, then: any) => list(OP_LET, list(list(elem, list(Symbol.for("car"), l))), then);
+    const rest = (l: symbol) => list(Symbol.for("cdr"), l);
+    inlineOver("map", (l, acc, x, body, next) =>
+        list(CORE_IF, list(Symbol.for("null?"), l), list(Symbol.for("reverse"), acc), step(l, x, list(next, rest(l), list(Symbol.for("cons"), body, acc)))));
+    inlineOver("for-each", (l, acc, x, body, next) =>
+        list(CORE_IF, list(Symbol.for("null?"), l), undefined, step(l, x, list(OP_BEGIN, body, list(next, rest(l), acc)))));
+    inlineOver("filter", (l, acc, x, body, next) =>
+        list(CORE_IF, list(Symbol.for("null?"), l), list(Symbol.for("reverse"), acc), step(l, x, list(next, rest(l), list(CORE_IF, body, list(Symbol.for("cons"), x, acc), acc)))));
+
+    evaluator.registerTransform(Symbol.for("when"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error("when must be of form (when test expr ...)");
+        return { expanded: list(CORE_IF, expr.car, cons(OP_BEGIN, expr.cdr)), state: TransformState.Recurse };
+    });
+    evaluator.registerTransform(Symbol.for("unless"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error("unless must be of form (unless test expr ...)");
+        return { expanded: list(CORE_IF, expr.car, undefined, cons(OP_BEGIN, expr.cdr)), state: TransformState.Recurse };
+    });
+
+    // (case key ((datum ...) expr ...) ... [(else expr ...)]), where a clause's exprs may be `=> proc`, called with the key
+    evaluator.registerTransform(Symbol.for("case"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 2) throw new Error("case must be of form (case key clause ...)");
+        const key = Symbol("key");
+        const clauses = toArray(expr.cdr);
+        const body = (clause: any) => {
+            if (!(clause.cdr instanceof Cons)) throw new Error("case clause must be of form ((datum ...) expr ...)");
+            if (clause.cdr.car !== OP_ARROW) return wrapMulti(clause.cdr);
+            if (clause.cdr.cdr === null || clause.cdr.cdr.cdr !== null) throw new Error("case: expected ((datum ...) => proc)");
+            return list(clause.cdr.cdr.car, key);
+        };
+        const args: any[] = [];
+        clauses.forEach((clause, i) => {
+            if (!(clause instanceof Cons)) throw new Error("case clause must be of form ((datum ...) expr ...)");
+            if (clause.car === OP_ELSE) {
+                if (i !== clauses.length - 1) throw new Error("else must be the final clause in a case");
+                args.push(body(clause));
+                return;
+            }
+            const test = cons(OP_OR, fromArray(toArray(clause.car).map(d => list(Symbol.for("eqv?"), key, list(OP_QUOTE, d)))));
+            args.push(test, body(clause));
+        });
+        const dispatch = args.length === 0 ? undefined : args.length === 1 ? args[0] : cons(CORE_IF, fromArray(args));
+        return { expanded: list(OP_LET, list(list(key, expr.car)), dispatch), state: TransformState.Recurse };
+    });
+
+    // (do ((var init [step]) ...) (test result ...) command ...): a named let
+    evaluator.registerTransform(Symbol.for("do"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3 || !(cadr(orig.cdr) instanceof Cons)) throw new Error("do must be of form (do ((var init [step]) ...) (test result ...) command ...)");
+        const specs = toArray(expr.car).map(spec => {
+            if (!(spec instanceof Cons) || !(spec.cdr instanceof Cons) || (spec.cdr.cdr !== null && spec.cdr.cdr.cdr !== null)) throw new Error("do: expected (var init [step])");
+            return { name: spec.car, init: spec.cdr.car, step: spec.cdr.cdr === null ? spec.car : spec.cdr.cdr.car };
+        });
+        const loop = Symbol("do");
+        const [test, ...results] = toArray(cadr(orig.cdr));
+        const next = list(OP_BEGIN, ...toArray(cddr(expr)), cons(loop, fromArray(specs.map(s => s.step))));
+        const done = results.length === 0 ? undefined : cons(OP_BEGIN, fromArray(results));
+        return { expanded: list(OP_LET, loop, fromArray(specs.map(s => list(s.name, s.init))), list(CORE_IF, test, done, next)), state: TransformState.Recurse };
+    });
+
+    evaluator.registerTransform(Symbol.for("delay-force"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length !== 2) throw new Error("delay-force must be of form (delay-force expr)");
+        return { expanded: list(Symbol.for("%make-lazy"), list(OP_LAMBDA, null, expr.car)), state: TransformState.Recurse };
+    });
+    evaluator.registerTransform(Symbol.for("delay"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length !== 2) throw new Error("delay must be of form (delay expr)");
+        return { expanded: list(Symbol.for("%make-lazy"), list(OP_LAMBDA, null, list(Symbol.for("make-promise"), expr.car))), state: TransformState.Recurse };
+    });
+
+    // (parameterize ((param value) ...) body ...): the params and values are evaluated, then the values converted, then
+    // the body runs with each param's continuation mark set
+    evaluator.registerTransform(Symbol.for("parameterize"), (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length < 3) throw new Error("parameterize must be of form (parameterize ((param value) ...) body ...)");
+        const bindings = toArray(expr.car).map(binding => {
+            if (!(binding instanceof Cons) || !(binding.cdr instanceof Cons) || binding.cdr.cdr !== null) throw new Error("parameterize: expected (param value)");
+            return { param: binding.car, value: binding.cdr.car, key: Symbol("key"), raw: Symbol("value"), conv: Symbol("converted") };
+        });
+        let body: any = cons(OP_LET, cons(null, expr.cdr));
+        for (let i = bindings.length - 1; i >= 0; i--) body = list(CORE_WITH_MARK, bindings[i].key, bindings[i].conv, body);
+        const convert = (b: typeof bindings[number]) => {
+            const c = Symbol("converter");
+            return list(OP_LET, list(list(c, list(Symbol.for("%parameter-converter"), b.key))), list(CORE_IF, c, list(c, b.raw), b.raw));
+        };
+        const evaluated = fromArray(bindings.flatMap(b => [list(b.key, list(Symbol.for("%parameter-key"), b.param)), list(b.raw, b.value)]));
+        const converted = fromArray(bindings.map(b => list(b.conv, convert(b))));
+        return { expanded: list(OP_LET, evaluated, list(OP_LET, converted, body)), state: TransformState.Recurse };
     });
 
     evaluator.registerTransform(OP_DEFINE_GLOBAL, (evaluator, expr, orig) => {
@@ -718,8 +899,25 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
 
     // (name arg ...) of a builtin or another aliased procedure calls its target directly when the argument count fits;
     // otherwise it stays an ordinary call of the prelude's procedure, which reports the wrong count when (and if) it runs
+    // (cons a (cons b ... tail)): one (list a b ...) when tail is '(), else one (cons* a b ... tail), so each pair's
+    // length is known as it is made rather than read from the pair after it
+    const OP_CONS = Symbol.for("cons");
+    const isCons = (e: any) => e instanceof Cons && e.car === OP_CONS && e.length === 3;
+    const isNull = (e: any) => e === null || (e instanceof Cons && e.car === OP_QUOTE && e.length === 2 && e.cdr.car === null);
+    const consChain = (orig: any): any => {
+        const heads: any[] = [];
+        let e = orig;
+        for (; isCons(e); e = cadr(e.cdr)) heads.push(e.cdr.car);
+        if (isNull(e)) return cons(Symbol.for("list"), fromArray(heads));
+        return heads.length > 1 ? cons(Symbol.for("cons*"), fromArray([...heads, e])) : null;
+    };
+
     for (const [name, { target, min, max }] of SCHEME_ALIASES) {
         evaluator.registerTransform(name, (evaluator, expr, orig) => {
+            if (name === OP_CONS && isCons(orig)) {
+                const chain = consChain(orig);
+                if (chain !== null) return { expanded: chain, state: TransformState.Recurse };
+            }
             const nargs = expr === null ? 0 : expr instanceof Cons && !expr.isImproper() ? expr.length : -1;
             if (nargs < min || nargs > max) return { expanded: orig, state: TransformState.DoChildren };
             if (name !== OP_APPLY) return { expanded: cons(target, expr), state: TransformState.DoChildren };

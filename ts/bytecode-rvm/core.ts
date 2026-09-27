@@ -6,7 +6,7 @@ import { Intrinsics } from "./intrinsics";
 // including its control operations (%call/cc, %raise, the coroutine operations), are intrinsics in every table instead
 // (CORE_INTRINSICS)
 export const CORE_FORMS: ReadonlyMap<symbol, { leaf: boolean }> = new Map([
-    ...["%if", "%lambda", "%quote", "%begin", "%set!", "%block", "%escape", "%loop", "%let", "%let*", "%letrec", "%let-values",
+    ...["%if", "%lambda", "%quote", "%begin", "%set!", "%block", "%escape", "%loop", "%let", "%let*", "%letrec", "%case-lambda", "%let-values",
         "%let-values/strict", "%with-mark", "%current-marks", "%define-global"].map(name => [name, true] as const),
     ...["%catch", "%dynamic-wind", "%call/ec", "%apply"].map(name => [name, false] as const),
 ].map(([name, leaf]) => [Symbol.for(name), Object.freeze({ leaf })]))
