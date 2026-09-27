@@ -16,45 +16,60 @@ import {
   CORE_CATCH,
   OP_CURRENT_MARKS,
   OP_DEFINE_GLOBAL,
-  unpackLambdaExprArgs,
-  Cons,
 } from "../common";
 import { AnalysisScope, VariableMetadata } from "./scope";
 
 const OP_APPLY = Symbol.for("%apply");
-const OP_APPLY_MULTI = Symbol.for("%apply-multi");
 import { CORE_FORMS } from "./core";
 import type { Intrinsics } from "./intrinsics";
 
-// Analyzes a fully transformed AST to handle scoping prior to actual compilation. This lets us avoid boxing of primitives
+// Analyzes the core forms (arrays, see compiler.ts) to handle scoping prior to actual compilation. This lets us avoid
+// boxing of primitives
+
+// the expressions directly inside a form (not its binders, labels or quoted data)
+const subExprs = (e: any[]): any[] => {
+    switch (e[0]) {
+        case CORE_QUOTE: return [];
+        case CORE_LAMBDA: return e.slice(3);
+        case CORE_LET: case CORE_LET_STAR: case CORE_LETREC: return [...e[1].map((b: any[]) => b[1]), ...e.slice(2)];
+        case CORE_LET_VALUES: case CORE_LET_VALUES_STRICT: return [...e[1].map((c: any[]) => c[2]), ...e.slice(2)];
+        case CORE_SET: case OP_DEFINE_GLOBAL: return [e[2]];
+        case CORE_BLOCK: case CORE_ESCAPE: return e.slice(2);
+        default: return e;
+    }
+};
 
 const mentions = (e: any, names: ReadonlySet<symbol>): boolean =>
-    typeof e === "symbol" ? names.has(e) : e instanceof Cons && e.car !== CORE_QUOTE && (mentions(e.car, names) || mentions(e.cdr, names));
+    typeof e === "symbol" ? names.has(e) : Array.isArray(e) && subExprs(e).some(x => mentions(x, names));
 
 // whether e makes a closure that mentions one of names
 const lambdaMentions = (e: any, names: ReadonlySet<symbol>): boolean =>
-    e instanceof Cons && e.car !== CORE_QUOTE && (e.car === CORE_LAMBDA ? mentions(e.cdr.cdr, names) : lambdaMentions(e.car, names) || lambdaMentions(e.cdr, names));
+    Array.isArray(e) && (e[0] === CORE_LAMBDA ? mentions(e, names) : subExprs(e).some(x => lambdaMentions(x, names)));
 
 // The %letrec names that are not lambdas but may be copied into a closure before their init has run, so they must be
 // treated as assigned (a box when captured) rather than filled into closures once known: a closure made by an earlier
 // (or its own) init mentions it, or earlier inits may have run the %letrec's lambdas, whose nested closures could then
 // have copied it. Inits that mention a lambda's name, or a value whose init did, may run them
-const lateValues = (bindings: Cons[]): symbol[] => {
-    const isLambda = (init: any) => init instanceof Cons && init.car === CORE_LAMBDA;
-    const runsGroup = new Set<symbol>(bindings.filter(b => isLambda(b.cdr.car)).map(b => b.car));
-    const values = bindings.filter(b => !isLambda(b.cdr.car));
+const lateValues = (bindings: [symbol, any][]): symbol[] => {
+    const isLambda = (init: any) => Array.isArray(init) && init[0] === CORE_LAMBDA;
+    const runsGroup = new Set<symbol>(bindings.filter(([, init]) => isLambda(init)).map(([name]) => name));
+    const values = bindings.filter(([, init]) => !isLambda(init));
     const late: symbol[] = [];
     let groupMayHaveRun = false;
-    values.forEach((b, i) => {
-        if (mentions(b.cdr.car, runsGroup)) {
+    values.forEach(([name, init], i) => {
+        if (mentions(init, runsGroup)) {
             groupMayHaveRun = true;
-            runsGroup.add(b.car);
+            runsGroup.add(name);
         }
-        const self = new Set([b.car]);
-        if (groupMayHaveRun || values.slice(0, i + 1).some(v => lambdaMentions(v.cdr.car, self))) late.push(b.car);
+        const self = new Set([name]);
+        if (groupMayHaveRun || values.slice(0, i + 1).some(([, v]) => lambdaMentions(v, self))) late.push(name);
     });
     return late;
 };
+
+// (spread x) of the table's spread intrinsic, x a variable
+export const isSpreadOf = (e: any, intrinsics: Intrinsics): e is [symbol, symbol] =>
+    intrinsics.spread !== undefined && Array.isArray(e) && e.length === 2 && e[0] === Symbol.for(intrinsics.spread.name) && typeof e[1] === "symbol";
 
 export class AstAnalysis {
     scopeMap = new WeakMap<object, AnalysisScope>();
@@ -63,7 +78,7 @@ export class AstAnalysis {
 
     analyze(ast: any) {
         const baseScope = new AnalysisScope(null);
-        if (ast instanceof Cons) this.scopeMap.set(ast, baseScope);
+        if (Array.isArray(ast)) this.scopeMap.set(ast, baseScope);
         this.visit(ast, baseScope);
         new CallLiveness(this.scopeMap, this.intrinsics).expr(ast, baseScope, new Set(), new Map());
         return baseScope;
@@ -75,68 +90,38 @@ export class AstAnalysis {
             scope.readVar(ast); 
             return;
         }
-        
-        // Base cases: primitives, strings, symbols, or null
-        if (ast === null || typeof ast !== "object") {
-            return;
-        }
+        if (!Array.isArray(ast)) return;
 
-        if (!(ast instanceof Cons)) return;
-
-        const op = ast.car;
+        const op = ast[0];
         switch (op) {
             case CORE_QUOTE:
                 return; // don't touch quoted
             case CORE_LAMBDA: {
-                const body = ast.cdr.cdr;
-                
                 const lambdaScope = new AnalysisScope(scope);
-                
-                const extractedParams = unpackLambdaExprArgs(ast);
-                for (const p of extractedParams.params) {
-                    lambdaScope.define(p); 
+                for (const p of ast[1]) lambdaScope.define(p);
+                const rest: symbol | null = ast[2];
+                if (rest !== null) {
+                    lambdaScope.define(rest);
+                    lambdaScope.getVarinfo(rest)!.isRestParam = true;
                 }
-                if (extractedParams.remParams) {
-                    lambdaScope.define(extractedParams.remParams);
-                    lambdaScope.getVarinfo(extractedParams.remParams)!.isRestParam = true;
-                }
-
                 this.scopeMap.set(ast, lambdaScope);
-
-                // Visit children (yes scope change)
-                let curr: any = body;
-                while (curr instanceof Cons) {
-                    this.visit(curr.car, lambdaScope);
-                    curr = curr.cdr;
-                }
-                if (curr !== null) {
-                    this.visit(curr, lambdaScope);
-                }
+                for (const e of ast.slice(3)) this.visit(e, lambdaScope);
                 return;
             }
             case CORE_SET: {
-                const sym = ast.cdr.car;
-                const value = ast.cdr.cdr.car;
-                
-                scope.markMutable(sym);
-                this.visit(value, scope);
+                scope.markMutable(ast[1]);
+                this.visit(ast[2], scope);
                 return;
             }
             // (%let ((x init) ...) body ...): inits are evaluated outside, body inside a block scope
             case CORE_LET: {
                 const letScope = new AnalysisScope(scope, false);
-                let binding: any = ast.cdr.car;
-                while (binding instanceof Cons) {
-                    this.visit(binding.car.cdr.car, scope);
-                    letScope.define(binding.car.car);
-                    binding = binding.cdr;
+                for (const [name, init] of ast[1]) {
+                    this.visit(init, scope);
+                    letScope.define(name);
                 }
                 this.scopeMap.set(ast, letScope);
-                let curr: any = ast.cdr.cdr;
-                while (curr instanceof Cons) {
-                    this.visit(curr.car, letScope);
-                    curr = curr.cdr;
-                }
+                for (const e of ast.slice(2)) this.visit(e, letScope);
                 return;
             }
             // (%let* ((name init) ...) body ...): each init sees the names before it. The bindings share a scope
@@ -144,24 +129,24 @@ export class AstAnalysis {
             // two variables while a long %let* of distinct names does not make lookups walk a scope per binding
             case CORE_LET_STAR: {
                 let inner = new AnalysisScope(scope, false);
-                for (let clause: any = ast.cdr.car; clause instanceof Cons; clause = clause.cdr) {
-                    this.visit(clause.car.cdr.car, inner);
-                    if (inner.getVarinfo(clause.car.car) !== null) inner = new AnalysisScope(inner, false);
-                    inner.define(clause.car.car);
-                    this.scopeMap.set(clause.car, inner);
+                for (const clause of ast[1]) {
+                    this.visit(clause[1], inner);
+                    if (inner.getVarinfo(clause[0]) !== null) inner = new AnalysisScope(inner, false);
+                    inner.define(clause[0]);
+                    this.scopeMap.set(clause, inner);
                 }
                 this.scopeMap.set(ast, inner);
-                for (let curr: any = ast.cdr.cdr; curr instanceof Cons; curr = curr.cdr) this.visit(curr.car, inner);
+                for (const e of ast.slice(2)) this.visit(e, inner);
                 return;
             }
             // (%letrec ((name init) ...) body ...): like %let, but the names are visible in the inits
             case CORE_LETREC: {
                 const letScope = new AnalysisScope(scope, false);
-                const bindings: Cons[] = ast.cdr.car === null ? [] : ast.cdr.car.toArray();
-                for (const b of bindings) letScope.define(b.car);
-                for (const b of bindings) this.visit(b.cdr.car, letScope);
+                const bindings: [symbol, any][] = ast[1];
+                for (const [name] of bindings) letScope.define(name);
+                for (const [, init] of bindings) this.visit(init, letScope);
                 this.scopeMap.set(ast, letScope);
-                for (let curr: any = ast.cdr.cdr; curr instanceof Cons; curr = curr.cdr) this.visit(curr.car, letScope);
+                for (const e of ast.slice(2)) this.visit(e, letScope);
                 for (const name of lateValues(bindings)) letScope.getVarinfo(name)!.mutable = true;
                 return;
             }
@@ -169,63 +154,33 @@ export class AstAnalysis {
             case CORE_LET_VALUES:
             case CORE_LET_VALUES_STRICT: {
                 const letScope = new AnalysisScope(scope, false);
-                let clause: any = ast.cdr.car;
-                while (clause instanceof Cons) {
-                    this.visit(clause.car.cdr.car, scope);
-                    let formals: any = clause.car.car;
-                    while (formals instanceof Cons) {
-                        letScope.define(formals.car);
-                        formals = formals.cdr;
-                    }
-                    if (typeof formals === "symbol") letScope.define(formals);
-                    clause = clause.cdr;
+                for (const [params, rest, init] of ast[1]) {
+                    this.visit(init, scope);
+                    for (const p of params) letScope.define(p);
+                    if (rest !== null) letScope.define(rest);
                 }
                 this.scopeMap.set(ast, letScope);
-                let curr: any = ast.cdr.cdr;
-                while (curr instanceof Cons) {
-                    this.visit(curr.car, letScope);
-                    curr = curr.cdr;
-                }
+                for (const e of ast.slice(2)) this.visit(e, letScope);
                 return;
             }
             // block names are labels, not variables
             case CORE_BLOCK:
-            case CORE_ESCAPE: {
-                let curr: any = ast.cdr.cdr;
-                while (curr instanceof Cons) {
-                    this.visit(curr.car, scope);
-                    curr = curr.cdr;
-                }
+            case CORE_ESCAPE:
+                for (const e of ast.slice(2)) this.visit(e, scope);
                 return;
-            }
-            case OP_DEFINE_GLOBAL: {
-                const value = ast.cdr.cdr.car;
-                this.visit(value, scope);
+            case OP_DEFINE_GLOBAL:
+                this.visit(ast[2], scope);
                 return;
-            }
-            // (%apply proc arg ... lst) / (%apply-multi proc lst): a variable as lst is only spread, so it may be a
-            // forwarded rest parameter
-            case OP_APPLY:
-            case OP_APPLY_MULTI: {
-                let curr: any = ast.cdr;
-                while (curr instanceof Cons) {
-                    if (curr.cdr === null && typeof curr.car === "symbol" && curr !== ast.cdr) scope.readApplyList(curr.car);
-                    else this.visit(curr.car, scope);
-                    curr = curr.cdr;
-                }
-                if (curr !== null) this.visit(curr, scope);
+            // (%apply proc arg ... (spread x)): x is only spread, so it may be a forwarded rest parameter
+            case OP_APPLY: {
+                const last = ast[ast.length - 1];
+                for (const e of ast.slice(1, -1)) this.visit(e, scope);
+                if (ast.length > 2 && isSpreadOf(last, this.intrinsics)) scope.readApplyList(last[1]);
+                else if (ast.length > 2) this.visit(last, scope);
                 return;
             }
         }
-        // Visit children (no scope change)
-        let curr: any = ast;
-        while (curr instanceof Cons) {
-            this.visit(curr.car, scope);
-            curr = curr.cdr;
-        }
-        if (curr !== null) {
-            this.visit(curr, scope);
-        }
+        for (const e of ast) this.visit(e, scope);
     }
 }
 
@@ -252,8 +207,7 @@ class CallLiveness {
         return meta !== null && meta.mutable && !meta.isCaptured ? meta : null;
     }
 
-    #seq(exprs: any, scope: AnalysisScope, out: Live, blocks: Map<symbol, Live>): Live {
-        const items = exprs instanceof Cons ? exprs.toArray() : [];
+    #seq(items: any[], scope: AnalysisScope, out: Live, blocks: Map<symbol, Live>): Live {
         let live = out;
         for (let i = items.length - 1; i >= 0; i--) live = this.expr(items[i], scope, live, blocks);
         return live;
@@ -280,21 +234,21 @@ class CallLiveness {
             const meta = this.#candidate(scope, ast);
             return meta === null || out.has(meta) ? out : union(out, new Set([meta]));
         }
-        if (!(ast instanceof Cons)) return out;
+        if (!Array.isArray(ast)) return out;
 
-        const op = ast.car;
+        const op = ast[0];
         switch (op) {
             case CORE_QUOTE:
                 return out;
             case CORE_LAMBDA: {
                 // a separate function: its own locals, and no escapes into ours
                 const lambdaScope = this.scopeMap.get(ast);
-                if (lambdaScope !== undefined) this.#seq(ast.cdr.cdr, lambdaScope, new Set(), new Map());
+                if (lambdaScope !== undefined) this.#seq(ast.slice(3), lambdaScope, new Set(), new Map());
                 return out;
             }
             // (%if c1 e1 c2 e2 ... [else]): each ci runs after the ones before it, then its branch or the rest of the chain
             case CORE_IF: {
-                const args = ast.cdr.toArray();
+                const args = ast.slice(1);
                 let live = args.length % 2 === 1 ? this.expr(args[args.length - 1], scope, out, blocks) : out;
                 for (let i = args.length - (args.length % 2 === 1 ? 3 : 2); i >= 0; i -= 2) {
                     live = this.expr(args[i], scope, union(this.expr(args[i + 1], scope, out, blocks), live), blocks);
@@ -302,75 +256,68 @@ class CallLiveness {
                 return live;
             }
             case CORE_BEGIN:
-                return this.#seq(ast.cdr, scope, out, blocks);
+                return this.#seq(ast.slice(1), scope, out, blocks);
             case CORE_SET: {
-                const meta = this.#candidate(scope, ast.cdr.car);
+                const meta = this.#candidate(scope, ast[1]);
                 let after = out;
                 if (meta !== null && out.has(meta)) {
                     after = new Set(out);
                     after.delete(meta);
                 }
-                return this.expr(ast.cdr.cdr.car, scope, after, blocks);
+                return this.expr(ast[2], scope, after, blocks);
             }
             case OP_DEFINE_GLOBAL:
-                return this.expr(ast.cdr.cdr.car, scope, out, blocks);
+                return this.expr(ast[2], scope, out, blocks);
             case CORE_LET_STAR: {
-                const clauses: Cons[] = ast.cdr.car === null ? [] : ast.cdr.car.toArray();
-                let live = new Set(this.#seq(ast.cdr.cdr, this.scopeMap.get(ast)!, out, blocks));
+                const clauses: [symbol, any][] = ast[1];
+                let live = new Set(this.#seq(ast.slice(2), this.scopeMap.get(ast)!, out, blocks));
                 for (let i = clauses.length - 1; i >= 0; i--) {
-                    for (const meta of this.#bound(this.scopeMap.get(clauses[i])!, [clauses[i].car])) live.delete(meta);
-                    live = this.expr(clauses[i].cdr.car, i === 0 ? scope : this.scopeMap.get(clauses[i - 1])!, live, blocks);
+                    for (const meta of this.#bound(this.scopeMap.get(clauses[i])!, [clauses[i][0]])) live.delete(meta);
+                    live = this.expr(clauses[i][1], i === 0 ? scope : this.scopeMap.get(clauses[i - 1])!, live, blocks);
                 }
                 return live;
             }
             // the lambdas are made first; then each other init runs, in order, and its name is set after it
             case CORE_LETREC: {
                 const letScope = this.scopeMap.get(ast)!;
-                const clauses: Cons[] = ast.cdr.car === null ? [] : ast.cdr.car.toArray();
-                let live = new Set(this.#seq(ast.cdr.cdr, letScope, out, blocks));
+                const clauses: [symbol, any][] = ast[1];
+                let live = new Set(this.#seq(ast.slice(2), letScope, out, blocks));
                 for (let i = clauses.length - 1; i >= 0; i--) {
-                    for (const meta of this.#bound(letScope, [clauses[i].car])) live.delete(meta);
-                    live = this.expr(clauses[i].cdr.car, letScope, live, blocks);
+                    for (const meta of this.#bound(letScope, [clauses[i][0]])) live.delete(meta);
+                    live = this.expr(clauses[i][1], letScope, live, blocks);
                 }
-                for (const meta of this.#bound(letScope, clauses.map(c => c.car))) live.delete(meta);
+                for (const meta of this.#bound(letScope, clauses.map(c => c[0]))) live.delete(meta);
                 return live;
             }
             case CORE_LET:
             case CORE_LET_VALUES:
             case CORE_LET_VALUES_STRICT: {
                 const letScope = this.scopeMap.get(ast)!;
-                const clauses: Cons[] = ast.cdr.car === null ? [] : ast.cdr.car.toArray();
-                const syms: symbol[] = [];
-                for (const clause of clauses) {
-                    let formals: any = clause.car;
-                    if (op === CORE_LET) formals = new Cons(formals, null);
-                    while (formals instanceof Cons) {
-                        syms.push(formals.car);
-                        formals = formals.cdr;
-                    }
-                    if (typeof formals === "symbol") syms.push(formals);
-                }
-                let live = new Set(this.#seq(ast.cdr.cdr, letScope, out, blocks));
+                const clauses: any[][] = ast[1];
+                // %let clauses are [name, init]; %let-values ones [params, rest, init]
+                const syms: symbol[] = op === CORE_LET ? clauses.map(c => c[0]) : clauses.flatMap(c => c[1] === null ? c[0] : [...c[0], c[1]]);
+                const init = (c: any[]) => op === CORE_LET ? c[1] : c[2];
+                let live = new Set(this.#seq(ast.slice(2), letScope, out, blocks));
                 for (const meta of this.#bound(letScope, syms)) live.delete(meta);
-                for (let i = clauses.length - 1; i >= 0; i--) live = this.expr(clauses[i].cdr.car, scope, live, blocks);
+                for (let i = clauses.length - 1; i >= 0; i--) live = this.expr(init(clauses[i]), scope, live, blocks);
                 return live;
             }
             case CORE_BLOCK:
-                return this.#seq(ast.cdr.cdr, scope, out, new Map(blocks).set(ast.cdr.car, out));
+                return this.#seq(ast.slice(2), scope, out, new Map(blocks).set(ast[1], out));
             case CORE_ESCAPE: {
-                const target = blocks.get(ast.cdr.car) ?? new Set<VariableMetadata>();
-                return ast.cdr.cdr === null ? target : this.expr(ast.cdr.cdr.car, scope, target, blocks);
+                const target = blocks.get(ast[1]) ?? new Set<VariableMetadata>();
+                return ast.length < 3 ? target : this.expr(ast[2], scope, target, blocks);
             }
             // key and value, then the body (in the mark's tail position); none of it is a call
             case CORE_WITH_MARK: {
-                const [key, value, body] = ast.cdr.toArray();
+                const [, key, value, body] = ast;
                 return this.expr(key, scope, this.expr(value, scope, this.expr(body, scope, out, blocks), blocks), blocks);
             }
             case OP_CURRENT_MARKS:
                 return out;
             // (thunk) is called; only if it raised is the handler evaluated and called
             case CORE_CATCH: {
-                const [thunk, handler, pre] = ast.cdr.toArray();
+                const [, thunk, handler, pre] = ast;
                 const after = union(out, this.expr(handler, scope, out, blocks));
                 for (const meta of after) meta.liveAcrossCall = true;
                 return this.expr(thunk, scope, pre === undefined ? after : this.expr(pre, scope, after, blocks), blocks);
@@ -379,7 +326,7 @@ class CallLiveness {
                 // the end of the body flows back to its start: iterate until the live set at the start is stable
                 let head: Live = this.#loopHeads.get(ast) ?? new Set();
                 for (;;) {
-                    const next = this.#seq(ast.cdr, scope, head, blocks);
+                    const next = this.#seq(ast.slice(1), scope, head, blocks);
                     if ([...next].every(m => head.has(m))) break;
                     head = union(head, next);
                 }
@@ -393,7 +340,7 @@ class CallLiveness {
         if (!this.#isLeaf(op, scope)) {
             for (const meta of out) meta.liveAcrossCall = true;
         }
-        const operands = this.#isIntrinsic(op) ? (ast.cdr instanceof Cons ? ast.cdr.toArray() : []) : ast.toArray();
+        const operands = this.#isIntrinsic(op) ? ast.slice(1) : ast;
         let live = out;
         for (let i = operands.length - 1; i >= 0; i--) live = this.expr(operands[i], scope, live, blocks);
         return live;

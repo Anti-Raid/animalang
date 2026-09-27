@@ -1,17 +1,15 @@
 // The AOT compiler: decodes bytecode into basic blocks, generates a function's JS source (see emit.ts) and builds it,
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
 import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, Table, isTruthy, packValues } from "../../common";
-import { Cons } from "../../list";
-import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markSet, recordTailMark } from "../../marks";
+import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
 import { DirectEmitter, ResumeEmitter } from "./emit";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
 import { Closure, ClosureTemplate, SHARED_INSTS } from "../bytecode";
 import type { ByteCode, DirectFn, ResumeFn } from "../bytecode";
-import { ControlRequest, HostTail, applyIntrinsic, raiseContinuable, restArrayArgs, stackSkip } from "../coreops";
+import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { OpCode } from "../interpreter";
-import { listToArray, listToValues, windowApplyArgs, windowRestArgs } from "../lists";
 import { INSTRUCTION_LENGTHS, basicBlockStarts } from "../opcodes";
 import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
@@ -30,15 +28,12 @@ export const JIT_DEPS = {
     MissingVarError,
     Closure,
     WindPoint,
-    windowApplyArgs,
-    windowRestArgs,
-    restArrayArgs,
+    applyArgs,
+    arrayArg,
     raiseContinuable,
     stackSkip,
     packValues,
-    listToValues,
-    listToArray,
-    Cons,
+    Handlers,
     MISSING,
     MAX_JS_DEPTH,
     MAX_NESTED_RESUMES,
@@ -270,7 +265,7 @@ export class AotCompiler {
                             break;
                         }
                         term = tmpl !== undefined && fitsArity(tmpl.arity, nargs)
-                            ? { k: "MaybeSelfTailCall", proc: procIdx, start, nargs, ip, arity: tmpl.arity }
+                            ? { k: "MaybeSelfTailCall", proc: procIdx, start, nargs, ip, arity: tmpl.arity, restPos: tmpl.code.restPos }
                             : { k: "TailCall", proc: procIdx, start, nargs, ip };
                         break;
                     }
@@ -297,8 +292,7 @@ export class AotCompiler {
                         insts.push({ k: "IntCall", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.APPLYINT:
-                    case OpCode.APPLYINTR:
-                        insts.push({ k: inst[opIp] === OpCode.APPLYINT ? "IntApply" : "IntApplyRest", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
+                        insts.push({ k: "IntApply", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
                     case OpCode.CALLEC: {
                         const proc = inst[ip++];

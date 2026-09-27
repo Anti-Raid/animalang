@@ -94,15 +94,15 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Function with straight-line ops followed by an unhandled opcode:
         // 0: LOADU32 r1, 50
         // 3: LOADU32 r2, 60
-        // 6: CALLINT %list, dest=r0, start=r1, nargs=2
+        // 6: CALLINT %values, dest=r0, start=r1, nargs=2
         // 11: RETURN r0
         const inst = new Uint32Array([
             OpCode.LOADU32, 1, 50,
             OpCode.LOADU32, 2, 60,
-            OpCode.CALLINT, corePos("%list"), 0, 1, 2,
+            OpCode.CALLINT, corePos("%values"), 0, 1, 2,
             OpCode.RETURN, 0
         ]);
-        const bc = new ByteCode([], inst, 4, undefined, undefined, false, CORE_INTRINSICS, [{ pos: corePos("%list"), name: "%list", leaf: true }]);
+        const bc = new ByteCode([], inst, 4, undefined, undefined, false, CORE_INTRINSICS, [{ pos: corePos("%values"), name: "%values", leaf: true }]);
 
         // Compile it with JIT
         AotCompiler.compile(bc);
@@ -112,7 +112,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // Evaluating this will run native code for LOADU32 r1, 50 and LOADU32 r2, 60,
         // then hit deopt(6) at CALL, drop to interpreter, and execute CALL and RETURN!
         const res = vm.evaluateRaw(bc, animaScope());
-        expect(new ASTStringifier().stringify(res)).toBe("(50 60)");
+        expect(new ASTStringifier().stringify(res)).toBe("(values 50 60)");
     });
 
     it("executes IF, ELSE, ENDIF control flow completely natively in AOT", () => {

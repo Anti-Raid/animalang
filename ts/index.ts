@@ -8,7 +8,7 @@ export { dumpFull, readFull } from './bytecode-rvm/utils'
 export { Table } from './table';
 export { Env } from './env';
 export { ASP, ASPParseError, ASPTokenError } from './scheme/reader';
-export { Cons } from './list';
+export { Cons } from './scheme/list';
 
 export * as common from './common'
 export { isTruthy, ErrorObject } from './common'

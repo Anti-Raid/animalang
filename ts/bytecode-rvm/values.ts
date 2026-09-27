@@ -3,8 +3,7 @@
 import { ErrorObject, IProcedure, OpaqueValue, formatPos, unpackValues } from "../common";
 import type { Env, SourcePos } from "../common";
 import { hostError } from "../errors";
-import { Cons } from "../list";
-import { Caught, EXCEPTION_HANDLERS, TAIL_TRAIL, markFirst, markOwn } from "../marks";
+import { Caught, EXCEPTION_HANDLERS, Handlers, TAIL_TRAIL, markFirst, markOwn } from "../marks";
 import type { Marks, TailTrail } from "../marks";
 import type { ByteCode, Closure, VMHost } from "./bytecode";
 import type { VMExecutor } from "./executor";
@@ -19,7 +18,7 @@ export const unpackForBinding = (val: any, count: number, flags: number): any[] 
     return vals;
 };
 
-export const restValues = (vals: any[], count: number): Cons | null => Cons.fromArray(vals.slice(count));
+export const restValues = (vals: any[], count: number): any[] => vals.slice(count);
 
 export class Box {
     constructor(public val: any) {}
@@ -203,7 +202,7 @@ export const catchHere = (e: any, tok: CatchToken, ctx: ExecutionContext): any =
     const marks = e.marks !== undefined ? e.marks : e.innermost !== null ? e.innermost.marks : undefined;
     if (marks === undefined) return null;
     const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
-    return handlers instanceof Cons && handlers.car === tok ? new Caught(caughtValue(e.error)) : null;
+    return handlers instanceof Handlers && handlers.handler === tok ? new Caught(caughtValue(e.error)) : null;
 };
 
 export class Frame {
@@ -300,8 +299,8 @@ export class Suspend {
     static raise(obj: any, continuable: boolean, marks: Marks) {
         const sig = new Suspend((ctx, executor, caller) => executor.raise(ctx, caller, obj, continuable), undefined, true);
         const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
-        if (handlers instanceof Cons && handlers.car instanceof CatchToken && handlers.car.pre === null) {
-            sig.escape = handlers.car;
+        if (handlers instanceof Handlers && handlers.handler instanceof CatchToken && handlers.handler.pre === null) {
+            sig.escape = handlers.handler;
             sig.escapeVal = new Caught(obj);
         }
         return sig;

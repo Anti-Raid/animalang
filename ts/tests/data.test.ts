@@ -1,7 +1,7 @@
 import { ASTStringifier, isDeepEqual, Table, BS, BSReader } from '../common';
 import { ASPParseError } from '../scheme/reader';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Cons } from '../list';
+import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
 import { ByteCode } from '../bytecode-rvm/vm';
 import { Anima } from '../anima';
@@ -715,7 +715,7 @@ describe('Floats, Infinities & NaNs', () => {
 
         const full = dumpFull(evaluator.compileRaw("(list 1 '(2 3))") as ByteCode);
         expect(full[1]).toBe(BYTECODE_VERSION);
-        expect(s.stringify(evaluator.evaluateRaw(readFull(full) as ByteCode))).toBe("(1 (2 3))");
+        expect(s.stringify(evaluator.evaluateRaw(readFull(full, evaluator.intrinsics) as ByteCode))).toBe("(1 (2 3))");
         const wrongVersion = full.slice();
         wrongVersion[1] = BYTECODE_VERSION + 1;
         expect(() => readFull(wrongVersion)).toThrow(`bytecode version ${BYTECODE_VERSION + 1} is not supported`);
@@ -724,7 +724,7 @@ describe('Floats, Infinities & NaNs', () => {
 
     it("serializes intrinsics by name and binds them to the loading table", () => {
         const bc = evaluator.compileRaw("(list (%test-add 1 2) (%test-call-or (lambda (x) x) 4))") as ByteCode;
-        // core operations (here %list) are recorded like any other
+        // the front end's (here %list) are recorded like any other
         expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%list", "%test-add", "%test-call-or"]);
         const dumped = dumpFull(bc);
         expect(s.stringify(evaluator.evaluateRaw(readFull(dumped, evaluator.intrinsics) as ByteCode))).toBe("(3 4)");
@@ -748,7 +748,7 @@ describe('Floats, Infinities & NaNs', () => {
         };
         const wide = bounded(3), narrow = bounded(1);
         expect(narrow.intrinsics.byName("%test-count")!.pos).toBe(wide.intrinsics.byName("%test-count")!.pos);
-        const applied = wide.compileRaw("(%apply %test-count '(1 2))") as ByteCode;
+        const applied = wide.compileRaw("(apply %test-count '(1 2))") as ByteCode;
         expect(s.stringify(wide.evaluateRaw(applied))).toBe("2");
         expect(() => narrow.evaluateRaw(applied.fresh(new Map(), narrow.intrinsics))).toThrow("%test-count: expected 0 to 1 args, got 2");
         expect(s.stringify(wide.evaluateRaw(applied.fresh(new Map(), wide.intrinsics)))).toBe("2");

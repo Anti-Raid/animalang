@@ -1,5 +1,5 @@
-import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, unpackLambdaExprArgs, wrapMulti, Cons, SOURCE_POS, type SourcePos } from "../common";
-import { AstAnalysis } from "./analysis";
+import { ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
+import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { liftLambdas } from "./lift";
@@ -8,16 +8,12 @@ import { arityMessage } from "./arity";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
-const lastItem = (list: Cons): any => {
-    let curr = list
-    while (curr.cdr instanceof Cons) curr = curr.cdr
-    return curr.car
-}
+// a body as one expression
+const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, ...body]
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_CALLEC = Symbol.for("%call/ec");
 const OP_APPLY = Symbol.for("%apply");
-const OP_APPLY_MARGS = Symbol.for("%apply-multi")
 
 // a %block that %escape can jump to: where its value goes and how its code ends
 interface BlockTarget {
@@ -47,9 +43,9 @@ interface CmpOpts {
     analyzer: AstAnalysis
 }
 
+// Compiles core forms, as arrays (see README.md): `[op, operand ...]`, symbols as variable references, anything else
+// that is not an array as a literal
 export class Compiler {
-    #s = new ASTStringifier()
-
     constructor(readonly intrinsics: Intrinsics = newIntrinsics(), private readonly debug: boolean = false) {
         if (!hasCore(intrinsics)) throw new Error("the compiler's intrinsics must start with the core operations (see newIntrinsics)")
     }
@@ -81,15 +77,12 @@ export class Compiler {
             if (opts.destReg === undefined) return 
             opts.nodes.push({t: "LoadValue", constant: null, destReg: opts.destReg})
             return
-        } else if (!(expr instanceof Cons)) { // non-cons (string, number, boolean, undefined, etc.)
+        } else if (!Array.isArray(expr)) { // a literal (string, number, boolean, undefined, etc.)
             if (opts.destReg === undefined) return  
             opts.nodes.push({t: "LoadValue", constant: expr, destReg: opts.destReg})
             return
         }
-
-        if (expr.isImproper()) {
-            throw new Error(`bad syntax: illegal use of dotted pair in execution context (consider quoting e.g. '${this.#s.stringify(expr)}')`);
-        }
+        if (expr.length === 0) throw new Error("bad syntax: an empty form")
 
         const pos = SOURCE_POS.get(expr)
         if (pos !== undefined && pos !== opts.pos) {
@@ -101,10 +94,10 @@ export class Compiler {
         this.#compileForm(expr, opts)
     }
 
-    #compileForm(expr: Cons, opts: CmpOpts) {
+    #compileForm(expr: any[], opts: CmpOpts) {
         const name = opts.name
         if (name !== undefined) opts = { ...opts, name: undefined }
-        const operator = expr.car;
+        const operator = expr[0];
 
         if (typeof operator === "symbol") {
             switch (operator) {
@@ -166,9 +159,6 @@ export class Compiler {
                 case OP_APPLY:
                     this.#compileApply(expr, opts)
                     return
-                case OP_APPLY_MARGS:
-                    this.#compileApplyMulti(expr, opts)
-                    return
             }
 
             const intrinsic = this.intrinsics.get(operator)
@@ -190,28 +180,28 @@ export class Compiler {
         this.#compileNormalCall(expr, opts)
     }
 
-    #compileBegin(expr: Cons, opts: CmpOpts) {
-        // We need to load a void if we see an empty begin block
-        if (expr.cdr === null) {
+    #compileBegin(expr: any[], opts: CmpOpts) {
+        this.#compileBody(expr.slice(1), opts)
+    }
+
+    // expressions in order, the last one giving the value (<#void> if there are none)
+    #compileBody(body: any[], opts: CmpOpts) {
+        if (body.length === 0) {
             if (opts.destReg === undefined) return 
             opts.nodes.push({t: "LoadValue", constant: undefined, destReg: opts.destReg})
             return
         }
-
-        let curr: any = expr.cdr;
-        while (curr instanceof Cons) {
-            const isLastChild = (curr.cdr === null);
-            const childIsTail = isLastChild && opts.isTail;
-            this.#compile(curr.car, { ...opts, destReg: isLastChild ? opts.destReg : undefined, isTail: childIsTail });
-            curr = curr.cdr;
-        }
+        body.forEach((e, i) => {
+            const isLastChild = i === body.length - 1;
+            this.#compile(e, { ...opts, destReg: isLastChild ? opts.destReg : undefined, isTail: isLastChild && opts.isTail });
+        });
     }
 
     // compiles both if calls as well as code that is converted into if calls
     // (%if c1 e1 c2 e2 ... [else]): the first ei whose ci is true, else `else` (or <#void>). One chain whatever the number
     // of clauses: IF c1 L1; e1; ELSE end; L1: <c2>; ELSEIF c2 L2; e2; ELSE end; L2: ...; else; ENDIF; end:
-    #compileIfCall(expr: Cons, opts: CmpOpts) {
-        const args = expr.cdr instanceof Cons ? expr.cdr.toArray() : []
+    #compileIfCall(expr: any[], opts: CmpOpts) {
+        const args = expr.slice(1)
         if (args.length < 2) {
             throw new Error(`%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else]), but got ${args.length} arguments`)
         }
@@ -231,18 +221,17 @@ export class Compiler {
         opts.nodes.push({ t: "Label", label: endLabel })
     }
 
-    #compileQuote(expr: Cons, opts: CmpOpts) {
+    #compileQuote(expr: any[], opts: CmpOpts) {
         if (expr.length !== 2) {
             throw new Error(`quote must be in format ["quote", expr] but have ${expr.length-1} arguments`)
         }
         if (opts.destReg === undefined) return
-        opts.nodes.push({t: "LoadValue", constant: normalizeExpr(expr.cdr.car), destReg: opts.destReg})
+        opts.nodes.push({t: "LoadValue", constant: normalizeExpr(expr[1]), destReg: opts.destReg})
     }
 
     // note that the syntax transformer alr handles defines inside a lambda so
-    #compileDefine(expr: Cons, opts: CmpOpts) {
-        const sym = expr.cdr.car;
-        const val = expr.cdr.cdr.car;
+    #compileDefine(expr: any[], opts: CmpOpts) {
+        const [, sym, val] = expr;
         if (typeof sym !== "symbol") throw new Error("internal error: complex defines should be transformed by AnimaTransform prior to reaching here")
         this.#ensureNotIntrinsic(sym, "define")
 
@@ -256,11 +245,10 @@ export class Compiler {
         }
     }
 
-    #compileSet(expr: Cons, opts: CmpOpts) {
-        // AnimaTransform ensures sets are of correct form
-        const sym = expr.cdr.car;
+    #compileSet(expr: any[], opts: CmpOpts) {
+        const [, sym, val] = expr;
+        if (typeof sym !== "symbol") throw new Error(`set!: ${String(sym)} is not a symbol`)
         this.#ensureNotIntrinsic(sym, "set!")
-        const val = expr.cdr.cdr.car;
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
@@ -273,13 +261,18 @@ export class Compiler {
         }
     }
 
-    #compileLambda(expr: Cons, opts: CmpOpts, name?: string) {
-        // AnimaTransform ensures lambdas are of correct form
+    // [%lambda, params, rest, body ...]: params an array of symbols, rest a symbol or null
+    #compileLambda(expr: any[], opts: CmpOpts, name?: string) {
         const lambdaScope = new CompilerScope(opts.scope)
         const ascope = opts.analyzer.scopeMap.get(expr)
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
 
-        const { params, remParams } = unpackLambdaExprArgs(expr, "lambda")
+        const params: symbol[] = expr[1]
+        const remParams: symbol | null = expr[2]
+        if (!Array.isArray(params) || (remParams !== null && typeof remParams !== "symbol")) throw new Error("%lambda must be of form [%lambda, [param ...], rest-or-null, body ...]")
+        const seen = new Set<symbol>()
+        for (const p of params) ensureCanBind(p, seen, "lambda")
+        if (remParams !== null) ensureCanBind(remParams, seen, "lambda")
         for (const p of params) this.#ensureNotIntrinsic(p, "lambda")
         this.#ensureNotIntrinsic(remParams, "lambda")
         const lambdaNodes: Node[] = []
@@ -305,39 +298,37 @@ export class Compiler {
 
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
-        const body = expr.cdr.cdr;
-        this.#compile(wrapMulti(body), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
+        this.#compile(bodyExpr(expr.slice(3)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
-        const restArray = remParams !== null && ascope.getVarinfo(remParams)!.forwardsRest
-        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, restArray);
+        const rest = remParams === null || ascope.getVarinfo(remParams)!.forwardsRest || this.intrinsics.pack === undefined ? "array" : "packed"
+        const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, rest);
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
     }
 
     // (%let-values ((formals expr) ...) body ...): every expr is evaluated and spread into registers (UNPACK), then
     // all the variables are bound in a block, as in %let
-    #compileLetValues(expr: Cons, opts: CmpOpts, strict: boolean) {
+    // clauses are [params, rest, init]
+    #compileLetValues(expr: any[], opts: CmpOpts, strict: boolean) {
         const ascope = opts.analyzer.scopeMap.get(expr)
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
-        const clauses = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
+        const clauses: [symbol[], symbol | null, any][] = expr[1]
 
         const bound: { sym: symbol, reg: number }[] = []
         const blocks: { start: number, size: number }[] = []
-        for (const clause of clauses) {
-            const names: symbol[] = []
-            let formals: any = clause.car
-            while (formals instanceof Cons) {
-                names.push(formals.car)
-                formals = formals.cdr
-            }
-            const rest: symbol | null = formals
+        for (const [names, rest, init] of clauses) {
             const valReg = opts.scope.allocTemp()
-            this.#compile(clause.cdr.car, { ...opts, destReg: valReg, isTail: false })
+            this.#compile(init, { ...opts, destReg: valReg, isTail: false })
             const size = names.length + (rest !== null ? 1 : 0)
             const start = opts.scope.regAlloc.allocBlock(size)
             opts.nodes.push({ t: "Unpack", srcReg: valReg, startReg: start, count: names.length, rest: rest !== null, strict })
+            const pack = this.intrinsics.pack
+            if (rest !== null && pack !== undefined) {
+                const reg = start + names.length
+                opts.nodes.push({ t: "IntApply", pos: pack.pos, destReg: reg, startReg: reg, nargs: 1 })
+            }
             opts.scope.freeTemp(valReg)
             names.forEach((sym, i) => bound.push({ sym, reg: start + i }))
             if (rest !== null) bound.push({ sym: rest, reg: start + names.length })
@@ -354,25 +345,25 @@ export class Compiler {
             const destReg = opts.scope.addLocal(sym)
             opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: reg, destReg })
         }
-        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope })
+        this.#compileBody(expr.slice(2), { ...opts, ascope })
         opts.scope.exitBlock()
         for (const { start, size } of blocks) opts.scope.regAlloc.freeBlock(start, size)
     }
 
     // (%block name body ...): the value of the body, or of an (%escape name value) jumping to its end
-    #compileBlock(expr: Cons, opts: CmpOpts) {
+    #compileBlock(expr: any[], opts: CmpOpts) {
         const end = new JumpLabel()
         const target: BlockTarget = {
-            name: expr.cdr.car, end, destReg: opts.destReg, isTail: opts.isTail, fnDepth: opts.fnDepth ?? 0,
+            name: expr[1], end, destReg: opts.destReg, isTail: opts.isTail, fnDepth: opts.fnDepth ?? 0,
             markDepth: opts.markRegions?.length ?? 0, parent: opts.blocks,
         }
         opts.nodes.push({ t: "Block", end })
-        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, blocks: target })
+        this.#compileBody(expr.slice(2), { ...opts, blocks: target })
         opts.nodes.push({ t: "Label", label: end })
     }
 
-    #compileEscape(expr: Cons, opts: CmpOpts) {
-        const name: symbol = expr.cdr.car
+    #compileEscape(expr: any[], opts: CmpOpts) {
+        const name: symbol = expr[1]
         let target = opts.blocks
         while (target !== undefined && target.name !== name) target = target.parent
         if (target === undefined) throw new Error(`%escape: no enclosing block named ${String(name.description)}`)
@@ -381,7 +372,7 @@ export class Compiler {
         }
         // the value is computed as if it were the block's own value: into its register, in its tail position
         const valueOpts = { ...opts, destReg: target.destReg, isTail: target.isTail }
-        if (expr.cdr.cdr !== null) this.#compile(expr.cdr.cdr.car, valueOpts)
+        if (expr.length > 2) this.#compile(expr[2], valueOpts)
         else this.#compile(undefined, valueOpts)
         const regions = opts.markRegions ?? []
         if (regions.length > target.markDepth) opts.nodes.push({ t: "MarkRestore", reg: regions[target.markDepth] })
@@ -390,8 +381,8 @@ export class Compiler {
 
     // (%with-mark key value body): in tail position the mark goes on the current frame (replacing its value for the key)
     // and stays until the frame returns; otherwise the body runs as a new frame, so the marks are saved and put back after
-    #compileWithMark(expr: Cons, opts: CmpOpts) {
-        const [key, value, body] = expr.cdr.toArray()
+    #compileWithMark(expr: any[], opts: CmpOpts) {
+        const [, key, value, body] = expr
         const saved = opts.isTail ? -1 : opts.scope.regAlloc.allocBlock(2)
         if (!opts.isTail) opts.nodes.push({ t: "MarkSave", reg: saved })
         const kv = opts.scope.regAlloc.allocBlock(2)
@@ -409,16 +400,12 @@ export class Compiler {
     }
 
     // (%loop body ...): repeats forever; only an %escape leaves it
-    #compileLoop(expr: Cons, opts: CmpOpts) {
+    #compileLoop(expr: any[], opts: CmpOpts) {
         const head = new JumpLabel()
         const end = new JumpLabel()
         opts.nodes.push({ t: "Loop", end })
         opts.nodes.push({ t: "Label", label: head })
-        let curr: any = expr.cdr
-        while (curr instanceof Cons) {
-            this.#compile(curr.car, { ...opts, destReg: undefined, isTail: false })
-            curr = curr.cdr
-        }
+        for (const e of expr.slice(1)) this.#compile(e, { ...opts, destReg: undefined, isTail: false })
         opts.nodes.push({ t: "EndLoop", head })
         opts.nodes.push({ t: "Label", label: end })
     }
@@ -438,7 +425,7 @@ export class Compiler {
         return false
     }
 
-    #compileDynamicWind(expr: Cons, opts: CmpOpts) {
+    #compileDynamicWind(expr: any[], opts: CmpOpts) {
         if (expr.length !== 4) {
             throw new Error(`%dynamic-wind requires 3 arguments (before, thunk, after), got ${expr.length - 1}`);
         }
@@ -446,9 +433,9 @@ export class Compiler {
         const block = opts.scope.regAlloc.allocBlock(3);
         const beforeProcReg = block, afterProcReg = block + 1, thunkProcReg = block + 2;
 
-        this.#compile(expr.cdr.car, { ...opts, destReg: beforeProcReg, isTail: false });
-        this.#compile(expr.cdr.cdr.car, { ...opts, destReg: thunkProcReg, isTail: false });
-        this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: afterProcReg, isTail: false });
+        this.#compile(expr[1], { ...opts, destReg: beforeProcReg, isTail: false });
+        this.#compile(expr[2], { ...opts, destReg: thunkProcReg, isTail: false });
+        this.#compile(expr[3], { ...opts, destReg: afterProcReg, isTail: false });
 
         opts.nodes.push({ t: "Call", procReg: beforeProcReg, startReg: 0, nargs: 0 });
         this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%wind"), destReg, startReg: beforeProcReg, nargs: 2 }));
@@ -460,13 +447,13 @@ export class Compiler {
     }
 
     // always a non-tail call: the escape continuation is deactivated when it returns
-    #compileCallEC(expr: Cons, opts: CmpOpts) {
+    #compileCallEC(expr: any[], opts: CmpOpts) {
         if (expr.length !== 2) {
             throw new Error(`%call/ec requires 1 argument, got ${expr.length - 1}`);
         }
         const procReg = opts.scope.allocTemp();
         const tokReg = opts.scope.allocTemp();
-        this.#compile(expr.cdr.car, { ...opts, destReg: procReg, isTail: false });
+        this.#compile(expr[1], { ...opts, destReg: procReg, isTail: false });
         opts.nodes.push({ t: "CallEC", procReg, tokReg, destReg: opts.destReg });
         opts.scope.freeTemp(tokReg);
         opts.scope.freeTemp(procReg);
@@ -475,7 +462,7 @@ export class Compiler {
     // (%catch thunk handler [pre]): CALLCATCH gives the value of (thunk), or a Caught when it raised, after which the
     // handler expression is evaluated and called with the error (in tail position if the %catch is); pre is evaluated
     // first, and runs on the error before unwinding
-    #compileCatch(expr: Cons, opts: CmpOpts) {
+    #compileCatch(expr: any[], opts: CmpOpts) {
         if (expr.length !== 3 && expr.length !== 4) {
             throw new Error(`%catch requires 2 or 3 arguments (thunk, handler, pre), got ${expr.length - 1}`);
         }
@@ -483,8 +470,8 @@ export class Compiler {
         const tokReg = opts.scope.allocTemp();
         const resReg = opts.scope.allocTemp();
         const preReg = expr.length === 4 ? opts.scope.allocTemp() : undefined;
-        this.#compile(expr.cdr.car, { ...opts, destReg: procReg, isTail: false });
-        if (preReg !== undefined) this.#compile(expr.cdr.cdr.cdr.car, { ...opts, destReg: preReg, isTail: false });
+        this.#compile(expr[1], { ...opts, destReg: procReg, isTail: false });
+        if (preReg !== undefined) this.#compile(expr[3], { ...opts, destReg: preReg, isTail: false });
         opts.nodes.push({ t: "CallCatch", procReg, tokReg, preReg, destReg: resReg });
         if (preReg !== undefined) opts.scope.freeTemp(preReg);
         opts.scope.freeTemp(tokReg);
@@ -498,7 +485,7 @@ export class Compiler {
         opts.scope.freeTemp(condReg);
 
         const call = opts.scope.regAlloc.allocBlock(2);
-        this.#compile(expr.cdr.cdr.car, { ...opts, destReg: call, isTail: false });
+        this.#compile(expr[2], { ...opts, destReg: call, isTail: false });
         opts.nodes.push({ t: "IntCall", pos: corePos("%caught-value"), destReg: call + 1, startReg: resReg, nargs: 1 });
         if (opts.isTail) opts.nodes.push({ t: "TailCall", procReg: call, startReg: call + 1, nargs: 1 });
         else opts.nodes.push({ t: "Call", procReg: call, destReg: opts.destReg, startReg: call + 1, nargs: 1 });
@@ -512,17 +499,11 @@ export class Compiler {
         opts.scope.freeTemp(resReg);
     }
 
-    #compileRuntimeOp(expr: Cons, opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {
-        const nargs = expr.cdr === null ? 0 : expr.cdr.length
-        if (nargs < minArgs || nargs > maxArgs) throw new Error(arityMessage(String(expr.car.description), minArgs, maxArgs, nargs))
+    #compileRuntimeOp(expr: any[], opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {
+        const nargs = expr.length - 1
+        if (nargs < minArgs || nargs > maxArgs) throw new Error(arityMessage(String(expr[0].description), minArgs, maxArgs, nargs))
         const startReg = opts.scope.regAlloc.allocBlock(nargs)
-        let curr: any = expr.cdr
-        let i = 0
-        while (curr instanceof Cons) {
-            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false })
-            i++
-            curr = curr.cdr
-        }
+        for (let i = 0; i < nargs; i++) this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false })
         emit(startReg, nargs, opts.destReg)
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
@@ -563,23 +544,30 @@ export class Compiler {
         return { procReg, isTemp: true };
     }
 
-    #compileApply(expr: Cons, opts: CmpOpts) {
+    #compileApply(expr: any[], opts: CmpOpts) {
         if (expr.length < 3) {
             throw new Error(`%apply requires at least 2 arguments (proc, ...args, args-lst), got ${expr.length - 1}`);
         }
-        const procExpr = expr.cdr.car;
-        const argsExprList = expr.cdr.cdr;
+        const procExpr = expr[1];
+        const argExprs = expr.slice(2);
+        argExprs[argExprs.length - 1] = this.#forwarded(argExprs[argExprs.length - 1], opts);
         const intrinsic = typeof procExpr === "symbol" ? this.intrinsics.get(procExpr) : undefined;
         if (intrinsic !== undefined) {
-            this.#compileApplyIntrinsic(intrinsic, argsExprList, opts);
+            this.#compileApplyIntrinsic(intrinsic, argExprs, opts);
             return;
         }
-        this.#compileApplyCall(procExpr, argsExprList.toArray(), opts, this.#isRestArray(lastItem(argsExprList), opts) ? "%apply-array" : "%apply-list");
+        this.#compileApplyCall(procExpr, argExprs, opts, argExprs.length === 1 && this.#isFresh(argExprs[0]) ? "%apply-fresh" : "%apply-array");
     }
 
-    // applying a procedure is a call of a core operation (see %apply-list) over [proc, arg ..., lst]. `inPlace` runs on
-    // the last argument's register first
-    #compileApplyCall(procExpr: any, argExprs: any[], opts: CmpOpts, op: string, inPlace?: string) {
+    // a call of an intrinsic that returns a new array, or an %apply of one
+    #isFresh(expr: any): boolean {
+        if (!Array.isArray(expr) || typeof expr[0] !== "symbol") return false
+        const op = expr[0] === OP_APPLY && typeof expr[1] === "symbol" ? expr[1] : expr[0]
+        return this.intrinsics.get(op)?.fresh === true
+    }
+
+    // applying a procedure is a call of the core operation %apply-array (or %apply-fresh) over [proc, arg ..., array]
+    #compileApplyCall(procExpr: any, argExprs: any[], opts: CmpOpts, op: string) {
         if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
             throw new Error(`${String(procExpr.description)} is an intrinsic and cannot be used as a procedure value`);
         }
@@ -587,59 +575,36 @@ export class Compiler {
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
         this.#compile(procExpr, { ...opts, destReg: startReg, isTail: false });
         argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + 1 + i, isTail: false }));
-        const last = startReg + nargs - 1;
-        if (inPlace !== undefined) opts.nodes.push({ t: "IntCall", pos: corePos(inPlace), destReg: last, startReg: last, nargs: 1 });
         opts.nodes.push({ t: "HostCall", pos: corePos(op), startReg, nargs, isTail: opts.isTail, destReg: opts.destReg });
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
     // (%apply %intrinsic arg ... lst): the argument count is only known at run time, so APPLYINT checks it there
-    #compileApplyIntrinsic(intrinsic: Intrinsic, argsExprList: any, opts: CmpOpts) {
+    #compileApplyIntrinsic(intrinsic: Intrinsic, argExprs: any[], opts: CmpOpts) {
         if (!intrinsic.leaf) throw new Error(`%apply: ${intrinsic.name} is not a leaf intrinsic, so it cannot be applied`);
-        const nargs = argsExprList === null ? 0 : argsExprList.length;
+        const nargs = argExprs.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        let curr: any = argsExprList;
-        let i = 0;
-        while (curr instanceof Cons) {
-            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false });
-            i++;
-            curr = curr.cdr;
-        }
-        const restArray = this.#isRestArray(lastItem(argsExprList), opts);
-        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntApply", pos: intrinsic.pos, destReg, startReg, nargs, restArray }));
+        argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + i, isTail: false }));
+        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntApply", pos: intrinsic.pos, destReg, startReg, nargs }));
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
-    #compileApplyMulti(expr: Cons, opts: CmpOpts) {
-        if (expr.length !== 3) {
-            throw new Error(`%apply-multi requires exactly 2 arguments (proc, args-list), got ${expr.length - 1}`);
-        }
-        const procExpr = expr.cdr.car;
-        const lstExpr = expr.cdr.cdr.car;
-
-        if (this.#isRestArray(lstExpr, opts)) this.#compileApplyCall(procExpr, [lstExpr], opts, "%apply-array-multi");
-        else this.#compileApplyCall(procExpr, [lstExpr], opts, "%apply-list", "%apply-args");
+    // (spread x) of a forwarded rest parameter is x itself (see VariableMetadata.forwardsRest)
+    #forwarded(expr: any, opts: CmpOpts): any {
+        if (!isSpreadOf(expr, this.intrinsics)) return expr
+        const sym = expr[1]
+        return opts.scope.resolve(sym).type === "Local" && opts.ascope.getVarinfo(sym)?.forwardsRest === true ? sym : expr
     }
 
-    // whether an %apply's list is a rest parameter the closure receives as an array (see VariableMetadata.forwardsRest)
-    #isRestArray(expr: any, opts: CmpOpts): boolean {
-        return typeof expr === "symbol" && opts.scope.resolve(expr).type === "Local" && opts.ascope.getVarinfo(expr)?.forwardsRest === true
-    }
     // a normal call
-    #compileNormalCall(expr: Cons, opts: CmpOpts) {
+    #compileNormalCall(expr: any[], opts: CmpOpts) {
         // We need to compile the proc and place it on its own tempval
-        const { procReg, isTemp } = this.#resolveProcReg(expr.car, opts);
+        const { procReg, isTemp } = this.#resolveProcReg(expr[0], opts);
 
         // Push all arguments to a contiguous reg block
-        const nargs = expr.cdr === null ? 0 : expr.cdr.length;
+        const nargs = expr.length - 1;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        let curr: any = expr.cdr;
-        let i = 0;
-        while (curr instanceof Cons) {
-            this.#compile(curr.car, { ...opts, destReg: startReg + i, isTail: false });
-            i++;
-            curr = curr.cdr;
-        }
+        for (let i = 0; i < nargs; i++) this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false });
 
         if (opts.isTail) {
             opts.nodes.push({t: "TailCall", nargs, procReg, startReg})
@@ -654,16 +619,16 @@ export class Compiler {
     // (%let ((x init) ...) body ...): inits are evaluated in the outer scope, then bound in a block of this function
     // (%let* ((name init) ...) body ...): each init runs with the names before it bound, then its name is bound; all in
     // one block of the current function, as nested %lets would be, without the nesting
-    #compileLetStar(expr: Cons, opts: CmpOpts) {
-        const bindings = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
+    #compileLetStar(expr: any[], opts: CmpOpts) {
+        const bindings: [symbol, any][] = expr[1]
         opts.scope.enterBlock()
         let ascope = opts.ascope
         for (const binding of bindings) {
-            const sym = binding.car
+            const [sym, init] = binding
             ensureCanBind(sym, undefined, "let*")
             this.#ensureNotIntrinsic(sym, "let*")
             const reg = opts.scope.allocTemp()
-            this.#compile(binding.cdr.car, { ...opts, ascope, destReg: reg, isTail: false, name: sym.description })
+            this.#compile(init, { ...opts, ascope, destReg: reg, isTail: false, name: sym.description })
             ascope = opts.analyzer.scopeMap.get(binding)!
             const inf = ascope.getVarinfo(sym)
             if (!inf) throw new Error("Could not fetch varinfo")
@@ -671,26 +636,26 @@ export class Compiler {
             opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: reg, destReg })
             opts.scope.freeTemp(reg)
         }
-        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope: opts.analyzer.scopeMap.get(expr)! })
+        this.#compileBody(expr.slice(2), { ...opts, ascope: opts.analyzer.scopeMap.get(expr)! })
         opts.scope.exitBlock()
     }
 
-    #compileLet(expr: Cons, opts: CmpOpts) {
+    #compileLet(expr: any[], opts: CmpOpts) {
         const ascope = opts.analyzer.scopeMap.get(expr)
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
-        const bindings = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
+        const bindings: [symbol, any][] = expr[1]
 
         const initRegs: number[] = []
-        for (const binding of bindings) {
+        for (const [sym, init] of bindings) {
             const reg = opts.scope.allocTemp()
-            this.#compile(binding.cdr.car, { ...opts, destReg: reg, isTail: false, name: binding.car.description })
+            this.#compile(init, { ...opts, destReg: reg, isTail: false, name: sym.description })
             initRegs.push(reg)
         }
 
         opts.scope.enterBlock()
         const seen = new Set<symbol>()
         for (let i = 0; i < bindings.length; i++) {
-            const sym = bindings[i].car
+            const sym = bindings[i][0]
             ensureCanBind(sym, seen, "let")
             this.#ensureNotIntrinsic(sym, "let")
             const inf = ascope.getVarinfo(sym)
@@ -698,7 +663,7 @@ export class Compiler {
             const destReg = opts.scope.addLocal(sym)
             opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: initRegs[i], destReg })
         }
-        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope })
+        this.#compileBody(expr.slice(2), { ...opts, ascope })
         opts.scope.exitBlock()
         for (const reg of initRegs) opts.scope.freeTemp(reg)
     }
@@ -707,18 +672,18 @@ export class Compiler {
     // are made first, all at once; the other inits then run in order. A name that is never assigned holds its value
     // directly, and the upvars captured before it existed are filled in once it does (FIXUPVAR); an assigned name (or
     // one a closure may copy before its init has run, see lateValues) is a box
-    #compileLetrec(expr: Cons, opts: CmpOpts) {
+    #compileLetrec(expr: any[], opts: CmpOpts) {
         const ascope = opts.analyzer.scopeMap.get(expr)
         if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
-        const bindings = expr.cdr.car === null ? [] : (expr.cdr.car as Cons).toArray() as Cons[]
-        const isLambda = bindings.map(b => b.cdr.car instanceof Cons && b.cdr.car.car === CORE_LAMBDA)
+        const bindings: [symbol, any][] = expr[1]
+        const isLambda = bindings.map(([, init]) => Array.isArray(init) && init[0] === CORE_LAMBDA)
 
         opts.scope.enterBlock()
         const seen = new Set<symbol>()
         const regs: number[] = []
         const boxed: boolean[] = []
         for (let i = 0; i < bindings.length; i++) {
-            const sym = bindings[i].car
+            const sym = bindings[i][0]
             ensureCanBind(sym, seen, "letrec")
             this.#ensureNotIntrinsic(sym, "letrec")
             const inf = ascope.getVarinfo(sym)
@@ -744,7 +709,7 @@ export class Compiler {
             const dest = boxed[i] ? opts.scope.allocTemp() : regs[i]
             if (boxed[i]) temps.push(dest)
             const before = opts.nodes.length
-            this.#compile(bindings[i].cdr.car, { ...opts, ascope, destReg: dest, isTail: false, name: bindings[i].car.description })
+            this.#compile(bindings[i][1], { ...opts, ascope, destReg: dest, isTail: false, name: bindings[i][0].description })
             if (boxed[i]) opts.nodes.push({ t: "SetBox", destReg: regs[i], srcReg: dest })
             return { dest, closure: opts.nodes.slice(before).reverse().find(n => n.t === "NewClosure") }
         }
@@ -762,7 +727,7 @@ export class Compiler {
         }
         for (const reg of temps) opts.scope.freeTemp(reg)
 
-        this.#compileBegin(new Cons(CORE_BEGIN, expr.cdr.cdr), { ...opts, ascope })
+        this.#compileBody(expr.slice(2), { ...opts, ascope })
         opts.scope.exitBlock()
     }
 

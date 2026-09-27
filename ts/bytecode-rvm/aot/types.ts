@@ -15,7 +15,7 @@ export type AotInst = { at?: number } & (
     | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }
     | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
     | { k: "MoveAcc"; dst: number }
-    | { k: "IntCall" | "IntApply" | "IntApplyRest"; pos: number; dst: number; start: number; nargs: number }
+    | { k: "IntCall" | "IntApply"; pos: number; dst: number; start: number; nargs: number }
     | { k: "Unpack"; src: number; start: number; count: number; flags: number }
     | { k: "SetMark"; key: number; val: number }
     | { k: "MarkSave" | "MarkRestore"; reg: number }
@@ -28,7 +28,7 @@ export type AotTerm = { at?: number } & (
     | { k: "Branch"; cond: number; then: number; else: number; elseif: boolean }
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
-    | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; arity: Arity }
+    | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; arity: Arity; restPos: number }
     | { k: "CallEC"; proc: number; tok: number; resume: number }
     | { k: "CallCatch"; proc: number; tok: number; pre: number; resume: number }
     | { k: "HostCall"; pos: number; start: number; nargs: number; isTail: boolean; resume: number }

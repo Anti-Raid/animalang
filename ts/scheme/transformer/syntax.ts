@@ -20,13 +20,15 @@ import {
     OP_CURRENT_MARKS,
     OP_CURRENT_STACK,
     SOURCE_POS,
-    Cons
 } from "../../common";
+import { Cons } from "../list";
+import { toCore } from "../core";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
 import { OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
 import { SCHEME_ALIASES } from "../builtins";
 import type { Closure } from "../../bytecode-rvm/exec";
 
+const OP_APPLY = Symbol.for("apply");
 const cons = (a: any, b: any) => new Cons(a, b);
 const car = (p: any) => (p instanceof Cons ? p.car : null);
 const cdr = (p: any) => (p instanceof Cons ? p.cdr : null);
@@ -306,10 +308,10 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     }));
     // direct calls take the snapshot in the caller itself, so no prelude frame shows in it
     for (const name of ["debug-frames", "debug-traceback"]) {
-        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => ({
-            expanded: list(Symbol.for(`%${name}`), list(OP_CURRENT_STACK), cons(Symbol.for("list"), expr)),
-            state: TransformState.DoChildren,
-        }));
+        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
+            const call = list(Symbol.for(`%${name}`), list(OP_CURRENT_STACK), cons(Symbol.for("%vector"), expr));
+            return { expanded: name === "debug-frames" ? list(Symbol.for("%vector->list"), call) : call, state: TransformState.DoChildren };
+        });
     }
     evaluator.registerTransform(OP_CURRENT_MARKS, lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("%current-marks takes no arguments");
@@ -554,7 +556,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (typeof onsym !== "symbol") throw new Error(`anima-macro onsym must be a constant symbol right now`);
         let cmpexpr = list(OP_LAMBDA, list(Symbol.for("orig")), expr.cdr.car);
         let trCmpExpr = evaluator.transform(cmpexpr);
-        let cmpExprBc = evaluator.expandcmp.compile(trCmpExpr);
+        let cmpExprBc = evaluator.expandcmp.compile(toCore(trCmpExpr));
         const res: Closure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
         evaluator.registerTransform(onsym, (evaluator, expr, orig) => {
             const resp = evaluator.expandvm.evaluateClosure(res, evaluator.scope, [orig]);
@@ -709,7 +711,10 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     for (const [name, { target, min, max }] of SCHEME_ALIASES) {
         evaluator.registerTransform(name, (evaluator, expr, orig) => {
             const nargs = expr === null ? 0 : expr instanceof Cons && !expr.isImproper() ? expr.length : -1;
-            return { expanded: nargs >= min && nargs <= max ? cons(target, expr) : orig, state: TransformState.DoChildren };
+            if (nargs < min || nargs > max) return { expanded: orig, state: TransformState.DoChildren };
+            if (name !== OP_APPLY) return { expanded: cons(target, expr), state: TransformState.DoChildren };
+            const args = toArray(expr);
+            return { expanded: fromArray([target, ...args.slice(0, -1), list(Symbol.for("%spread"), args[args.length - 1])]), state: TransformState.DoChildren };
         });
     }
 };

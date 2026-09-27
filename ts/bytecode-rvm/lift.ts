@@ -3,81 +3,65 @@
 // so it captures nothing and compiles to a constant closure: none is made each time the %letrec runs. The variables
 // passed include the lifted lambdas it calls (itself too, if it recurses), which it receives as values, and those its
 // callees need. A free variable that is assigned anywhere stops the lifting (a copy would miss the assignments)
-import { Cons, CORE_BLOCK, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
+import { CORE_BLOCK, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
 
-const toArr = (x: any): any[] => x instanceof Cons ? x.toArray() : [];
-const list = (items: any[]): any => Cons.fromArray(items);
-const keepPos = (to: any, from: any): any => {
+const keepPos = <T>(to: T, from: any): T => {
     const pos = SOURCE_POS.get(from);
-    if (pos !== undefined && to instanceof Cons) SOURCE_POS.set(to, pos);
+    if (pos !== undefined && Array.isArray(to)) SOURCE_POS.set(to, pos);
     return to;
 };
 
-// the names a parameter list or formals binds
-const formalNames = (formals: any): symbol[] => {
-    const out: symbol[] = [];
-    let p = formals;
-    for (; p instanceof Cons; p = p.cdr) out.push(p.car);
-    if (typeof p === "symbol") out.push(p);
-    return out;
-};
+// the names a lambda binds: [%lambda, params, rest, ...]
+const lambdaNames = (lambda: any[]): symbol[] => lambda[2] === null ? lambda[1] : [...lambda[1], lambda[2]];
 
-const arityAccepts = (formals: any, nargs: number): boolean => {
-    let fixed = 0, p = formals;
-    for (; p instanceof Cons; p = p.cdr) fixed++;
-    return p === null ? nargs === fixed : nargs >= fixed;
-};
+const arityAccepts = (lambda: any[], nargs: number): boolean => lambda[2] === null ? nargs === lambda[1].length : nargs >= lambda[1].length;
 
 // Each expression position in `e` with the names bound around it (beyond those around `e`), and how to rebuild `e`
 // from new expressions for them. Block labels and the names %set! / %define-global assign are not expressions. For a
 // %let* (`seq`), each position's names add to those of the positions before it (see withBounds)
 type Parts = { exprs: [any, symbol[]][], rebuild: (next: any[]) => any, seq?: boolean };
-const parts = (e: Cons): Parts => {
-    const same = (exprs: [any, symbol[]][], rebuild: (next: any[]) => any) => ({ exprs, rebuild: (next: any[]) => keepPos(rebuild(next), e) });
-    switch (e.car) {
-        case CORE_LET_STAR: {
-            const bindings = toArr(e.cdr.car);
-            const body = toArr(e.cdr.cdr);
-            const exprs: [any, symbol[]][] = [
-                ...bindings.map((b, i) => [b.cdr.car, i === 0 ? [] : [bindings[i - 1].car]] as [any, symbol[]]),
-                ...body.map((x, i) => [x, i === 0 && bindings.length > 0 ? [bindings[bindings.length - 1].car] : []] as [any, symbol[]]),
-            ];
-            return {
-                exprs, seq: true, rebuild: next => keepPos(new Cons(CORE_LET_STAR, new Cons(list(bindings.map((b, i) => list([b.car, next[i]]))), list(next.slice(bindings.length)))), e),
-            };
-        }
+const parts = (e: any[]): Parts => {
+    const same = (exprs: [any, symbol[]][], rebuild: (next: any[]) => any): Parts => ({ exprs, rebuild: next => keepPos(rebuild(next), e) });
+    const op = e[0];
+    switch (op) {
         case CORE_QUOTE:
             return { exprs: [], rebuild: () => e };
         case CORE_LAMBDA: {
-            const bound = formalNames(e.cdr.car);
-            return same(toArr(e.cdr.cdr).map(x => [x, bound]), next => new Cons(CORE_LAMBDA, new Cons(e.cdr.car, list(next))));
+            const bound = lambdaNames(e);
+            return same(e.slice(3).map(x => [x, bound]), next => [CORE_LAMBDA, e[1], e[2], ...next]);
         }
         case CORE_LET:
         case CORE_LETREC: {
-            const bindings = toArr(e.cdr.car);
-            const names = bindings.map(b => b.car);
-            const inner = e.car === CORE_LETREC ? names : [];
-            const body = toArr(e.cdr.cdr);
-            return same([...bindings.map(b => [b.cdr.car, inner] as [any, symbol[]]), ...body.map(x => [x, names] as [any, symbol[]])], next =>
-                new Cons(e.car, new Cons(list(bindings.map((b, i) => list([b.car, next[i]]))), list(next.slice(bindings.length)))));
+            const bindings: [symbol, any][] = e[1];
+            const names = bindings.map(b => b[0]);
+            const inner = op === CORE_LETREC ? names : [];
+            return same([...bindings.map(b => [b[1], inner] as [any, symbol[]]), ...e.slice(2).map(x => [x, names] as [any, symbol[]])], next =>
+                [op, bindings.map((b, i) => keepPos([b[0], next[i]], b)), ...next.slice(bindings.length)]);
+        }
+        case CORE_LET_STAR: {
+            const bindings: [symbol, any][] = e[1];
+            const body = e.slice(2);
+            const exprs: [any, symbol[]][] = [
+                ...bindings.map((b, i) => [b[1], i === 0 ? [] : [bindings[i - 1][0]]] as [any, symbol[]]),
+                ...body.map((x, i) => [x, i === 0 && bindings.length > 0 ? [bindings[bindings.length - 1][0]] : []] as [any, symbol[]]),
+            ];
+            return { exprs, seq: true, rebuild: next => keepPos([op, bindings.map((b, i) => keepPos([b[0], next[i]], b)), ...next.slice(bindings.length)], e) };
         }
         case CORE_LET_VALUES:
         case CORE_LET_VALUES_STRICT: {
-            const clauses = toArr(e.cdr.car);
-            const names = clauses.flatMap(c => formalNames(c.car));
-            const body = toArr(e.cdr.cdr);
-            return same([...clauses.map(c => [c.cdr.car, []] as [any, symbol[]]), ...body.map(x => [x, names] as [any, symbol[]])], next =>
-                new Cons(e.car, new Cons(list(clauses.map((c, i) => list([c.car, next[i]]))), list(next.slice(clauses.length)))));
+            const clauses: [symbol[], symbol | null, any][] = e[1];
+            const names = clauses.flatMap(c => c[1] === null ? c[0] : [...c[0], c[1]]);
+            return same([...clauses.map(c => [c[2], []] as [any, symbol[]]), ...e.slice(2).map(x => [x, names] as [any, symbol[]])], next =>
+                [op, clauses.map((c, i) => [c[0], c[1], next[i]]), ...next.slice(clauses.length)]);
         }
         case CORE_SET:
         case OP_DEFINE_GLOBAL:
-            return same([[e.cdr.cdr.car, []]], next => list([e.car, e.cdr.car, next[0]]));
+            return same([[e[2], []]], next => [op, e[1], next[0]]);
         case CORE_BLOCK:
-            return same(toArr(e.cdr.cdr).map(x => [x, []]), next => new Cons(CORE_BLOCK, new Cons(e.cdr.car, list(next))));
         case CORE_ESCAPE:
-            return e.cdr.cdr === null ? { exprs: [], rebuild: () => e } : same([[e.cdr.cdr.car, []]], next => list([CORE_ESCAPE, e.cdr.car, next[0]]));
+            return same(e.slice(2).map(x => [x, []]), next => [op, e[1], ...next]);
         default:
-            return same(toArr(e).map(x => [x, []]), next => list(next));
+            return same(e.map(x => [x, []]), next => next);
     }
 };
 
@@ -97,42 +81,36 @@ function* withBounds(p: Parts, bound: ReadonlySet<symbol>): Generator<[any, Read
 
 // every name %set! assigns anywhere in `e`
 const assignedNames = (e: any, out: Set<symbol> = new Set()): Set<symbol> => {
-    if (!(e instanceof Cons)) return out;
-    if (e.car === CORE_SET) out.add(e.cdr.car);
+    if (!Array.isArray(e)) return out;
+    if (e[0] === CORE_SET) out.add(e[1]);
     for (const [x] of parts(e).exprs) assignedNames(x, out);
     return out;
 };
 
+const FORMS = new Set([CORE_QUOTE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LETREC, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_SET, OP_DEFINE_GLOBAL, CORE_BLOCK, CORE_ESCAPE]);
+
 // The unshadowed uses of `name` in `e`: calls (with the names bound between `e` and each call, unless the call is inside
 // one of `skip`, the lifted lambdas, which rename what they need), and whether it is used any other way
-type Uses = { calls: { node: Cons, bound: ReadonlySet<symbol> }[], other: boolean };
+type Uses = { calls: { node: any[], bound: ReadonlySet<symbol> }[], other: boolean };
 const usesOf = (e: any, name: symbol, skip: ReadonlySet<any>, bound: ReadonlySet<symbol> = new Set(), out: Uses = { calls: [], other: false }, inSkip = false): Uses => {
     if (e === name) {
         out.other = true;
         return out;
     }
-    if (!(e instanceof Cons)) return out;
-    if (e.car === CORE_SET && e.cdr.car === name) out.other = true;
+    if (!Array.isArray(e)) return out;
+    if (e[0] === CORE_SET && e[1] === name) out.other = true;
     const inner = inSkip || skip.has(e);
     let i = 0;
     for (const [x, around] of withBounds(parts(e), bound)) {
-        if (around.has(name)) {
-            i++;
-            continue;
-        }
-        // the operator of a call
-        if (i === 0 && x === name && e.car === name && !isForm(e)) {
-            out.calls.push({ node: e, bound: inner ? new Set() : new Set(bound) });
-        } else {
-            usesOf(x, name, skip, around, out, inner);
+        if (!around.has(name)) {
+            // the operator of a call
+            if (i === 0 && x === name && e[0] === name && !FORMS.has(e[0])) out.calls.push({ node: e, bound: inner ? new Set() : new Set(bound) });
+            else usesOf(x, name, skip, around, out, inner);
         }
         i++;
     }
     return out;
 };
-
-const FORMS = new Set([CORE_QUOTE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LETREC, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_SET, OP_DEFINE_GLOBAL, CORE_BLOCK, CORE_ESCAPE]);
-const isForm = (e: Cons) => FORMS.has(e.car);
 
 // the names of `scope` used (unshadowed) in `e`
 const freeIn = (e: any, scope: ReadonlySet<symbol>, bound: ReadonlySet<symbol>, out: Set<symbol>): Set<symbol> => {
@@ -140,25 +118,25 @@ const freeIn = (e: any, scope: ReadonlySet<symbol>, bound: ReadonlySet<symbol>, 
         if (scope.has(e) && !bound.has(e)) out.add(e);
         return out;
     }
-    if (!(e instanceof Cons)) return out;
+    if (!Array.isArray(e)) return out;
     for (const [x, around] of withBounds(parts(e), bound)) freeIn(x, scope, around, out);
     return out;
 };
 
-// `e` with the unshadowed free uses of the names in `map` replaced, and the calls in `calls` given their extra arguments
-const rewrite = (e: any, map: ReadonlyMap<symbol, symbol>, extra: ReadonlyMap<Cons, symbol[]>, bound: ReadonlySet<symbol> = new Set()): any => {
+// `e` with the unshadowed free uses of the names in `map` replaced, and the calls in `extra` given their extra arguments
+const rewrite = (e: any, map: ReadonlyMap<symbol, symbol>, extra: ReadonlyMap<any[], symbol[]>, bound: ReadonlySet<symbol> = new Set()): any => {
     if (typeof e === "symbol") return !bound.has(e) && map.get(e) || e;
-    if (!(e instanceof Cons)) return e;
+    if (!Array.isArray(e)) return e;
     const p = parts(e);
-    const added = extra.get(e);
     const next: any[] = [];
     for (const [x, around] of withBounds(p, bound)) next.push(rewrite(x, map, extra, around));
-    const rebuild = p.rebuild;
-    if (added === undefined) return rebuild(next);
+    const added = extra.get(e);
+    if (added === undefined) return p.rebuild(next);
     // inside a lifted lambda these are its fresh parameters, which nothing shadows
-    const args = added.map(a => map.get(a) ?? a);
-    return keepPos(list([next[0], ...args, ...next.slice(1)]), e);
+    return keepPos([next[0], ...added.map(a => map.get(a) ?? a), ...next.slice(1)], e);
 };
+
+const isLambdaExpr = (e: any): boolean => Array.isArray(e) && e[0] === CORE_LAMBDA;
 
 export const liftLambdas = (ast: any): any => {
     const assigned = assignedNames(ast);
@@ -166,20 +144,20 @@ export const liftLambdas = (ast: any): any => {
     // `scope`: the local names bound around `e`. `unsafe`: those that may not have their value yet when code there runs
     // (%letrec values), which a copy would miss, so they cannot be passed
     const walk = (e: any, scope: ReadonlySet<symbol>, unsafe: ReadonlySet<symbol>): any => {
-        if (!(e instanceof Cons)) return e;
-        if (e.car === CORE_LETREC) {
-            const bindings: Cons[] = toArr(e.cdr.car);
-            const names = bindings.map(b => b.car as symbol);
-            const lambdas = new Set(names.filter((_, i) => isLambdaExpr(bindings[i].cdr.car)));
+        if (!Array.isArray(e)) return e;
+        if (e[0] === CORE_LETREC) {
+            const bindings: [symbol, any][] = e[1];
+            const names = bindings.map(b => b[0]);
+            const lambdas = new Set(names.filter((_, i) => isLambdaExpr(bindings[i][1])));
             const values = names.filter(n => !lambdas.has(n));
             // the values' inits run before some values have theirs; if they may run the lambdas, so may everything else
-            const runsEarly = bindings.some(b => !isLambdaExpr(b.cdr.car) && freeIn(b.cdr.car, lambdas, new Set(), new Set()).size > 0);
+            const runsEarly = bindings.some(b => !isLambdaExpr(b[1]) && freeIn(b[1], lambdas, new Set(), new Set()).size > 0);
             const inner = new Set([...scope, ...names]);
             const inInits = new Set([...unsafe, ...values]);
             const afterInits = runsEarly ? inInits : unsafe;
-            const next = bindings.map(b => list([b.car, walk(b.cdr.car, inner, isLambdaExpr(b.cdr.car) ? afterInits : inInits)]));
-            const body = toArr(e.cdr.cdr).map(x => walk(x, inner, afterInits));
-            return liftIn(keepPos(new Cons(CORE_LETREC, new Cons(list(next), list(body))), e), scope, afterInits);
+            const next = bindings.map(b => keepPos([b[0], walk(b[1], inner, isLambdaExpr(b[1]) ? afterInits : inInits)], b));
+            const body = e.slice(2).map((x: any) => walk(x, inner, afterInits));
+            return liftIn(keepPos([CORE_LETREC, next, ...body], e), scope, afterInits);
         }
         const p = parts(e);
         const next: any[] = [];
@@ -187,16 +165,15 @@ export const liftLambdas = (ast: any): any => {
         return p.rebuild(next);
     };
 
-    const liftIn = (letrec: Cons, outer: ReadonlySet<symbol>, unsafe: ReadonlySet<symbol>): Cons => {
-        const bindings: Cons[] = toArr(letrec.cdr.car);
-        const body = toArr(letrec.cdr.cdr);
-        const names = bindings.map(b => b.car as symbol);
+    const liftIn = (letrec: any[], outer: ReadonlySet<symbol>, unsafe: ReadonlySet<symbol>): any[] => {
+        const bindings: [symbol, any][] = letrec[1];
+        const body = letrec.slice(2);
+        const names = bindings.map(b => b[0]);
         const scope = new Set([...outer, ...names]);
-        const inits = new Map<symbol, any>(bindings.map(b => [b.car, b.cdr.car]));
-        const isLambda = (name: symbol) => { const init = inits.get(name); return init instanceof Cons && init.car === CORE_LAMBDA; };
-        const within = [...bindings.map(b => b.cdr.car), ...body];
+        const inits = new Map<symbol, any>(bindings);
+        const within = [...bindings.map(b => b[1]), ...body];
 
-        let lifted = new Set(names.filter(n => isLambda(n) && !assigned.has(n)));
+        let lifted = new Set(names.filter(n => isLambdaExpr(inits.get(n)) && !assigned.has(n)));
         let fv = new Map<symbol, symbol[]>();
         let calls = new Map<symbol, Uses["calls"]>();
         for (;;) {
@@ -205,18 +182,20 @@ export const liftLambdas = (ast: any): any => {
             const next = new Set<symbol>();
             for (const name of lifted) {
                 const uses = within.reduce((u, x) => usesOf(x, name, skip, new Set(), u), { calls: [], other: false } as Uses);
-                if (uses.other || uses.calls.some((c: { node: Cons }) => !arityAccepts(inits.get(name).cdr.car, c.node.length - 1))) continue;
+                if (uses.other || uses.calls.some((c: Uses["calls"][number]) => !arityAccepts(inits.get(name), c.node.length - 1))) continue;
                 next.add(name);
                 calls.set(name, uses.calls);
             }
             // what each passes: its free locals (lifted ones it calls included), then what those need, to a fixpoint
             fv = new Map([...next].map(name => {
                 const lambda = inits.get(name);
-                return [name, [...freeIn(new Cons(CORE_BEGIN_MARK, lambda.cdr.cdr), scope, new Set(formalNames(lambda.cdr.car)), new Set())]];
+                const free = new Set<symbol>();
+                for (const x of lambda.slice(3)) freeIn(x, scope, new Set(lambdaNames(lambda)), free);
+                return [name, [...free]];
             }));
             for (let changed = true; changed;) {
                 changed = false;
-                for (const [name, vars] of fv) {
+                for (const vars of fv.values()) {
                     for (const v of [...vars]) {
                         for (const w of fv.get(v) ?? []) {
                             if (!vars.includes(w)) {
@@ -237,25 +216,19 @@ export const liftLambdas = (ast: any): any => {
         }
         if (lifted.size === 0) return letrec;
 
-        const extra = new Map<Cons, symbol[]>();
+        const extra = new Map<any[], symbol[]>();
         for (const name of lifted) for (const c of calls.get(name)!) extra.set(c.node, fv.get(name)!);
-        const liftedInit = (name: symbol): any => {
+        const liftedInit = (name: symbol): any[] => {
             const lambda = inits.get(name);
             const vars = fv.get(name)!;
             const renamed = new Map(vars.map(v => [v, Symbol(v.description)]));
-            const params = vars.map(v => renamed.get(v)!).reduceRight((rest: any, p) => new Cons(p, rest), lambda.cdr.car);
-            const newBody = toArr(lambda.cdr.cdr).map(x => rewrite(x, renamed, extra, new Set(formalNames(lambda.cdr.car))));
-            return keepPos(new Cons(CORE_LAMBDA, new Cons(params, list(newBody))), lambda);
+            const newBody = lambda.slice(3).map((x: any) => rewrite(x, renamed, extra, new Set(lambdaNames(lambda))));
+            return keepPos([CORE_LAMBDA, [...vars.map(v => renamed.get(v)!), ...lambda[1]], lambda[2], ...newBody], lambda);
         };
-        const newBindings = bindings.map(b => list([b.car, lifted.has(b.car) ? liftedInit(b.car) : rewrite(b.cdr.car, new Map(), extra)]));
+        const newBindings = bindings.map(b => keepPos([b[0], lifted.has(b[0]) ? liftedInit(b[0]) : rewrite(b[1], new Map(), extra)], b));
         const newBody = body.map(x => rewrite(x, new Map(), extra));
-        return keepPos(new Cons(CORE_LETREC, new Cons(list(newBindings), list(newBody))), letrec) as Cons;
+        return keepPos([CORE_LETREC, newBindings, ...newBody], letrec);
     };
 
     return walk(ast, new Set(), new Set());
 };
-
-const isLambdaExpr = (e: any): boolean => e instanceof Cons && e.car === CORE_LAMBDA;
-
-// freeIn walks a lambda's body as the expressions of a form with no binders of its own
-const CORE_BEGIN_MARK = Symbol("lambda body");

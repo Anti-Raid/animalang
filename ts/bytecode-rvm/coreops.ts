@@ -1,23 +1,21 @@
 // The VM's own operations as intrinsics (CORE_INTRINSICS, the start of every table), and the control requests the control
 // operations (and host intrinsics' HostTail) return for the VM to carry out at the call
-import { ASTStringifier, ErrorObject, MultipleValues, packValues } from "../common";
+import { ASTStringifier, ErrorObject, MultipleValues, packValues, unpackValues } from "../common";
 import { hostError } from "../errors";
-import { Cons } from "../list";
-import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markValues } from "../marks";
+import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markValues } from "../marks";
 import type { Marks } from "../marks";
 import { arityMessage } from "./arity";
 import type { Closure } from "./bytecode";
 import type { VMExecutor } from "./executor";
 import { Intrinsics } from "./intrinsics";
 import type { InlineFn, IntrinsicFn, IntrinsicOptions } from "./intrinsics";
-import { applyArgsList, listToArray, listToValues, makeList, valuesToList, windowApplyArgs, windowRestArgs } from "./lists";
 import { Coroutine, DIRECT_SUSPEND_LIMIT, MAX_NESTED_RESUMES, StackSnapshot, Suspend, WindPoint, formatTraceback, frameInfos } from "./values";
 import type { ExecutionContext, Frame } from "./values";
 // (%debug-frames k args) / (%debug-traceback k args): args is ([coroutine] [msg] [level]), k the caller's continuation
 // the frames %debug-frames / %debug-traceback describe: the stack snapshot they are given, or a coroutine's
 export const debugTarget = (ctx: ExecutionContext, regs: readonly any[], start: number) => {
     let frames = (regs[start] as StackSnapshot).frames;
-    const args = listToArray(regs[start + 1]);
+    const args = arrayArg("%debug-frames", regs[start + 1]).slice();
     if (args[0] instanceof Coroutine) {
         const co = args.shift() as Coroutine;
         if (co !== ctx.coroutine) frames = frameInfos(co.frame);
@@ -216,9 +214,17 @@ export const stackSkip = (skip: any): number => {
     if (!Number.isInteger(skip) || skip < 0) throw hostError("%current-stack: expected a count of frames to skip");
     return skip;
 };
-export const restArrayArgs = (regs: readonly any[], start: number, nargs: number, multi: boolean): any[] => {
-    if (!Array.isArray(regs[start + nargs - 1])) throw hostError("%apply-array: the last argument must be a rest array");
-    return windowRestArgs(regs, start, nargs, multi);
+export const arrayArg = (who: string, val: any): any[] => {
+    if (!Array.isArray(val)) throw hostError(`${who}: expected an array but got ${new ASTStringifier().stringify(val)}`);
+    return val;
+};
+// the arguments of an %apply: the window's leading values, then the elements of its last, an array. Always a new array,
+// as the last may be a forwarded rest array that is applied again
+export const applyArgs = (regs: readonly any[], start: number, nargs: number): any[] => {
+    const last = arrayArg("%apply", regs[start + nargs - 1]);
+    const args = regs.slice(start, start + nargs - 1);
+    for (let i = 0; i < last.length; i++) args.push(last[i]);
+    return args;
 };
 
 // a one-argument template; the argument is always a register name, so it may be repeated freely
@@ -231,7 +237,7 @@ export const unaryInline = (inline: (a: string, d: Readonly<Record<string, strin
 // ExecutionContext and VMExecutor
 export const CORE_INTRINSICS: Intrinsics = (() => {
     const table = new Intrinsics();
-    const deps = { Cons, MultipleValues, WindPoint, Caught, EXCEPTION_HANDLERS };
+    const deps = { MultipleValues, WindPoint, Caught, EXCEPTION_HANDLERS, Handlers };
     const core = (name: string, args: [number, number], fn: IntrinsicFn, options: Omit<IntrinsicOptions, "args" | "deps"> = {}) =>
         table.register(name, fn, { args, leaf: true, ...options, deps: options.inline === undefined ? undefined : deps });
     // (%coroutine-create proc [finally]): finally is a thunk run when the coroutine, once started, is left for good
@@ -250,21 +256,20 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%caught-value", [1, 1], (regs, start) => regs[start].error, { inline: unaryInline(v => `${v}.error`) });
     core("%make-caught", [1, 1], (regs, start) => new Caught(regs[start]), { inline: unaryInline((v, d) => `new ${d.Caught}(${v})`) });
     core("%handler-key", [0, 0], () => EXCEPTION_HANDLERS, { inline: (args, slow, tmp, d) => d.EXCEPTION_HANDLERS });
+    // (%push-handler handler handlers): the handlers mark with handler innermost
+    core("%push-handler", [2, 2], (regs, start) => new Handlers(regs[start], regs[start + 1]), {
+        inline: ([h, outer], slow, tmp, d) => `(${outer} === null || ${outer} instanceof ${d.Handlers} ? new ${d.Handlers}(${h}, ${outer}) : ${slow})`,
+    });
     core("%values-cons", [2, 2], (regs, start) => {
         const vals = regs[start + 1];
         return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
     }, { inline: ([x, v], slow, tmp, d) => `(${v} instanceof ${d.MultipleValues} ? new ${d.MultipleValues}([${x}, ...${v}.values]) : new ${d.MultipleValues}([${x}, ${v}]))` });
-    core("%list", [0, Infinity], (regs, start, nargs) => makeList(regs, start, nargs), {
-        inline: (args, slow, tmp, d) => args.reduceRight((tail, arg) => `new ${d.Cons}(${arg}, ${tail})`, "null"),
-    });
     core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)));
-    core("%values->list", [1, 1], (regs, start, nargs) => valuesToList(regs, start, nargs));
-    core("%list->values", [1, 1], (regs, start, nargs) => listToValues(regs, start, nargs));
-    core("%apply-args", [1, 1], (regs, start, nargs) => applyArgsList(regs, start, nargs));
+    core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
     core("%debug-frames", [2, 2], (regs, start, nargs, ctx) => {
         const { frames, args } = debugTarget(ctx, regs, start);
         const level = typeof args[0] === "number" ? args[0] : 0;
-        return Cons.fromArray(frames.slice(level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]));
+        return frames.slice(level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]);
     }, { context: true });
     core("%debug-traceback", [2, 2], (regs, start, nargs, ctx) => {
         const { frames, args } = debugTarget(ctx, regs, start);
@@ -277,9 +282,9 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         const val = regs[start];
         return val instanceof MultipleValues ? val.values[0] : val;
     }, { inline: unaryInline((v, d) => `(${v} instanceof ${d.MultipleValues} ? ${v}.values[0] : ${v})`) });
-    // (%marks-first set key none) / (%marks->list set key): continuation-mark-set-first / ->list
+    // (%marks-first set key none) / (%marks->array set key): continuation-mark-set-first / its values, innermost first
     core("%marks-first", [3, 3], (regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2]));
-    core("%marks->list", [2, 2], (regs, start) => Cons.fromArray(markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1])));
+    core("%marks->array", [2, 2], (regs, start) => markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1]));
 
     // Control operations: not leaves, they return a ControlRequest the VM carries out at the call. Those whose value is
     // that of the call itself (`tail: false`) are never compiled as tail calls
@@ -292,18 +297,14 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     };
     control("%call/cc", [1, 1], (regs, start) => CallCCRequest.of(regs[start]));
     control("%coroutine-yield", [0, Infinity], (regs, start, nargs) => YieldRequest.of(nargs === 1 ? regs[start] : packValues(copyWindow(regs, start, start + nargs))), false);
-    control("%coroutine-yield-list", [1, 1], (regs, start, nargs) => YieldRequest.of(listToValues(regs, start, nargs)), false);
     control("%coroutine-resume", [1, Infinity], (regs, start, nargs) => ResumeRequest.of(regs[start], copyWindow(regs, start + 1, start + nargs)));
-    control("%coroutine-resume-list", [2, 2], (regs, start) => ResumeRequest.of(regs[start], listToArray(regs[start + 1])));
+    control("%coroutine-resume-array", [2, 2], (regs, start) => ResumeRequest.of(regs[start], arrayArg("%coroutine-resume-array", regs[start + 1]).slice()));
     control("%coroutine-raise", [2, 2], (regs, start) => ResumeRequest.of(regs[start], [regs[start + 1]], true));
     control("%raise", [1, 2], (regs, start, nargs) => RaiseRequest.of(regs[start], nargs === 2 ? raiseContinuable(regs[start + 1]) : false), false);
     control("%current-stack", [0, 1], (regs, start, nargs) => StackRequest.of(nargs === 1 ? stackSkip(regs[start]) : 0), false);
-    // applying a procedure ((%apply proc arg ... lst) and %apply-multi compile to these): (proc arg ... last), where
-    // last is a list, a forwarded rest array (see ClosureTemplate.restArray), or for %apply-multi a rest array whose own
-    // last element is a list
-    control("%apply-list", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], windowApplyArgs(regs, start + 1, nargs - 1)));
-    control("%apply-array", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], restArrayArgs(regs, start + 1, nargs - 1, false)));
-    control("%apply-array-multi", [2, 2], (regs, start, nargs) => new HostTail(regs[start], restArrayArgs(regs, start + 1, nargs - 1, true)));
+    // (%apply proc arg ... array) compiles to these: %apply-fresh when the array is a new one nothing else holds
+    control("%apply-array", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], applyArgs(regs, start + 1, nargs - 1)));
+    control("%apply-fresh", [2, 2], (regs, start) => new HostTail(regs[start], arrayArg("%apply", regs[start + 1])));
     return table.freeze();
 })();
 

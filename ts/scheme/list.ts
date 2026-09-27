@@ -1,6 +1,7 @@
-import { hostError } from "./errors";
+import { hostError } from "../errors";
+import { BSReader, DATUM, type BS, type Datum } from "../common";
 
-export class Cons {
+export class Cons implements Datum {
     public car: any;
     public cdr: any;
 
@@ -145,4 +146,66 @@ export class Cons {
         }
         return curr; // done: true, value: tail (null if proper, atom if improper)
     }
+
+    get [DATUM](): true {
+        return true;
+    }
+
+    get bsid() {
+        return "Cons";
+    }
+
+    dump(w: BS): void {
+        let count = 0;
+        for (let curr: any = this; curr instanceof Cons; curr = curr.cdr) count++;
+        w.writeU32(count);
+        let curr: any = this;
+        for (; curr instanceof Cons; curr = curr.cdr) w.writeValue(curr.car);
+        w.writeValue(curr);
+    }
+
+    equals(other: any, equal: (a: any, b: any) => boolean): boolean {
+        if (!(other instanceof Cons)) return false;
+        const len = this.length;
+        if (len !== other.length) return false;
+        if (len !== -2) {
+            let pa: any = this, pb: any = other;
+            for (; pa instanceof Cons && pb instanceof Cons; pa = pa.cdr, pb = pb.cdr) {
+                if (!equal(pa.car, pb.car)) return false;
+            }
+            return equal(pa, pb);
+        }
+        const iterA = this[Symbol.iterator]();
+        const iterB = other[Symbol.iterator]();
+        while (true) {
+            const nextA = iterA.next();
+            const nextB = iterB.next();
+            if (nextA.done) return equal(nextA.value, nextB.value);
+            if (!equal(nextA.value, nextB.value)) return false;
+        }
+    }
+
+    stringify(stringify: (v: any) => string): string {
+        const parts: string[] = [];
+        let curr: any = this;
+        for (; curr instanceof Cons; curr = curr.cdr) parts.push(stringify(curr.car));
+        if (curr !== null) parts.push(".", stringify(curr));
+        return `(${parts.join(" ")})`;
+    }
+
+    copy(copy: (v: any) => any): Cons {
+        const { elements, rest } = this.toDottedArray();
+        let tail = copy(rest);
+        for (let i = elements.length - 1; i >= 0; i--) tail = new Cons(copy(elements[i]), tail);
+        return tail;
+    }
 }
+
+BSReader.registerType("Cons", r => {
+    const count = r.readU32();
+    const cars = new Array(count);
+    for (let i = 0; i < count; i++) cars[i] = r.read();
+    let tail: any = r.read();
+    for (let i = count - 1; i >= 0; i--) tail = new Cons(cars[i], tail);
+    return tail;
+});

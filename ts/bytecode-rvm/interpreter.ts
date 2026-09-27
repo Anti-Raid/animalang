@@ -5,9 +5,8 @@ import { ContinuationMarkSet, markSet, recordTailMark } from "../marks";
 import { bindArgs } from "./arity";
 import { Closure } from "./bytecode";
 import type { ClosureTemplate } from "./bytecode";
-import { ControlRequest, applyIntrinsic } from "./coreops";
+import { ControlRequest, applyArgs, applyIntrinsic, arrayArg } from "./coreops";
 import type { VMExecutor } from "./executor";
-import { windowApplyArgs, windowRestArgs } from "./lists";
 import { NO_REG, UNPACK_REST } from "./opcodes";
 import { Box, CatchToken, EscapeContinuation, MISSING, restValues, tailName, unpackForBinding } from "./values";
 import type { ExecutionContext, Frame } from "./values";
@@ -46,7 +45,6 @@ export enum OpCode {
     CALLINT,
     APPLYINT,
     ELSEIF,
-    APPLYINTR,
     CALLCTX,
     FIXUPVAR,
 }
@@ -219,7 +217,7 @@ export class BytecodeInterpreter {
                             if (nargs >= arity.min && nargs <= arity.max) {
                                 // bindArgs, with its common case inline: V8 does not inline calls into this loop
                                 if (arity.rest === "none") for (let i = 0; i < nargs; i++) regs[i] = regs[startReg + i];
-                                else bindArgs(arity, regs, regs, startReg, nargs);
+                                else bindArgs(arity, regs, regs, startReg, nargs, proc.tmpl.code.pack);
                                 ip = 0;
                                 break;
                             }
@@ -250,16 +248,9 @@ export class BytecodeInterpreter {
                         const entry = frame.code.table!.entries[inst[ip++]];
                         const destReg = inst[ip++];
                         const startReg = inst[ip++];
-                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, windowApplyArgs(regs, startReg, inst[ip++]), ctx, executor);
-                        break;
-                    }
-                    case OpCode.APPLYINTR: {
-                        const entry = frame.code.table!.entries[inst[ip++]];
-                        const destReg = inst[ip++];
-                        const startReg = inst[ip++];
                         const nargs = inst[ip++];
-                        // a rest array alone is the argument array itself: intrinsics never write to or keep it
-                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, nargs === 1 ? regs[startReg] : windowRestArgs(regs, startReg, nargs, false), ctx, executor);
+                        // an array alone is the argument array itself: intrinsics never write to or keep it
+                        regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, nargs === 1 ? arrayArg("%apply", regs[startReg]) : applyArgs(regs, startReg, nargs), ctx, executor);
                         break;
                     }
                     case OpCode.CALLEC: {

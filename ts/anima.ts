@@ -1,4 +1,4 @@
-import { Env, Cons, CORE_LAMBDA } from "./common"
+import { Env, CORE_LAMBDA } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
 import { newIntrinsics } from "./bytecode-rvm/core"
 import { Compiler } from "./bytecode-rvm/compiler"
@@ -101,8 +101,9 @@ export class Anima {
         return this.compileAstToClosure(this.#requireFrontEnd().read(s), args, globals)
     }
 
+    // without a front end, `args` is the lambda's parameters (an array of symbols) and `bast` its body, a core form
     compileAstToClosure(bast: any, args: any, globals: Env): Closure {
-        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : Cons.list(CORE_LAMBDA, args, bast)
+        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : [CORE_LAMBDA, args, null, bast]
         const bc = this.compileRawAst(ast)
         return this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
     }

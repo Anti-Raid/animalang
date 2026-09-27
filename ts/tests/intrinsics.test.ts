@@ -1,6 +1,6 @@
 import { ASTStringifier } from '../common';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Cons } from '../list';
+import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
 import { ByteCode, AotCompiler, OpCode } from '../bytecode-rvm/vm';
 import { Closure, CORE_COUNT, CORE_INTRINSICS, corePos, INSTRUCTION_LENGTHS } from '../bytecode-rvm/exec';
@@ -10,7 +10,7 @@ import { Anima } from '../anima';
 import { impl, implAot } from '../bytecode-rvm/meta';
 import { dumpFull, readFull, stringifyInst } from '../bytecode-rvm/utils';
 import { OPCODES } from '../bytecode-rvm/opcodes';
-import { arityMessage, bindArgs, closureArity, restValue } from '../bytecode-rvm/arity';
+import { arityMessage, bindArgs, closureArity } from '../bytecode-rvm/arity';
 import { CORE_FORMS, hasCore, newIntrinsics } from '../bytecode-rvm/core';
 import { readdirSync, readFileSync } from 'fs';
 import { registerTestIntrinsics } from './helpers';
@@ -131,8 +131,16 @@ describe('Anima', () => {
             const bare = new Anima(vmImpl)
             expect(bare.intrinsics.byName("%car")).toBeUndefined()
             expect(() => bare.compileRaw(`(+ 1 2)`)).toThrow("no front end")
-            const ifForm = Cons.list(Symbol.for("%if"), false, 1, Cons.list(Symbol.for("%list"), 2, 3))
-            expect(s.stringify(bare.evaluateRaw(bare.compileRawAst(ifForm)))).toBe("(2 3)")
+            const ifForm = [Symbol.for("%if"), false, 1, [Symbol.for("%values"), 2, 3]]
+            expect(s.stringify(bare.evaluateRaw(bare.compileRawAst(ifForm)))).toBe("(values 2 3)")
+            // its sequences are arrays: rest parameters, and what %apply spreads
+            const restForm = [[Symbol.for("%lambda"), [], Symbol.for("r"), Symbol.for("r")], 1, 2]
+            expect(bare.evaluateRaw(bare.compileRawAst(restForm))).toEqual([1, 2])
+            const applyForm = [Symbol.for("%apply"), [Symbol.for("%lambda"), [Symbol.for("a")], Symbol.for("r"), Symbol.for("r")], 1, [Symbol.for("%quote"), [2, 3]]]
+            expect(bare.evaluateRaw(bare.compileRawAst(applyForm))).toEqual([2, 3])
+            // a front end has one pack and one spread
+            expect(() => evaluator.registerIntrinsic("%my-pack", () => null, { leaf: true, sequence: "pack" })).toThrow("already has a sequence pack")
+            expect(() => bare.registerIntrinsic("%my-spread", () => null, { sequence: "spread" })).toThrow("must be a leaf")
         })
 
         it('gives inline templates their deps', () => {
@@ -171,8 +179,9 @@ describe("Opcode spec", () => {
     it("disassembles from the spec", () => {
         const anima = createScheme(impl)
         const bc = anima.compileRaw(`
-            (define (ds-ap f . xs) (%apply-multi f xs))
-            (define (ds-sum . xs) (%apply %+ xs))
+            (define (ds-ap f . xs) (apply f 1 xs))
+            (define (ds-sum . xs) (apply %+ xs))
+            (define (ds-l f lst) (apply f lst))
             (let-values (((a . b) (values 1 2))) (if a (car b) (ds-ap ds-sum 1 '(2))))`) as ByteCode
         const lines = stringifyInst(bc)
         const sum = stringifyInst(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-sum").tmpl.code)
@@ -182,8 +191,11 @@ describe("Opcode spec", () => {
         expect(lines.some(line => /CALLINT +pos=%car, /.test(line))).toBe(true)
         expect(lines.some(line => /LOADCONST +dst=r\d+, const=\(2\)$/.test(line))).toBe(true)
         expect(lines.some(line => /CALL +proc=r\d+, start=r\d+, nargs=3, tail=tail$/.test(line))).toBe(true)
-        expect(sum.some(line => /APPLYINTR +pos=%\+, dst=r\d+, start=r\d+, nargs=1$/.test(line))).toBe(true)
-        expect(ap.some(line => /CALLHOST +pos=%apply-array-multi, start=r\d+, nargs=2, tail=tail$/.test(line))).toBe(true)
+        expect(sum.some(line => /APPLYINT +pos=%\+, dst=r\d+, start=r\d+, nargs=1$/.test(line))).toBe(true)
+        expect(ap.some(line => /CALLHOST +pos=%apply-array, start=r\d+, nargs=3, tail=tail$/.test(line))).toBe(true)
+        // a spread list is a new array, called with as it is
+        const l = stringifyInst(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-l").tmpl.code)
+        expect(l.some(line => /CALLHOST +pos=%apply-fresh, start=r\d+, nargs=2, tail=tail$/.test(line))).toBe(true)
         // ips count by the spec's lengths
         const ips = lines.filter(line => /^\d{4}:/.test(line)).map(line => +line.slice(0, 4))
         for (let i = 1; i < ips.length; i++) expect(ips[i] - ips[i - 1]).toBe(INSTRUCTION_LENGTHS[bc.inst[ips[i - 1]] as OpCode])
@@ -195,11 +207,11 @@ describe("Core operations", () => {
         const a = createScheme(impl), b = createScheme(implAot)
         for (const table of [a.intrinsics, b.intrinsics, newIntrinsics(), newIntrinsics(a.intrinsics)]) {
             expect(hasCore(table)).toBe(true)
-            expect(table.byName("%list")!.pos).toBe(corePos("%list"))
+            expect(table.byName("%values")!.pos).toBe(corePos("%values"))
         }
         expect(CORE_COUNT).toBe(CORE_INTRINSICS.entries.length)
         expect(() => new Compiler(new Intrinsics())).toThrow("must start with the core operations")
-        expect(() => a.registerIntrinsic("%list", () => null)).toThrow("'%list' is already defined")
+        expect(() => a.registerIntrinsic("%values", () => null)).toThrow("'%values' is already defined")
         expect(() => CORE_INTRINSICS.register("%x", () => null)).toThrow("frozen")
         expect(() => a.registerIntrinsic("%x", () => null, { context: true })).toThrow("only the VM's core operations do")
         // leaves that take the context have their own opcode, so other intrinsic calls pass just the window
@@ -212,17 +224,17 @@ describe("Core operations", () => {
             const anima = createScheme(vmImpl)
             const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)))
             expect(run("(%list 1 2 3)")).toBe("(1 2 3)")
-            expect(run("(%apply %list 1 '(2 3))")).toBe("(1 2 3)")
+            expect(run("(apply %list 1 '(2 3))")).toBe("(1 2 3)")
             // one that takes the context, applied
-            expect(run("(let ((co (%coroutine-create (lambda () 1)))) (%apply %coroutine-status (list co)))")).toBe("suspended")
+            expect(run("(let ((co (%coroutine-create (lambda () 1)))) (apply %coroutine-status (list co)))")).toBe("suspended")
             expect(run("(let ((co (%coroutine-create (lambda () 1)))) (%coroutine-close co) (%coroutine-status co))")).toBe("dead")
-            expect(() => run("(%list->values 1 2)")).toThrow("%list->values: expected exactly 1 args, got 2")
+            expect(() => run("(%values->array 1 2)")).toThrow("%values->array: expected exactly 1 args, got 2")
         }
         const anima = createScheme(impl)
-        const bc = anima.compileRaw("(%list 1 2)") as ByteCode
-        expect(stringifyInst(bc).some(line => /CALLINT +pos=%list, /.test(line))).toBe(true)
+        const bc = anima.compileRaw("(%values 1 2)") as ByteCode
+        expect(stringifyInst(bc).some(line => /CALLINT +pos=%values, /.test(line))).toBe(true)
         // code that only uses core operations loads without a table
-        expect(new ASTStringifier().stringify(anima.evaluateRaw(readFull(dumpFull(bc)) as ByteCode))).toBe("(1 2)")
+        expect(new ASTStringifier().stringify(anima.evaluateRaw(readFull(dumpFull(bc)) as ByteCode))).toBe("(values 1 2)")
     })
 })
 describe("Control operations", () => {
@@ -230,7 +242,7 @@ describe("Control operations", () => {
         for (const vmImpl of [impl, implAot]) {
             const anima = createScheme(vmImpl)
             const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)))
-            for (const name of ["%call/cc", "%raise", "%current-stack", "%coroutine-yield", "%coroutine-resume", "%apply-list", "%apply-array"]) {
+            for (const name of ["%call/cc", "%raise", "%current-stack", "%coroutine-yield", "%coroutine-resume", "%coroutine-resume-array", "%apply-array"]) {
                 const entry = CORE_INTRINSICS.byName(name)!
                 expect(entry.leaf, name).toBe(false)
                 expect(anima.intrinsics.byName(name), name).toBe(entry)
@@ -240,9 +252,9 @@ describe("Control operations", () => {
             expect(run("(define (cc-loop n) (if (= n 0) 'done (%call/cc (lambda (k) (cc-loop (- n 1)))))) (cc-loop 100000)")).toBe("done")
             expect(run("(%catch (lambda () (%raise 'boom)) (lambda (e) (list 'caught e)))")).toBe("(caught boom)")
             expect(() => run("(%raise 'boom 5)")).toThrow("%raise: continuable must be #t or #f")
-            expect(run("(define (cs-f skip) (vector-ref (car (%debug-frames (%current-stack skip) '())) 0)) (cs-f 0)")).toBe('"cs-f"')
+            expect(run("(define (cs-f skip) (vector-ref (vector-ref (%debug-frames (%current-stack skip) #()) 0) 0)) (cs-f 0)")).toBe('"cs-f"')
             expect(() => run("(%current-stack -1)")).toThrow("%current-stack: expected a count of frames to skip")
-            expect(() => run("(%apply-array list '(1))")).toThrow("%apply-array: the last argument must be a rest array")
+            expect(() => run("(%apply-array list '(1))")).toThrow("%apply: expected an array but got (1)")
             expect(run("(let ((co (%coroutine-create (lambda (a) (+ a (%coroutine-yield (* a 2))))))) (list (%coroutine-resume co 5) (%coroutine-resume co 1)))")).toBe("(10 6)")
             // the Scheme names are aliases: a call whose count does not fit calls the prelude procedure, which reports it
             expect(run("(list (call/cc (lambda (k) (k 1))) (dynamic-wind (lambda () 0) (lambda () 2) (lambda () 0)) (map call/cc (list (lambda (k) 3))))")).toBe("(1 2 (3))")
@@ -263,25 +275,19 @@ describe("Control operations", () => {
     })
 })
 describe("Argument binding", () => {
-    it("binds positionals and a rest list or array, in place over the argument window too", () => {
-        const list = closureArity(2, "list")
-        expect(list).toEqual({ min: 2, max: Infinity, rest: "list" })
+    it("binds positionals and a packed or array rest, in place over the argument window too", () => {
+        const packed = closureArity(2, "packed")
+        expect(packed).toEqual({ min: 2, max: Infinity, rest: "packed" })
         const fresh: any[] = []
-        bindArgs(list, fresh, ["x", "a", "b", "c", "d"], 1, 4)
-        expect(fresh.slice(0, 2)).toEqual(["a", "b"])
-        expect(new ASTStringifier().stringify(fresh[2])).toBe('("c" "d")')
+        bindArgs(packed, fresh, ["x", "a", "b", "c", "d"], 1, 4, (regs, start, nargs) => regs.slice(start, start + nargs).join("+"))
+        expect(fresh).toEqual(["a", "b", "c+d"])
         // a self tail call: the window overlaps the parameters it is bound to
         const regs = ["p0", "p1", "p2", "a", "b", "c"]
-        bindArgs(closureArity(2, "array"), regs, regs, 1, 5)
+        bindArgs(closureArity(2, "array"), regs, regs, 1, 5, null)
         expect(regs.slice(0, 3)).toEqual(["p1", "p2", ["a", "b", "c"]])
         const exact = ["p0", "p1", "x", "y"]
-        bindArgs(closureArity(2, "none"), exact, exact, 2, 2)
+        bindArgs(closureArity(2, "none"), exact, exact, 2, 2, null)
         expect(exact).toEqual(["x", "y", "x", "y"])
-        // an owned argument array can be the rest array itself; otherwise it is copied
-        const args = [1, 2]
-        expect(restValue("array", args, 0, 2, true)).toBe(args)
-        expect(restValue("array", args, 0, 2)).not.toBe(args)
-        expect(restValue("list", args, 2, 2)).toBe(null)
     })
 
     it("gives closures and intrinsics one arity message", () => {
@@ -290,9 +296,9 @@ describe("Argument binding", () => {
         expect(arityMessage("f", 2, 3, 4)).toBe("f: expected 2 to 3 args, got 4")
         const anima = createScheme(impl)
         const tmpl = (anima.compileRaw("(define (ab-f a . r) r)") as ByteCode).constants.find((c: any) => c instanceof Closure)!.tmpl
-        expect(tmpl.arity).toEqual({ min: 1, max: Infinity, rest: "list" })
+        expect(tmpl.arity).toEqual({ min: 1, max: Infinity, rest: "packed" })
         expect(() => anima.evaluateRaw(anima.compileRaw("(define (ab-g a b) a) (ab-g 1)"))).toThrow("ab-g: expected exactly 2 args, got 1")
-        expect(() => anima.evaluateRaw(anima.compileRaw("(%apply %car '(1 2))"))).toThrow("%car: expected exactly 1 args, got 2")
+        expect(() => anima.evaluateRaw(anima.compileRaw("(apply %car '(1 2))"))).toThrow("%car: expected exactly 1 args, got 2")
         expect(() => anima.compileRaw("(%car 1 2)")).toThrow("%car: expected exactly 1 args, got 2")
     })
 })
@@ -306,7 +312,9 @@ describe("Compiler intrinsics", () => {
     it("belong to a compiler that knows nothing of the Scheme front end", () => {
         const dir = new URL("../bytecode-rvm/", import.meta.url);
         const files = readdirSync(dir, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => `${(entry as any).parentPath ?? (entry as any).path}/${entry.name}`);
-        const mentions = files.filter(file => /scheme/i.test(readFileSync(file, "utf8")));
+        const mentions = files.filter(file => /scheme/i.test(readFileSync(file, "utf8")) || /\bCons\b/.test(readFileSync(file, "utf8")));
         expect(mentions).toEqual([]);
+        // nor does the code the VM and the front end share
+        expect(readFileSync(new URL("../common.ts", import.meta.url), "utf8")).not.toMatch(/\bCons\b|scheme\//);
     });
 });

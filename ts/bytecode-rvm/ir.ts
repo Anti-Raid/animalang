@@ -1,6 +1,7 @@
 import { ConstPool, type SourcePos } from "../common";
 import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, corePos, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
+import type { RestKind } from "./arity";
 import { OPCODES } from "./opcodes";
 
 let nextLabelId = 0;
@@ -145,14 +146,12 @@ export type Node = {
     isTail: boolean,
     destReg?: number
 } | {
-    // (%apply %intrinsic arg ... lst) of a leaf intrinsic (APPLYINT)
+    // (%apply %intrinsic arg ... array) of a leaf intrinsic (APPLYINT)
     t: "IntApply",
     pos: number,
     destReg: number,
     startReg: number,
-    nargs: number,
-    // the last argument is a forwarded rest array (APPLYINTR)
-    restArray: boolean
+    nargs: number
 } | {
     // a leaf intrinsic (CALLINT)
     t: "IntCall",
@@ -173,7 +172,7 @@ export type Node = {
 export class IR {
     constructor(private readonly table: Intrinsics, private readonly debug: boolean = false) {}
 
-    lower(nodes: Node[], numRegs: number): ByteCode {
+    lower(nodes: Node[], numRegs: number, packRest: boolean = false): ByteCode {
         const cpool = new ConstPool()
         const inst: number[] = []
         // an instruction, with as many operands as OPCODES says it has
@@ -272,7 +271,7 @@ export class IR {
                     emit(this.table.entries[node.pos].context ? OpCode.CALLCTX : OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "IntApply":
-                    emit(node.restArray ? OpCode.APPLYINTR : OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
+                    emit(OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
                     break
                 case "Unpack": {
                     emit(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
@@ -301,8 +300,8 @@ export class IR {
                     break
                 }
                 case "NewClosure": {
-                    const closureBc = this.lower(node.template.code, node.template.numRegs)
-                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name, node.template.restArray)
+                    const closureBc = this.lower(node.template.code, node.template.numRegs, node.template.rest === "packed")
+                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name, node.template.rest)
                     if(ct.upvarLocs.length === 0) {
                         // We can just directly push the template as a raw constant in the pool
                         const cidx = cpool.mutPush(Closure.fromTemplate(ct))
@@ -359,7 +358,10 @@ export class IR {
             inst[jump] = resolvedOffset
         }
 
-        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
+        const restPos = packRest ? use(this.table.pack!.pos) : -1
+        const code = new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
+        code.restPos = restPos
+        return code
     }
 }
 
@@ -371,7 +373,7 @@ export class ClosureTemplateIR {
     numRegs: number;
     upvarLocs: UpVarLoc[] // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public restArray: boolean = false) {
+    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public rest: RestKind = "array") {
         this.params = params
         this.remParams = remParams
         this.code = code

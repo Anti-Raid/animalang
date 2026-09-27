@@ -1,6 +1,6 @@
 import { ASTStringifier } from '../common';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Cons } from '../list';
+import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
 import { ByteCode } from '../bytecode-rvm/vm';
 import { Anima } from '../anima';

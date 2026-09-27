@@ -1,7 +1,8 @@
-import { Cons } from "../common";
+import { Cons } from "./list";
 import type { AnimaOptions } from "../bytecode-rvm/meta";
 import { Anima } from "../anima";
 import { ASP } from "./reader";
+import { toCore } from "./core";
 import { schemeBase } from "./base";
 import { loadPrelude } from "./prelude";
 import { OP_LAMBDA } from "./symbols";
@@ -21,7 +22,7 @@ export const createScheme = (options: AnimaOptions, maxSteps: number = 0): Anima
     const publicScope = loadPrelude(anima.compiler, anima.vm, evaluator, intrinsics);
     anima.attachFrontEnd({
         read: (source, file) => new ASP(source, true, file).parse(),
-        transform: ast => evaluator.transform(ast),
+        transform: ast => toCore(evaluator.transform(ast)),
         lambda: (params, body) => Cons.list(OP_LAMBDA, params, body),
     }, publicScope.chained());
     return anima;

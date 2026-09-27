@@ -2,11 +2,11 @@
 import { IProcedure } from "../common";
 import type { BS, BSReader, SerializableBytecode, SourcePos } from "../common";
 import { closureArity } from "./arity";
-import type { Arity } from "./arity";
+import type { Arity, RestKind } from "./arity";
 import { CORE_INTRINSICS } from "./coreops";
 import type { VMExecutor } from "./executor";
 import type { OpCode } from "./interpreter";
-import type { Intrinsic, Intrinsics } from "./intrinsics";
+import type { Intrinsic, IntrinsicFn, Intrinsics } from "./intrinsics";
 import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
 import type { ExecutionContext, Frame } from "./values";
 export type ExecutionMode = "interp" | "aot";
@@ -44,6 +44,8 @@ export class ByteCode implements SerializableBytecode {
     // of tail calls reaching the depth limit): past a few, its heap code tail calls through heap frames, which run such
     // chains in constant space without unwinding the js stack
     public tailSuspends: number = 0;
+    // the pack intrinsic a packed rest parameter is made with (see RestKind), or -1
+    public restPos: number = -1;
 
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
@@ -59,6 +61,10 @@ export class ByteCode implements SerializableBytecode {
         // metadata: the intrinsics the code uses, by name (for binding to another table, serialization and disassembly)
         public intrinsics: readonly UsedIntrinsic[] = []
     ) {}
+
+    get pack(): IntrinsicFn | null {
+        return this.restPos === -1 ? null : this.table!.fns[this.restPos];
+    }
 
     // Makes the operands positions in `table`, by name: an error if an intrinsic is missing or its leaf flag differs from
     // the one the code was compiled for (either way). Rewrites the instructions (copying them if other code runs them)
@@ -85,6 +91,7 @@ export class ByteCode implements SerializableBytecode {
                 for (const off of INTRINSIC_OPERANDS[inst[ip]]) inst[ip + off] = moved.get(inst[ip + off]) ?? inst[ip + off];
             }
             this.inst = inst;
+            this.restPos = moved.get(this.restPos) ?? this.restPos;
         }
         this.intrinsics = bound;
         this.table = table;
@@ -126,6 +133,7 @@ export class ByteCode implements SerializableBytecode {
         if (known !== undefined) return known;
         const copy = new ByteCode([], this.inst, this.numReg, this.lineTable, this.files, this.debug, this.table, this.intrinsics);
         copies.set(this, copy);
+        copy.restPos = this.restPos;
         SHARED_INSTS.add(this.inst);
         copy.bind(table);
         copy.constants = this.constants.map(c => {
@@ -165,6 +173,7 @@ export class ByteCode implements SerializableBytecode {
         bs.writeArray(this.files);
         bs.writeValue(this.debug);
         bs.writeArray(this.intrinsics.flatMap(({ pos, name, leaf }) => [pos, name, leaf]));
+        bs.writeValue(this.restPos);
     }
 
     // loaded code is bound to `table`, by name; without one, to the core operations (code that uses others needs a table)
@@ -177,12 +186,14 @@ export class ByteCode implements SerializableBytecode {
             const files = bsr.readArray() as string[];
             const debug = bsr.read() as boolean;
             const flat = bsr.readArray();
+            const restPos = bsr.read() as number;
             const intrinsics: UsedIntrinsic[] = [];
             for (let i = 0; i < flat.length; i += 3) intrinsics.push({ pos: flat[i], name: flat[i + 1], leaf: flat[i + 2] });
             if (table === null && intrinsics.some(used => CORE_INTRINSICS.byName(used.name) === undefined)) {
                 throw new Error("bytecode that uses intrinsics needs an intrinsics table to load");
             }
             const code = new ByteCode(constants, inst, numReg, lineTable, files, debug, null, intrinsics);
+            code.restPos = restPos;
             code.bind(table ?? CORE_INTRINSICS);
             return code;
         });
@@ -203,19 +214,17 @@ export class ClosureTemplate implements SerializableBytecode {
     // how it binds its arguments: every call binds them through this (see bindArgs)
     readonly arity: Arity;
 
-    // `restArray`: the rest parameter is only ever spread back into a call (the compiler's analysis proves it), so it is
-    // bound to a plain array of the rest arguments rather than a list, and only APPLY / APPLYINTR ever read it
-    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null, public restArray: boolean = false) {
+    constructor(params: symbol[], remParams: symbol | null, code: ByteCode, upvarLocs: UpVarLoc[], public name: string | null = null, public rest: RestKind = "array") {
         this.params = params;
         this.remParams = remParams;
         this.code = code;
         this.upvarLocs = upvarLocs;
-        this.arity = closureArity(params.length, remParams === null ? "none" : restArray ? "array" : "list");
+        this.arity = closureArity(params.length, remParams === null ? "none" : rest);
     }
 
     // the same template running other code
     withCode(code: ByteCode): ClosureTemplate {
-        return new ClosureTemplate(this.params, this.remParams, code, this.upvarLocs, this.name, this.restArray);
+        return new ClosureTemplate(this.params, this.remParams, code, this.upvarLocs, this.name, this.rest);
     }
 
     dump(bs: BS) {
@@ -224,7 +233,7 @@ export class ClosureTemplate implements SerializableBytecode {
         bs.writeValue(this.code);
         bs.writeValue(this.upvarLocs);
         bs.writeValue(this.name);
-        bs.writeValue(this.restArray);
+        bs.writeValue(this.rest);
     }
 
     static register(bsr: BSReader) {
@@ -234,8 +243,8 @@ export class ClosureTemplate implements SerializableBytecode {
             const code = bsr.readSerializable<ByteCode>("ByteCode");
             const upvarLocs = bsr.readArray() as UpVarLoc[];
             const name = bsr.read() as string | null;
-            const restArray = bsr.read() as boolean;
-            return new ClosureTemplate(params, remParams, code, upvarLocs, name, restArray);
+            const rest = bsr.read() as RestKind;
+            return new ClosureTemplate(params, remParams, code, upvarLocs, name, rest);
         });
     }
 }

@@ -1,8 +1,7 @@
-import { Cons } from "./list";
 import { Table } from "./table";
 import { Env } from "./env";
 
-export { Cons, Table, Env };
+export { Table, Env };
 
 /** Returns if a value is truthy or not */
 export const isTruthy = (val: any): boolean => {
@@ -35,38 +34,7 @@ export const isDeepEqual = (a: any, b: any): boolean => {
         return true;
     }
 
-    // Lists (Cons only)
-    if (a instanceof Cons && b instanceof Cons) {
-        const len = a.length;
-        if (len !== b.length) return false;
-        if (len === 0) return true;
-
-        // proper or improper: walk both, then compare the tails
-        if (len !== -2) {
-            let pa: any = a, pb: any = b;
-            for (; pa instanceof Cons && pb instanceof Cons; pa = pa.cdr, pb = pb.cdr) {
-                if (!isDeepEqual(pa.car, pb.car)) return false;
-            }
-            return isDeepEqual(pa, pb);
-        }
-
-        const iterA = a[Symbol.iterator]();
-        const iterB = b[Symbol.iterator]();
-
-        while (true) {
-            const nextA = iterA.next();
-            const nextB = iterB.next();
-
-            if (nextA.done) {
-                return isDeepEqual(nextA.value, nextB.value); 
-            }
-
-            // Compare the current elements
-            if (!isDeepEqual(nextA.value, nextB.value)) {
-                return false;
-            }
-        }
-    }
+    if (isDatum(a)) return a.equals(b, isDeepEqual);
 
     // Closures/other types
     return false;
@@ -156,6 +124,19 @@ export const packValues = (vals: any[]): any => vals.length === 1 ? vals[0] : ne
 
 export const unpackValues = (val: any): any[] => val instanceof MultipleValues ? val.values : [val];
 
+export const DATUM = Symbol("datum");
+
+// a front end's own kind of data (e.g. Scheme's pairs): how it is compared, printed, copied and serialized. Marked by a
+// property rather than a base class, as V8 does not inline a derived class's constructor
+export interface Datum extends SerializableBytecode {
+    readonly [DATUM]: true;
+    equals(other: any, equal: (a: any, b: any) => boolean): boolean;
+    stringify(stringify: (v: any) => string): string;
+    copy(copy: (v: any) => any): any;
+}
+
+export const isDatum = (v: any): v is Datum => typeof v === "object" && v !== null && v[DATUM] === true;
+
 export abstract class OpaqueValue {
     abstract get typeName(): string;
 }
@@ -191,24 +172,7 @@ export class ASTStringifier {
         // Lists
         if (ast === null) return "()";
 
-        // Cons
-        if (ast instanceof Cons) {
-            const parts: string[] = [];
-            let current: any = ast;
-
-            while (current !== null) {
-                if (current instanceof Cons) {
-                    parts.push(this.stringify(current.car));
-                    current = current.cdr;
-                } else {
-                    // Improper list/pair
-                    parts.push(".");
-                    parts.push(this.stringify(current));
-                    break;
-                }
-            }
-            return `(${parts.join(" ")})`;
-        }
+        if (isDatum(ast)) return ast.stringify(v => this.stringify(v));
 
         // Vectors
         if (Array.isArray(ast)) {
@@ -252,9 +216,7 @@ export class ASTStringifier {
 
 // Normalizes an expression
 export const normalizeExpr = (expr: any): any =>{
-    if (expr instanceof Cons) {
-        return new Cons(normalizeExpr(expr.car), normalizeExpr(expr.cdr));
-    }
+    if (isDatum(expr)) return expr.copy(normalizeExpr);
     if (Array.isArray(expr)) {
         return expr.map(normalizeExpr);
     }
@@ -276,50 +238,6 @@ export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxC
     if (SPECIAL_FORMS.has(param)) {
         throw new Error(`${String(param)}: bad syntax`)
     }
-}
-
-export type UnpackedLambdaArgs = { params: symbol[], remParams: symbol | null }
-export const unpackLambdaExprArgs = (expr: any, ctx?: string): UnpackedLambdaArgs => {
-    let params: symbol[] = []
-    let remParams: symbol | null = null
-    let args = (expr instanceof Cons) ? expr.cdr.car : expr;
-
-    if (args === null) {
-        // () -> 0 params
-    } else if (typeof args === "symbol") {
-        remParams = args;
-    } else if (args instanceof Cons) {
-        let curr: any = args;
-        while (curr instanceof Cons) {
-            params.push(curr.car);
-            curr = curr.cdr;
-        }
-        if (curr !== null) {
-            remParams = curr;
-        }
-    } else {
-        throw new Error(`${ctx || "lambda"} arguments must be a symbol (to bind all as a list to said symbol) or a list`);
-    }
-
-    // Validate params and remParams here
-    const seen = new Set<symbol>();
-    for(let i = 0; i < params.length; i++) {
-        ensureCanBind(params[i], seen, ctx || "lambda")
-    }
-    if (remParams) {
-        ensureCanBind(remParams, seen, ctx || "lambda")
-    }
-
-    return { params, remParams }
-}
-
-export const wrapMulti = (exprs: any): any => {
-    if (exprs === null) return null;
-    if (exprs instanceof Cons) {
-        if (exprs.cdr === null) return exprs.car;
-        return new Cons(CORE_BEGIN, exprs);
-    }
-    return exprs;
 }
 
 /**
@@ -350,7 +268,6 @@ export class BS {
     static readonly CLASS = 0x0A
     static readonly UNIQUESYMBOL = 0x0B
     static readonly F64 = 0x0C
-    static readonly CONS = 0x0D
     static readonly UNDEFINED = 0xFF
 
     constructor(initialCapacity: number = 1024) {
@@ -484,22 +401,6 @@ export class BS {
         }
     }
 
-    /**
-     * Writes a cons chain
-     *
-     * Format: <CONS><pair count><car>...<final cdr>
-     */
-    writeCons(cons: Cons): void {
-        let count = 0;
-        for (let curr: any = cons; curr instanceof Cons; curr = curr.cdr) count++;
-        this.#ensureCapacity(2);
-        this.#buffer[this.#length++] = BS.CONS;
-        this.#buffer[this.#length++] = count;
-        let curr: any = cons;
-        for (; curr instanceof Cons; curr = curr.cdr) this.writeValue(curr.car);
-        this.writeValue(curr);
-    }
-
     /** Writes a boolean value */
     writeBool(val: boolean): void {
         this.#ensureCapacity(2);
@@ -552,8 +453,6 @@ export class BS {
             this.writeArray(val);
         } else if (val instanceof Map) {
             this.writeMap(val);
-        } else if (val instanceof Cons) {
-            this.writeCons(val);
         } else if (typeof val === 'object' && 'bsid' in val && 'dump' in val && typeof val.dump === 'function') {
             this.writeSerializable(val as SerializableBytecode);
         } else if (typeof val === 'object') {
@@ -573,6 +472,7 @@ export class BSReader {
     #buffer: Uint32Array;
     #cursor: number = 0;
     #textDecoder = new TextDecoder();
+    static readonly #types = new Map<string, (r: BSReader) => any>();
     #factories = new Map<string, (r: BSReader) => any>();
     #uniqueSymbolIds = new Map<number, symbol>()
 
@@ -602,6 +502,11 @@ export class BSReader {
      */
     registerFactory(bsid: string, factory: (r: BSReader) => any): void {
         this.#factories.set(bsid, factory);
+    }
+
+    // a factory for every reader: for data types (see Datum)
+    static registerType(bsid: string, factory: (r: BSReader) => any): void {
+        BSReader.#types.set(bsid, factory);
     }
 
     /**
@@ -691,15 +596,6 @@ export class BSReader {
                 return obj;
             }
 
-            case BS.CONS: {
-                const count = this.#buffer[this.#cursor++];
-                const cars = new Array(count);
-                for (let i = 0; i < count; i++) cars[i] = this.read();
-                let tail: any = this.read();
-                for (let i = count - 1; i >= 0; i--) tail = new Cons(cars[i], tail);
-                return tail;
-            }
-
             case BS.NULL:
                 return null;
             
@@ -709,7 +605,7 @@ export class BSReader {
             case BS.CLASS: {
                 // Read the class ID using the STR tag deserializer logic
                 const bsid = this.readString();
-                const factory = this.#factories.get(bsid);
+                const factory = this.#factories.get(bsid) ?? BSReader.#types.get(bsid);
                 if (!factory) {
                     throw new Error(`no factory registered for SerializableBytecode class '${bsid}'`);
                 }
@@ -846,7 +742,7 @@ export class ConstPool {
     }
 
     #freezeObj(obj: any) {
-        if (typeof obj !== "object" || obj === null || obj instanceof Cons || obj instanceof Table) return obj;
+        if (typeof obj !== "object" || obj === null || isDatum(obj) || obj instanceof Table) return obj;
         Object.keys(obj).forEach(prop => {
             if (typeof obj[prop] === 'object' && !Object.isFrozen(obj[prop])) {
                 this.#freezeObj(obj[prop]);

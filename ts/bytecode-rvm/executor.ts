@@ -2,11 +2,10 @@
 // runs heap frames through the interpreter or AOT code
 import { Env, ErrorObject, IProcedure, UnhandledError, packValues } from "../common";
 import { hostError } from "../errors";
-import { Cons } from "../list";
-import { Caught, EXCEPTION_HANDLERS, markFirst, markSet } from "../marks";
+import { Caught, EXCEPTION_HANDLERS, Handlers, markFirst, markSet } from "../marks";
 import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
-import { bindArgs, checkArity, restList } from "./arity";
+import { bindArgs, checkArity } from "./arity";
 import { ByteCode, Closure, ClosureTemplate, createRegs } from "./bytecode";
 import type { VMHost } from "./bytecode";
 import { CORE_INTRINSICS, corePos, tracebackMessage } from "./coreops";
@@ -172,7 +171,7 @@ export class VMExecutor {
         const closureRegs: any[] = createRegs(closure.tmpl.code.numReg);
         // bindArgs, with its common case inline: this runs on every call
         if (arity.rest === "none") for (let i = 0; i < nargs; i++) closureRegs[i] = args[startOffset + i];
-        else bindArgs(arity, closureRegs, args, startOffset, nargs);
+        else bindArgs(arity, closureRegs, args, startOffset, nargs, closure.tmpl.code.pack);
         return closureRegs;
     }
 
@@ -194,7 +193,7 @@ export class VMExecutor {
         const fn = code.directFn!;
         const numPos = code.directRestArity;
         // `args` is always a fresh array the caller gives up, so a rest array with no positional params can be it
-        const rest = proc.tmpl.arity.rest === "array" ? (numPos === 0 ? args : args.slice(numPos)) : restList(args, numPos, args.length);
+        const rest = proc.tmpl.arity.rest === "array" ? (numPos === 0 ? args : args.slice(numPos)) : code.pack!(args, numPos, args.length - numPos);
         // spreading into the call is slow, so the common arities are called directly
         switch (numPos) {
             case 0: return fn(ctx, proc, this, depth, marks, mframe, rest);
@@ -212,7 +211,7 @@ export class VMExecutor {
 
     // calls `proc` with `tok` as the innermost exception handler; its value, or a Caught, is returned to `frame`
     public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, tok: CatchToken): Frame | null {
-        const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Cons(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
+        const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
         if (proc instanceof Closure) return this.newFrame(ctx, proc, this.createClosureArg(proc, 0, [], 0), frame, marks, frame.mframe + 1);
         try {
             return this.invoke(ctx, proc, frame, [], 0, 0, false);
@@ -299,9 +298,9 @@ export class VMExecutor {
     // handlers installed, and if it returns, that is the value of a continuable raise, else a secondary error for them
     public raise(ctx: ExecutionContext, frame: Frame | null, obj: any, continuable: boolean, marks: Marks = frame?.marks ?? null, mframe: number = frame?.mframe ?? 0): Frame | null {
         const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
-        if (!(handlers instanceof Cons)) return this.#unhandled(ctx, frame, obj);
-        const handler = handlers.car;
-        const outer = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, handlers.cdr);
+        if (!(handlers instanceof Handlers)) return this.#unhandled(ctx, frame, obj);
+        const handler = handlers.handler;
+        const outer = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, handlers.outer);
         if (handler instanceof CatchToken) {
             if (handler.pre !== null) {
                 const escape = new Frame(raiseHelpers().escapeWith, [handler, undefined, undefined], 0, frame, ctx, outer, mframe + 1);

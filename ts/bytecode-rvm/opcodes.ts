@@ -79,9 +79,8 @@ export const OPCODES: readonly OpSpec[] = Object.freeze([
         doc: "call the non-leaf intrinsic at pos in the code's table on reg[start .. start+nargs); a HostTail result is called in its place",
     },
     { name: "CALLINT", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "reg[dst] = the leaf intrinsic at pos in the code's table applied to reg[start .. start+nargs)" },
-    { name: "APPLYINT", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "like CALLINT, with the last argument a list spread into the arguments (the count is checked here)" },
+    { name: "APPLYINT", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "like CALLINT, with the last argument an array spread into the arguments (the count is checked here)" },
     { name: "ELSEIF", operands: [["cond", "reg"], ["else", "ip"]], split: "always", doc: "like IF, for a later condition of the same chain (IF ... ELSE end; ELSEIF ... ELSE end; ... ENDIF)" },
-    { name: "APPLYINTR", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "like APPLYINT, with the last argument a forwarded rest array (see ClosureTemplate.restArray)" },
     { name: "CALLCTX", operands: [["pos", "intrinsic"], ["dst", "reg"], ["start", "reg"], ["nargs", "u32"]], doc: "like CALLINT, for an intrinsic that takes the context (a core operation): also passes ctx and executor" },
     { name: "FIXUPVAR", operands: [["clo", "reg"], ["upvar", "upvar"], ["src", "reg"]], doc: "reg[clo].upvars[upvar] = reg[src] (ties the closures of a %letrec to each other once all exist)" },
 ]);

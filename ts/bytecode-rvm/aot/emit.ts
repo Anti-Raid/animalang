@@ -77,23 +77,16 @@ export type ControlAot = {
     tailProc?: boolean,
 };
 export const valuesOf = (args: string[]) => args.length === 1 ? args[0] : `packValues([${args.join(", ")}])`;
-export const resumeArgs = (name: string, args: string[]) => name === "%coroutine-resume" ? `[${args.slice(1).join(", ")}]` : `listToArray(${args[1]})`;
-export const applyArgsOf = (name: string, args: string[]) => {
-    const rest = args.slice(1);
-    const window = `[${rest.join(", ")}], 0, ${rest.length}`;
-    return name === "%apply-list" ? `windowApplyArgs(${window})` : `restArrayArgs(${window}, ${name === "%apply-array-multi"})`;
-};
+export const resumeArgs = (name: string, args: string[]) => name === "%coroutine-resume" ? `[${args.slice(1).join(", ")}]` : `arrayArg("%coroutine-resume-array", ${args[1]}).slice()`;
+export const applyArgsOf = (name: string, args: string[]) => name === "%apply-fresh" ? `arrayArg("%apply", ${args[1]})` : `applyArgs([${args.slice(1).join(", ")}], 0, ${args.length - 1})`;
 export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, ControlAot>([
     ["%call/cc", {
         heap: s => `return executor.callCC(ctx, ${s.args[0]}, frame, ${s.isTail});`,
         direct: s => `throw Suspend.callCC(${s.args[0]});`,
         tailProc: true,
     }],
-    ...["%coroutine-yield", "%coroutine-yield-list"].map((name): [string, ControlAot] => {
-        const val = (s: ControlSite) => name === "%coroutine-yield" ? valuesOf(s.args) : `listToValues([${s.args[0]}], 0, 1)`;
-        return [name, { heap: s => `return executor.coYield(ctx, frame, ${val(s)});`, direct: s => `throw Suspend.yield(${val(s)});` }];
-    }),
-    ...["%coroutine-resume", "%coroutine-resume-list"].map((name): [string, ControlAot] => [name, {
+    ["%coroutine-yield", { heap: s => `return executor.coYield(ctx, frame, ${valuesOf(s.args)});`, direct: s => `throw Suspend.yield(${valuesOf(s.args)});` }],
+    ...["%coroutine-resume", "%coroutine-resume-array"].map((name): [string, ControlAot] => [name, {
         heap: s => `return executor.coResume(ctx, ${s.isTail ? "frame.parent" : "frame"}, ${s.args[0]}, ${resumeArgs(name, s.args)}, frame.marks, frame.mframe);`,
         // inside a coroutine, its frames must stay on the heap, where it can be traced while it waits
         direct: s => s.isTail
@@ -111,7 +104,7 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
         direct: s => `throw Suspend.stack(${s.args.length === 1 ? `stackSkip(${s.args[0]})` : "0"});`,
         continues: true,
     }],
-    ...["%apply-list", "%apply-array", "%apply-array-multi"].map((name): [string, ControlAot] => [name, {
+    ...["%apply-array", "%apply-fresh"].map((name): [string, ControlAot] => [name, {
         heap: s => `{ const args = ${applyArgsOf(name, s.args)}; return executor.invoke(ctx, ${s.args[0]}, frame, args, 0, args.length, ${s.isTail}); }`,
         direct: (s, callArray) => `{ const proc = ${s.args[0]}, args = ${applyArgsOf(name, s.args)}; ${callArray} }`,
         tailProc: true,
@@ -222,7 +215,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
         const restRegs = Array.from({ length: term.nargs - min }, (_, i) => `r${term.start + min + i}`);
         const moves: string[] = [];
         if (rest === "array") moves.push(`const rest = [${restRegs.join(", ")}];`);
-        if (rest === "list") moves.push(`const rest = ${restRegs.reduceRight((tail, reg) => `new Cons(${reg}, ${tail})`, "null")};`);
+        if (rest === "packed") moves.push(`const rest = ${this.intrinsicCall(term.restPos, term.start + min, term.nargs - min)};`);
         for (let i = 0; i < min; i++) {
             if (term.start + i !== i) moves.push(`r${i} = r${term.start + i};`);
         }
@@ -295,13 +288,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "IntCall":
                 return this.emit(`r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)};`);
             case "IntApply": {
+                // an array alone is the argument array itself: intrinsics never write to or keep it
                 const entry = this.table!.entries[inst.pos];
-                return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, windowApplyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}), ctx, executor);`);
-            }
-            case "IntApplyRest": {
-                // a rest array alone is the argument array itself: intrinsics never write to or keep it
-                const entry = this.table!.entries[inst.pos];
-                const args = inst.nargs === 1 ? `r${inst.start}` : `windowRestArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs}, false)`;
+                const args = inst.nargs === 1 ? `arrayArg("%apply", r${inst.start})` : `applyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs})`;
                 return this.emit(`r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, ${args}, ctx, executor);`);
             }
             default: {
@@ -853,7 +842,7 @@ export class DirectEmitter extends FunctionEmitter {
                 return this.emit(`
                     r${term.tok} = new CatchToken(ctx.id, ctx.wind, closure.tmpl.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}`});
                     try {
-                        const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Cons(r${term.tok}, markFirst(marks, EXCEPTION_HANDLERS, null)));
+                        const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(r${term.tok}, markFirst(marks, EXCEPTION_HANDLERS, null)));
                         ${this.#call(term.proc, 0, 0, term.resume, "handlers")}
                     } catch (e) {
                         const caught = catchHere(e, r${term.tok}, ctx);

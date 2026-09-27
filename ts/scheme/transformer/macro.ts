@@ -1,4 +1,5 @@
-import { Cons, Env, CORE_QUOTE, SOURCE_POS } from "../../common"
+import { Env, CORE_QUOTE, SOURCE_POS } from "../../common"
+import { Cons } from "../list"
 import { Compiler } from "../../bytecode-rvm/compiler"
 import { AnimaVM } from "../../bytecode-rvm/vm"
 import type { AnimaOptions } from "../../bytecode-rvm/meta"

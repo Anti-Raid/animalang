@@ -1,5 +1,5 @@
 import { ErrorObject, IProcedure, isDeepEqual, isTruthy, symGen, Table } from "../common";
-import { Cons } from "../list";
+import { Cons } from "./list";
 import { ContinuationMarkSet } from "../marks";
 import { hostError } from "../errors";
 import type { InlineFn, IntrinsicFn, Intrinsics } from "../bytecode-rvm/intrinsics";
@@ -369,12 +369,29 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
 // what the templates may refer to
 const INLINE_DEPS = { Cons, Table, IProcedure, ErrorObject, ContinuationMarkSet, MISSING: MISSING_KEY };
 
+// (apply proc arg ... lst): the elements of lst, as the VM's %apply takes them
+const spreadList = (lst: any, into: any[] = []): any[] => {
+    let p = lst;
+    for (; p instanceof Cons; p = p.cdr) into.push(p.car);
+    if (p !== null) throw hostError(`apply: last argument must be a list but got ${String(lst)}`);
+    return into;
+};
+
 // Registers every builtin as the leaf intrinsic %name, always in the same order (so the cached prelude's intrinsics are at
-// the same positions in every instance)
+// the same positions in every instance). Lists are the table's sequences: rest parameters are lists (%list packs them),
+// and %spread makes the array %apply takes of one
 export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
     for (const { name, min, max, fn, inline } of SCHEME_BUILTINS) {
         intrinsics.register(`%${name}`, fn, { args: [min, max], leaf: true, inline, deps: inline === undefined ? undefined : INLINE_DEPS });
     }
+    intrinsics.register("%list", (regs, start, nargs) => {
+        let tail: Cons | null = null;
+        for (let i = start + nargs - 1; i >= start; i--) tail = new Cons(regs[i], tail);
+        return tail;
+    }, { leaf: true, sequence: "pack", inline: (args, _slow, _tmp, d) => args.reduceRight((tail, arg) => `new ${d.Cons}(${arg}, ${tail})`, "null"), deps: INLINE_DEPS });
+    intrinsics.register("%spread", (regs, start) => spreadList(regs[start]), { args: [1, 1], leaf: true, sequence: "spread" });
+    // (%apply-args arg ... lst): the arguments of (apply proc arg ... lst)
+    intrinsics.register("%apply-args", (regs, start, nargs) => spreadList(regs[start + nargs - 1], regs.slice(start, start + nargs - 1)), { args: [1, Infinity], leaf: true, fresh: true });
 };
 
 // A procedure whose direct calls become a core form or intrinsic: (name arg ...) is rewritten to (target arg ...) when
@@ -388,8 +405,8 @@ const alias = (name: string, target: string, min: number, max: number, wrapper =
 
 export const SCHEME_ALIASES: ReadonlyMap<symbol, SchemeAlias> = new Map([
     ...SCHEME_BUILTINS.map(({ name, min, max }) => alias(name, `%${name}`, min, max, true)),
-    // the VM's own operations: list and values, and the control operations
     alias("list", "%list", 0, Infinity, false),
+    // the VM's own operations: values, and the control operations
     alias("values", "%values", 0, Infinity, false),
     alias("call/cc", "%call/cc", 1, 1),
     alias("call-with-current-continuation", "%call/cc", 1, 1),
@@ -411,10 +428,10 @@ export const SCHEME_ALIASES: ReadonlyMap<symbol, SchemeAlias> = new Map([
 export const ALIAS_WRAPPERS = [
     ...[...SCHEME_ALIASES].filter(([, { wrapper }]) => wrapper).map(([sym, { target, min, max }]) => {
         const name = Symbol.keyFor(sym)!, op = Symbol.keyFor(target)!;
-        if (min !== max) return `(define ($${name} . args) (%apply ${op} args))`;
+        if (min !== max) return `(define ($${name} . args) (%apply ${op} (%spread args)))`;
         const params = Array.from({ length: min }, (_, i) => ` a${i}`).join("");
         return `(define ($${name}${params}) (${op}${params}))`;
     }),
     "(define ($list . args) args)",
-    "(define ($values . args) (%list->values args))",
+    "(define ($values . args) (%apply %values (%spread args)))",
 ].join("\n");

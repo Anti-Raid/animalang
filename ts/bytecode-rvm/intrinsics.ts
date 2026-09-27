@@ -25,6 +25,11 @@ export type IntrinsicOptions = {
     // a call in tail position is a tail call (the default): its value is the caller's. false for the control operations
     // whose value is that of the call itself (yielding, raising), which are then compiled as a call and a return
     tail?: boolean,
+    // the table's sequences, which are arrays unless a front end has its own: "pack" makes one of its argument window
+    // (a rest parameter's value), "spread" makes an array of one (what %apply takes last). Each at most once per table
+    sequence?: "pack" | "spread",
+    // returns a new array nothing else holds, which %apply may then call with as it is (as a spread intrinsic does)
+    fresh?: boolean,
 }
 
 export type Intrinsic = {
@@ -36,6 +41,7 @@ export type Intrinsic = {
     readonly leaf: boolean,
     readonly context: boolean,
     readonly tail: boolean,
+    readonly fresh: boolean,
     readonly inline: InlineFn | undefined,
     // the local variable holding each dep in generated code (D<slot> for DEPS[slot])
     readonly deps: Readonly<Record<string, string>>,
@@ -57,6 +63,8 @@ export class Intrinsics {
     // names code compiled with this table cannot bind, besides the intrinsics: a front end's keywords ("special form")
     // and the procedures it provides ("builtin")
     readonly reserved = new Map<symbol, "special form" | "builtin">()
+    #pack: Intrinsic | undefined
+    #spread: Intrinsic | undefined
 
     // `base`: a table to start from (its entries at the same positions, and its reserved names)
     // made from a base table (every table but the core operations' own)
@@ -70,6 +78,8 @@ export class Intrinsics {
         this.deps.push(...base.deps)
         for (const [sym, pos] of base.#bySym) this.#bySym.set(sym, pos)
         for (const [sym, kind] of base.reserved) this.reserved.set(sym, kind)
+        this.#pack = base.#pack
+        this.#spread = base.#spread
     }
 
     get frozen(): boolean {
@@ -92,6 +102,8 @@ export class Intrinsics {
         if (!(Number.isInteger(min) && min >= 0 && (max === Infinity || Number.isInteger(max)) && max >= min)) {
             throw new Error(`the intrinsic '${name}' has a bad argument count range [${min}, ${max}]`)
         }
+        if (options.sequence !== undefined && this[options.sequence] !== undefined) throw new Error(`the table already has a sequence ${options.sequence} intrinsic`)
+        if (options.sequence !== undefined && !(options.leaf ?? false)) throw new Error(`the sequence ${options.sequence} intrinsic '${name}' must be a leaf`)
         const deps: Record<string, string> = {}
         for (const [dep, value] of Object.entries(options.deps ?? {})) {
             let slot = this.deps.indexOf(value)
@@ -99,12 +111,22 @@ export class Intrinsics {
             deps[dep] = `D${slot}`
         }
         const entry: Intrinsic = Object.freeze({
-            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, inline: options.inline, deps: Object.freeze(deps),
+            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", inline: options.inline, deps: Object.freeze(deps),
         })
         this.entries.push(entry)
         this.fns.push(fn)
         this.#bySym.set(sym, entry.pos)
+        if (options.sequence === "pack") this.#pack = entry
+        if (options.sequence === "spread") this.#spread = entry
         return entry
+    }
+
+    get pack(): Intrinsic | undefined {
+        return this.#pack
+    }
+
+    get spread(): Intrinsic | undefined {
+        return this.#spread
     }
 
     get(sym: symbol): Intrinsic | undefined {

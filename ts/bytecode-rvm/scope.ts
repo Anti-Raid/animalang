@@ -11,12 +11,12 @@ export class VariableMetadata {
     // set by AstAnalysis's second pass
     liveAcrossCall: boolean = false
 
-    // a lambda's rest parameter, and whether it is read anywhere but as the list of an %apply / %apply-multi
+    // a lambda's rest parameter, and whether it is read anywhere but spread as the last argument of an %apply
     isRestParam: boolean = false
     readOutsideApply: boolean = false
 
-    // a rest parameter only ever spread back into a call never needs to be a list: the closure receives its rest
-    // arguments as a plain array instead (ClosureTemplate.restArray), which only APPLY/APPLYINTR ever see
+    // a rest parameter only ever spread back into a call is never packed: the closure receives its rest arguments as a
+    // plain array instead, which only %apply ever sees
     get forwardsRest() { return this.isRestParam && !this.mutable && !this.isCaptured && !this.readOutsideApply }
 
     constructor(public mutable: boolean = false, public isCaptured: boolean = false, ) {}
@@ -67,7 +67,7 @@ export class AnalysisScope {
         return meta !== null;
     }
 
-    // a read as the spread list of an %apply, which a forwarded rest parameter allows
+    // a read spread as the last argument of an %apply, which a forwarded rest parameter allows
     readApplyList(sym: symbol) {
         this.#use(sym);
     }

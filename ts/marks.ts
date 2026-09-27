@@ -78,6 +78,11 @@ export const recordTailMark = (marks: Marks, frame: number, name: string): Marks
 // catch tokens of enclosing %catch forms
 export const EXCEPTION_HANDLERS = Symbol("exception handlers");
 
+// the value of the EXCEPTION_HANDLERS mark: handler procedures and catch tokens, innermost first
+export class Handlers {
+    constructor(readonly handler: any, readonly outer: Handlers | null) {}
+}
+
 // what a %catch receives when an error is caught: it unwinds to the %catch, which then calls its handler
 export class Caught {
     constructor(readonly error: any) {}

@@ -1,6 +1,6 @@
 import { SOURCE_POS, type SourcePos } from "../common";
 import { OP_BEGIN, OP_QUOTE } from "./symbols";
-import { Cons } from "../list";
+import { Cons } from "./list";
 
 export class ASPTokenError extends Error {
     pos: number;
