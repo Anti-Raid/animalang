@@ -600,6 +600,61 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     inlineOver("filter", (l, acc, x, body, next) =>
         list(CORE_IF, list(Symbol.for("null?"), l), list(Symbol.for("reverse"), acc), step(l, x, list(next, rest(l), list(CORE_IF, body, list(Symbol.for("cons"), x, acc), acc)))));
 
+    // `x (R7RS quasiquote, nested levels too): lists and vectors are built with list, cons*, append and list->vector from
+    // their parts, and any part with nothing unquoted in it stays a quoted constant
+    const QUASIQUOTE = Symbol.for("quasiquote"), UNQUOTE = Symbol.for("unquote"), SPLICE = Symbol.for("unquote-splicing");
+    const isForm = (x: any, sym: symbol) => x instanceof Cons && x.car === sym && x.length === 2;
+    const unquotes = (x: any, depth: number): boolean => {
+        if (Array.isArray(x)) return x.some(e => unquotes(e, depth));
+        if (!(x instanceof Cons)) return false;
+        if (isForm(x, UNQUOTE) || isForm(x, SPLICE)) return depth === 1 || unquotes(cadr(x), depth - 1);
+        if (isForm(x, QUASIQUOTE)) return unquotes(cadr(x), depth + 1);
+        return unquotes(x.car, depth) || unquotes(x.cdr, depth);
+    };
+    const quasi = (x: any, depth: number): any => {
+        if (!unquotes(x, depth)) return list(OP_QUOTE, x);
+        if (Array.isArray(x)) {
+            // with nothing spliced, the vector is made directly from its elements
+            if (depth > 1 || !x.some(e => isForm(e, SPLICE))) return cons(Symbol.for("vector"), fromArray(x.map(e => quasi(e, depth))));
+            return list(Symbol.for("list->vector"), quasi(Cons.fromArray(x), depth));
+        }
+        if (isForm(x, UNQUOTE) && depth === 1) return cadr(x);
+        if (isForm(x, SPLICE) && depth === 1) throw new Error("unquote-splicing: not in a list");
+        // a nested one is its keyword and its operand, a list at the level inside (so a ,@ there splices into it)
+        if (isForm(x, UNQUOTE) || isForm(x, SPLICE) || isForm(x, QUASIQUOTE)) {
+            return list(Symbol.for("cons*"), list(OP_QUOTE, x.car), quasi(x.cdr, x.car === QUASIQUOTE ? depth + 1 : depth - 1));
+        }
+        // the elements, in runs of plain ones (a list, or a cons* onto what follows) and spliced ones, then the tail. From
+        // the last element with something unquoted on, the rest of the list is constant, and shared as a quoted tail
+        const segments: any[] = [];
+        let run: any[] = [];
+        let p: any = x;
+        for (; p instanceof Cons && !isForm(p, UNQUOTE) && !isForm(p, SPLICE) && unquotes(p, depth); p = p.cdr) {
+            if (depth === 1 && isForm(p.car, SPLICE)) {
+                if (run.length > 0) segments.push(cons(Symbol.for("list"), fromArray(run)));
+                run = [];
+                segments.push(cadr(p.car));
+            } else {
+                run.push(quasi(p.car, depth));
+            }
+        }
+        // (a . ,@x) splices nothing into anything
+        if (depth === 1 && isForm(p, SPLICE)) throw new Error("unquote-splicing: not allowed in the tail of a list");
+        const tail = p === null ? null : unquotes(p, depth) ? quasi(p, depth) : list(OP_QUOTE, p);
+        if (segments.length === 0) return tail === null ? cons(Symbol.for("list"), fromArray(run)) : cons(Symbol.for("cons*"), fromArray([...run, tail]));
+        const last = run.length === 0 ? tail : tail === null ? cons(Symbol.for("list"), fromArray(run)) : cons(Symbol.for("cons*"), fromArray([...run, tail]));
+        // append checks the lists it copies; one spliced last is checked on its own, as it is shared rather than copied
+        if (last === null) segments[segments.length - 1] = list(Symbol.for("%splice-list"), segments[segments.length - 1]);
+        return cons(Symbol.for("append"), fromArray(last === null ? segments : [...segments, last]));
+    };
+    evaluator.registerTransform(QUASIQUOTE, (evaluator, expr, orig) => {
+        if (!(orig instanceof Cons) || orig.length !== 2) throw new Error("quasiquote must be of form (quasiquote datum)");
+        return { expanded: quasi(expr.car, 1), state: TransformState.Recurse };
+    });
+    for (const [sym, name] of [[UNQUOTE, "unquote"], [SPLICE, "unquote-splicing"]] as const) {
+        evaluator.registerTransform(sym, () => { throw new Error(`${name}: not in a quasiquote`); });
+    }
+
     evaluator.registerTransform(Symbol.for("when"), (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error("when must be of form (when test expr ...)");
         return { expanded: list(CORE_IF, expr.car, cons(OP_BEGIN, expr.cdr)), state: TransformState.Recurse };

@@ -59,7 +59,9 @@ const unescapeString = (body: string): string => {
     return out
 }
 
-const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', '{', '}', ';', '"', "'"])
+const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', '{', '}', ';', '"', "'", "`", ","])
+// the reader's abbreviations: 'x is (quote x), `x (quasiquote x), ,x (unquote x) and ,@x (unquote-splicing x)
+const ASP_ABBREVIATIONS = new Map([["'", OP_QUOTE], ["`", Symbol.for("quasiquote")], [",", Symbol.for("unquote")], [",@", Symbol.for("unquote-splicing")]])
 const ASP_CLOSING_TOKENS = new Set([')', ']', '}'])
 
 export class ASP {    
@@ -157,9 +159,15 @@ export class ASP {
                 continue;
             }
 
-            // Quote/'reader' has similar behavior to lists
-            if (char === "'") {
-                push(this.advance());
+            // abbreviations: ' ` , ,@
+            if (char === "'" || char === "`" || char === ",") {
+                this.advance();
+                if (char === "," && this.peek() === "@") {
+                    this.advance();
+                    push(",@");
+                } else {
+                    push(char);
+                }
                 continue;
             }
 
@@ -213,14 +221,13 @@ export class ASP {
 
             const startOffset = this.#tokenOffsets[current];
 
-            // Quote
-            if (token === "'") {
-                current++; // Skip the quote
+            const abbreviation = ASP_ABBREVIATIONS.get(token);
+            if (abbreviation !== undefined) {
+                current++;
                 if (current >= tokens.length) {
-                    throw new ASPParseError("Unexpected end of input: Missing expression after '", current);
+                    throw new ASPParseError(`Unexpected end of input: Missing expression after ${token}`, current);
                 }
-                const nextExpr = walk(); // Parse the next expr after the quote
-                return Cons.list(OP_QUOTE, nextExpr);  // Wrap in quote builtin proc
+                return Cons.list(abbreviation, walk());
             }
 
             // Vectors

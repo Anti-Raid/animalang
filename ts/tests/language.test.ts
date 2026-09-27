@@ -6,7 +6,7 @@ import { ByteCode, AnimaVM, OpCode } from '../bytecode-rvm/vm';
 import { Closure, INSTRUCTION_LENGTHS } from '../bytecode-rvm/exec';
 import { Anima } from '../anima';
 import { impl, implAot } from '../bytecode-rvm/meta';
-import { dumpFull, readFull } from '../bytecode-rvm/utils';
+import { dumpFull, readFull, stringifyInst } from '../bytecode-rvm/utils';
 import { registerTestIntrinsics } from './helpers';
 
 describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
@@ -1783,6 +1783,56 @@ describe('Anima', () => {
             for (const f of ["(lambda (x) (if (= x 2) (call/cc (lambda (c) (set! k c) x)) x))", "(let ((g (lambda (x) (if (= x 2) (call/cc (lambda (c) (set! k c) x)) x)))) g)"]) {
                 expect(run(`(define k #f) (define results '()) (let ((r (map ${f} '(1 2 3)))) (set! results (cons r results)) (if (< (length results) 3) (k (* 10 (length results))) (reverse results)))`)).toBe("((1 2 3) (1 10 3) (1 20 3))")
             }
+        })
+    });
+
+    describe('quasiquote', () => {
+        it('builds lists and vectors (R7RS examples)', () => {
+            expect(run("`(list ,(+ 1 2) 4)")).toBe("(list 3 4)")
+            expect(run("(let ((name 'a)) `(list ,name ',name))")).toBe("(list a (quote a))")
+            expect(run("`(a ,(+ 1 2) ,@(map (lambda (x) (* x x)) '(4 5 6)) b)")).toBe("(a 3 16 25 36 b)")
+            expect(run("`((foo ,(- 10 3)) ,@(cdr '(c)) . ,(car '(cons)))")).toBe("((foo 7) . cons)")
+            expect(run("`#(10 5 ,(* 2 1) ,@(map (lambda (x) (* x 2)) '(8 4)) 8)")).toBe("#(10 5 2 16 8 8)")
+            expect(run("`(1 ,@'() 2)")).toBe("(1 2)")
+            expect(run("(define xs '(3 4)) (list `(1 2 ,@xs) `(,@xs) `(0 . ,xs))")).toBe("((1 2 3 4) (3 4) (0 3 4))")
+            // nothing unquoted: a constant
+            expect(run("(list `(a b (c)) `sym `5 `#(1 2))")).toBe("((a b (c)) sym 5 #(1 2))")
+            // the spliced list is copied, except at the end
+            expect(run("(define ys '(1 2)) (list `(,@ys 3) (eq? (cdr `(0 ,@ys)) ys) (eq? `(,@ys 3) ys))")).toBe("((1 2 3) #t #f)")
+        })
+
+        it('builds only what changes', () => {
+            // the constant tail after the last unquote is one shared constant
+            expect(run("(define (qf x) `(a ,x b c)) (list (qf 1) (qf 2) (eq? (cddr (qf 1)) (cddr (qf 2))) (length (qf 1)))")).toBe("((a 1 b c) (a 2 b c) #t 4)")
+            expect(run("(define (qs xs) `(,@xs z)) (list (qs '(1 2)) (eq? (cddr (qs '(1 2))) (cdr (qs '(3)))))")).toBe("((1 2 z) #t)")
+            // a vector with nothing spliced is made directly
+            const bc = evaluator.compileRaw("(define (qv x) `#(1 ,x 3))") as ByteCode
+            const fn = bc.constants.find((c: any) => c instanceof Closure)!
+            expect(stringifyInst(fn.tmpl.code).some((l: string) => /pos=%vector,/.test(l))).toBe(true)
+            expect(stringifyInst(fn.tmpl.code).some((l: string) => /list->vector/.test(l))).toBe(false)
+            evaluator.evaluateRaw(bc)
+            expect(run("(qv 2)")).toBe("#(1 2 3)")
+        })
+
+        it('nests levels', () => {
+            expect(run("`(a `(b ,(c ,(+ 1 2))))")).toBe("(a (quasiquote (b (unquote (c 3)))))")
+            expect(run("`(a `(b ,(foo ,(+ 1 3) d) e) f)")).toBe("(a (quasiquote (b (unquote (foo 4 d)) e)) f)")
+            expect(run("(let ((name1 'x) (name2 'y)) `(a `(b ,,name1 ,',name2 d) e))")).toBe("(a (quasiquote (b (unquote x) (unquote (quote y)) d)) e)")
+            expect(run("(let ((xs '(1 2))) `(a `(b ,@,@xs)))")).toBe("(a (quasiquote (b (unquote-splicing 1 2))))")
+        })
+
+        it('rejects unquotes outside a quasiquote', () => {
+            expect(() => run(",x")).toThrow("unquote: not in a quasiquote")
+            expect(() => run("`,@x")).toThrow("unquote-splicing: not in a list")
+            expect(() => run("`(1 ,@5 2)")).toThrow("append: expected a list")
+            // spliced last, it is checked too, and a splice in a list's tail is refused
+            expect(() => run("`(1 ,@5)")).toThrow("unquote-splicing: expected a list but got 5")
+            expect(() => run("`(1 ,@'(2 . 3))")).toThrow("unquote-splicing: expected a list")
+            expect(() => run("`(,@7)")).toThrow("unquote-splicing: expected a list")
+            expect(() => evaluator.compileRaw("(define (qt x) `(1 . ,@x))")).toThrow("unquote-splicing: not allowed in the tail of a list")
+            expect(() => evaluator.compileRaw("(define (qt x) `(1 unquote-splicing x))")).toThrow("unquote-splicing: not allowed in the tail of a list")
+            // one level in, it is data
+            expect(run("`(a `(b . ,@(c)))")).toBe("(a (quasiquote (b unquote-splicing (c))))")
         })
     });
 

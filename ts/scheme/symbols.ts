@@ -36,6 +36,6 @@ export const SCHEME_SPECIAL_FORMS: readonly symbol[] = [
     Symbol.for("let-values"),
     Symbol.for("let*-values"),
     OP_AT,
-    ...["when", "unless", "case", "do", "=>", "define-values", "delay", "delay-force", "parameterize", "case-lambda", "reset", "shift"].map(name => Symbol.for(name)),
+    ...["when", "unless", "case", "do", "=>", "define-values", "delay", "delay-force", "parameterize", "case-lambda", "reset", "shift", "quasiquote", "unquote", "unquote-splicing"].map(name => Symbol.for(name)),
 ];
 

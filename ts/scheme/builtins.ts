@@ -541,6 +541,12 @@ export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
         for (let p = regs[start]; p instanceof Cons; p = p.cdr) cdrs.push(p.car.cdr);
         return Cons.fromArray(cdrs);
     }, { args: [1, 1], leaf: true });
+    // (%splice-list x): x, a list spliced last in a quasiquote
+    intrinsics.register("%splice-list", (regs, start) => {
+        const lst = regs[start];
+        if (lst === null || (lst instanceof Cons && lst.length >= 0)) return lst;
+        throw hostError(`unquote-splicing: expected a list but got ${new ASTStringifier().stringify(lst)}`);
+    }, { args: [1, 1], leaf: true, inline: unaryInline((a, slow, d) => `(${a} === null || (${a} instanceof ${d.Cons} && ${a}.length >= 0) ? ${a} : ${slow})`), deps: INLINE_DEPS });
     // (%apply-args arg ... lst): the arguments of (apply proc arg ... lst)
     intrinsics.register("%apply-args", (regs, start, nargs) => spreadList(regs[start + nargs - 1], regs.slice(start, start + nargs - 1)), { args: [1, Infinity], leaf: true, fresh: true });
 };
