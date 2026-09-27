@@ -427,16 +427,16 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         }
 
         const paramsList = fromArray(params);
-        const exprsList = fromArray(exprs);
 
         if (loopName) {
             const loop = namedLetAsLoop(evaluator, loopName, params, exprs, bodyCons);
             if (loop !== null) return { expanded: loop, state: TransformState.ReturnImm };
+            // the initial values are evaluated outside the letrec (fresh names hold them), so the procedure is only ever
+            // called, which lets it be lifted
             const lambdaExpr = cons(OP_LAMBDA, cons(paramsList, bodyCons));
-            const letrecBindings = list(list(loopName, lambdaExpr));
-            const letrecExpr = list(OP_LETREC, letrecBindings, loopName);
-            const namedLetExpr = cons(letrecExpr, exprsList);
-            return { expanded: namedLetExpr, state: TransformState.Recurse };
+            const temps = exprs.map(() => Symbol("init"));
+            const letrecExpr = list(OP_LETREC, list(list(loopName, lambdaExpr)), cons(loopName, fromArray(temps)));
+            return { expanded: list(OP_LET, fromArray(temps.map((t, i) => list(t, exprs[i]))), letrecExpr), state: TransformState.Recurse };
         }
         
         return { expanded: cons(CORE_LET, cons(fromArray(params.map((p, i) => list(p, exprs[i]))), bodyCons)), state: TransformState.Recurse };

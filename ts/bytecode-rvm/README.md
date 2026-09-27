@@ -176,9 +176,10 @@ A procedure's argument count is an `Arity` (`arity.ts`): `min`, `max`, and for a
 ## Pipeline
 
 1. A front end reads the source and lowers it to core forms (a call of a builtin becoming a call of its intrinsic).
-2. `analysis.ts` works out which variables live in `Box`es: those captured (used from inside a nested `%lambda`; a `%let` is not a boundary), and those assigned with `set!` that are live across a call, i.e. read after a call that is not a leaf (may call back into the VM) before being assigned again. A continuation captured during such a call restores the frame's registers when re-entered, so only then would a register copy differ from a shared location. A second, backward liveness pass over the core forms (with a fixed point for `%loop`, and `%escape` flowing to its block's continuation) finds them; calls of leaf intrinsics do not count. It also finds the rest parameters that are only ever the list of an `%apply` / `%apply-multi`, which are forwarded as arrays (see `%apply`).
-3. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers, and `IR.lower` turns those into a `ByteCode` (a `Uint32Array` of instructions plus a constant pool).
-4. The bytecode runs either in the interpreter (`BytecodeInterpreter`) or, in `"aot"` mode, is compiled to JS functions (`AotCompiler`).
+2. `lift.ts` lifts lambdas: a `%letrec` lambda whose name is never assigned and only ever called gets its free local variables as extra parameters, passed by every call (the lifted lambdas it calls, itself included when it recurses, among them), so it captures nothing and compiles to a constant closure instead of one made each time the `%letrec` runs. It is not lifted if a variable it would receive is assigned, may not have its value yet when it is called (a `%letrec` value, see `lateValues`), or is shadowed at a call.
+3. `analysis.ts` works out which variables live in `Box`es: only assigned ones (with `%set!`), when they are captured (used from inside a nested `%lambda`; a `%let` is not a boundary) or live across a call, i.e. read after a call before being assigned again. A variable that is never assigned is copied into the closures that capture it.
+4. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers, and `IR.lower` turns those into a `ByteCode` (a `Uint32Array` of instructions plus a constant pool).
+5. The bytecode runs either in the interpreter (`BytecodeInterpreter`) or, in `"aot"` mode, is compiled to JS functions (`AotCompiler`).
 
 ## Execution contexts
 

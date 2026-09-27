@@ -1434,6 +1434,44 @@ describe('Anima', () => {
             expect(run(`(letrec ((x 1) (f (lambda () x))) (set! x 5) (f))`)).toBe("5")
         })
 
+        it('lifts helpers that are only called, so no closure is made for them', () => {
+            const closuresIn = (src: string): number => {
+                const closure = evaluator.evaluateRaw(evaluator.compileRaw(src))
+                const inst: Uint32Array = closure.tmpl.code.inst
+                let made = 0
+                for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) if (inst[ip] === OpCode.NEWCLOSURE) made++
+                return made
+            }
+            expect(run(`(define (ll1 k) (define (helper x) (+ k x)) (helper 1)) (ll1 5)`)).toBe("6")
+            expect(closuresIn(`(lambda (k) (define (helper x) (+ k x)) (helper 1))`)).toBe(0)
+            // recursive and mutually recursive helpers receive themselves and each other
+            expect(run(`(define (ll2 n) (define (sum i acc) (if (= i 0) acc (sum (- i 1) (+ acc n)))) (list (sum 3 0) (sum 1 0))) (ll2 5)`)).toBe("(15 5)")
+            expect(closuresIn(`(lambda (n) (define (sum i acc) (if (= i 0) acc (sum (- i 1) (+ acc n)))) (sum 3 0))`)).toBe(0)
+            expect(run(`(define (ll3 d) (define (ev? k) (if (= k 0) d (od? (- k 1)))) (define (od? k) (if (= k 0) (not d) (ev? (- k 1)))) (list (ev? 4) (od? 4))) (ll3 #t)`)).toBe("(#t #f)")
+            expect(closuresIn(`(lambda (d) (define (ev? k) (if (= k 0) d (od? (- k 1)))) (define (od? k) (if (= k 0) (not d) (ev? (- k 1)))) (ev? 4))`)).toBe(0)
+            // calls from a closure that escapes, and rest parameters
+            expect(run(`(define (ll4 k) (define (h x) (+ k x)) (lambda (y) (h y))) ((ll4 10) 5)`)).toBe("15")
+            expect(run(`(define (ll5 k) (define (h . xs) (cons k xs)) (h 1 2)) (ll5 0)`)).toBe("(0 1 2)")
+        })
+
+        it('lifts named lets that are not loops, evaluating their initial values outside', () => {
+            expect(run(`(define (nl-copy l) (let copy ((l l)) (if (null? l) '() (cons (car l) (copy (cdr l)))))) (nl-copy '(1 2 3))`)).toBe("(1 2 3)")
+            // an initial value naming the loop means the variable around it
+            expect(run(`(define (nl-outer walk) (let walk ((n (walk))) (if (= n 0) 'done (list n (walk (- n 1)))))) (nl-outer (lambda () 2))`)).toBe("(2 (1 done))")
+        })
+
+        it('keeps helpers closures when lifting them would be wrong', () => {
+            // used as a value
+            expect(run(`(define (lk1 k) (define (h) k) h) ((lk1 7))`)).toBe("7")
+            // a free variable that is assigned
+            expect(run(`(define (lk2 k) (define (h) k) (set! k 9) (h)) (lk2 1)`)).toBe("9")
+            // a call where a free variable is shadowed, or inside a lifted helper that shadows it
+            expect(run(`(define (lk3 k) (define (h) k) (let ((k 100)) (h))) (lk3 1)`)).toBe("1")
+            expect(run(`(define (lk4 k) (define (g) k) (define (f) (let ((k 50)) (g))) (f)) (lk4 2)`)).toBe("2")
+            // a call with the wrong number of arguments still fails as a call of a closure
+            expect(() => run(`(define (lk5) (define (h x) x) (h)) (lk5)`)).toThrow()
+        })
+
         it('keeps letrec semantics when the values are not all lambdas, or a name is assigned', () => {
             expect(run(`(letrec ((x 1) (f (lambda () x))) (f))`)).toBe("1")
             expect(run(`(letrec ((f (lambda () 1)) (g (lambda () (f)))) (set! f (lambda () 2)) (g))`)).toBe("2")

@@ -28,7 +28,7 @@ Each surface form lowers to a core form:
 | `quote`, `'datum` | `(%quote <datum>)` |
 | `lambda` | `(%lambda <params> <body> ...)` |
 | `let`, `let*` (nested), and any immediately applied lambda `((lambda (p ...) body) arg ...)` | `(%let ((<symbol> <init>) ...) <body> ...)` |
-| `letrec`, `letrec*`, internal `define`s, and named `let`s that are not loops | `(%letrec ((<symbol> <init>) ...) <body> ...)` |
+| `letrec`, `letrec*`, internal `define`s, and named `let`s that are not loops (`(let ((t init) ...) (%letrec ((name (lambda ...))) (name t ...)))`, so the procedure is only ever called and can be lifted) | `(%letrec ((<symbol> <init>) ...) <body> ...)` |
 | `receive`, `let-values`, `let*-values` (nested) | `(%let-values/strict ((<formals> <expr>) ...) <body> ...)` |
 | `set!` | `(%set! <symbol> <expr>)` |
 | `with-continuation-mark` | `(%with-mark <key> <value> <body>)` |

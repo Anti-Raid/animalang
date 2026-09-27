@@ -2,6 +2,7 @@ import { ASTStringifier, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE
 import { AstAnalysis } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
+import { liftLambdas } from "./lift";
 import { corePos } from "./exec";
 import { arityMessage } from "./arity";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
@@ -54,6 +55,7 @@ export class Compiler {
     }
 
     compile(trExpr: any, debug: boolean = this.debug) {
+        trExpr = liftLambdas(trExpr)
         // Step 1 is to analyze our variables so we know what to box and what not to box
         let analyzer = new AstAnalysis(this.intrinsics)
         const ascope = analyzer.analyze(trExpr)
