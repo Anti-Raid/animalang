@@ -12,7 +12,6 @@ import { Intrinsics, type Intrinsic } from "./intrinsics";
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, ...body]
 
 const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
-const OP_CALLEC = Symbol.for("%call/ec");
 const OP_APPLY = Symbol.for("%apply");
 
 // a %block that %escape can jump to: where its value goes and how its code ends
@@ -160,9 +159,6 @@ export class Compiler {
                     return
                 case OP_DYNAMIC_WIND:
                     this.#compileDynamicWind(expr, opts)
-                    return
-                case OP_CALLEC:
-                    this.#compileCallEC(expr, opts)
                     return
                 case CORE_CATCH:
                     this.#compileCatch(expr, opts)
@@ -477,20 +473,7 @@ export class Compiler {
         opts.scope.regAlloc.freeBlock(block, 3);
     }
 
-    // always a non-tail call: the escape continuation is deactivated when it returns
-    #compileCallEC(expr: any[], opts: CmpOpts) {
-        if (expr.length !== 2) {
-            throw new VMError(Msg.FormArgs, ["%call/ec", "1 argument", expr.length - 1]);
-        }
-        const procReg = opts.scope.allocTemp();
-        const tokReg = opts.scope.allocTemp();
-        this.#compile(expr[1], { ...opts, destReg: procReg, isTail: false });
-        opts.nodes.push({ t: "CallEC", procReg, tokReg, destReg: opts.destReg });
-        opts.scope.freeTemp(tokReg);
-        opts.scope.freeTemp(procReg);
-    }
-
-    // (%catch thunk handler [pre]): CALLCATCH gives the value of (thunk), or a Caught when it raised, after which the
+    // (%catch thunk handler [pre]): %call-catching gives the value of (thunk), or a Caught when it raised, after which the
     // handler expression is evaluated and called with the error (in tail position if the %catch is); pre is evaluated
     // first, and runs on the error before unwinding
     #compileCatch(expr: any[], opts: CmpOpts) {
@@ -498,17 +481,12 @@ export class Compiler {
             throw new VMError(Msg.FormArgs, ["%catch", "2 to 4 arguments (thunk, handler, pre, guarded)", expr.length - 1]);
         }
         if (expr.length === 5 && typeof expr[4] !== "boolean") throw new VMError(Msg.CatchGuard, []);
-        const guarded = expr[4] === true;
-        const procReg = opts.scope.allocTemp();
-        const tokReg = opts.scope.allocTemp();
+        const args = expr[4] === true ? [expr[1], expr[3], true] : expr.length >= 4 ? [expr[1], expr[3]] : [expr[1]];
         const resReg = opts.scope.allocTemp();
-        const preReg = expr.length >= 4 ? opts.scope.allocTemp() : undefined;
-        this.#compile(expr[1], { ...opts, destReg: procReg, isTail: false });
-        if (preReg !== undefined) this.#compile(expr[3], { ...opts, destReg: preReg, isTail: false });
-        opts.nodes.push({ t: "CallCatch", procReg, tokReg, preReg, guarded, destReg: resReg });
-        if (preReg !== undefined) opts.scope.freeTemp(preReg);
-        opts.scope.freeTemp(tokReg);
-        opts.scope.freeTemp(procReg);
+        const startReg = opts.scope.regAlloc.allocBlock(args.length);
+        args.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + i, isTail: false }));
+        opts.nodes.push({ t: "HostCall", pos: corePos("%call-catching"), startReg, nargs: args.length, isTail: false, destReg: resReg });
+        opts.scope.regAlloc.freeBlock(startReg, args.length);
 
         const condReg = opts.scope.allocTemp();
         opts.nodes.push({ t: "IntCall", pos: corePos("%caught?"), destReg: condReg, startReg: resReg, nargs: 1 });

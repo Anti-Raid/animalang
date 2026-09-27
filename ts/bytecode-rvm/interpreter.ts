@@ -7,8 +7,8 @@ import { Closure } from "./bytecode";
 import type { ClosureTemplate } from "./bytecode";
 import { ControlRequest, applyArgs, applyIntrinsic, arrayArg } from "./coreops";
 import type { VMExecutor } from "./executor";
-import { CATCH_GUARDED, NO_REG, UNPACK_REST } from "./opcodes";
-import { Box, CatchToken, EscapeContinuation, MISSING, restValues, tailName, unpackForBinding } from "./values";
+import { NO_REG, UNPACK_REST } from "./opcodes";
+import { Box, MISSING, restValues, tailName, unpackForBinding } from "./values";
 import type { ExecutionContext, Frame } from "./values";
 // The opcodes, whose operands and meaning OPCODES (opcodes.ts) describes, in the same order. Declared here because the
 // interpreter switches over them: esbuild only inlines an enum's values in the file that declares it
@@ -39,8 +39,6 @@ export enum OpCode {
     MARKSAVE,
     MARKRESTORE,
     CURMARKS,
-    CALLEC,
-    CALLCATCH,
     CALLHOST,
     CALLINT,
     APPLYINT,
@@ -252,22 +250,6 @@ export class BytecodeInterpreter {
                         // an array alone is the argument array itself: intrinsics never write to or keep it
                         regs[destReg] = applyIntrinsic(entry.fn, entry.name, entry.min, entry.max, nargs === 1 ? arrayArg("%apply", regs[startReg]) : applyArgs(regs, startReg, nargs), ctx, executor);
                         break;
-                    }
-                    case OpCode.CALLEC: {
-                        const procReg = inst[ip++];
-                        const tokReg = inst[ip++];
-                        regs[tokReg] = new EscapeContinuation(ctx.id, ctx.wind, frame.code, tokReg);
-                        frame.ip = ip;
-                        return executor.invoke(ctx, regs[procReg], frame, regs, tokReg, 1, false);
-                    }
-                    case OpCode.CALLCATCH: {
-                        const procReg = inst[ip++];
-                        const tokReg = inst[ip++];
-                        const preReg = inst[ip++];
-                        const flags = inst[ip++];
-                        const tok = regs[tokReg] = new CatchToken(ctx.id, ctx.wind, frame.code, tokReg, preReg === NO_REG ? null : regs[preReg], (flags & CATCH_GUARDED) !== 0);
-                        frame.ip = ip;
-                        return executor.callCatch(ctx, regs[procReg], frame, tok);
                     }
                     case OpCode.CALLHOST: {
                         const entry = frame.code.table!.entries[inst[ip++]];

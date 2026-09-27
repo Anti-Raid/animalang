@@ -178,19 +178,16 @@ export const countControlSuspend = (code: ByteCode): void => {
     }
 };
 
-// an escape-only continuation (call/ec), usable until its %call/ec returns. The %call/ec's frame is the one of `code`
-// holding this in register `reg` (cleared when it returns); a direct-mode %call/ec catches escapes to it itself
+// an escape-only continuation (call/ec), usable while the frame whose pending call it was made for still holds it
+// (Frame.escape) among the current frames; a direct-mode %call/ec catches escapes to it itself
 export class EscapeContinuation extends IProcedure {
-    constructor(public readonly ctxId: number, public readonly wind: WindPoint | null, public readonly code: ByteCode, public readonly reg: number) {
+    constructor(public readonly ctxId: number, public readonly wind: WindPoint | null) {
         super("escape continuation");
     }
 
-    // the frame to return to, found among `from` and its callers; copies made by call/cc hold it too
-    target(from: Frame | null): Frame | null {
-        for (let f = from; f !== null; f = f.parent) {
-            if (f.code === this.code && f.regs[this.reg] === this) return f;
-        }
-        return null;
+    // what its frame holds
+    get owner(): EscapeContinuation {
+        return this;
     }
 }
 
@@ -201,9 +198,8 @@ export class CatchToken extends EscapeContinuation {
     // a pre of #f or <#void> is none (e.g. xpcall with no handler)
     public readonly pre: any;
 
-    constructor(ctxId: number, wind: WindPoint | null, code: ByteCode, reg: number, pre: any = null,
-        public readonly guarded: boolean = false, readonly of: CatchToken | null = null) {
-        super(ctxId, wind, code, reg);
+    constructor(ctxId: number, wind: WindPoint | null, pre: any = null, public readonly guarded: boolean = false, readonly of: CatchToken | null = null) {
+        super(ctxId, wind);
         this.pre = pre === false || pre === undefined ? null : pre;
     }
 
@@ -211,19 +207,14 @@ export class CatchToken extends EscapeContinuation {
         return this.of !== null;
     }
 
-    forPre(): CatchToken {
-        return new CatchToken(this.ctxId, this.wind, this.code, this.reg, null, false, this);
+    get owner(): EscapeContinuation {
+        return this.of ?? this;
     }
 
-    target(from: Frame | null): Frame | null {
-        const tok = this.of ?? this;
-        for (let f = from; f !== null; f = f.parent) {
-            if (f.code === this.code && f.regs[this.reg] === tok) return f;
-        }
-        return null;
+    forPre(): CatchToken {
+        return new CatchToken(this.ctxId, this.wind, null, false, this);
     }
 }
-
 
 // the value of a caught error, as handlers see it
 export const caughtValue = (err: any, vm: VMHost): any => {
@@ -257,6 +248,8 @@ export class Frame {
     public winds: Map<WindPoint | null, WindPoint | null> | null = null;
     // exact position of the last instruction run, when debug code knows it better than ip
     public posIp: number = -1;
+    // the escape continuation or catch token of the %call/ec or %catch this frame's pending call is, cleared when it resumes
+    public escape: EscapeContinuation | null = null;
 
     // `marks`: the continuation marks visible in this frame; `mframe`: its logical frame (a tail call keeps its caller's)
     constructor(
@@ -280,6 +273,7 @@ export class Frame {
     thaw(ctx: ExecutionContext): Frame {
         const copy = new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx, this.marks, this.mframe);
         copy.winds = this.winds;
+        copy.escape = this.escape;
         return copy;
     }
 
@@ -316,6 +310,8 @@ export class Suspend {
     // set when invoking an escape continuation, so a direct-mode %call/ec on the way out can take the value itself
     escape: EscapeContinuation | null = null;
     escapeVal: any = undefined;
+    // for the next frame pushed: the token of the direct-mode %call/ec or %catch it was left through
+    pendingEscape: EscapeContinuation | null = null;
     // the marks where it was thrown, when that was a tail call (which rebuilds no frame): errors are raised with them
     marks: Marks | undefined = undefined;
     mframe: number = 0;
@@ -324,6 +320,10 @@ export class Suspend {
     constructor(public readonly action: SuspendAction | null, public readonly error?: any, public readonly control: boolean = false) {}
 
     push(frame: Frame) {
+        if (this.pendingEscape !== null) {
+            frame.escape = this.pendingEscape;
+            this.pendingEscape = null;
+        }
         if (this.outermost === null) {
             this.innermost = frame;
         } else {
@@ -370,6 +370,14 @@ export class Suspend {
 
     static abort(tag: any, values: any[]) {
         return new Suspend((ctx, executor, caller) => executor.abort(ctx, caller, tag, values), undefined, true);
+    }
+
+    static escape(proc: any) {
+        return new Suspend((ctx, executor, caller) => executor.callEscape(ctx, proc, caller), undefined, true);
+    }
+
+    static catching(proc: any, pre: any, guarded: boolean) {
+        return new Suspend((ctx, executor, caller) => executor.callCatch(ctx, proc, caller, pre, guarded), undefined, true);
     }
 
     static callCC(proc: any) {

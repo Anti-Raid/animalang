@@ -29,8 +29,6 @@ export type AotTerm = { at?: number } & (
     | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; arity: Arity; restPos: number }
-    | { k: "CallEC"; proc: number; tok: number; resume: number }
-    | { k: "CallCatch"; proc: number; tok: number; pre: number; guarded: boolean; resume: number }
     | { k: "HostCall"; pos: number; start: number; nargs: number; isTail: boolean; resume: number }
     | { k: "Return"; reg: number });
 

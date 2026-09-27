@@ -13,12 +13,9 @@ export const TAIL = 1;
 // UNPACK flags
 export const UNPACK_REST = 1;
 export const UNPACK_STRICT = 2;
-// CALLCATCH flags
-export const CATCH_GUARDED = 1;
 
 export type OperandKind =
     | "reg"       // a register
-    | "optreg"    // a register, or NO_REG
     | "const"     // a constant-pool index
     | "u32"       // an immediate count or number
     | "upvar"     // an upvar index
@@ -71,11 +68,6 @@ export const OPCODES: readonly OpSpec[] = Object.freeze([
     { name: "MARKSAVE", operands: [["dst", "reg"]], doc: "reg[dst], reg[dst+1] = the current marks and logical frame, then start a new logical frame" },
     { name: "MARKRESTORE", operands: [["src", "reg"]], doc: "marks and logical frame = reg[src], reg[src+1]" },
     { name: "CURMARKS", operands: [["dst", "reg"]], doc: "reg[dst] = the current continuation marks, as a mark set" },
-    { name: "CALLEC", operands: [["proc", "reg"], ["tok", "reg"]], split: "always", doc: "reg[tok] = a new escape continuation; call reg[proc] with it" },
-    { name: "CALLCATCH",
-        operands: [["proc", "reg"], ["tok", "reg"], ["pre", "optreg"], ["flags", "flags"]], split: "always", bits: ["guarded"],
-        doc: "reg[tok] = a new catch token; call reg[proc] with it as the innermost exception handler (reg[pre], if any, runs on the error before unwinding; guarded: an error in it comes to this catch too)",
-    },
     { name: "CALLHOST",
         operands: [["pos", "intrinsic"], ["start", "reg"], ["nargs", "u32"], ["tail", "tail"]], ...TAIL_CALL,
         doc: "call the non-leaf intrinsic at pos in the code's table on reg[start .. start+nargs); a HostTail result is called in its place",

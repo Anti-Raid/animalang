@@ -31,7 +31,6 @@ const constToString = (s: any): string => {
 const operandToString = (code: ByteCode, spec: OpSpec, kind: OperandKind, value: number): string => {
     switch (kind) {
         case "reg": return `r${value}`
-        case "optreg": return value === NO_REG ? "-" : `r${value}`
         case "const": return constToString(code.constants[value])
         case "u32": case "bool": return `${value}`
         case "upvar": return `upvar(${value})`
@@ -75,7 +74,7 @@ export const deepPrint = (bc: ByteCode) => {
 const BYTECODE_MAGIC = 0x414E4D41
 
 // bump whenever opcodes, builtin indices or the serialized layout change
-export const BYTECODE_VERSION = 28
+export const BYTECODE_VERSION = 29
 
 export const dumpFull = (b: SerializableBytecode): Uint32Array => {
     const bs = new BS()

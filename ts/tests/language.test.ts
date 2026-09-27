@@ -1683,7 +1683,6 @@ describe('Anima', () => {
                 expect(run(`(list (+ 1 (${cc} (lambda (k) (+ 10 (k 5))))) (${cc} (lambda (k) 7)) (${cc} (lambda (k) (if #t (k 'early) 'late))))`)).toBe("(6 7 early)")
                 // no escape continuation or continuation is made at all
                 const made = ops(`(lambda (x) (+ 1 (${cc} (lambda (k) (if (> x 0) (k x) 0)))))`)
-                expect(made).not.toContain(OpCode.CALLEC)
                 expect(made).not.toContain(OpCode.CALLHOST)
             }
             // several values, and none
@@ -1694,6 +1693,27 @@ describe('Anima', () => {
             expect(run(`(define (cc-loop n) (if (= n 0) 'done (call/cc (lambda (k) (cc-loop (- n 1)))))) (cc-loop 100000)`)).toBe("done")
             // a k of its own in the body is not the continuation
             expect(run(`(call/cc (lambda (k) (let ((k (lambda (x) (* x 100)))) (k 2))))`)).toBe("200")
+        })
+
+        it('call/ec and %catch hold their token in an escape frame', () => {
+            // a procedure that is not a literal lambda: a real escape continuation
+            expect(run(`(define (esc k) (+ 1 (k 5))) (list (call/ec esc) (call/ec (lambda (k) k)))`)).toBe("(5 <procedure>)")
+            expect(() => run(`(define saved (call/ec (lambda (k) k))) (saved 1)`)).toThrow("escape continuation invoked outside of its dynamic extent")
+            // an old token is dead even while its frame runs another %call/ec
+            expect(() => run(`(define old #f) (define (grab k) (set! old k) 1) (define (use k) (old 5)) (define (two) (+ (call/ec grab) (call/ec use))) (two)`)).toThrow("escape continuation invoked outside of its dynamic extent")
+            // escaped to after a yield, from frames rebuilt around the escape frame
+            expect(run(`(define (body k) (coroutine-yield 1) (k 'escaped) 'not)
+                        (define co (coroutine-create (lambda () (coroutine-yield (call/ec body)) 'end)))
+                        (list (coroutine-resume co) (coroutine-resume co) (coroutine-resume co))`)).toBe("(1 escaped end)")
+            expect(run(`(define co2 (coroutine-create (lambda () (%catch (lambda () (coroutine-yield 1) (raise 'late)) (lambda (e) (list 'caught e))))))
+                        (list (coroutine-resume co2) (coroutine-resume co2))`)).toBe("(1 (caught late))")
+            // re-entering the extent through a continuation makes k live again
+            expect(run(`(define again #f) (define n 0)
+                        (define (body k) (call/cc (lambda (c) (set! again c))) (set! n (+ n 1)) (k n))
+                        (define r (call/ec body))
+                        (if (< n 3) (again #f) (list r n))`)).toBe("(3 3)")
+            expect(run(`(%call-catching (lambda () 7))`)).toBe("7")
+            expect(() => run(`(%call-catching (lambda () 7) #f 5)`)).toThrow("%catch: guarded must be #t or #f")
         })
 
         it('keeps a real continuation when k is used any other way', () => {

@@ -8,10 +8,10 @@ import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
 import { CaseLambda, Closure, ClosureTemplate, SHARED_INSTS } from "../bytecode";
 import type { ByteCode, DirectFn, ResumeFn } from "../bytecode";
-import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, raiseContinuable, stackSkip } from "../coreops";
+import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { OpCode } from "../interpreter";
-import { CATCH_GUARDED, INSTRUCTION_LENGTHS, basicBlockStarts } from "../opcodes";
+import { INSTRUCTION_LENGTHS, basicBlockStarts } from "../opcodes";
 import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
@@ -32,6 +32,7 @@ export const JIT_DEPS = {
     applyArgs,
     arrayArg,
     raiseContinuable,
+    catchGuard,
     stackSkip,
     packValues,
     Handlers,
@@ -62,7 +63,7 @@ export class AotCompiler {
 
         // one try around the loop: any error ends the run
         try {
-            if (frame.ip === 0 && frame.code.directArity === 0 && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
+            if (frame.ip === 0 && frame.code.directArity === 0 && !frame.code.internal && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
             while (frame !== null) {
                 const frameCtx: ExecutionContext = frame.ctx;
                 frame = executor.enter(frameCtx, frame);
@@ -298,19 +299,6 @@ export class AotCompiler {
                     case OpCode.APPLYINT:
                         insts.push({ k: "IntApply", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
                         break;
-                    case OpCode.CALLEC: {
-                        const proc = inst[ip++];
-                        term = { k: "CallEC", proc, tok: inst[ip++], resume: ip };
-                        break;
-                    }
-                    case OpCode.CALLCATCH: {
-                        const proc = inst[ip++];
-                        const tok = inst[ip++];
-                        const pre = inst[ip++];
-                        const guarded = (inst[ip++] & CATCH_GUARDED) !== 0;
-                        term = { k: "CallCatch", proc, tok, pre, guarded, resume: ip };
-                        break;
-                    }
                     case OpCode.CALLHOST: {
                         const pos = inst[ip++];
                         const start = inst[ip++];

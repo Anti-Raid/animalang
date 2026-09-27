@@ -31,7 +31,7 @@ export class Liveness {
 
     static #resumePoint(term: AotTerm): number | null {
         switch (term.k) {
-            case "Call": case "CallEC": case "CallCatch": return term.resume;
+            case "Call": return term.resume;
             case "HostCall": return term.isTail ? null : term.resume;
             default: return null;
         }
@@ -47,7 +47,6 @@ export class Liveness {
             if (term.k === "MaybeSelfTailCall") {
                 for (let i = 0; i < term.arity.params + (term.arity.rest === "none" ? 0 : 1); i++) written.add(i);
             }
-            if (term.k === "CallEC" || term.k === "CallCatch") written.add(term.tok);
         }
         return [...written].filter(r => r < numReg).sort((a, b) => a - b);
     }
@@ -78,8 +77,6 @@ export class Liveness {
         switch (term.k) {
             case "Branch": return [term.cond];
             case "Call": case "TailCall": case "MaybeSelfTailCall": return [term.proc, ...windowRegs(term.start, term.nargs)];
-            case "CallEC": return [term.proc];
-            case "CallCatch": return term.pre === NO_REG ? [term.proc] : [term.proc, term.pre];
             case "HostCall": return windowRegs(term.start, term.nargs);
             case "Return": return [term.reg];
             default: return [];
@@ -91,7 +88,7 @@ export class Liveness {
             case "Jump": return [term.target];
             case "Block": case "Loop": return [term.body];
             case "Branch": return [term.then, term.else];
-            case "Call": case "CallEC": case "CallCatch": return [term.resume];
+            case "Call": return [term.resume];
             case "HostCall": return term.isTail ? [] : [term.resume];
             case "MaybeSelfTailCall": return [0];
             default: return [];

@@ -2,7 +2,7 @@ import { ConstPool, type SourcePos } from "../common";
 import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, corePos, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import type { RestKind } from "./arity";
-import { CATCH_GUARDED, OPCODES } from "./opcodes";
+import { OPCODES } from "./opcodes";
 
 let nextLabelId = 0;
 
@@ -95,13 +95,6 @@ export type Node = {
     t: "SetBox",
     destReg: number,
     srcReg: number
-} | {
-    t: "CallEC" | "CallCatch",
-    procReg: number,
-    tokReg: number,
-    preReg?: number,
-    guarded?: boolean,
-    destReg?: number
 } | {
     // start of a %block whose escapes jump to `end`
     t: "Block",
@@ -328,14 +321,6 @@ export class IR {
                 case "Move": {
                     emit(OpCode.MOVE, node.destReg, node.srcReg)
                     break
-                }
-                case "CallEC":
-                case "CallCatch": {
-                    if (node.t === "CallEC") emit(OpCode.CALLEC, node.procReg, node.tokReg);
-                    else emit(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG, node.guarded ? CATCH_GUARDED : 0);
-                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
-                    emit(OpCode.CALLINT, use(corePos("%end-escape")), node.tokReg, node.tokReg, 1);
-                    break;
                 }
                 case "Pos": {
                     let fileIdx = files.indexOf(node.pos.file);

@@ -135,7 +135,7 @@ describe('Anima', () => {
             evaluator.intrinsics.setFormatter((op, args, fmt, at) => op === Msg.ErrorInHandler ? "error in error handling" : base(op, args, fmt, at))
             expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (error-object-message r)) (lambda (e) (raise 'again)) #t)`)).toBe('"error in error handling"')
             const bc = evaluator.compileRaw(`(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) #t)`) as ByteCode
-            expect(stringifyInst(bc).some(line => /CALLCATCH +proc=r\d+, tok=r\d+, pre=r\d+, flags=guarded$/.test(line))).toBe(true)
+            expect(stringifyInst(bc).some(line => /CALLHOST +pos=%call-catching, start=r\d+, nargs=3, tail=-$/.test(line))).toBe(true)
         })
 
         it('delivers %raise to handlers, continuable or not', () => {

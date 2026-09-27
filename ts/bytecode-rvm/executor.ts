@@ -15,7 +15,7 @@ import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuat
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
 // register 0 with what a pre-unwind handler returned. `coroutineFinally` is under the procedure of a coroutine with a
-// finally thunk (in its register 1): it leaves the thunk's wind and calls it, then returns the procedure's value
+// finally thunk (in its register 1): it leaves the thunk's wind and calls it, then returns the procedure's value.
 export let helpers: { handlerReturned: Closure, escapeWith: Closure, prompt: Closure, coroutineFinally: Closure } | null = null;
 export const raiseHelpers = () => helpers ??= {
     handlerReturned: helperClosure(1, [new ErrorObject(vmError(Msg.HandlerReturned))], [
@@ -42,6 +42,12 @@ export const raiseHelpers = () => helpers ??= {
         OpCode.RETURN, 0,
     ], "coroutine-finally"),
 };
+
+const escapeTarget = (tok: EscapeContinuation, from: Frame | null): Frame | null => {
+    const owner = tok.owner;
+    for (let f = from; f !== null; f = f.parent) if (f.escape === owner) return f;
+    return null;
+};
 export const helperClosure = (numReg: number, constants: any[], inst: number[], name: string = "raise"): Closure => {
     const positions = new Set<number>();
     for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip]]) for (const off of INTRINSIC_OPERANDS[inst[ip]]) positions.add(inst[ip + off]);
@@ -62,6 +68,7 @@ export class VMExecutor {
         if (frame.isShared(ctx)) {
             frame = frame.thaw(ctx);
         }
+        if (frame.escape !== null) frame.escape = null;
         return frame;
     }
 
@@ -113,7 +120,7 @@ export class VMExecutor {
                 throw vmError(Msg.EscapeBoundary);
             }
             if (nargs !== 1) throw vmError(Msg.EscapeArgs, nargs);
-            const target = proc.target(callerFrame);
+            const target = escapeTarget(proc, callerFrame);
             if (target === null) throw vmError(Msg.EscapeOutsideExtent);
             return this.#jumpTo(ctx, target, mapWind(target, proc.wind), callerArgs[startReg]);
         }
@@ -251,12 +258,31 @@ export class VMExecutor {
 
     // --- continuations and dynamic-wind ---
 
-    // calls `proc` with `tok` as the innermost exception handler; its value, or a Caught, is returned to `frame`
-    public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, tok: CatchToken): Frame | null {
+    // direct code's %call/ec or %catch, as an exception it does not take leaves it: the frame rebuilt for it holds the
+    // token, and a call not yet made is made with `marks`
+    public pushEscape(e: any, tok: EscapeContinuation, marks: Marks, mframe: number): any {
+        if (e instanceof Suspend) {
+            if (e.innermost === null && e.marks === undefined) {
+                e.marks = marks;
+                e.mframe = mframe + 1;
+            }
+            e.pendingEscape = tok;
+        }
+        return e;
+    }
+
+    // calls `proc` with a new escape continuation, which `frame` holds until it resumes
+    public callEscape(ctx: ExecutionContext, proc: any, frame: Frame): Frame | null {
+        const tok = frame.escape = new EscapeContinuation(ctx.id, ctx.wind);
+        return this.invoke(ctx, proc, frame, [tok], 0, 1, false, frame.marks, frame.mframe + 1);
+    }
+
+    // calls `proc` with a new catch token as the innermost exception handler; its value, or a Caught, is returned to `frame`
+    public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, pre: any, guarded: boolean): Frame | null {
+        const tok = frame.escape = new CatchToken(ctx.id, ctx.wind, pre, guarded);
         const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
-        if (proc instanceof Closure) return this.newFrame(ctx, proc, this.createClosureArg(proc, 0, [], 0), frame, marks, frame.mframe + 1);
         try {
-            return this.invoke(ctx, proc, frame, [], 0, 0, false);
+            return this.invoke(ctx, proc, frame, [], 0, 0, false, marks, frame.mframe + 1);
         } catch (err) {
             if (err instanceof EscapedError) throw err;
             ctx.acc = new Caught(caughtValue(err, this.vm));
@@ -333,6 +359,7 @@ export class VMExecutor {
         for (let i = k.frames.length - 1; i >= 0; i--) {
             const f = k.frames[i];
             const copy = new Frame(f.closure, f.regs.slice(), f.ip, parent, ctx, move(f.marks), f.mframe + shift);
+            copy.escape = f.escape;
             copy.posIp = f.posIp;
             if (f.winds === null) {
                 copy.winds = winds;
@@ -425,7 +452,7 @@ export class VMExecutor {
                 const escape = new Frame(raiseHelpers().escapeWith, [handler, undefined, undefined], 0, frame, ctx, preMarks, mframe + 1);
                 return this.invoke(ctx, handler.pre, escape, [obj], 0, 1, false);
             }
-            const target = handler.target(frame);
+            const target = escapeTarget(handler, frame);
             if (target === null) throw vmError(Msg.CatchOutsideExtent);
             const val = handler.inPre ? new ErrorObject(this.vm.message(vmError(Msg.ErrorInHandler, obj), errorPos(frame))) : obj;
             return this.#jumpTo(ctx, target, mapWind(target, handler.wind), new Caught(val));

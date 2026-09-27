@@ -49,7 +49,7 @@ const successors = (term: AotTerm): number[] => {
         case "Jump": return [term.target];
         case "Block": case "Loop": return [term.body];
         case "Branch": return [term.then, term.else];
-        case "Call": case "CallEC": case "CallCatch": return [term.resume];
+        case "Call": return [term.resume];
         case "HostCall": return term.isTail ? [] : [term.resume];
         case "TailCall": case "MaybeSelfTailCall": case "Return": return [];
     }
@@ -77,7 +77,6 @@ export const blockFacts = (blocks: AotBlock[], table: Intrinsics | null, constan
         const block = blocks[i];
         const facts = new Map(entry.get(block.start)!);
         for (const inst of block.insts) transfer(inst, facts, table, constants);
-        if (block.term.k === "CallEC" || block.term.k === "CallCatch") facts.delete(block.term.tok);
         const before = out.get(block.start);
         if (before !== undefined && same(before, facts)) continue;
         out.set(block.start, facts);

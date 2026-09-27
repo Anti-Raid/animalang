@@ -109,6 +109,50 @@ export class CallCCRequest extends ControlRequest {
     }
 }
 
+// (%call/ec proc)
+export class EscapeRequest extends ControlRequest {
+    proc: any = undefined;
+
+    static readonly #reused = new EscapeRequest();
+    static of(proc: any): EscapeRequest {
+        const r = EscapeRequest.#reused;
+        r.proc = proc;
+        return r;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
+        return executor.callEscape(ctx, this.proc, frame);
+    }
+
+    direct(): any {
+        throw Suspend.escape(this.proc);
+    }
+}
+
+// (%call-catching thunk [pre [guarded]]): what %catch compiles to
+export class CatchRequest extends ControlRequest {
+    proc: any = undefined;
+    pre: any = null;
+    guarded: boolean = false;
+
+    static readonly #reused = new CatchRequest();
+    static of(proc: any, pre: any, guarded: boolean): CatchRequest {
+        const r = CatchRequest.#reused;
+        r.proc = proc;
+        r.pre = pre;
+        r.guarded = guarded;
+        return r;
+    }
+
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
+        return executor.callCatch(ctx, this.proc, frame, this.pre, this.guarded);
+    }
+
+    direct(): any {
+        throw Suspend.catching(this.proc, this.pre, this.guarded);
+    }
+}
+
 // (%call-with-prompt tag thunk handler)
 export class PromptRequest extends ControlRequest {
     tag: any = undefined;
@@ -280,6 +324,10 @@ export const raiseContinuable = (flag: any): boolean => {
     if (typeof flag !== "boolean") throw vmError(Msg.BadContinuable);
     return flag;
 };
+export const catchGuard = (flag: any): boolean => {
+    if (typeof flag !== "boolean") throw vmError(Msg.CatchGuard);
+    return flag;
+};
 export const stackSkip = (skip: any): number => {
     if (!Number.isInteger(skip) || skip < 0) throw vmError(Msg.BadStackSkip);
     return skip;
@@ -321,7 +369,6 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%end-wind", [0, 0], (regs, start, nargs, ctx) => { if (ctx.wind !== null) ctx.wind = ctx.wind.parent; }, {
         context: true, inline: () => `(ctx.wind !== null && (ctx.wind = ctx.wind.parent), undefined)`,
     });
-    core("%end-escape", [1, 1], () => undefined, { inline: () => `undefined` });
     core("%caught?", [1, 1], (regs, start) => regs[start] instanceof Caught, { inline: unaryInline((v, d) => `${v} instanceof ${d.Caught}`) });
     core("%caught-value", [1, 1], (regs, start) => regs[start].error, { inline: unaryInline(v => `${v}.error`) });
     core("%make-caught", [1, 1], (regs, start) => new Caught(regs[start]), { inline: unaryInline((v, d) => `new ${d.Caught}(${v})`) });
@@ -368,6 +415,8 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         return out;
     };
     control("%call/cc", [1, 1], (regs, start) => CallCCRequest.of(regs[start]));
+    control("%call/ec", [1, 1], (regs, start) => EscapeRequest.of(regs[start]), false);
+    control("%call-catching", [1, 3], (regs, start, nargs) => CatchRequest.of(regs[start], nargs >= 2 ? regs[start + 1] : null, nargs === 3 ? catchGuard(regs[start + 2]) : false), false);
     control("%coroutine-yield", [0, Infinity], (regs, start, nargs) => YieldRequest.of(nargs === 1 ? regs[start] : packValues(copyWindow(regs, start, start + nargs))), false);
     control("%coroutine-resume", [1, Infinity], (regs, start, nargs) => ResumeRequest.of(regs[start], copyWindow(regs, start + 1, start + nargs)));
     control("%coroutine-resume-array", [2, 2], (regs, start) => ResumeRequest.of(regs[start], arrayArg("%coroutine-resume-array", regs[start + 1]).slice()));

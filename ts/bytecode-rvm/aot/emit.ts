@@ -69,11 +69,12 @@ export const inlineDeps = (entry: Intrinsic, used: Set<string>): Readonly<Record
 //    spilled): statements that return the frame to run next, or with `continues`, set ctx.acc and carry on
 //  - direct: direct code, after rip is set: statements that throw a Suspend, or set acc (return it, in tail position),
 //    or declare `proc` and `args` and then run `callArray`, which calls proc with args (see DirectEmitter.#callArray)
+//    or `call`, which calls `proc` (in scope) with args, leaving its value in acc
 //  - tailProc: in tail position, the first argument is what debug code records as the tail call
 export type ControlSite = { args: string[], isTail: boolean };
 export type ControlAot = {
     heap: (s: ControlSite) => string,
-    direct: (s: ControlSite, callArray: string) => string,
+    direct: (s: ControlSite, callArray: string, call: (args: string[], marks: string) => string) => string,
     continues?: boolean,
     tailProc?: boolean,
 };
@@ -85,6 +86,36 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
         heap: s => `return executor.callCC(ctx, ${s.args[0]}, frame, ${s.isTail});`,
         direct: s => `throw Suspend.callCC(${s.args[0]});`,
         tailProc: true,
+    }],
+    ["%call/ec", {
+        heap: s => `return executor.callEscape(ctx, ${s.args[0]}, frame);`,
+        direct: (s, callArray, call) => `{
+            const tok = new EscapeContinuation(ctx.id, ctx.wind);
+            try {
+                const proc = ${s.args[0]};
+                ${call(["tok"], "marks")}
+            } catch (e) {
+                if (!(e instanceof Suspend && e.escape === tok && ctx.wind === tok.wind)) throw executor.pushEscape(e, tok, marks, mframe);
+                countControlSuspend(closure.tmpl.code);
+                acc = e.escapeVal;
+            }
+        }`,
+    }],
+    ["%call-catching", {
+        heap: s => `return executor.callCatch(ctx, ${s.args[0]}, frame, ${s.args[1] ?? "null"}, ${s.args.length === 3 ? `catchGuard(${s.args[2]})` : "false"});`,
+        direct: (s, callArray, call) => `{
+            const tok = new CatchToken(ctx.id, ctx.wind, ${s.args[1] ?? "null"}, ${s.args.length === 3 ? `catchGuard(${s.args[2]})` : "false"});
+            const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
+            try {
+                const proc = ${s.args[0]};
+                ${call([], "handlers")}
+            } catch (e) {
+                const caught = catchHere(e, tok, ctx);
+                if (caught === null) throw executor.pushEscape(e, tok, handlers, mframe);
+                countControlSuspend(closure.tmpl.code);
+                acc = caught;
+            }
+        }`,
     }],
     ["%coroutine-yield", { heap: s => `return executor.coYield(ctx, frame, ${valuesOf(s.args)});`, direct: s => `throw Suspend.yield(${valuesOf(s.args)});` }],
     ...["%coroutine-resume", "%coroutine-resume-array"].map((name): [string, ControlAot] => [name, {
@@ -497,21 +528,6 @@ export class ResumeEmitter extends FunctionEmitter {
                     }
                     ${this.jump(term.resume, next)}
                 `);
-            // the receiver gets a heap frame, so escapes from its body are jumps rather than js exceptions
-            case "CallEC":
-                return this.emit(`
-                    r${term.tok} = new EscapeContinuation(ctx.id, ctx.wind, frame.code, ${term.tok});
-                    frame.ip = ${term.resume};
-                    ${this.#spills(live.spillsFor(term.resume, [term.tok]))}
-                    return executor.invoke(ctx, r${term.proc}, frame, [r${term.tok}], 0, 1, false);
-                `);
-            case "CallCatch":
-                return this.emit(`
-                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, frame.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}${term.guarded ? ", true" : ""}`});
-                    frame.ip = ${term.resume};
-                    ${this.#spills(live.spillsFor(term.resume, [term.tok]))}
-                    return executor.callCatch(ctx, r${term.proc}, frame, r${term.tok});
-                `);
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
@@ -894,12 +910,19 @@ export class DirectEmitter extends FunctionEmitter {
         `;
     }
 
-    #call(procReg: number, start: number, nargs: number, resume: number, marksExpr: string = "marks"): string {
-        const args = this.argList(start, nargs);
+    #call(procReg: number, start: number, nargs: number, resume: number): string {
         return `
             {
                 const proc = r${procReg};
                 rip = ${resume};
+                ${this.#callProc(this.argList(start, nargs), nargs)}
+            }
+        `;
+    }
+
+    // calls `proc` (in scope) with `args`, leaving the value in acc
+    #callProc(args: string, nargs: number, marksExpr: string = "marks"): string {
+        return `
                 ${nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
                     acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
                 } else ` : ""}if (${this.directGuard("proc", `${nargs}`)}) {
@@ -916,7 +939,6 @@ export class DirectEmitter extends FunctionEmitter {
                 } else {
                     throw Suspend.invoke(proc, [${args}]);
                 }
-            }
         `;
     }
 
@@ -935,41 +957,13 @@ export class DirectEmitter extends FunctionEmitter {
                     ${this.#call(term.proc, term.start, term.nargs, term.resume)}
                     ${this.jump(term.resume, next)}
                 `);
-            case "CallEC":
-                // escapes that need no unwinding end here; others go on out and find this frame once it is rebuilt
-                return this.emit(`
-                    r${term.tok} = new EscapeContinuation(ctx.id, ctx.wind, closure.tmpl.code, ${term.tok});
-                    try {
-                        ${this.#call(term.proc, term.tok, 1, term.resume)}
-                    } catch (e) {
-                        const own = e instanceof Suspend && e.escape === r${term.tok};
-                        if (own) countControlSuspend(closure.tmpl.code);
-                        if (!own || ctx.wind !== r${term.tok}.wind) throw e;
-                        acc = e.escapeVal;
-                    }
-                    ${this.jump(term.resume, next)}
-                `);
-            case "CallCatch":
-                return this.emit(`
-                    r${term.tok} = new CatchToken(ctx.id, ctx.wind, closure.tmpl.code, ${term.tok}${term.pre === NO_REG ? "" : `, r${term.pre}${term.guarded ? ", true" : ""}`});
-                    try {
-                        const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(r${term.tok}, markFirst(marks, EXCEPTION_HANDLERS, null)));
-                        ${this.#call(term.proc, 0, 0, term.resume, "handlers")}
-                    } catch (e) {
-                        const caught = catchHere(e, r${term.tok}, ctx);
-                        if (caught === null) throw e;
-                        countControlSuspend(closure.tmpl.code);
-                        acc = caught;
-                    }
-                    ${this.jump(term.resume, next)}
-                `);
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
                     const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail };
                     return this.emit(`
                         rip = ${term.isTail ? -1 : term.resume};
-                        ${control.direct(site, this.#callArray(term.isTail))}
+                        ${control.direct(site, this.#callArray(term.isTail), (args, marks) => this.#callProc(args.join(", "), args.length, marks))}
                         ${term.isTail ? "" : this.jump(term.resume, next)}
                     `);
                 }
