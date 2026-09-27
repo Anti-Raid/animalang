@@ -2,8 +2,26 @@ import { Msg, opName, type Formatter } from "../common";
 // AOT inlining: given the js expressions of the arguments and of a call to the operation itself (the fallback, which
 // reports errors), returns a js expression computing the result, or null to always make the call. `tmp` names a scratch
 // variable the expression may assign; `d` maps each declared dep to the local variable holding it
-// `known`: for each argument, whether it is certainly a number (see aot/facts.ts), so the template may skip checking it
-export type InlineFn = (args: string[], slow: string, tmp: string, d: Readonly<Record<string, string>>, known: readonly boolean[]) => string | null;
+// Kinds of values, for the AOT compiler's type facts (see aot/facts.ts): names a front end chooses and gives meaning
+// (TypeSystem), except "boolean", which the VM knows (it decides truthiness)
+export type Kind = string;
+export type ArgKinds = readonly (Kind | undefined)[];
+
+// what an intrinsic returns (or else it throws): always a kind, or a kind given what is known of its arguments' kinds
+export type Returns = Kind | ((kinds: ArgKinds) => Kind | undefined);
+
+// A front end's kinds: `ofConstant` gives a literal's kind; `guard` a js test that `expr` is of `kind` (a version of a
+// function for parameters of that kind checks them with it), or null; `coerce` wraps an expression known to give a
+// value of `kind` so V8 sees that kind too (a template's slow path), or null. `deps`: values `guard` refers to, as ${d.name}
+export type TypeSystem = {
+    ofConstant(value: any): Kind | undefined,
+    guard(kind: Kind, expr: string, d: Readonly<Record<string, string>>): string | null,
+    coerce?(kind: Kind, expr: string): string | null,
+    deps?: Record<string, unknown>,
+};
+
+// `known`: for each argument, its kind when certain (see aot/facts.ts), so the template may skip checking it
+export type InlineFn = (args: string[], slow: string, tmp: string, d: Readonly<Record<string, string>>, known: ArgKinds) => string | null;
 
 // Reads only regs[start .. start+nargs), and never writes to regs or keeps it: in the interpreter it is the caller's live
 // register file. A non-leaf may return hostTail(proc, ...args) instead of a value. `ctx` and `executor` (the running
@@ -32,8 +50,10 @@ export type IntrinsicOptions = {
     sequence?: "pack" | "spread",
     // returns a new array nothing else holds, which %apply may then call with as it is (as a spread intrinsic does)
     fresh?: boolean,
-    // what it always returns (or else it throws), for the AOT compiler's type facts
-    returns?: "number" | "boolean",
+    // what it returns, for the AOT compiler's type facts
+    returns?: Returns,
+    // the kind its fast path wants its arguments to be: a version of a function for parameters of that kind reads it
+    wants?: Kind,
 }
 
 export type Intrinsic = {
@@ -46,7 +66,8 @@ export type Intrinsic = {
     readonly context: boolean,
     readonly tail: boolean,
     readonly fresh: boolean,
-    readonly returns: "number" | "boolean" | undefined,
+    readonly returns: Returns | undefined,
+    readonly wants: Kind | undefined,
     readonly inline: InlineFn | undefined,
     // the local variable holding each dep in generated code (D<slot> for DEPS[slot])
     readonly deps: Readonly<Record<string, string>>,
@@ -72,6 +93,9 @@ export class Intrinsics {
     #spread: Intrinsic | undefined
     // how the VM's and the compiler's messages are worded (see Msg): the front end's formatter, if it sets one
     #format: Formatter = opName
+    #types: TypeSystem | null = null
+    // the locals of the type system's deps in generated code, by name
+    #typeDeps: Record<string, string> = {}
 
     // `base`: a table to start from (its entries at the same positions, and its reserved names)
     // made from a base table (every table but the core operations' own)
@@ -88,6 +112,8 @@ export class Intrinsics {
         this.#pack = base.#pack
         this.#spread = base.#spread
         this.#format = base.#format
+        this.#types = base.#types
+        this.#typeDeps = base.#typeDeps
     }
 
     get frozen(): boolean {
@@ -119,7 +145,7 @@ export class Intrinsics {
             deps[dep] = `D${slot}`
         }
         const entry: Intrinsic = Object.freeze({
-            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, inline: options.inline, deps: Object.freeze(deps),
+            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, deps: Object.freeze(deps),
         })
         this.entries.push(entry)
         this.fns.push(fn)
@@ -141,6 +167,34 @@ export class Intrinsics {
         if (this.#frozen) throw new Error("cannot set the formatter: the intrinsics are frozen")
         this.#format = format
         return this
+    }
+
+    get types(): TypeSystem | null {
+        return this.#types
+    }
+
+    get typeDeps(): Readonly<Record<string, string>> {
+        return this.#typeDeps
+    }
+
+    setTypes(types: TypeSystem): this {
+        if (this.#frozen) throw new Error("cannot set the type system: the intrinsics are frozen")
+        const deps: Record<string, string> = {}
+        for (const [dep, value] of Object.entries(types.deps ?? {})) {
+            let slot = this.deps.indexOf(value)
+            if (slot === -1) slot = this.deps.push(value) - 1
+            deps[dep] = `D${slot}`
+        }
+        this.#types = types
+        this.#typeDeps = Object.freeze(deps)
+        return this
+    }
+
+    // what an intrinsic returns given its arguments' kinds, if certain
+    static resultKind(entry: Intrinsic, kinds: ArgKinds | null): Kind | undefined {
+        const returns = entry.returns
+        if (typeof returns !== "function") return returns
+        return kinds === null ? undefined : returns(kinds)
     }
 
     get pack(): Intrinsic | undefined {

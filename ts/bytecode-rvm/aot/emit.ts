@@ -10,7 +10,7 @@ import type { AotBlock, AotInst, AotTerm } from "./types";
 import type { Arity } from "../arity";
 import { CORE_COUNT } from "../coreops";
 import { OpCode } from "../interpreter";
-import type { Intrinsic, Intrinsics } from "../intrinsics";
+import { Intrinsics, type Intrinsic, type Kind } from "../intrinsics";
 import { INSTRUCTION_LENGTHS, NO_REG, UNPACK_REST } from "../opcodes";
 import { DIRECT_SUSPEND_LIMIT } from "../values";
 
@@ -142,7 +142,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     // a branch's condition: a known boolean as it is
     protected truthy(reg: number): string {
-        return this.facts.get(reg) === "boolean" ? `r${reg}` : `isTruthy(r${reg})`;
+        return this.facts.get(reg) === "boolean" ? `r${reg}` : `(r${reg} !== false)`;
     }
 
     // debug code only: statement recording the exact position of the op about to run
@@ -330,10 +330,11 @@ export abstract class FunctionEmitter extends CodeEmitter {
         const direct = this.windowCall(`I${pos}`, start, nargs, entry.context);
         if (entry.inline === undefined) return direct;
         const regs = windowRegs(start, nargs);
-        const known = regs.map(r => this.facts.get(r) === "number");
+        const known = regs.map(r => this.facts.get(r));
         // a declared result is also what the slow path gives, said so V8 keeps it unboxed through the template's branches
         const slow = this.windowCall(`RT[${pos}]`, start, nargs, entry.context);
-        const typedSlow = entry.returns === "number" ? `+${slow}` : entry.returns === "boolean" ? `!!${slow}` : slow;
+        const result = Intrinsics.resultKind(entry, known);
+        const typedSlow = result === undefined ? slow : result === "boolean" ? `!!${slow}` : this.table?.types?.coerce?.(result, slow) ?? slow;
         const inlined = entry.inline(regs.map(r => `r${r}`), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known);
         return inlined ?? direct;
     }
@@ -593,30 +594,38 @@ export class DirectEmitter extends FunctionEmitter {
     #seed: Facts | null = null;
     #specCheck: string | null = null;
 
-    // the positional parameters some intrinsic with a declared result reads: a version knowing them to be numbers can
-    // drop their checks, which cost most in hot loops over the floats computed from them
-    #numericParams(params: number): number[] {
-        const read = new Set<number>();
+    // the kinds of the positional parameters intrinsics want (`wants`) where they read them (directly, or through the
+    // moves a parameter is usually copied by first): a version knowing them can drop their checks, which cost most in hot
+    // loops over the floats computed from them. A parameter wanted as two kinds is left out
+    #paramKinds(params: number): Map<number, Kind> {
+        const wanted = new Map<number, Kind | null>();
+        const want = (reg: number, kind: Kind) => wanted.set(reg, wanted.has(reg) && wanted.get(reg) !== kind ? null : kind);
         for (const block of this.blocks) {
             for (const x of block.insts) {
-                if ((x.k === "IntCall" || x.k === "IntApply") && this.table?.entries[x.pos]?.returns !== undefined) {
-                    for (const r of windowRegs(x.start, x.nargs)) read.add(r);
-                }
+                if (x.k !== "IntCall" && x.k !== "IntApply") continue;
+                const kind = this.table?.entries[x.pos]?.wants;
+                if (kind !== undefined) for (const r of windowRegs(x.start, x.nargs)) want(r, kind);
             }
         }
-        // and the registers moved into those (a parameter is usually copied to a temporary first)
         for (let grew = true; grew;) {
             grew = false;
             for (const block of this.blocks) {
                 for (const x of block.insts) {
-                    if (x.k === "Move" && read.has(x.dst) && !read.has(x.src)) {
-                        read.add(x.src);
-                        grew = true;
+                    const kind = x.k === "Move" ? wanted.get(x.dst) : undefined;
+                    if (x.k === "Move" && kind !== undefined && kind !== null && wanted.get(x.src) !== kind) {
+                        const before = wanted.get(x.src);
+                        want(x.src, kind);
+                        grew = wanted.get(x.src) !== before || grew;
                     }
                 }
             }
         }
-        return Array.from({ length: params }, (_, i) => i).filter(i => read.has(i));
+        const out = new Map<number, Kind>();
+        for (let i = 0; i < params; i++) {
+            const kind = wanted.get(i);
+            if (kind !== undefined && kind !== null) out.set(i, kind);
+        }
+        return out;
     }
     protected readonly endOfCode = "return undefined;";
 
@@ -645,10 +654,18 @@ export class DirectEmitter extends FunctionEmitter {
                 let ip = 0, rip = 0, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
         `);
-        const numeric = this.debug ? [] : this.#numericParams(closureArity.params);
-        this.#specCheck = numeric.length > 0 ? numeric.map(i => `typeof r${i} === "number"`).join(" && ") : null;
+        // a parameter whose kind has no check (guard) the front end can write stays checked in the body
+        const types = this.table?.types ?? null;
+        const guards = new Map<number, string>();
+        const kinds = this.debug || types === null ? new Map<number, Kind>() : this.#paramKinds(closureArity.params);
+        for (const [i, kind] of kinds) {
+            const test = types!.guard(kind, `r${i}`, inlineDeps({ name: "the type system", deps: this.table!.typeDeps } as Intrinsic, this.usedDeps));
+            if (test !== null) guards.set(i, test);
+        }
+        const numeric = [...guards.keys()];
+        this.#specCheck = numeric.length > 0 ? numeric.map(i => `(${guards.get(i)})`).join(" && ") : null;
         const structured = this.#structuredBody();
-        const special = structured !== null && this.#specCheck !== null ? this.#structuredBody(new Map(numeric.map(i => [i, "number"]))) : null;
+        const special = structured !== null && this.#specCheck !== null ? this.#structuredBody(new Map(numeric.map(i => [i, kinds.get(i)!]))) : null;
         if (special === null) this.#specCheck = null;
         this.emit(`
                 ${special !== null ? `let spec = ${this.#specCheck};` : ""}

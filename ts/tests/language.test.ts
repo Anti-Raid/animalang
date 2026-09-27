@@ -1804,6 +1804,55 @@ describe('Anima', () => {
         })
     });
 
+    describe('bigints', () => {
+        it('reads bigints written 123n, and refuses integers a double would round', () => {
+            expect(run("(list 9007199254740993n (bigint? 9007199254740993n) (bigint? 9007199254740991) (bigint? 5) 123n (bigint? 123n) -99999999999999999999n)")).toBe("(9007199254740993 #t #f #f 123 #t -99999999999999999999)")
+            expect(() => evaluator.compileRaw("9007199254740993")).toThrow("integer 9007199254740993 is too large for a double to hold exactly; write 9007199254740993n for a bigint")
+            // one a double holds exactly is a double, however large
+            expect(run("(list 9007199254740992 (bigint? 100000000000000000000) 1e20)")).toBe("(9007199254740992 #f 100000000000000000000)")
+        })
+
+        it('does arithmetic on two bigints or two doubles, not a mix', () => {
+            expect(run("(list (+ 1n 2n) (bigint? (+ 1n 2n)) (* 2n 3n) (- 5n) (- 10n 3n 2n) (* 2n) (+ 1n))")).toBe("(3 #t 6 -5 5 2 1)")
+            expect(run("(list (/ 6n 3n) (bigint? (/ 6n 3n)) (/ 1n) (quotient 7n 2n) (quotient -7 2) (modulo -7n 3n) (remainder -7n 3n))")).toBe("(2 #t 1 3 -3 2 -1)")
+            expect(run("(* 9007199254740993n 9007199254740993n)")).toBe("81129638414606699710187514626049")
+            expect(() => run("(+ 1n 2)")).toThrow("+: cannot mix a bigint and a double (convert with bigint or inexact)")
+            expect(() => run("(= 1n 1)")).toThrow("=: cannot mix a bigint and a double")
+            expect(() => run("(< 1 2n)")).toThrow("<: cannot mix")
+            expect(() => run("(modulo 7n 2)")).toThrow("modulo: cannot mix")
+            expect(() => run("(/ 7n 2n)")).toThrow("/: 7 / 2 is not a whole bigint (use quotient)")
+            expect(() => run("(/ 1n 0n)")).toThrow("division by zero")
+            expect(() => run("(modulo 1n 0n)")).toThrow("modulo: division by zero")
+            expect(() => run("(+ 1n 'x)")).toThrow("+ requires numbers")
+            // converting first
+            expect(run("(list (+ (bigint 1) 2n) (+ (inexact 1n) 2.5))")).toBe("(3 3.5)")
+        })
+
+        it('compares and tests', () => {
+            expect(run("(list (= 1n 1n) (= 2n 3n) (< 1n 2n) (> 3n 2n 1n) (<= 2n 2n) (zero? 0n) (positive? 5n) (negative? -5n) (even? 10n) (odd? 7n))")).toBe("(#t #f #t #t #t #t #t #t #t #t)")
+            expect(run("(list (number? 1n) (integer? 1n) (exact-integer? 2.0) (exact-integer? 2.5) (finite? 1n) (eqv? 5n 5n) (eq? 5n 5n) (equal? '(1n) (list 1n)) (eqv? 1 1n))")).toBe("(#t #t #t #f #t #t #t #t #f)")
+        })
+
+        it('converts', () => {
+            expect(run("(list (bigint 5) (bigint? (bigint 5)) (bigint \"123456789012345678901234567890\") (exact 4.0) (bigint? (exact 4.0)) (exact 1e20) (bigint? (exact 1e20)) (inexact 12n) (bigint? (inexact 12n)))")).toBe("(5 #t 123456789012345678901234567890 4 #f 100000000000000000000 #t 12 #f)")
+            expect(() => run("(exact 1.5)")).toThrow("exact: no exact integer")
+            expect(() => run("(bigint 1.5)")).toThrow("bigint: expected an integer")
+        })
+
+        it('survives serialization', () => {
+            const bc = evaluator.compileRaw("(list 123456789012345678901234567890n 7n)")
+            expect(s.stringify(evaluator.evaluateRaw(readFull(dumpFull(bc), evaluator.intrinsics) as ByteCode))).toBe("(123456789012345678901234567890 7)")
+        })
+
+        it('keeps AOT type facts sound', () => {
+            // a bigint accumulator is not known to be a number, though the loop adds to it like one
+            expect(run("(define big 9007199254740993n) (define (bl n) (let loop ((i 0) (acc 0n)) (if (= i n) acc (loop (+ i 1) (+ acc big))))) (list (bl 3) (bigint? (bl 3)))")).toBe("(27021597764222979 #t)")
+            // bigint arguments take the checked version of a function specialized for numbers
+            expect(run("(define (sq1 a b) (+ (* a a) b)) (list (sq1 3037000500n 1n) (bigint? (sq1 3037000500n 1n)) (sq1 3 1))")).toBe("(9223372037000250001 #t 10)")
+            expect(() => run("(define (cnt n) (let loop ((i 0)) (if (< i n) (loop (+ i 1)) i))) (cnt 5n)")).toThrow("<: cannot mix")
+        })
+    });
+
     describe('quasiquote', () => {
         it('builds lists and vectors (R7RS examples)', () => {
             expect(run("`(list ,(+ 1 2) 4)")).toBe("(list 3 4)")

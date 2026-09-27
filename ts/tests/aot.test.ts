@@ -1,4 +1,5 @@
 import { ASTStringifier } from '../scheme/printer';
+import { Anima } from '../anima';
 import { describe, it, expect } from 'vitest';
 import { createScheme } from '../scheme';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from '../bytecode-rvm/vm';
@@ -102,7 +103,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         // a loop over numbers it computes itself: no checks in the version for number parameters
         const mandel = "(define (mandel cr ci) (let loop ((zr 0.0) (zi 0.0) (i 0)) (if (or (= i 50) (> (+ (* zr zr) (* zi zi)) 4.0)) i (loop (+ (- (* zr zr) (* zi zi)) cr) (+ (* 2.0 zr zi) ci) (+ i 1)))))";
         const src = source(mandel);
-        expect(src).toContain('let spec = typeof r0 === "number" && typeof r1 === "number";');
+        expect(src).toContain('let spec = (typeof r0 === "number") && (typeof r1 === "number");');
         const special = src.slice(src.indexOf("if (spec) {"), src.indexOf("return undefined;"));
         expect(special).not.toContain("typeof");
         // the same results as the interpreter, which has no type facts
@@ -117,6 +118,63 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         expect(run("(define (k2 a b) (if (= b 0) a (k2 (if (= b 1) 'sym (+ a 1)) (- b 1)))) (list (k2 0 3) (k2 1.5 2))")).toBe("(sym sym)");
         // a boolean it knows needs no truthiness test
         expect(source("(define (p a b) (if (< a b) 1 2))")).toContain("if (r");
+    });
+
+    it("takes its kinds from the front end: a made-up one works like numbers", () => {
+        class V2 { constructor(readonly x: number, readonly y: number) {} }
+        const S = Symbol.for;
+        const build = (impl_: any) => {
+            const anima = new Anima(impl_);
+            anima.intrinsics.setTypes({ ofConstant: () => undefined, guard: (kind, e, d) => kind === "vec2" ? `${e} instanceof ${d.V2}` : null, deps: { V2 } });
+            anima.registerIntrinsic("%v2+", (regs, st) => {
+                const a = regs[st], b = regs[st + 1];
+                if (!(a instanceof V2) || !(b instanceof V2)) throw new Error("v2+: expected vectors");
+                return new V2(a.x + b.x, a.y + b.y);
+            }, {
+                args: [2, 2], leaf: true, wants: "vec2", deps: { V2 },
+                returns: kinds => kinds.every(k => k === "vec2") ? "vec2" : undefined,
+                inline: ([a, b], slow, _tmp, d, known) => {
+                    const checks = [a, b].filter((_, i) => known[i] !== "vec2").map(x => `${x} instanceof ${d.V2}`);
+                    const value = `new ${d.V2}(${a}.x + ${b}.x, ${a}.y + ${b}.y)`;
+                    return checks.length === 0 ? value : `(${checks.join(" && ")} ? ${value} : ${slow})`;
+                },
+            });
+            return anima;
+        };
+        // (lambda (a b) (%v2+ (%v2+ a b) b)): the inner result is known, and the parameters in a version for vec2s
+        const fnAst = [S("%lambda"), [[], [S("a"), S("b")], null, [S("%v2+"), [S("%v2+"), S("a"), S("b")], S("b")]]];
+        const aot = build(implAot);
+        const bc = aot.compiler.compile(fnAst);
+        const tmpl = (bc.constants.find((c: any) => c instanceof Closure) as any).tmpl;
+        const src = AotCompiler.generateSource(tmpl.code, tmpl);
+        const direct = src.slice(src.indexOf("direct: function"));
+        expect(direct).toMatch(/let spec = \(r0 instanceof D\d+\) && \(r1 instanceof D\d+\);/);
+        const special = direct.slice(direct.indexOf("if (spec) {"), direct.indexOf("return undefined;"));
+        expect(special).not.toContain("instanceof");
+        const f = aot.evaluateRaw(bc);
+        const r = aot.evaluateClosure(f, [new V2(1, 2), new V2(10, 20)]);
+        expect([r.x, r.y]).toEqual([21, 42]);
+        expect(() => aot.evaluateClosure(f, [1, 2])).toThrow("v2+: expected vectors");
+        // without a type system nothing is known of numbers: they keep their checks
+        const bare = new Anima(implAot);
+        const plus = bare.registerIntrinsic("%p+", (regs, st) => regs[st] + regs[st + 1], { args: [2, 2], leaf: true, inline: ([a, b], slow, _t, _d, known) => known.every(k => k === "number") ? `${a} + ${b}` : `(typeof ${a} === "number" && typeof ${b} === "number" ? ${a} + ${b} : ${slow})` });
+        expect(plus.name).toBe("%p+");
+        const bc2 = bare.compiler.compile([S("%lambda"), [[], [S("n")], null, [S("%p+"), 1, [S("%p+"), 2, S("n")]]]]);
+        const t2 = (bc2.constants.find((c: any) => c instanceof Closure) as any).tmpl;
+        expect(AotCompiler.generateSource(t2.code, t2)).toContain('typeof ');
+    });
+
+    it("knows bigints too, through Scheme's kinds", () => {
+        const anima = createScheme(implAot);
+        const bc = anima.compileRaw("(define (pow2 n) (let loop ((i 0n) (acc 1n)) (if (= i n) acc (loop (+ i 1n) (* acc 2n)))))") as ByteCode;
+        const fn = bc.constants.find((c: any) => c instanceof Closure)!;
+        const src = AotCompiler.generateSource(fn.tmpl.code, fn.tmpl);
+        const direct = src.slice(src.indexOf("direct: function"));
+        // i and acc are known bigints: + and * on them are bare
+        expect(direct).toMatch(/r\d+ = \(\(r\d+ \+ r\d+\)\);/);
+        expect(direct).toMatch(/r\d+ = \(\(r\d+ \* r\d+\)\);/);
+        anima.evaluateRaw(bc);
+        expect(new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw("(pow2 70n)")))).toBe("1180591620717411303424");
     });
 
     it("deoptimizes cleanly to interpreter on unhandled opcodes", () => {

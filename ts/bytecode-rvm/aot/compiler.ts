@@ -1,6 +1,7 @@
 // The AOT compiler: decodes bytecode into basic blocks, generates a function's JS source (see emit.ts) and builds it,
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
-import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, Table, isTruthy, packValues } from "../../common";
+import type { TypeSystem } from "../intrinsics";
+import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, Table, packValues } from "../../common";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
 import { DirectEmitter, ResumeEmitter } from "./emit";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
@@ -23,7 +24,6 @@ export const JIT_DEPS = {
     restValues,
     IProcedure,
     ErrorObject,
-    isTruthy,
     Box,
     MissingVarError,
     Closure,
@@ -118,7 +118,7 @@ export class AotCompiler {
     // the compiled source of shared instruction arrays: copies of a ByteCode (ByteCode.fresh) only build their own functions.
     // Source that calls intrinsics also depends on what they generate: their positions, inline templates and deps' locals.
     // Instances that register the same intrinsics the same way (e.g. from the same front end) share it
-    static readonly #sources = new WeakMap<Uint32Array, { uses: readonly SourceUse[], factory: Function }[]>();
+    static readonly #sources = new WeakMap<Uint32Array, { uses: readonly SourceUse[], types: TypeSystem | null, factory: Function }[]>();
 
     static #sameUses(a: readonly SourceUse[], b: readonly SourceUse[]): boolean {
         if (a.length !== b.length) return false;
@@ -126,7 +126,7 @@ export class AotCompiler {
             const x = a[i], y = b[i];
             // name and bounds are written into the source of APPLYINT (IntApply / IntApplyRest)
             // and what they return, which the type facts rely on
-            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max || x.returns !== y.returns) return false;
+            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max || x.returns !== y.returns || x.wants !== y.wants) return false;
             const dx = Object.entries(x.deps), dy = y.deps;
             if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
         }
@@ -134,15 +134,16 @@ export class AotCompiler {
     }
 
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns }; });
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns, wants } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns, wants }; });
         let variants = this.#sources.get(code.inst);
-        let factory = variants?.find(v => this.#sameUses(v.uses, uses))?.factory;
+        const types = code.table?.types ?? null;
+        let factory = variants?.find(v => v.types === types && this.#sameUses(v.uses, uses))?.factory;
         if (factory === undefined) {
             // parsing the source is most of the cost, so copies share the factory and only call it for their own functions
             factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl));
             if (SHARED_INSTS.has(code.inst)) {
                 if (variants === undefined) this.#sources.set(code.inst, variants = []);
-                variants.push({ uses, factory });
+                variants.push({ uses, types, factory });
             }
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};

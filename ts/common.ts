@@ -3,10 +3,7 @@ import { Env } from "./env";
 
 export { Table, Env };
 
-/** Returns if a value is truthy or not */
-export const isTruthy = (val: any): boolean => {
-    return val !== false
-}   
+   
 
 // @internal
 const DEEP_EQUAL_MISSING = Symbol("missing");
@@ -251,6 +248,7 @@ export class BS {
     static readonly CLASS = 0x0A
     static readonly UNIQUESYMBOL = 0x0B
     static readonly F64 = 0x0C
+    static readonly BIGINT = 0x0D
     static readonly UNDEFINED = 0xFF
 
     constructor(initialCapacity: number = 1024) {
@@ -424,6 +422,8 @@ export class BS {
             } else {
                 this.writeF64(val);
             }
+        } else if (typeof val === 'bigint') {
+            this.#writeString(val.toString(), BS.BIGINT);
         } else if (typeof val === 'string') {
             this.writeString(val);
         } else if (typeof val === 'symbol') {
@@ -503,7 +503,7 @@ export class BSReader {
     /**
      * Reads the next dynamically typed value based on its tag.
      */
-    read(): number | Uint32Array | string | symbol | boolean | null | undefined | any[] | Map<any, any> | Record<string, any> {
+    read(): number | bigint | Uint32Array | string | symbol | boolean | null | undefined | any[] | Map<any, any> | Record<string, any> {
         if (!this.hasMore) throw new Error("Unexpected end of bytecode");
 
         const tag = this.#buffer[this.#cursor++];
@@ -526,6 +526,7 @@ export class BSReader {
                 return arr;
             }
             
+            case BS.BIGINT:
             case BS.STR:
             case BS.SYMBOL: 
             case BS.UNIQUESYMBOL: {
@@ -545,6 +546,7 @@ export class BSReader {
                 }
                 
                 const str = this.#textDecoder.decode(bytes);
+                if (tag === BS.BIGINT) return BigInt(str);
                 return tag === BS.UNIQUESYMBOL ? this.#internUniqueSymbolFromId(symId, str) : tag === BS.SYMBOL ? Symbol.for(str) : str;
             }
 

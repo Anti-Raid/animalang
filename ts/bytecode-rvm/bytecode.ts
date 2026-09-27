@@ -112,13 +112,13 @@ export class ByteCode implements SerializableBytecode {
     runsWith(table: Intrinsics | null): boolean {
         if (table === this.table || !this.usesIntrinsics) return true;
         const own = this.table;
-        if (table === null || own === null) return false;
+        if (table === null || own === null || table.types !== own.types) return false;
         for (const { pos } of this.intrinsics) {
             const mine: Intrinsic = own.entries[pos];
             const theirs: Intrinsic | undefined = table.entries[pos];
             // a table copied from this code's (or from the same base) holds the very same entry
             if (theirs !== mine) {
-                if (theirs === undefined || theirs.name !== mine.name || theirs.fn !== mine.fn || theirs.leaf !== mine.leaf || theirs.inline !== mine.inline || theirs.returns !== mine.returns) return false;
+                if (theirs === undefined || theirs.name !== mine.name || theirs.fn !== mine.fn || theirs.leaf !== mine.leaf || theirs.inline !== mine.inline || theirs.returns !== mine.returns || theirs.wants !== mine.wants) return false;
                 for (const dep in mine.deps) if (theirs.deps[dep] !== mine.deps[dep]) return false;
                 for (const dep in theirs.deps) if (!(dep in mine.deps)) return false;
             }

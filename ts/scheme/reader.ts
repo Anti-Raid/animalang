@@ -341,7 +341,12 @@ export class ASP {
 
             // Numbers
             if (token.trim() !== "") {
+                // bigints are written 123n; an integer a double cannot hold exactly is an error rather than rounded
+                if (/^[+-]?\d+n$/.test(token)) return BigInt(token.slice(0, -1));
                 const num = Number(token);
+                if (/^[+-]?\d+$/.test(token) && BigInt(num) !== BigInt(token)) {
+                    throw new ASPParseError(`integer ${token} is too large for a double to hold exactly; write ${token}n for a bigint`, current);
+                }
                 if (!Number.isNaN(num)) return num;
             }
 

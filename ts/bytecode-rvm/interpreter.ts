@@ -1,6 +1,6 @@
 // The opcodes and the bytecode interpreter. The OpCode enum is declared here, next to the interpreter's switch: esbuild
 // only inlines an enum's values in the file that declares it, and a switch over imported enum members is far slower
-import { MissingVarError, isTruthy } from "../common";
+import { MissingVarError } from "../common";
 import { ContinuationMarkSet, markSet, recordTailMark } from "../marks";
 import { bindArgs } from "./arity";
 import { Closure } from "./bytecode";
@@ -118,7 +118,7 @@ export class BytecodeInterpreter {
                     case OpCode.ELSEIF: {
                         const condReg = inst[ip++];
                         const elseOffset = inst[ip++];
-                        if (!isTruthy(regs[condReg])) {
+                        if (regs[condReg] === false) {
                             ip = elseOffset;
                         }
                         break;

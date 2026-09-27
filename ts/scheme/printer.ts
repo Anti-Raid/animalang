@@ -4,6 +4,7 @@ export class ASTStringifier {
     constructor() {}
 
     public stringify(ast: any): string {
+        if (typeof ast === "bigint") return ast.toString();
         // Booleans+number
         if (typeof ast === "number") {
             if (ast === Infinity) return "+inf.0";

@@ -1,9 +1,10 @@
-import { ErrorObject, IProcedure, OpaqueValue, isDeepEqual, isTruthy, symGen, Table } from "../common";
+import { ErrorObject, IProcedure, OpaqueValue, isDeepEqual, symGen, Table } from "../common";
 import { ASTStringifier } from "./printer";
+import { add, div, exact, isExactInteger, isNum, modulo, mul, neg, quotient, remainder, requireNum, sameKind, sub, type Num } from "./numbers";
 import { Cons, MCons } from "./list";
 import { ContinuationMarkSet } from "../marks";
 import { hostError } from "../errors";
-import type { InlineFn, IntrinsicFn, Intrinsics } from "../bytecode-rvm/intrinsics";
+import type { ArgKinds, InlineFn, IntrinsicFn, Intrinsics, Returns, TypeSystem } from "../bytecode-rvm/intrinsics";
 
 // Scheme's builtins, one entry each: registered as the leaf intrinsic %name (with its AOT template, if any), called
 // directly as (name arg ...) (see SCHEME_ALIASES) and as a value through the prelude's $name wrapper. The argument count
@@ -15,7 +16,7 @@ export type SchemeBuiltin = {
     readonly fn: IntrinsicFn,
     readonly inline?: InlineFn,
     // what it always returns (or else throws), for the AOT compiler's type facts
-    readonly returns?: "number" | "boolean",
+    readonly returns?: Returns,
 }
 
 const builtin = (name: string, min: number, max: number, fn: IntrinsicFn, inline?: InlineFn): SchemeBuiltin => ({ name, min, max, fn, inline });
@@ -23,7 +24,9 @@ const builtin = (name: string, min: number, max: number, fn: IntrinsicFn, inline
 // --- AOT templates (see InlineFn): each falls back to the builtin itself, so its errors are unchanged ---
 
 // the checks that the arguments not already known to be numbers are
-const numberChecks = (args: string[], known: readonly boolean[]) => args.filter((_, i) => !known[i]).map(a => `typeof ${a} === "number"`);
+const numberChecks = (args: string[], known: ArgKinds) => args.filter((_, i) => known[i] !== "number").map(a => `typeof ${a} === "number"`);
+
+const allBigints = (known: ArgKinds, n: number) => n > 0 && known.length === n && known.every(k => k === "bigint");
 
 // `value` when every check holds, else `slow`; no check at all when every argument is known
 const guarded = (checks: string[], value: string, slow: string) => checks.length === 0 ? `(${value})` : `(${checks.join(" && ")} ? ${value} : ${slow})`;
@@ -33,6 +36,8 @@ const foldInline = (op: string, empty: string | null, unary: (a: string) => stri
     if (args.length === 0) return empty;
     const nonZero = divisors ? (args.length === 1 ? args : args.slice(1)).map(d => `${d} !== 0`) : [];
     const value = args.length === 1 ? unary(args[0]) : args.slice(1).reduce((acc, b) => `(${acc} ${op} ${b})`, args[0]);
+    // known bigints: JS does bigint arithmetic itself (division keeps its checks, in the builtin)
+    if (!divisors && args.length > 1 && allBigints(known, args.length)) return `(${value})`;
     return guarded([...numberChecks(args, known), ...nonZero], value, slow);
 };
 
@@ -40,6 +45,7 @@ const foldInline = (op: string, empty: string | null, unary: (a: string) => stri
 const chainInline = (op: string): InlineFn => (args, slow, _tmp, _d, known) => {
     if (args.length === 0) return null;
     const tests = args.slice(1).map((b, i) => `${args[i]} ${op} ${b}`);
+    if (args.length > 1 && allBigints(known, args.length)) return `(${tests.join(" && ")})`;
     return guarded(numberChecks(args, known), tests.length > 0 ? tests.join(" && ") : "true", slow);
 };
 
@@ -51,24 +57,14 @@ const vectorIndexOk = (v: string, k: string) => `Array.isArray(${v}) && Number.i
 
 // --- helpers ---
 
-const numAt = (name: string, regs: readonly any[], i: number): number => {
-    const val = regs[i];
-    if (typeof val !== "number") throw hostError(`${name} requires numbers, but received ${typeof val}`);
-    return val;
-};
-
-// both numbers, the second not 0
-const divisorArgs = (name: string, regs: readonly any[], start: number) => {
-    const a = regs[start], b = regs[start + 1];
-    if (typeof a !== "number" || typeof b !== "number") throw hostError(`${name}: requires numbers, but received ${typeof a}/${typeof b}`);
-    if (b === 0) throw hostError(`${name}: division by zero`);
-};
+const numAt = (name: string, regs: readonly any[], i: number): Num => requireNum(name, regs[i]);
 
 // every argument a number, and each pair of neighbours in the relation
-const chain = (name: string, holds: (a: number, b: number) => boolean): IntrinsicFn => (regs, start, nargs) => {
+const chain = (name: string, holds: (a: Num, b: Num) => boolean): IntrinsicFn => (regs, start, nargs) => {
     let prev = numAt(name, regs, start);
     for (let i = start + 1; i < start + nargs; i++) {
         const val = numAt(name, regs, i);
+        sameKind(name, prev, val);
         if (!holds(prev, val)) return false;
         prev = val;
     }
@@ -196,42 +192,30 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     builtin("+", 0, Infinity, (regs, start, nargs) => {
         if (nargs === 0) return 0;
         let acc = numAt("+", regs, start);
-        for (let i = start + 1; i < start + nargs; i++) acc += numAt("+", regs, i);
+        for (let i = start + 1; i < start + nargs; i++) acc = add(acc, numAt("+", regs, i));
         return acc;
     }, foldInline("+", "0", a => a)),
     builtin("-", 1, Infinity, (regs, start, nargs) => {
         let acc = numAt("-", regs, start);
-        if (nargs === 1) return -acc;
-        for (let i = start + 1; i < start + nargs; i++) acc -= numAt("-", regs, i);
+        if (nargs === 1) return neg(acc);
+        for (let i = start + 1; i < start + nargs; i++) acc = sub(acc, numAt("-", regs, i));
         return acc;
     }, foldInline("-", null, a => `-${a}`)),
     builtin("*", 0, Infinity, (regs, start, nargs) => {
-        let acc = 1;
-        for (let i = start; i < start + nargs; i++) acc *= numAt("*", regs, i);
+        if (nargs === 0) return 1;
+        let acc = numAt("*", regs, start);
+        for (let i = start + 1; i < start + nargs; i++) acc = mul(acc, numAt("*", regs, i));
         return acc;
     }, foldInline("*", "1", a => a)),
     builtin("/", 1, Infinity, (regs, start, nargs) => {
         let acc = numAt("/", regs, start);
-        if (nargs === 1) {
-            if (acc === 0) throw hostError("division by zero");
-            return 1 / acc;
-        }
-        for (let i = start + 1; i < start + nargs; i++) {
-            const val = numAt("/", regs, i);
-            if (val === 0) throw hostError("division by zero");
-            acc /= val;
-        }
+        if (nargs === 1) return div(typeof acc === "bigint" ? 1n : 1, acc);
+        for (let i = start + 1; i < start + nargs; i++) acc = div(acc, numAt("/", regs, i));
         return acc;
     }, foldInline("/", null, a => `1 / ${a}`, true)),
-    builtin("modulo", 2, 2, (regs, start) => {
-        divisorArgs("modulo", regs, start);
-        const a = regs[start], b = regs[start + 1];
-        return ((a % b) + b) % b;
-    }),
-    builtin("remainder", 2, 2, (regs, start) => {
-        divisorArgs("remainder", regs, start);
-        return regs[start] % regs[start + 1];
-    }),
+    builtin("modulo", 2, 2, (regs, start) => modulo("modulo", numAt("modulo", regs, start), numAt("modulo", regs, start + 1))),
+    builtin("remainder", 2, 2, (regs, start) => remainder("remainder", numAt("remainder", regs, start), numAt("remainder", regs, start + 1))),
+    builtin("quotient", 2, 2, (regs, start) => quotient(numAt("quotient", regs, start), numAt("quotient", regs, start + 1))),
     builtin("=", 1, Infinity, chain("=", (a, b) => a === b), chainInline("===")),
     builtin("eq?", 1, Infinity, allSame((a, b) => a === b), args => args.length === 0 ? null : `(${args.length === 1 ? "true" : args.slice(1).map(b => `${args[0]} === ${b}`).join(" && ")})`),
     builtin("<", 1, Infinity, chain("<", (a, b) => a < b), chainInline("<")),
@@ -241,6 +225,17 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     // DEVIATION: normal scheme requires arity 2, anima extends this to arity >=1
     builtin("eqv?", 1, Infinity, allSame(Object.is)),
     builtin("equal?", 1, Infinity, allSame(isDeepEqual)),
+
+    // exactness: (bigint x) of an integer double or a string of digits; (exact x) an integer as itself or, past a
+    // double's exact integers, a bigint; (inexact x) a double
+    builtin("bigint", 1, 1, (regs, start) => {
+        const v = regs[start];
+        if (typeof v === "string" && /^[+-]?\d+$/.test(v)) return BigInt(v);
+        if (typeof v === "bigint" || Number.isInteger(v)) return BigInt(v);
+        throw hostError(`bigint: expected an integer but got ${new ASTStringifier().stringify(v)}`);
+    }),
+    builtin("exact", 1, 1, (regs, start) => exact("exact", numAt("exact", regs, start))),
+    builtin("inexact", 1, 1, (regs, start) => Number(numAt("inexact", regs, start))),
 
     // lists
     builtin("cons", 2, 2, (regs, start) => Cons.pair(regs[start], regs[start + 1]), (args, _slow, _tmp, d) => args.length === 2 ? `${d.Cons}.pair(${args[0]}, ${args[1]})` : null),
@@ -280,15 +275,17 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
         if (!(p instanceof MCons)) throw hostError(`set-m${field}!: expected a mutable pair but got ${new ASTStringifier().stringify(p)}`);
         p[field] = regs[start + 1];
     })),
-    predicate("number?", val => typeof val === "number", a => `typeof ${a} === "number"`),
-    predicate("integer?", val => typeof val === "number" && Number.isInteger(val), a => `Number.isInteger(${a})`),
-    predicate("positive?", val => typeof val === "number" && val > 0, a => `(typeof ${a} === "number" && ${a} > 0)`),
-    predicate("negative?", val => typeof val === "number" && val < 0, a => `(typeof ${a} === "number" && ${a} < 0)`),
-    predicate("zero?", val => typeof val === "number" && val === 0, a => `${a} === 0`),
-    predicate("even?", val => requireInteger("even?", val) % 2 === 0, (a, slow) => `(Number.isInteger(${a}) ? ${a} % 2 === 0 : ${slow})`),
-    predicate("odd?", val => Math.abs(requireInteger("odd?", val) % 2) === 1, (a, slow) => `(Number.isInteger(${a}) ? Math.abs(${a} % 2) === 1 : ${slow})`),
+    predicate("number?", isNum, a => `(typeof ${a} === "number" || typeof ${a} === "bigint")`),
+    predicate("integer?", isExactInteger, a => `(Number.isInteger(${a}) || typeof ${a} === "bigint")`),
+    predicate("exact-integer?", isExactInteger, a => `(Number.isInteger(${a}) || typeof ${a} === "bigint")`),
+    predicate("bigint?", val => typeof val === "bigint", a => `typeof ${a} === "bigint"`),
+    predicate("positive?", val => isNum(val) && val > 0, a => `(typeof ${a} === "number" ? ${a} > 0 : typeof ${a} === "bigint" && ${a} > 0n)`),
+    predicate("negative?", val => isNum(val) && val < 0, a => `(typeof ${a} === "number" ? ${a} < 0 : typeof ${a} === "bigint" && ${a} < 0n)`),
+    predicate("zero?", val => isNum(val) && val == 0, a => `(${a} === 0 || ${a} === 0n)`),
+    predicate("even?", val => typeof val === "bigint" ? val % 2n === 0n : requireInteger("even?", val) % 2 === 0, (a, slow) => `(Number.isInteger(${a}) ? ${a} % 2 === 0 : ${slow})`),
+    predicate("odd?", val => typeof val === "bigint" ? val % 2n !== 0n : Math.abs(requireInteger("odd?", val) % 2) === 1, (a, slow) => `(Number.isInteger(${a}) ? Math.abs(${a} % 2) === 1 : ${slow})`),
     predicate("infinite?", val => typeof val === "number" && (val === Infinity || val === -Infinity), a => `(${a} === Infinity || ${a} === -Infinity)`),
-    predicate("finite?", val => typeof val === "number" && Number.isFinite(val), a => `Number.isFinite(${a})`),
+    predicate("finite?", val => typeof val === "bigint" || (typeof val === "number" && Number.isFinite(val)), a => `(Number.isFinite(${a}) || typeof ${a} === "bigint")`),
     predicate("nan?", val => typeof val === "number" && Number.isNaN(val), a => `Number.isNaN(${a})`),
     predicate("boolean?", val => typeof val === "boolean", a => `typeof ${a} === "boolean"`),
     predicate("void?", val => typeof val === "undefined", a => `${a} === undefined`),
@@ -352,7 +349,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     }),
 
     // misc
-    builtin("not", 1, 1, (regs, start) => !isTruthy(regs[start])),
+    builtin("not", 1, 1, (regs, start) => regs[start] === false, unaryInline(a => `${a} === false`)),
     builtin("display", 1, 1, (regs, start) => {
         console.log(regs[start]);
         return undefined;
@@ -482,11 +479,25 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
 ];
 
 // what the other builtins always return (the predicates declare theirs)
-const RETURNS: Readonly<Record<string, "number" | "boolean">> = {
-    "+": "number", "-": "number", "*": "number", "/": "number", "modulo": "number", "remainder": "number",
+// arithmetic: a number of numbers, a bigint of bigints (the two never mix, see numbers.ts)
+const sameKindResult: Returns = kinds => kinds.every(k => k === "number") ? "number" : kinds.length > 0 && kinds.every(k => k === "bigint") ? "bigint" : undefined;
+
+const RETURNS: Readonly<Record<string, Returns>> = {
+    "+": sameKindResult, "-": sameKindResult, "*": sameKindResult, "/": sameKindResult,
+    "modulo": sameKindResult, "remainder": sameKindResult, "quotient": sameKindResult,
     "length": "number", "vector-length": "number",
     "=": "boolean", "<": "boolean", "<=": "boolean", ">": "boolean", ">=": "boolean",
     "not": "boolean", "eq?": "boolean", "eqv?": "boolean", "equal?": "boolean",
+};
+
+// the builtins whose fast paths want numbers (a function's version for number parameters reads them)
+const NUMERIC = new Set(["+", "-", "*", "/", "modulo", "remainder", "quotient", "=", "<", "<=", ">", ">="]);
+
+// Scheme's kinds: doubles are "number", bigints "bigint" (booleans the VM knows itself)
+export const SCHEME_TYPES: TypeSystem = {
+    ofConstant: v => typeof v === "number" ? "number" : typeof v === "bigint" ? "bigint" : undefined,
+    guard: (kind, e) => kind === "number" ? `typeof ${e} === "number"` : kind === "bigint" ? `typeof ${e} === "bigint"` : null,
+    coerce: (kind, e) => kind === "number" ? `+${e}` : null,
 };
 
 // what the templates may refer to
@@ -505,7 +516,7 @@ const spreadList = (lst: any, into: any[] = []): any[] => {
 // and %spread makes the array %apply takes of one
 export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
     for (const { name, min, max, fn, inline, returns } of SCHEME_BUILTINS) {
-        intrinsics.register(`%${name}`, fn, { args: [min, max], leaf: true, inline, deps: inline === undefined ? undefined : INLINE_DEPS, returns: returns ?? RETURNS[name] });
+        intrinsics.register(`%${name}`, fn, { args: [min, max], leaf: true, inline, deps: inline === undefined ? undefined : INLINE_DEPS, returns: returns ?? RETURNS[name], wants: NUMERIC.has(name) ? "number" : undefined });
     }
     intrinsics.register("%list", (regs, start, nargs) => {
         let tail: Cons | null = null;

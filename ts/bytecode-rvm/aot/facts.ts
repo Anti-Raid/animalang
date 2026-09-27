@@ -1,27 +1,32 @@
-// Type facts: which registers hold a number or a boolean for certain, so inline templates can skip their type checks
-// (see InlineFn's `known`). A check V8 cannot drop costs most on numbers it keeps unboxed (floats), which it must box
-// to test. Facts come from literals, moves, and intrinsics that declare what they return (`returns`)
-import type { Intrinsics } from "../intrinsics";
+// Type facts: the kind (see Kind) each register certainly holds, so inline templates can skip their type checks (see
+// InlineFn's `known`). A check V8 cannot drop costs most on numbers it keeps unboxed (floats), which it must box to
+// test. Facts come from literals (the front end's TypeSystem.ofConstant; booleans the VM knows), moves, and intrinsics
+// that declare what they return (`returns`). The VM gives the kinds no meaning, but for "boolean" (truthiness)
+import { Intrinsics, type Kind } from "../intrinsics";
 import type { AotBlock, AotInst, AotTerm } from "./types";
+import { windowRegs } from "./liveness";
 
-export type Kind = "number" | "boolean";
 export type Facts = Map<number, Kind>;
 
-const kindOf = (value: any): Kind | undefined => typeof value === "number" ? "number" : typeof value === "boolean" ? "boolean" : undefined;
+const kindOf = (value: any, table: Intrinsics | null): Kind | undefined =>
+    typeof value === "boolean" ? "boolean" : table?.types?.ofConstant(value);
 
 // `facts` after `inst`
 export const transfer = (inst: AotInst, facts: Facts, table: Intrinsics | null, constants: readonly any[]): void => {
     const set = (reg: number, kind: Kind | undefined) => kind === undefined ? facts.delete(reg) : facts.set(reg, kind);
     switch (inst.k) {
         case "LoadInt":
-            return void facts.set(inst.dst, "number");
+            return void set(inst.dst, kindOf(inst.value, table));
         case "LoadConst":
-            return void set(inst.dst, kindOf(constants[inst.idx]));
+            return void set(inst.dst, kindOf(constants[inst.idx], table));
         case "Move":
             return void set(inst.dst, facts.get(inst.src));
         case "IntCall":
-        case "IntApply":
-            return void set(inst.dst, table?.entries[inst.pos]?.returns);
+        case "IntApply": {
+            const entry = table?.entries[inst.pos];
+            const kinds = inst.k === "IntCall" ? windowRegs(inst.start, inst.nargs).map(r => facts.get(r)) : null;
+            return void set(inst.dst, entry === undefined ? undefined : Intrinsics.resultKind(entry, kinds));
+        }
         case "Unpack":
             for (let i = 0; i <= inst.count; i++) facts.delete(inst.start + i);
             return;

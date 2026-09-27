@@ -1,6 +1,6 @@
 import type { Intrinsics } from "../bytecode-rvm/intrinsics";
 import { newIntrinsics } from "../bytecode-rvm/core";
-import { registerSchemeIntrinsics, SCHEME_ALIASES } from "./builtins";
+import { registerSchemeIntrinsics, SCHEME_ALIASES, SCHEME_TYPES } from "./builtins";
 import { SCHEME_SPECIAL_FORMS } from "./symbols";
 import { schemeFormat } from "./messages";
 
@@ -14,6 +14,7 @@ export const schemeBase = (): Intrinsics => {
     const table = newIntrinsics();
     registerSchemeIntrinsics(table);
     table.setFormatter(schemeFormat);
+    table.setTypes(SCHEME_TYPES);
     for (const sym of SCHEME_SPECIAL_FORMS) table.reserved.set(sym, "special form");
     for (const sym of SCHEME_ALIASES.keys()) table.reserved.set(sym, "builtin");
     return base = table.freeze();

@@ -12,4 +12,4 @@ export { Cons, MCons } from './scheme/list';
 export { ASTStringifier } from './scheme/printer';
 
 export * as common from './common'
-export { isTruthy, ErrorObject } from './common'
+export { ErrorObject } from './common'
