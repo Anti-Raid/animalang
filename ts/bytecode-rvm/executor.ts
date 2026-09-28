@@ -59,6 +59,8 @@ export const helperClosure = (numReg: number, constants: any[], inst: number[], 
 
 export class VMExecutor {
     public nestedResumes: number = 0;
+    // the coroutine running now, or null outside any
+    public running: Coroutine | null = null;
 
     constructor(public vm: VMHost) {}
 
@@ -524,6 +526,7 @@ export class VMExecutor {
             ctx.coroutine.frame = resumeTo;
         }
         co.status = "running";
+        this.running = co;
         if (!co.started) {
             co.started = true;
             // raised into a coroutine that never ran: there is no handler, so it dies with the error
@@ -551,6 +554,7 @@ export class VMExecutor {
         const barrier = new ExecutionContext(this.vm, co instanceof Coroutine ? co.ctx.scope : new Env());
         barrier.barrier = true;
         const outer = ctx?.coroutine ?? null;
+        const running = this.running;
         const frame = this.coResume(barrier, null, co, args, null, 0, raising);
         if (outer !== null) outer.status = "normal";
         this.nestedResumes++;
@@ -559,6 +563,7 @@ export class VMExecutor {
         } finally {
             this.nestedResumes--;
             if (outer !== null) outer.status = "running";
+            this.running = running;
         }
         return barrier.acc;
     }
@@ -586,8 +591,10 @@ export class VMExecutor {
         }
 
         const outer = ctx?.coroutine ?? null;
+        const running = this.running;
         if (outer !== null) outer.status = "normal";
         co.status = "running";
+        this.running = co;
         try {
             this.#unwindCoroutine(co);
         } catch (err) {
@@ -595,6 +602,7 @@ export class VMExecutor {
         } finally {
             co.status = "dead";
             if (outer !== null) outer.status = "running";
+            this.running = running;
         }
     }
 
@@ -624,6 +632,7 @@ export class VMExecutor {
         const resumer = co.resumer!;
         co.resumer = null;
         if (resumer.ctx.coroutine !== null) resumer.ctx.coroutine.status = "running";
+        this.running = resumer.ctx.coroutine;
         return resumer;
     }
 

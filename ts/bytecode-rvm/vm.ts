@@ -76,18 +76,28 @@ export class AnimaVM {
         }
     }
 
+    // the coroutine running the code that called into the host now, or null outside any
+    public currentCoroutine(): Coroutine | null {
+        return this.executor.running;
+    }
+
     // stack traceback of a suspended coroutine (empty if it has not started or is dead)
     public traceback(co: Coroutine, msg?: string): string {
         if (!(co instanceof Coroutine)) throw new Error("traceback: expected a coroutine");
         return formatTraceback(frameInfos(co.frame), msg, this.intrinsics.format);
     }
 
-    // an error that leaves for the host is worded, whatever path it took out
+    // an error that leaves for the host is worded, whatever path it took out; code run from the host runs outside any
+    // coroutine, until it resumes one
     #entry<T>(run: () => T): T {
+        const running = this.executor.running;
+        this.executor.running = null;
         try {
             return run();
         } catch (err) {
             throw this.message(err);
+        } finally {
+            this.executor.running = running;
         }
     }
 

@@ -386,6 +386,27 @@ describe('Anima', () => {
             expect(() => evaluator.coroutineResume(failing)).toThrow("nope");
         });
 
+        it('knows the current coroutine, from code and from the host', () => {
+            evaluator.registerIntrinsic("%test-current", () => evaluator.currentCoroutine(), { args: [0, 0], leaf: true })
+            expect(evaluator.currentCoroutine()).toBe(null)
+            expect(run(`(list (current-coroutine) (null? (%test-current)) ((car (list current-coroutine))) (%current-coroutine 'none))`)).toBe("(#f #t #f none)")
+            expect(run(`(define co (coroutine-create (lambda () (list (eq? (current-coroutine) co) (eq? (%test-current) co)))))
+                        (coroutine-resume co)`)).toBe("(#t #t)")
+            // nested: back in the outer one after the inner yields, returns or is closed
+            expect(run(`(define inner (coroutine-create (lambda () (coroutine-yield (eq? (%test-current) inner)) 'done)))
+                        (define outer (coroutine-create (lambda ()
+                            (let* ((a (coroutine-resume inner)) (b (eq? (%test-current) outer)) (c (coroutine-resume inner)) (d (eq? (current-coroutine) outer)))
+                              (list a b c d)))))
+                        (list (coroutine-resume outer) (null? (%test-current)))`)).toBe("((#t #t done #t) #t)")
+            expect(run(`(define dies (coroutine-create (lambda () (raise 'x))))
+                        (define outer2 (coroutine-create (lambda () (%catch (lambda () (coroutine-resume dies)) (lambda (e) (eq? (%test-current) outer2))))))
+                        (coroutine-resume outer2)`)).toBe("#t")
+            const co = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (coroutine-yield (eq? (%test-current) (current-coroutine))) (current-coroutine)))`))
+            expect(evaluator.coroutineResume(co).value).toBe(true)
+            expect(evaluator.currentCoroutine()).toBe(null)
+            expect(evaluator.coroutineResume(co).value).toBe(co)
+        })
+
         it('raising into a coroutine', () => {
             // the pending yield raises, under the coroutine's own handlers, and the coroutine goes on
             expect(run(`(define rc (coroutine-create (lambda () (coroutine-yield (try (lambda () (coroutine-yield 1)) (lambda (e) (list 'caught e)))) 'end)))
@@ -1559,9 +1580,9 @@ describe('Anima', () => {
         })
 
         it('%first-value truncates multiple values to the first (Lua)', () => {
-            expect(run(`(list (%first-value (values 1 2 3)) (%first-value 5) (%first-value (values)))`)).toBe("(1 5 <#void>)")
-            expect(run(`(define (two) (values 10 20)) (define (fv-sum) (+ (%first-value (two)) 1)) (fv-sum)`)).toBe("11")
-            expect(() => run(`(%first-value)`)).toThrow("%first-value: expected exactly 1 args, got 0")
+            expect(run(`(list (%first-value (values 1 2 3) 'none) (%first-value 5 'none) (%first-value (values) 'none) (%first-value (values) <#void>))`)).toBe("(1 5 none <#void>)")
+            expect(run(`(define (two) (values 10 20)) (define (fv-sum) (+ (%first-value (two) <#void>) 1)) (fv-sum)`)).toBe("11")
+            expect(() => run(`(%first-value 1)`)).toThrow("%first-value: expected exactly 2 args, got 1")
         })
 
         it('compiles without closures', () => {

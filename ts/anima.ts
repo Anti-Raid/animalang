@@ -94,6 +94,10 @@ export class Anima {
         this.#vm.closeCoroutine(co)
     }
 
+    public currentCoroutine(): any {
+        return this.#vm.currentCoroutine()
+    }
+
     public traceback(co: any, msg?: string): string {
         return this.#vm.traceback(co, msg)
     }

@@ -360,6 +360,9 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         table.register(name, fn, { args, leaf: true, ...options, deps: options.inline === undefined ? undefined : deps });
     // (%coroutine-create proc [finally]): finally is a thunk run when the coroutine, once started, is left for good
     core("%coroutine-create", [1, 2], (regs, start, nargs, ctx, executor) => executor.coCreate(ctx, regs[start], nargs === 2 ? regs[start + 1] : null), { context: true });
+    core("%current-coroutine", [1, 1], (regs, start, nargs, ctx) => ctx!.coroutine ?? regs[start], {
+        context: true, inline: ([missing]) => `(ctx.coroutine !== null ? ctx.coroutine : ${missing})`,
+    });
     core("%coroutine-status", [1, 1], (regs, start, nargs, ctx, executor) => executor.coStatus(regs[start]), { context: true });
     // closing a coroutine runs its dynamic-wind after-thunks
     core("%coroutine-close", [1, 1], (regs, start, nargs, ctx, executor) => { executor.coClose(ctx, regs[start]); }, { context: true, leaf: false });
@@ -385,10 +388,11 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%make-case-lambda", [1, Infinity], (regs, start, nargs) => new CaseLambda(regs.slice(start, start + nargs)));
     core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)));
     core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
-    core("%debug-frames", [2, 2], (regs, start, nargs, ctx) => {
+    core("%debug-frames", [3, 3], (regs, start, nargs, ctx) => {
         const { frames, args } = debugTarget(ctx, regs, start);
         const level = typeof args[0] === "number" ? args[0] : 0;
-        return frames.slice(level).map(f => [f.name, f.pos?.file ?? false, f.pos?.line ?? false, f.pos?.col ?? false]);
+        const missing = regs[start + 2];
+        return frames.slice(level).map(f => [f.name, f.pos?.file ?? missing, f.pos?.line ?? missing, f.pos?.col ?? missing]);
     }, { context: true });
     core("%debug-traceback", [2, 2], (regs, start, nargs, ctx) => {
         const { frames, args } = debugTarget(ctx, regs, start);
@@ -396,12 +400,12 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         const level = typeof args[0] === "number" ? args[0] : 0;
         return formatTraceback(frames.slice(level), tracebackMessage(msg, v => ctx!.vm.print(v)), ctx!.vm.intrinsics.format);
     }, { context: true });
-    // Lua's truncation of multiple values to one: the first value, or <#void> for none
-    core("%first-value", [1, 1], (regs, start) => {
+    // Lua's truncation of multiple values to one: the first value, or `missing` for none
+    core("%first-value", [2, 2], (regs, start) => {
         const val = regs[start];
-        return val instanceof MultipleValues ? val.values[0] : val;
-    }, { inline: unaryInline((v, d) => `(${v} instanceof ${d.MultipleValues} ? ${v}.values[0] : ${v})`) });
-    // (%marks-first set key none) / (%marks->array set key): continuation-mark-set-first / its values, innermost first
+        return val instanceof MultipleValues ? (val.values.length > 0 ? val.values[0] : regs[start + 1]) : val;
+    }, { inline: ([v, missing], slow, tmp, d) => `(${v} instanceof ${d.MultipleValues} ? (${v}.values.length > 0 ? ${v}.values[0] : ${missing}) : ${v})` });
+    // (%marks-first set key missing) / (%marks->array set key): continuation-mark-set-first / its values, innermost first
     core("%marks-first", [3, 3], (regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2]));
     core("%marks->array", [2, 2], (regs, start) => markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1]));
 

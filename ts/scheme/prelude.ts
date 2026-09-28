@@ -69,9 +69,12 @@ export const STD_PRELUDE = `
 (define $continuation-mark-set->list
     (lambda (set key) (%vector->list (%marks->array set key))))
 
+(define $current-coroutine
+    (lambda () (%current-coroutine #f)))
+
 (define $debug-frames
     (lambda args
-        (%vector->list (%debug-frames (%current-stack 1) (%list->vector args)))))
+        (%vector->list (%debug-frames (%current-stack 1) (%list->vector args) #f))))
 
 (define $debug-traceback
     (lambda args

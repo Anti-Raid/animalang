@@ -135,6 +135,7 @@ Rest parameters and `%apply` use arrays unless the table has its own sequences: 
   - Resume and yield switch coroutines inside the driver loop (every frame records its execution context), so nothing nests on the JS stack. `%coroutine-resume` in tail position is a proper tail call: the coroutine's yields and final value go straight to the caller's caller, so chains of tail resumes (schedulers, symmetric hand-offs) run in constant space. They are control operations (see below); the variadic forms take their values over the argument window.
   - The first resume passes its values as the procedure's arguments. Later resumes make the pending `%coroutine-yield` return their values, and `%coroutine-resume` returns the yielded values, both as multiple values (see `values`).
   - Status is one of `suspended`, `running`, `normal` (it resumed another coroutine) or `dead`. Resuming a non-suspended coroutine is an error.
+  - `(%current-coroutine <missing>)` is the coroutine running now, or `<missing>` outside any. A host intrinsic can ask the same with `Anima.currentCoroutine()` (the executor tracks it as coroutines switch); code the host runs, and the host itself between runs, are outside any coroutine until they resume one.
   - An error the coroutine does not handle marks it `dead` and is raised again in the resumer as-is, after the coroutine's pending `dynamic-wind` after-thunks run (innermost first, inside the coroutine, as `%coroutine-close` runs them); an error in an after-thunk replaces it.
   - `<finally>`, a thunk, runs once a coroutine that started is left for good: it returns (after the thunk, its values are the resume's), dies with an error, or is closed; not on a yield. The procedure runs as the body of a `dynamic-wind` whose after-thunk is `<finally>`, entered when it starts, so an error or a close runs it as they run any pending after-thunk, and it cannot yield. The procedure returns through a frame of the VM's that calls it, which tracebacks leave out.
   - `(%coroutine-raise <co> <obj>)` resumes `<co>` with its pending `%coroutine-yield` raising `<obj>` (non-continuably) instead of returning, so the coroutine's own handlers see it; if they handle it, the coroutine goes on, and the resume returns what it next yields or returns. A coroutine that never ran dies with the error without running. The host equivalent is `Anima.coroutineRaise(co, obj)`, which returns as `coroutineResume` does.
@@ -143,19 +144,20 @@ Rest parameters and `%apply` use arrays unless the table has its own sequences: 
   - Yielding from inside code a host function runs itself (rather than through a tail request) is an error: that code runs in a separate execution context.
 
 ### `%first-value`
-- **Form**: `(%first-value <expr>)`
-- **Semantics**: The first of `<expr>`'s multiple values, `<expr>` itself if it is a single value, or `<#void>` if it has none. This is Lua's truncation of a call used as a single value (`g() + 1`, `f(g(), x)`); the AOT emitter inlines it as an `instanceof MultipleValues` check.
+- **Form**: `(%first-value <expr> <missing>)`
+- **Semantics**: The first of `<expr>`'s multiple values, `<expr>` itself if it is a single value, or `<missing>` if it has none (Lua passes `nil`, `<#void>`). This is Lua's truncation of a call used as a single value (`g() + 1`, `f(g(), x)`); the AOT emitter inlines it as an `instanceof MultipleValues` check.
 
 ### `%debug-frames` / `%debug-traceback`
-- **Forms**: `(%debug-frames <stack> <args>)`, `(%debug-traceback <stack> <args>)`, where `<stack>` is a stack snapshot from `%current-stack` and `<args>` is the array `#([coroutine] [msg] [level])`
-- **Semantics**: Describe the frames of `<stack>` (or of a suspended coroutine) as an array of `#(name file line col)` records, or a traceback string.
+- **Forms**: `(%debug-frames <stack> <args> <missing>)`, `(%debug-traceback <stack> <args>)`, where `<stack>` is a stack snapshot from `%current-stack` and `<args>` is the array `#([coroutine] [msg] [level])`
+- **Semantics**: Describe the frames of `<stack>` (or of a suspended coroutine) as an array of `#(name file line col)` records (`<missing>` for a position it does not know), or a traceback string.
 ### Core operations
-The VM's own operations. They are intrinsics like any other (see host intrinsics), registered in `CORE_INTRINSICS` (`coreops.ts`), which every table starts from (`newIntrinsics` in `core.ts`; the compiler refuses a table that does not). So each is at the same position in every table: the compiler emits several of them itself when lowering other forms (by `corePos(name)`), and every one can also be written directly. They compile like any intrinsic (`CALLINT`, or `CALLHOST` for `%coroutine-close`), with AOT templates for the small ones. Those that need the running context are registered with `context` and get `ctx` and `executor` as extra arguments:
+The VM's own operations. They are intrinsics like any other (see host intrinsics), registered in `CORE_INTRINSICS` (`coreops.ts`), which every table starts from (`newIntrinsics` in `core.ts`; the compiler refuses a table that does not). So each is at the same position in every table: the compiler emits several of them itself when lowering other forms (by `corePos(name)`), and every one can also be written directly. They compile like any intrinsic (`CALLINT`, or `CALLHOST` for `%coroutine-close`), with AOT templates for the small ones. Those that can come up empty take the value to give then as a last `<missing>` argument, so each front end supplies its own (`#f`, say, or Lua's `nil`, which is `<#void>`), and those that need the running context are registered with `context` and get `ctx` and `executor` as extra arguments:
 
 | Form | Arguments | Leaf | What it does |
 |---|---|---|---|
 | `%coroutine-create` | 1-2 | yes | make a coroutine from a procedure, with an optional finally thunk |
 | `%coroutine-status` | 1 | yes | a coroutine's status |
+| `%current-coroutine` | 1 | yes | the coroutine running now, or the argument outside any |
 | `%coroutine-close` | 1 | no | close a coroutine, running its pending dynamic-wind after-thunks |
 | `%wind`, `%end-wind` | 2 (before, after), 0 | yes | push / pop a wind point: the steps `%dynamic-wind` lowers to. They must be balanced |
 | `%caught?`, `%caught-value`, `%make-caught` | 1 | yes | test / unwrap / make the value a `%catch` produces when its thunk raised |
@@ -166,9 +168,9 @@ The VM's own operations. They are intrinsics like any other (see host intrinsics
 | `%make-case-lambda` | 1 or more | yes | the procedure of a `%lambda` of several clauses, from their closures |
 | `%values-cons` | 2 | yes | prepend a value to multiple values |
 | `%values->array` | 1 | yes | an array of multiple values |
-| `%first-value` | 1 | yes | see above |
+| `%first-value` | 2 | yes | see above |
 | `%marks-first`, `%marks->array` | 3, 2 | yes | `continuation-mark-set-first` / the values of a key, innermost first |
-| `%debug-frames`, `%debug-traceback` | 2 | yes | see above |
+| `%debug-frames`, `%debug-traceback` | 3, 2 | yes | see above |
 
 ### Control operations
 Core operations that transfer control, so they are not leaves: `%call/cc`, `%call/ec`, `%call-catching`, `%raise`, `%current-stack`, `%coroutine-yield`, `%coroutine-resume`, `%coroutine-resume-array`, `%coroutine-raise`, `%call-with-prompt`, `%call/comp`, `%abort`, `%prompt-finish` (what a prompt's helper frame returns through: not a request, it returns the value or a `HostTail` of the handler), and `%apply-array` and `%apply-fresh` (what `%apply` of a procedure compiles to). Each returns a `ControlRequest` describing the transfer, which the VM carries out at the call (`CALLHOST`), exactly as a host intrinsic's `HostTail` is (see below): heap code with the calling frame (`run`), direct code by suspending to heap frames, or for a nested resume by running the coroutine in place (`direct`). So they need no opcodes of their own, and the interpreter handles them all in one place. The AOT compiler writes out what each one's request does at the call (`CONTROL_AOT` in `aot/emit.ts`: a template for heap code and one for direct code), so compiled code makes no request object and does not dispatch on one, which shows in tight coroutine and `call/cc` loops; the argument checks are helpers shared with the intrinsics. In debug code, a request made in tail position records its procedure (or coroutine) as the tail call. `%call/ec`, `%call-catching`, `%raise`, `%current-stack` and the yields are registered with `tail: false`: their value is that of the call itself, so they are never compiled as tail calls.

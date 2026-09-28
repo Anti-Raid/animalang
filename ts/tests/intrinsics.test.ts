@@ -325,7 +325,7 @@ describe("Control operations", () => {
             expect(run("(define (cc-loop n) (if (= n 0) 'done (%call/cc (lambda (k) (cc-loop (- n 1)))))) (cc-loop 100000)")).toBe("done")
             expect(run("(%catch (lambda () (%raise 'boom)) (lambda (e) (list 'caught e)))")).toBe("(caught boom)")
             expect(() => run("(%raise 'boom 5)")).toThrow("%raise: continuable must be #t or #f")
-            expect(run("(define (cs-f skip) (vector-ref (vector-ref (%debug-frames (%current-stack skip) #()) 0) 0)) (cs-f 0)")).toBe('"cs-f"')
+            expect(run("(define (cs-f skip) (vector-ref (vector-ref (%debug-frames (%current-stack skip) #() #f) 0) 0)) (cs-f 0)")).toBe('"cs-f"')
             expect(() => run("(%current-stack -1)")).toThrow("%current-stack: expected a count of frames to skip")
             expect(() => run("(%apply-array list '(1))")).toThrow("%apply: expected an array but got (1)")
             expect(run("(let ((co (%coroutine-create (lambda (a) (+ a (%coroutine-yield (* a 2))))))) (list (%coroutine-resume co 5) (%coroutine-resume co 1)))")).toBe("(10 6)")

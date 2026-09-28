@@ -351,10 +351,16 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     // direct calls take the snapshot in the caller itself, so no prelude frame shows in it
     for (const name of ["debug-frames", "debug-traceback"]) {
         evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
-            const call = list(Symbol.for(`%${name}`), list(OP_CURRENT_STACK), cons(Symbol.for("%vector"), expr));
+            const call = name === "debug-frames"
+                ? list(Symbol.for("%debug-frames"), list(OP_CURRENT_STACK), cons(Symbol.for("%vector"), expr), false)
+                : list(Symbol.for("%debug-traceback"), list(OP_CURRENT_STACK), cons(Symbol.for("%vector"), expr));
             return { expanded: name === "debug-frames" ? list(Symbol.for("%vector->list"), call) : call, state: TransformState.DoChildren };
         });
     }
+    evaluator.registerTransform(Symbol.for("current-coroutine"), (evaluator, expr) => {
+        if (toArray(expr).length !== 0) throw new Error("current-coroutine takes no arguments");
+        return { expanded: list(Symbol.for("%current-coroutine"), false), state: TransformState.Recurse };
+    });
     evaluator.registerTransform(OP_CURRENT_MARKS, lowerTo(OP_CURRENT_MARKS, orig => {
         if (orig.length !== 1) throw new Error("%current-marks takes no arguments");
     }));
