@@ -887,7 +887,7 @@ export class DirectEmitter extends FunctionEmitter {
                 if (${this.directGuard("clause", `${nargs}`)}) return clause.tmpl.code.directFn(ctx, clause, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
                 return executor.callCase(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
             }
-            throw Suspend.invoke(${proc}, [${args}]);
+            return executor.callOther(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
         `;
     }
 
@@ -905,7 +905,7 @@ export class DirectEmitter extends FunctionEmitter {
             } else if (proc instanceof CaseLambda) {
                 ${done} executor.callCase(ctx, proc, args, depth + 1, marks, ${frameArg});
             } else {
-                throw Suspend.invoke(proc, args);
+                ${done} executor.callOther(ctx, proc, args, depth + 1, marks, ${frameArg});
             }
         `;
     }
@@ -937,7 +937,7 @@ export class DirectEmitter extends FunctionEmitter {
                         ? clause.tmpl.code.directFn(ctx, clause, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""})
                         : executor.callCase(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
                 } else {
-                    throw Suspend.invoke(proc, [${args}]);
+                    acc = executor.callOther(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
                 }
         `;
     }

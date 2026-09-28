@@ -1,4 +1,5 @@
-import { ErrorObject, IProcedure, OpaqueValue, isDeepEqual, symGen, Table } from "../common";
+import { ErrorObject, IProcedure, OpaqueValue, isDeepEqual, symGen } from "../common";
+import { Table } from "./table";
 import { ASTStringifier } from "./printer";
 import { add, div, exact, isExactInteger, isNum, modulo, mul, neg, quotient, remainder, requireNum, sameKind, sub, type Num } from "./numbers";
 import { Cons, MCons } from "./list";
@@ -463,7 +464,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     onTable("table-size", tbl => tbl.size),
     onTable("table-keys", tbl => [...tbl.keys()]),
     onTable("table-values", tbl => [...tbl.values()]),
-    onTable("table-copy", tbl => tbl.copy()),
+    onTable("table-copy", tbl => tbl.clone()),
     onTable("table-entries", tbl => [...tbl.entries()]),
     onTable("table-freeze!", tbl => {
         tbl.frozen = true;
@@ -475,7 +476,6 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
         for (const [k, v] of source.entries()) target.set(k, v);
         return target;
     }),
-    onTable("table-border", tbl => tbl.border(), t => `${t}.border()`),
 ];
 
 // what the other builtins always return (the predicates declare theirs)
@@ -599,6 +599,7 @@ export const SCHEME_ALIASES: ReadonlyMap<symbol, SchemeAlias> = new Map([
     alias("apply", "%apply", 2, Infinity),
     alias("coroutine-create", "%coroutine-create", 1, 2, true),
     alias("coroutine-status", "%coroutine-status", 1, 1),
+    alias("coroutine-yieldable?", "%coroutine-yieldable?", 0, 0),
     alias("coroutine-close", "%coroutine-close", 1, 1),
     alias("coroutine-resume", "%coroutine-resume", 1, Infinity),
     alias("coroutine-raise", "%coroutine-raise", 2, 2),

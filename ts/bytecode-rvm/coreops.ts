@@ -225,7 +225,8 @@ export class AbortRequest extends ControlRequest {
     }
 }
 
-// (%coroutine-yield v ...): never in tail position (the value it is resumed with is the value of the call)
+// (%coroutine-yield v ...), or hostYield: the values it is resumed with are the value of the call. The core operation is
+// never in tail position; a host intrinsic's can be, and then they are its caller's
 export class YieldRequest extends ControlRequest {
     val: any = undefined;
 
@@ -236,14 +237,22 @@ export class YieldRequest extends ControlRequest {
         return r;
     }
 
-    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
-        return executor.coYield(ctx, frame, this.val);
+    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
+        return isTail ? executor.coYield(ctx, frame.parent, this.val, frame.marks, frame.mframe) : executor.coYield(ctx, frame, this.val);
     }
 
     direct(): any {
         throw Suspend.yield(this.val);
     }
 }
+
+// A host intrinsic that is not a leaf may return this instead of a value: the coroutine running the call yields `values`,
+// and the values it is resumed with are the value of the call
+export const hostYield = (...values: any[]): YieldRequest => {
+    const r = new YieldRequest();
+    r.val = values.length === 1 ? values[0] : packValues(values);
+    return r;
+};
 
 // (%coroutine-resume co v ...), or with `raising`, (%coroutine-raise co obj): args is [obj], raised by the pending yield
 export class ResumeRequest extends ControlRequest {
@@ -362,6 +371,9 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%coroutine-create", [1, 2], (regs, start, nargs, ctx, executor) => executor.coCreate(ctx, regs[start], nargs === 2 ? regs[start + 1] : null), { context: true });
     core("%current-coroutine", [1, 1], (regs, start, nargs, ctx) => ctx!.coroutine ?? regs[start], {
         context: true, inline: ([missing]) => `(ctx.coroutine !== null ? ctx.coroutine : ${missing})`,
+    });
+    core("%coroutine-yieldable?", [0, 0], (regs, start, nargs, ctx) => ctx!.coroutineYieldable, {
+        context: true, returns: "boolean", inline: () => `ctx.coroutineYieldable`,
     });
     core("%coroutine-status", [1, 1], (regs, start, nargs, ctx, executor) => executor.coStatus(regs[start]), { context: true });
     // closing a coroutine runs its dynamic-wind after-thunks

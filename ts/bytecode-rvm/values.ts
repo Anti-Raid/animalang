@@ -107,6 +107,11 @@ export class ExecutionContext {
     ) {
         this.id = ++ExecutionContext.nextId;
     }
+
+    // whether %coroutine-yield would work here: inside a coroutine that is not being closed
+    get coroutineYieldable(): boolean {
+        return this.coroutine !== null && !this.coroutine.closing;
+    }
 }
 
 // how debug code names a tail-called procedure in the tail-call trails
@@ -115,24 +120,112 @@ export const tailName = (proc: any): string =>
 
 export type CoroutineStatus = "suspended" | "running" | "normal" | "dead";
 
+// `marks`/`mframe`: those of the code that resumed it (a tail resume's frame is gone), where its errors are raised again
+export type Resumer = { ctx: ExecutionContext, frame: Frame | null, marks: Marks, mframe: number };
+
+// Its state changes only through the transitions below, which the executor makes
 export class Coroutine extends OpaqueValue {
-    public status: CoroutineStatus = "suspended";
-    public started: boolean = false;
-    public closing: boolean = false;
-    public frame: Frame | null = null;
-    // `marks`/`mframe`: those of the code that resumed it (a tail resume's frame is gone), where its errors are raised again
-    public resumer: { ctx: ExecutionContext, frame: Frame | null, marks: Marks, mframe: number } | null = null;
-    public readonly ctx: ExecutionContext;
+    #status: CoroutineStatus = "suspended";
+    #started: boolean = false;
+    #closing: boolean = false;
+    #frame: Frame | null = null;
+    // the marks where it yielded, where a raise into it is raised (a tail yield's frame is gone)
+    #marks: Marks = null;
+    #mframe: number = 0;
+    #resumer: Resumer | null = null;
+    readonly #ctx: ExecutionContext;
+    readonly #proc: any;
+    readonly #fin: any;
 
     // `fin`: a thunk run when the coroutine is left for good (it returns, dies with an error or is closed), once started
-    constructor(public readonly proc: any, vm: VMHost, scope: Env, public readonly fin: any = null) {
+    constructor(proc: any, vm: VMHost, scope: Env, fin: any = null) {
         super();
-        this.ctx = new ExecutionContext(vm, scope);
-        this.ctx.coroutine = this;
+        this.#proc = proc;
+        this.#fin = fin;
+        this.#ctx = new ExecutionContext(vm, scope);
+        this.#ctx.coroutine = this;
     }
 
     get typeName() {
         return "coroutine";
+    }
+
+    get status(): CoroutineStatus {
+        return this.#status;
+    }
+
+    // running its dynamic-wind after-thunks as it is left for good, when it cannot yield
+    get closing(): boolean {
+        return this.#closing;
+    }
+
+    // where it waits: where it yielded when suspended, where it resumed another when normal
+    get frame(): Frame | null {
+        return this.#frame;
+    }
+
+    get ctx(): ExecutionContext {
+        return this.#ctx;
+    }
+
+    get proc(): any {
+        return this.#proc;
+    }
+
+    get fin(): any {
+        return this.#fin;
+    }
+
+    // resumed by `resumer`: whether this is its first run, and the frame and marks it yielded with
+    resume(resumer: Resumer): { first: boolean, frame: Frame | null, marks: Marks, mframe: number } {
+        const first = !this.#started;
+        const frame = this.#frame;
+        this.#started = true;
+        this.#resumer = resumer;
+        this.#status = "running";
+        this.#frame = null;
+        return { first, frame, marks: this.#marks, mframe: this.#mframe };
+    }
+
+    // it resumed another coroutine, from `frame` (null for a nested resume)
+    waitOn(frame: Frame | null): void {
+        this.#status = "normal";
+        this.#frame = frame;
+    }
+
+    // the coroutine it resumed is done for now
+    wake(): void {
+        this.#status = "running";
+        this.#frame = null;
+    }
+
+    // `frame` is null when it yielded in tail position with no caller left: resuming it then returns from it
+    suspend(frame: Frame | null, marks: Marks, mframe: number): void {
+        this.#status = "suspended";
+        this.#frame = frame;
+        this.#marks = marks;
+        this.#mframe = mframe;
+    }
+
+    finish(): void {
+        this.#status = "dead";
+        this.#frame = null;
+    }
+
+    // closed while suspended: it runs again only for its after-thunks
+    startClose(): void {
+        this.#status = "running";
+        this.#frame = null;
+    }
+
+    markClosing(closing: boolean): void {
+        this.#closing = closing;
+    }
+
+    detachResumer(): Resumer {
+        const resumer = this.#resumer!;
+        this.#resumer = null;
+        return resumer;
     }
 }
 
@@ -393,7 +486,7 @@ export class Suspend {
     }
 
     static yield(val: any) {
-        return new Suspend((ctx, executor, caller) => executor.coYield(ctx, caller, val), undefined, true);
+        return new Suspend((ctx, executor, caller, sig) => executor.coYield(ctx, caller, val, sig.marks, sig.mframe), undefined, true);
     }
 }
 

@@ -98,6 +98,10 @@ export class Anima {
         return this.#vm.currentCoroutine()
     }
 
+    public coroutineYieldable(): boolean {
+        return this.#vm.coroutineYieldable()
+    }
+
     public traceback(co: any, msg?: string): string {
         return this.#vm.traceback(co, msg)
     }

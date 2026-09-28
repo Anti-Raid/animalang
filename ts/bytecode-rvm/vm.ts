@@ -81,6 +81,12 @@ export class AnimaVM {
         return this.executor.running;
     }
 
+    // whether the Anima code that called into the host now could yield: inside a coroutine that is not being closed
+    public coroutineYieldable(): boolean {
+        const co = this.executor.running;
+        return co !== null && !co.closing;
+    }
+
     // stack traceback of a suspended coroutine (empty if it has not started or is dead)
     public traceback(co: Coroutine, msg?: string): string {
         if (!(co instanceof Coroutine)) throw new Error("traceback: expected a coroutine");

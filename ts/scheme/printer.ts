@@ -1,4 +1,4 @@
-import { ErrorObject, IProcedure, MultipleValues, OpaqueValue, Table, isDatum } from "../common";
+import { ErrorObject, IProcedure, MultipleValues, OpaqueValue, isDatum } from "../common";
 
 export class ASTStringifier {
     constructor() {}
@@ -34,15 +34,6 @@ export class ASTStringifier {
         if (Array.isArray(ast)) {
             const parts = ast.map(x => this.stringify(x));
             return `#(${parts.join(" ")})`;
-        }
-
-        // Tables
-        if (ast instanceof Table) {
-            const parts: string[] = [];
-            for (const [k, v] of ast.entries()) {
-                parts.push(`${this.stringify(k)} ${this.stringify(v)}`);
-            }
-            return `{${parts.join(" ")}}`;
         }
 
         // Procs

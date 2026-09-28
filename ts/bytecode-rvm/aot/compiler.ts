@@ -1,7 +1,7 @@
 // The AOT compiler: decodes bytecode into basic blocks, generates a function's JS source (see emit.ts) and builds it,
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
 import type { TypeSystem } from "../intrinsics";
-import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, Table, packValues } from "../../common";
+import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, packValues } from "../../common";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
 import { DirectEmitter, ResumeEmitter } from "./emit";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
@@ -39,7 +39,6 @@ export const JIT_DEPS = {
     MISSING,
     MAX_JS_DEPTH,
     MAX_NESTED_RESUMES,
-    Table,
     Env,
     Frame,
     Suspend,

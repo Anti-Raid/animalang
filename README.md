@@ -11,6 +11,7 @@ The host API changed. Host functions now go through intrinsics only: there are n
 - **The function signature is `fn(regs, start, nargs)`**: the arguments are `regs[start]` to `regs[start + nargs - 1]`. `registerHostIntrinsic` functions took `(...args)` and need porting; `BuiltinFunction` callbacks already had this signature. Do not keep `regs` after the call returns.
 - **Options**: `{ args: [min, max], leaf, inline, deps }`. The argument count is checked when code compiles. Set `leaf: true` for a function that only computes a value; it is cheaper to call and can have an inline template for AOT code.
 - **Calling back into Anima**: an intrinsic that is not a leaf calls an Anima procedure by returning `hostTail(proc, ...args)` (or `hostTailFrom(proc, regs, from, count)`) instead of calling it itself. The call then runs in the VM, so the procedure can yield, capture continuations and raise.
+- **Yielding from the host**: an intrinsic that is not a leaf yields the coroutine running it by returning `hostYield(...values)`; the values the coroutine is resumed with are the value of the call.
 - **Host functions as values**: an intrinsic is not a value. Wrap it in a procedure, e.g. `(define (clamp . args) (%apply %clamp args))` for a leaf, or a fixed-arity `(lambda (f x) (%with-double f x))` for any intrinsic.
 - **Serialized code** records the intrinsics it uses by name: load it with `readFull(bytes, anima.intrinsics)` into an instance that has registered them.
 
@@ -112,7 +113,7 @@ conditions match, returns `#<void>`. Throws an error if any clause is malformed.
 
 #### Table Operations
 
-Tables are first-class associative maps with freezing support for safe FFI boundaries. Like Lua tables, keys `1..n` are stored densely in an array part and every other key in a hash part (a JavaScript `Map`). A table never holds `<#void>`: storing `<#void>` under a key removes it. Keys cannot be `<#void>` or NaN; `1` and `1.0` are the same key, and so are `0` and `-0`. Iteration visits `1..n` in order, then the other keys in insertion order.
+Tables are first-class associative maps (a JavaScript `Map`) with freezing support for safe FFI boundaries. Keys compare as `Map` keys do: `1` and `1.0` are the same key, and so are `0` and `-0`. A table never holds `<#void>`: storing `<#void>` under a key removes it. Iteration visits keys in insertion order.
 
 - `{key1 val1 key2 val2 ...}`: Literal syntax for tables. Desugars at read time to `(table key1 val1 key2 val2 ...)`. Empty table literal `{}` desugars to `(table)`. Keys and values evaluate dynamically at runtime.
 - `(table? val)`: Returns `#t` if `val` is an instance of `Table`, `#f` otherwise. Arity: 1.
@@ -123,7 +124,6 @@ Tables are first-class associative maps with freezing support for safe FFI bound
 - `(table-delete! tbl key)`: Deletes `key` and its associated value from `tbl`. Throws an error if `tbl` is frozen. Returns `#t` if the key was present and removed, `#f` otherwise. Arity: 2.
 - `(table-clear! tbl)`: Removes all entries from `tbl`. Throws an error if `tbl` is frozen. Returns `#<void>`. Arity: 1.
 - `(table-size tbl)`: Returns the number of entries stored in `tbl`. Arity: 1.
-- `(table-border tbl)`: Returns a border of `tbl`, like Lua's `#t`: the `n` such that keys `1..n` are all set and `n + 1` is not (`0` if key `1` is not set). O(1). Arity: 1.
 - `(table-empty? tbl)`: Returns `#t` if `tbl` is empty (`size === 0`), `#f` otherwise. Arity: 1.
 - `(empty? val)`: Generic empty predicate also returns `#t` for empty tables.
 - `(table-keys tbl)`: Returns a vector (native JavaScript array) containing all keys in `tbl`. Arity: 1.
@@ -139,9 +139,11 @@ Tables are first-class associative maps with freezing support for safe FFI bound
 The `Table` class exported from `animalang` provides clean integration with host TypeScript / JavaScript environments:
 
 - **Constructor**: `new Table(frozen = false)`
-- **Methods**: `.get(key)` (`undefined` when missing), `.lookup(key, missing)`, `.set(key, val)` (`undefined` removes the key), `.has(key)`, `.delete(key)`, `.clear()`, `.copy()`
-- **Properties**: `.size`, `.frozen` (getter & setter: `tbl.frozen = true`), and `.border()` (see `table-border`)
+- **Methods**: `.get(key)` (`undefined` when missing), `.lookup(key, missing)`, `.set(key, val)` (`undefined` removes the key), `.has(key)`, `.delete(key)`, `.clear()`, `.clone()` (a shallow copy)
+- **Properties**: `.size`, `.frozen` (`tbl.frozen = true`)
 - **Iteration**: Implements `Iterable<[any, any]>` (`for (const [k, v] of tbl)`), `.entries()`, `.keys()`, `.values()`
+
+`LuaTable` (also exported, from `ts/lua/table.ts`) is the Lua front end's table: keys `1..n` live densely in an array part and the rest in a hash part, `.border()` is Lua's `#t`, and keys cannot be `<#void>` or NaN. It has the same methods.
 
 Global environments are a separate class, `Env` (`anima.scope`), with `.get`, `.set`, `.has` and `.lookup`; an `Env` chains to its parent environment (user globals over the builtins).
 

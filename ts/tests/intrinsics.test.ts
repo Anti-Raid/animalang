@@ -390,5 +390,8 @@ describe("Compiler intrinsics", () => {
         expect(mentions).toEqual([]);
         // nor does the code the VM and the front end share
         expect(readFileSync(new URL("../common.ts", import.meta.url), "utf8")).not.toMatch(/\bCons\b|scheme\//);
+        // nor of either front end's tables
+        const tables = [...files, new URL("../common.ts", import.meta.url).pathname].filter(file => /\bTable\b|lua\/table|from "\.\.?\/table"/.test(readFileSync(file, "utf8")));
+        expect(tables).toEqual([]);
     });
 });

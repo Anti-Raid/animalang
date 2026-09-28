@@ -1,4 +1,6 @@
-import { isDeepEqual, Table, BS, BSReader } from '../common';
+import { isDeepEqual, BS, BSReader } from '../common';
+import { Table } from '../scheme/table';
+import { LuaTable } from '../lua/table';
 import { ASTStringifier } from '../scheme/printer';
 import { ASPParseError } from '../scheme/reader';
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -10,7 +12,7 @@ import { impl, implAot } from '../bytecode-rvm/meta';
 import { dumpFull, readFull, BYTECODE_VERSION } from '../bytecode-rvm/utils';
 import { registerTestIntrinsics } from './helpers';
 
-describe("Table internals", () => {
+describe("LuaTable internals", () => {
     it('border() is always a valid border and contents match a plain Map under random edits', () => {
         let seed = 12345
         const rand = (n: number) => {
@@ -19,7 +21,7 @@ describe("Table internals", () => {
         }
         const problems: string[] = []
         for (let round = 0; round < 20; round++) {
-            const t = new Table()
+            const t = new LuaTable()
             const model = new Map<any, any>()
             for (let step = 0; step < 150; step++) {
                 const key = rand(10) === 0 ? `s${rand(3)}` : rand(12) + 1
@@ -38,6 +40,24 @@ describe("Table internals", () => {
             for (const [k, v] of model) if (t.get(k) !== v) problems.push(`round ${round}: ${k} is ${t.get(k)}, expected ${v}`)
         }
         expect(problems).toEqual([])
+    });
+});
+describe("tables as data", () => {
+    it('compare, print and serialize themselves', () => {
+        const roundTrip = (v: any) => { const w = new BS(); w.writeValue(v); return new BSReader(w.finalize()).read() as any }
+        for (const make of [() => new Table(), () => new LuaTable()]) {
+            const a = make().set(1, "x").set("k", make().set("n", 2))
+            const b = make().set(1, "x").set("k", make().set("n", 2))
+            expect(isDeepEqual(a, b)).toBe(true)
+            expect(isDeepEqual(a, make().set(1, "x"))).toBe(false)
+            expect(new ASTStringifier().stringify(a)).toBe('{1 "x" "k" {"n" 2}}')
+            a.frozen = true
+            const back = roundTrip(a)
+            expect(back.constructor).toBe(a.constructor)
+            expect(isDeepEqual(back, a)).toBe(true)
+            expect(back.frozen).toBe(true)
+        }
+        expect(isDeepEqual(new Table().set(1, "x"), new LuaTable().set(1, "x"))).toBe(false)
     });
 });
 describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
@@ -461,8 +481,8 @@ describe('Tables (using Table class)', () => {
         expect(rawT.get("count")).toBe(5);
     });
 
-    it('stores keys 1..n in an array part and treats <#void> as absent', () => {
-        const t = new Table();
+    it('LuaTable stores keys 1..n in an array part and treats <#void> as absent', () => {
+        const t = new LuaTable();
         t.set(2, "b"); t.set(1, "a"); t.set("k", "v"); t.set(3, "c");
         expect(t.border()).toBe(3);
         expect([...t.entries()]).toEqual([[1, "a"], [2, "b"], [3, "c"], ["k", "v"]]);

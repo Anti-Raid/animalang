@@ -1,6 +1,6 @@
 // VMExecutor: calls, returns, continuations, dynamic-wind, exception delivery and coroutines, and the driver loop that
 // runs heap frames through the interpreter or AOT code
-import { Env, ErrorObject, IProcedure, Msg, UnhandledError, VMError, packValues, vmError } from "../common";
+import { Env, ErrorObject, IProcedure, Msg, TRY_CALL, UnhandledError, VMError, packValues, vmError } from "../common";
 import { BARRIER, Caught, EXCEPTION_HANDLERS, Handlers, MarkEntry, markFirst, markSet, reentersBarrier } from "../marks";
 import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
@@ -10,7 +10,7 @@ import type { VMHost } from "./bytecode";
 import { CORE_INTRINSICS, corePos, tracebackMessage } from "./coreops";
 import { BytecodeInterpreter, OpCode } from "./interpreter";
 import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
-import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos } from "./values";
+import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
@@ -127,7 +127,36 @@ export class VMExecutor {
             return this.#jumpTo(ctx, target, mapWind(target, proc.wind), callerArgs[startReg]);
         }
 
-        throw vmError(Msg.NonProcedure, proc);
+        const handler = this.#hooked(proc);
+        if (handler === null) throw vmError(Msg.NonProcedure, proc);
+        const args = [proc];
+        for (let i = 0; i < nargs; i++) args.push(callerArgs[startReg + i]);
+        return this.invoke(ctx, handler, callerFrame, args, 0, args.length, isTail, marks, mframe);
+    }
+
+    // the procedure `value` gives to be called in its place (see TRY_CALL), if it is not a procedure
+    #hooked(value: any): IProcedure | null {
+        if (value === null || value === undefined || value instanceof IProcedure) return null;
+        const handler = value[TRY_CALL];
+        return handler instanceof IProcedure ? handler : null;
+    }
+
+    // a call from direct code of what is not a closure or case-lambda: a continuation on heap frames, else the
+    // procedure the value gives (TRY_CALL), with the value before `args`
+    public callOther(ctx: ExecutionContext, value: any, args: any[], depth: number, marks: any, mframe: number): any {
+        const handler = this.#hooked(value);
+        if (handler === null) throw Suspend.invoke(value, args);
+        const all = [value, ...args];
+        if (handler instanceof CaseLambda) return this.callCase(ctx, handler, all, depth, marks, mframe);
+        if (handler instanceof Closure) {
+            if (handler.tmpl.arity.pad) return this.callPadded(ctx, handler, all, depth, marks, mframe);
+            const code = handler.tmpl.code;
+            if (depth < MAX_JS_DEPTH) {
+                if (code.directArity === all.length) return this.callDirect(ctx, handler, all, depth, marks, mframe);
+                if (code.directRestArity !== -1 && all.length >= code.directRestArity) return this.callDirectRest(ctx, handler, all, depth, marks, mframe);
+            }
+        }
+        throw Suspend.invoke(handler, all);
     }
 
     #jumpTo(ctx: ExecutionContext, frame: Frame | null, wind: WindPoint | null, val: any): Frame | null {
@@ -157,7 +186,7 @@ export class VMExecutor {
             if (ctx.pendingWind !== null) return this.advanceWindTransition(ctx);
             const co = ctx.coroutine;
             if (co === null || co.status !== "running" || co.closing) return null;
-            co.status = "dead";
+            co.finish();
             const resumer = this.#detachResumer(co);
             ctx = resumer.ctx;
             frame = resumer.frame;
@@ -391,11 +420,7 @@ export class VMExecutor {
                     ctx.wind = action.nextWind;
                 }
 
-                if (action.thunk instanceof Closure) {
-                    const pregs = this.createClosureArg(action.thunk, 0, [], 0);
-                    return this.newFrame(ctx, action.thunk, pregs, null);
-                }
-
+                if (action.thunk instanceof IProcedure || this.#hooked(action.thunk) !== null) return this.invoke(ctx, action.thunk, null, [], 0, 0, false);
                 throw vmError(Msg.NonProcedureWind, action.thunk);
             }
 
@@ -418,7 +443,6 @@ export class VMExecutor {
             const co = ctx.coroutine;
             if (co !== null && co.closing) throw err;
             if (co !== null && co.status === "running") {
-                co.frame = null;
                 // the coroutine is left: its pending dynamic-wind after-thunks run first, and an error in one replaces this one
                 let error = err.error;
                 try {
@@ -426,7 +450,7 @@ export class VMExecutor {
                 } catch (thunkErr) {
                     error = thunkErr instanceof UnhandledError ? thunkErr.error : thunkErr;
                 }
-                co.status = "dead";
+                co.finish();
                 const resumer = this.#detachResumer(co);
                 if (resumer.ctx.barrier) throw new ReRaise(error);
                 return this.handleHostException(resumer.ctx, resumer.frame, new ReRaise(error, resumer.marks, resumer.mframe));
@@ -492,7 +516,7 @@ export class VMExecutor {
     public coCreate(ctx: ExecutionContext, proc: any, fin: any = null): Coroutine {
         // the body runs as the coroutine's first frame, so it must be Anima code: a closure (builtins used as values are
         // closures too), not a continuation
-        if (!(proc instanceof Closure)) {
+        if (!(proc instanceof Closure || proc instanceof CaseLambda)) {
             throw vmError(Msg.ExpectedClosure, "coroutine-create", proc);
         }
         if (fin !== null && !(fin instanceof IProcedure)) {
@@ -519,16 +543,11 @@ export class VMExecutor {
         if (!(co instanceof Coroutine)) throw vmError(Msg.ExpectedCoroutine, who, co);
         if (co.status !== "suspended") throw vmError(Msg.CannotResume, who, co.status);
 
-        co.resumer = { ctx, frame: resumeTo, marks, mframe };
         // a coroutine resuming another keeps its frames where they can be traced while it waits
-        if (ctx.coroutine !== null) {
-            ctx.coroutine.status = "normal";
-            ctx.coroutine.frame = resumeTo;
-        }
-        co.status = "running";
+        ctx.coroutine?.waitOn(resumeTo);
+        const { first, frame, marks: yieldMarks, mframe: yieldMframe } = co.resume({ ctx, frame: resumeTo, marks, mframe });
         this.running = co;
-        if (!co.started) {
-            co.started = true;
+        if (first) {
             // raised into a coroutine that never ran: there is no handler, so it dies with the error
             if (raising) return this.raise(co.ctx, null, args[0], false);
             let bottom: Frame | null = null;
@@ -540,12 +559,10 @@ export class VMExecutor {
             }
             return this.invoke(co.ctx, co.proc, bottom, args, 0, args.length, false);
         }
-        const frame = co.frame;
-        co.frame = null;
         // (%coroutine-raise co obj): the pending yield raises obj, under the coroutine's own handlers
-        if (raising) return this.raise(co.ctx, frame, args[0], false);
+        if (raising) return this.raise(co.ctx, frame, args[0], false, yieldMarks, yieldMframe);
         co.ctx.acc = packValues(args);
-        return frame;
+        return frame !== null ? frame : this.setRetVal(co.ctx, null, co.ctx.acc);
     }
 
     // runs a coroutine to its next yield or return in a nested driver loop and returns the value (used by the host and by direct-mode code)
@@ -555,25 +572,25 @@ export class VMExecutor {
         barrier.barrier = true;
         const outer = ctx?.coroutine ?? null;
         const running = this.running;
-        const frame = this.coResume(barrier, null, co, args, null, 0, raising);
-        if (outer !== null) outer.status = "normal";
         this.nestedResumes++;
         try {
+            const frame = this.coResume(barrier, null, co, args, null, 0, raising);
+            outer?.waitOn(null);
             if (frame !== null) this.#runLoop(barrier, frame);
         } finally {
             this.nestedResumes--;
-            if (outer !== null) outer.status = "running";
+            outer?.wake();
             this.running = running;
         }
         return barrier.acc;
     }
 
-    public coYield(ctx: ExecutionContext, frame: Frame, val: any): Frame | null {
+    // `marks`/`mframe`: where it yielded, when that is not `frame` (a tail yield)
+    public coYield(ctx: ExecutionContext, frame: Frame | null, val: any, marks: Marks = frame?.marks ?? null, mframe: number = frame?.mframe ?? 0): Frame | null {
         const co = ctx.coroutine;
         if (co === null) throw vmError(Msg.YieldOutside);
         if (co.closing) throw vmError(Msg.YieldClosing);
-        co.frame = frame;
-        co.status = "suspended";
+        co.suspend(frame, marks, mframe);
         return this.#returnToResumer(co, val);
     }
 
@@ -584,24 +601,23 @@ export class VMExecutor {
         if (co.status === "dead") return;
         if (co.status !== "suspended") throw vmError(Msg.CannotClose, "coroutine-close", co.status);
 
-        co.frame = null;
         if (co.ctx.wind === null) {
-            co.status = "dead";
+            co.finish();
             return;
         }
 
         const outer = ctx?.coroutine ?? null;
         const running = this.running;
-        if (outer !== null) outer.status = "normal";
-        co.status = "running";
+        outer?.waitOn(null);
+        co.startClose();
         this.running = co;
         try {
             this.#unwindCoroutine(co);
         } catch (err) {
             throw new ReRaise(err instanceof UnhandledError ? err.error : err);
         } finally {
-            co.status = "dead";
-            if (outer !== null) outer.status = "running";
+            co.finish();
+            outer?.wake();
             this.running = running;
         }
     }
@@ -612,14 +628,14 @@ export class VMExecutor {
         const cctx = co.ctx;
         const actions = computeWindTransition(cctx.wind, null);
         if (actions.length === 0) return;
-        co.closing = true;
+        co.markClosing(true);
         try {
             cctx.pendingWind = { actions, actionIdx: 0, targetFrame: null, targetVal: undefined, targetWind: null };
             const frame = this.advanceWindTransition(cctx);
             if (frame !== null) this.#runLoop(cctx, frame);
         } finally {
             cctx.pendingWind = null;
-            co.closing = false;
+            co.markClosing(false);
         }
     }
 
@@ -628,10 +644,9 @@ export class VMExecutor {
         return this.setRetVal(resumer.ctx, resumer.frame, val);
     }
 
-    #detachResumer(co: Coroutine): NonNullable<Coroutine["resumer"]> {
-        const resumer = co.resumer!;
-        co.resumer = null;
-        if (resumer.ctx.coroutine !== null) resumer.ctx.coroutine.status = "running";
+    #detachResumer(co: Coroutine): Resumer {
+        const resumer = co.detachResumer();
+        resumer.ctx.coroutine?.wake();
         this.running = resumer.ctx.coroutine;
         return resumer;
     }

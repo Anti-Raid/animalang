@@ -1,4 +1,4 @@
-import { MissingVarError, Env } from '../common';
+import { MissingVarError, Env, ErrorObject, OpaqueValue, TRY_CALL } from '../common';
 import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
@@ -8,6 +8,7 @@ import { Anima } from '../anima';
 import { impl, implAot } from '../bytecode-rvm/meta';
 import { dumpFull, readFull, stringifyInst } from '../bytecode-rvm/utils';
 import { registerTestIntrinsics } from './helpers';
+import { hostYield } from '../bytecode-rvm/exec';
 
 describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
 let bcCache: Record<string, ByteCode> = {}
@@ -34,11 +35,6 @@ describe('Anima', () => {
 
 
     describe('Primitives, Strings & Symbols', () => {
-        it('table-border is the array-part border and is inlined', () => {
-            expect(run(`(define (tb t) (table-border t)) (let ((t {1 "a" 2 "b" 3 "c"})) (table-set! t 2 <#void>) (list (tb t) (tb {}) (tb {"x" 1}) (table-size t)))`)).toBe("(1 0 0 2)")
-            expect(run(`(let ((t {})) (table-set! t 2 "b") (table-set! t 1 "a") (table-border t))`)).toBe("2")
-            expect(() => run(`(define (tb2 t) (table-border t)) (tb2 '())`)).toThrow("table-border requires a table")
-        })
         it('inlined n-ary arithmetic agrees with the builtins', () => {
             const outcome = (src: string) => {
                 try {
@@ -405,6 +401,111 @@ describe('Anima', () => {
             expect(evaluator.coroutineResume(co).value).toBe(true)
             expect(evaluator.currentCoroutine()).toBe(null)
             expect(evaluator.coroutineResume(co).value).toBe(co)
+        })
+
+        it('calls a value whose TRY_CALL is a procedure', () => {
+            class Callable extends OpaqueValue { constructor(readonly proc: any) { super() } get typeName() { return "callable" } get [TRY_CALL]() { return this.proc } }
+            class Plain extends OpaqueValue { get typeName() { return "plain" } }
+            evaluator.registerIntrinsic("%test-callable", (regs, s) => new Callable(regs[s]), { args: [1, 1], leaf: true })
+            evaluator.registerIntrinsic("%test-with-field", (regs, s) => Object.assign(new Plain(), { [TRY_CALL]: regs[s] }), { args: [1, 1], leaf: true })
+            // a field set on the value itself
+            expect(run(`((%test-with-field (lambda (self x) (* x 2))) 21)`)).toBe("42")
+            expect(run(`(define t (%test-callable (lambda (self a b) (list 'called a b)))) (list (t 1 2) (apply t '(3 4)))`)).toBe("((called 1 2) (called 3 4))")
+            // hot, in tail position, and deeper than the js stack
+            expect(run(`(define inc (%test-callable (lambda (self n) (+ n 1)))) (define (hot i acc) (if (= i 0) acc (hot (- i 1) (inc acc)))) (hot 10000 0)`)).toBe("10000")
+            expect(run(`(define down (%test-callable (lambda (self n) (if (= n 0) 'bottom (self (- n 1)))))) (define (via n) (down n)) (via 20000)`)).toBe("bottom")
+            expect(run(`(define deep (%test-callable (lambda (self n) (if (= n 0) 0 (+ 1 (self (- n 1))))))) (deep 20000)`)).toBe("20000")
+            // padded and case-lambda procedures, and continuations still called as themselves
+            expect(run(`(define cl (%test-callable (case-lambda ((self) 'none) ((self a) a)))) (list (cl) (cl 5) (call/cc (lambda (k) ((%test-callable (lambda (self v) (k v))) 'out))))`)).toBe("(none 5 out)")
+            // <#void>, or what is not a procedure: the usual error
+            expect(() => run(`((%test-callable <#void>) 2)`)).toThrow("Attempted to call a non-procedure")
+            expect(() => run(`((%test-callable (%test-callable 1)) 2)`)).toThrow("Attempted to call a non-procedure")
+            expect(() => run(`(5 1)`)).toThrow("Attempted to call a non-procedure: 5")
+            expect(() => run(`({"call" 1} 2)`)).toThrow("Attempted to call a non-procedure")
+        })
+
+        it('yields from a host intrinsic with hostYield', () => {
+            evaluator.registerIntrinsic("%test-yield", (regs, s, n) => hostYield(...regs.slice(s, s + n)), { args: [0, Infinity] })
+            // the values it is resumed with are the call's value
+            expect(run(`(define co (coroutine-create (lambda () (list (%test-yield 1) (%test-yield 2)))))
+                        (list (coroutine-resume co) (coroutine-resume co 'a) (coroutine-resume co 'b) (coroutine-status co))`)).toBe("(1 2 (a b) dead)")
+            // in tail position: the caller's value, or with no caller left, the coroutine's
+            expect(run(`(define (y v) (%test-yield v)) (define co2 (coroutine-create (lambda () (list (y 1) 'after))))
+                        (list (coroutine-resume co2) (coroutine-resume co2 'r))`)).toBe("(1 (r after))")
+            expect(run(`(define co3 (coroutine-create (lambda () (%test-yield 1))))
+                        (list (coroutine-resume co3) (coroutine-resume co3 'x) (coroutine-status co3))`)).toBe("(1 x dead)")
+            // several values and none, in a loop hot enough for direct code
+            expect(run(`(define co4 (coroutine-create (lambda () (let loop ((i 0) (acc 0)) (if (= i 200) acc (loop (+ i 1) (+ acc (%test-yield i i))))))))
+                        (let loop ((n 1) (seen (call-with-values (lambda () (coroutine-resume co4)) list))) (if (= n 200) (list seen (coroutine-resume co4 1)) (loop (+ n 1) (call-with-values (lambda () (coroutine-resume co4 1)) list))))`)).toBe("((199 199) 200)")
+            expect(run(`(define co5 (coroutine-create (lambda () (%test-yield) 'done))) (call-with-values (lambda () (coroutine-resume co5)) list)`)).toBe("()")
+            // raised into at the yield, under the coroutine's handlers
+            expect(run(`(define co6 (coroutine-create (lambda () (%catch (lambda () (%test-yield 1)) (lambda (e) (list 'caught e))))))
+                        (list (coroutine-resume co6) (coroutine-raise co6 'boom))`)).toBe("(1 (caught boom))")
+            expect(() => run(`(%test-yield 1)`)).toThrow("coroutine-yield: not inside a coroutine")
+        })
+
+        it('lets the host suspend a coroutine on async work, then resume it or raise into it', async () => {
+            const pending: Promise<void>[] = []
+            let result: any = undefined
+            const settle = (r: { done: boolean, value: any }) => { if (r.done) result = r.value }
+            // (%test-await x): suspends the coroutine until the work settles; 'fail fails it
+            evaluator.registerIntrinsic("%test-await", (regs, s) => {
+                const co = evaluator.currentCoroutine()
+                const x = regs[s]
+                const work = new Promise<number>((resolve, reject) => setTimeout(() => x === Symbol.for("fail") ? reject(new Error("async boom")) : resolve(x * 2), 1))
+                pending.push(work.then(v => settle(evaluator.coroutineResume(co, v)), e => settle(evaluator.coroutineRaise(co, new ErrorObject(e)))))
+                return hostYield()
+            }, { args: [1, 1] })
+            const co = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda ()
+                (let* ((a (%test-await 21))
+                       (b (%catch (lambda () (%test-await 'fail)) (lambda (e) (error-object-message e))))
+                       (c (%test-await a)))
+                  (list a b c))))`))
+            settle(evaluator.coroutineResume(co))
+            let waits = 0
+            for (; pending.length > 0; waits++) {
+                expect(result).toBeUndefined()
+                expect(co.status).toBe("suspended")
+                await pending.shift()
+            }
+            expect(co.status).toBe("dead")
+            expect(waits).toBe(3)
+            expect(s.stringify(result)).toBe('(42 "async boom" 84)')
+
+            // an async failure nothing in the coroutine handles kills it, and the raise reports it to the host
+            const failing = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (%test-await 'fail) 'unreached))`))
+            evaluator.coroutineResume(failing)
+            const raised = pending.shift()!.then(() => "resolved", (e: any) => e.message)
+            expect(await raised).toBe("async boom")
+            expect(failing.status).toBe("dead")
+        })
+
+        it('knows whether it can yield', () => {
+            evaluator.registerIntrinsic("%test-yieldable", () => evaluator.coroutineYieldable(), { args: [0, 0], leaf: true })
+            expect(evaluator.coroutineYieldable()).toBe(false)
+            expect(run(`(list (coroutine-yieldable?) (coroutine-resume (coroutine-create (lambda () (coroutine-yieldable?)))))`)).toBe("(#f #t)")
+            expect(run(`(list (%test-yieldable) (coroutine-resume (coroutine-create (lambda () (%test-yieldable)))))`)).toBe("(#f #t)")
+            expect(run(`(define seen '())
+                        (define co (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1)) (lambda () (set! seen (list (coroutine-yieldable?) (%test-yieldable))))))))
+                        (coroutine-resume co) (coroutine-close co) seen`)).toBe("(#f #f)")
+        })
+
+        it('takes any procedure where the VM calls one itself', () => {
+            // dynamic-wind thunks run again by a continuation, and a coroutine's body
+            expect(run(`(define log '()) (define k #f) (define n 0)
+                        (dynamic-wind (case-lambda (() (set! log (cons 'in log))) ((x) x)) (lambda () (call/cc (lambda (c) (set! k c))) (set! n (+ n 1))) (case-lambda (() (set! log (cons 'out log))) ((x) x)))
+                        (when (< n 2) (k #f)) (reverse log)`)).toBe("(in out in out)")
+            expect(run(`(coroutine-resume (coroutine-create (case-lambda ((x) (list 'one x)) ((x y) 'two))) 5)`)).toBe("(one 5)")
+        })
+
+        it('keeps the running coroutine when a nested resume fails', () => {
+            evaluator.registerIntrinsic("%test-raise-into", (regs, s) => {
+                try { evaluator.coroutineRaise(regs[s], "boom") } catch { }
+                return evaluator.currentCoroutine()
+            }, { args: [1, 1], leaf: true })
+            expect(run(`(define fresh (coroutine-create (lambda () 1)))
+                        (define outer (coroutine-create (lambda () (eq? (%test-raise-into fresh) outer))))
+                        (list (coroutine-resume outer) (coroutine-status fresh))`)).toBe("(#t dead)")
         })
 
         it('raising into a coroutine', () => {
@@ -1690,6 +1791,13 @@ describe('Anima', () => {
             expect(run(`(let ((g (case-lambda ((a) 1)))) (set! g (lambda (a) 2)) (g 0))`)).toBe("2")
             // tail calls between clauses stay loops
             expect(run(`((lambda () (define f (case-lambda ((n) (f n 0)) ((n acc) (if (= n 0) acc (f (- n 1) (+ acc 1)))))) (f 100000)))`)).toBe("100000")
+        })
+
+        it('boxes a letrec lambda name assigned after a call in an earlier init', () => {
+            // re-entering the first init must see f as assigned since, not as the register held when it was captured
+            expect(run(`(define g #f) (define r '())
+                        (letrec ((a (call/cc (lambda (c) (set! g c) 1))) (f (lambda () 1)) (b f))
+                          (set! r (cons (procedure? b) r)) (set! f 5) (when (< (length r) 2) (g 2)) r)`)).toBe("(#f #t)")
         })
 
         it('call/cc and call/ec whose k is only called in the body are blocks', () => {

@@ -1,26 +1,10 @@
-import { Table } from "./table";
 import { Env } from "./env";
 
-export { Table, Env };
-
-   
-
-// @internal
-const DEEP_EQUAL_MISSING = Symbol("missing");
+export { Env };
 
 export const isDeepEqual = (a: any, b: any): boolean => {
     // If simple eqv? logic works, return true as no more work needed
     if (Object.is(a, b)) return true;
-
-    // Tables
-    if (a instanceof Table && b instanceof Table) {
-        if (a.size !== b.size) return false;
-        for (const [key, val] of a.entries()) {
-            const other = b.lookup(key, DEEP_EQUAL_MISSING);
-            if (other === DEEP_EQUAL_MISSING || !isDeepEqual(val, other)) return false;
-        }
-        return true;
-    }
 
     // Vectors
     if (Array.isArray(a) && Array.isArray(b)) {
@@ -193,6 +177,14 @@ export interface Datum extends SerializableBytecode {
 }
 
 export const isDatum = (v: any): v is Datum => typeof v === "object" && v !== null && v[DATUM] === true;
+
+// A value that is not a procedure but can be called (Lua's __call): `value[TRY_CALL]`, a field or a getter, is the
+// procedure to call instead, with the value before the arguments, or <#void> when it cannot be called
+export const TRY_CALL = Symbol("try-call");
+
+export interface TryCall {
+    readonly [TRY_CALL]: any;
+}
 
 export abstract class OpaqueValue {
     abstract get typeName(): string;
@@ -727,7 +719,7 @@ export class ConstPool {
     }
 
     #freezeObj(obj: any) {
-        if (typeof obj !== "object" || obj === null || isDatum(obj) || obj instanceof Table) return obj;
+        if (typeof obj !== "object" || obj === null || isDatum(obj)) return obj;
         Object.keys(obj).forEach(prop => {
             if (typeof obj[prop] === 'object' && !Object.isFrozen(obj[prop])) {
                 this.#freezeObj(obj[prop]);

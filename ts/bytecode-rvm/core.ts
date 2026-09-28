@@ -8,7 +8,7 @@ import { Intrinsics } from "./intrinsics";
 export const CORE_FORMS: ReadonlyMap<symbol, { leaf: boolean }> = new Map([
     ...["%if", "%lambda", "%quote", "%begin", "%set!", "%block", "%escape", "%loop", "%let", "%let*", "%letrec", "%let-values",
         "%let-values/strict", "%with-mark", "%current-marks", "%define-global"].map(name => [name, true] as const),
-    ...["%catch", "%dynamic-wind", "%call/ec", "%apply"].map(name => [name, false] as const),
+    ...["%catch", "%dynamic-wind", "%apply"].map(name => [name, false] as const),
 ].map(([name, leaf]) => [Symbol.for(name), Object.freeze({ leaf })]))
 
 export const isCoreForm = (sym: symbol): boolean => CORE_FORMS.has(sym)
