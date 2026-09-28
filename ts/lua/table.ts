@@ -1,10 +1,11 @@
-import { hostError } from "./errors";
+import { BSReader, DATUM, type BS, type Datum } from "../common";
+import { hostError } from "../errors";
 
 const isArrayKey = (key: any): key is number => typeof key === "number" && Number.isInteger(key) && key >= 1;
 
-// Anima's (and transpiled Luau's) table: keys 1..n live densely in an array part, everything else in a hash part.
-// Storing <#void> (undefined) removes a key, so no key maps to void.
-export class Table implements Iterable<[any, any]> {
+// Lua's table: keys 1..n live densely in an array part, everything else in a hash part.
+// Storing <#void> (undefined, Lua's nil) removes a key, so no key maps to void.
+export class LuaTable implements Datum, Iterable<[any, any]> {
     #arr: any[] = [];
     #hash: Map<any, any> = new Map();
     #frozen: boolean;
@@ -114,9 +115,56 @@ export class Table implements Iterable<[any, any]> {
         return this.entries();
     }
 
-    copy(): Table {
-        const copyTbl = new Table();
-        for (const [k, v] of this.entries()) copyTbl.set(k, v);
-        return copyTbl;
+    clone(): LuaTable {
+        const out = new LuaTable();
+        for (const [k, v] of this.entries()) out.set(k, v);
+        return out;
+    }
+
+    get [DATUM](): true {
+        return true;
+    }
+
+    get bsid() {
+        return "LuaTable";
+    }
+
+    dump(w: BS): void {
+        w.writeU32(this.#frozen ? 1 : 0);
+        w.writeU32(this.size);
+        for (const [k, v] of this.entries()) {
+            w.writeValue(k);
+            w.writeValue(v);
+        }
+    }
+
+    equals(other: any, equal: (a: any, b: any) => boolean): boolean {
+        if (!(other instanceof LuaTable) || other.size !== this.size) return false;
+        for (const [k, v] of this.entries()) {
+            const o = other.lookup(k, MISSING);
+            if (o === MISSING || !equal(v, o)) return false;
+        }
+        return true;
+    }
+
+    stringify(stringify: (v: any) => string): string {
+        const parts: string[] = [];
+        for (const [k, v] of this.entries()) parts.push(`${stringify(k)} ${stringify(v)}`);
+        return `{${parts.join(" ")}}`;
+    }
+
+    copy(): LuaTable {
+        return this;
     }
 }
+
+const MISSING = Symbol("missing");
+
+BSReader.registerType("LuaTable", r => {
+    const frozen = r.readU32() === 1;
+    const size = r.readU32();
+    const t = new LuaTable();
+    for (let i = 0; i < size; i++) t.set(r.read(), r.read());
+    t.frozen = frozen;
+    return t;
+});
