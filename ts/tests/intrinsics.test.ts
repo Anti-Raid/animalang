@@ -333,7 +333,7 @@ describe("Control operations", () => {
             expect(run("(list (call/cc (lambda (k) (k 1))) (dynamic-wind (lambda () 0) (lambda () 2) (lambda () 0)) (map call/cc (list (lambda (k) 3))))")).toBe("(1 2 (3))")
             expect(() => run("(raise 'a 'b)")).toThrow("raise: expected exactly 1 args, got 2")
             expect(() => run("(call/cc)")).toThrow("call/cc: expected exactly 1 args, got 0")
-            expect(() => run("(define (call/cc x) x)")).toThrow("cannot bind builtin call/cc")
+            expect(run("(let ((call/cc (lambda (f) 'mine))) (call/cc 1))")).toBe("mine")
         }
         // AOT code carries control operations out at the call, with no request object
         const co = createScheme(impl).compileRaw("(define (co-f v) (+ 1 (%coroutine-yield v)))") as ByteCode

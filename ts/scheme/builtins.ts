@@ -1,4 +1,4 @@
-import { ErrorObject, IProcedure, OpaqueValue, isDeepEqual, symGen } from "../common";
+import { Env, ErrorObject, IProcedure, OpaqueValue, isDeepEqual, symGen } from "../common";
 import { Table } from "./table";
 import { ASTStringifier } from "./printer";
 import { add, div, exact, isExactInteger, isNum, modulo, mul, neg, quotient, remainder, requireNum, sameKind, sub, type Num } from "./numbers";
@@ -574,6 +574,8 @@ export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
     }, { args: [1, 1], leaf: true, inline: unaryInline((a, slow, d) => `(${a} === null || (${a} instanceof ${d.Cons} && ${a}.length >= 0) ? ${a} : ${slow})`), deps: INLINE_DEPS });
     // (%apply-args arg ... lst): the arguments of (apply proc arg ... lst)
     intrinsics.register("%apply-args", (regs, start, nargs) => spreadList(regs[start + nargs - 1], regs.slice(start, start + nargs - 1)), { args: [1, Infinity], leaf: true, fresh: true });
+    // what a program that redefines a builtin binds its name to first, so reading it before the definition runs is an error
+    intrinsics.register("%unbound", () => Env.UNDEFINED, { args: [0, 0], leaf: true });
 };
 
 // A procedure whose direct calls become a core form or intrinsic: (name arg ...) is rewritten to (target arg ...) when

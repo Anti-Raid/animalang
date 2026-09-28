@@ -67,7 +67,7 @@ to achieve this is to parse multiple top-level expressions expr1 expr2... in a b
 
 ### Other Rules
 
-1. Like Scheme, Anima makes use of lexical scoping. Nested scopes inherit parent variables and can 'shadow' parent variables of the same name.
+1. Like Scheme, Anima makes use of lexical scoping. Nested scopes inherit parent variables and can 'shadow' parent variables of the same name. Builtin procedures (`car`, `map`, `list`, ...) can be shadowed too, locally or by a top-level `define`; special forms (`if`, `lambda`, `cond`, ...) and `%` intrinsics cannot.
 `define` strictly mutates or initializes within the local execution scope and never the parent scope and variables in the outermost scope 
 cannot be reassigned or mutated whatsoever for sandboxing purposes.
 

@@ -1,4 +1,5 @@
 import { IProcedure, Env } from "../common";
+import { TWINNED } from "./transformer/syntax";
 import type { Compiler } from "../bytecode-rvm/compiler";
 import type { AnimaVM } from "../bytecode-rvm/vm";
 import type { ByteCode } from "../bytecode-rvm/exec";
@@ -161,6 +162,12 @@ export const loadPrelude = (cmp: Compiler, vm: AnimaVM, evaluator: MacroEvaluato
             }
             publicScope.set(publicSym, value);
             intrinsics.reserved.set(publicSym, "builtin");
+            // what the transformer emits refers to it by this, which code cannot bind or redefine
+            if (TWINNED.has(publicSym.description!)) {
+                const twin = Symbol.for(`@${publicSym.description}`);
+                publicScope.set(twin, value);
+                intrinsics.reserved.set(twin, "builtin");
+            }
         }
     }
     publicScope.frozen = true;

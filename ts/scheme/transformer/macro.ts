@@ -1,9 +1,9 @@
-import { Env, CORE_QUOTE, SOURCE_POS } from "../../common"
+import { Env, CORE_QUOTE, OP_DEFINE_GLOBAL, SOURCE_POS } from "../../common"
 import { Cons } from "../list"
 import { Compiler } from "../../bytecode-rvm/compiler"
 import { AnimaVM } from "../../bytecode-rvm/vm"
 import type { AnimaOptions } from "../../bytecode-rvm/meta"
-import { OP_QUOTE, OP_AT } from "../symbols"
+import { OP_QUOTE, OP_AT, OP_BEGIN, OP_DEFINE } from "../symbols"
 import type { Intrinsics } from "../../bytecode-rvm/intrinsics";
 
 export enum TransformState {
@@ -18,6 +18,9 @@ export interface TransformResult {
 }
 
 export type Transform = (evaluator: MacroEvaluator, expr: any, orig: any) => TransformResult;
+
+const DEFINE_VALUES = Symbol.for("define-values")
+const UNBOUND = Symbol.for("%unbound")
 
 const MAX_TRANSFORM_DEPTH = 1000
 // how deeply transformation may recurse on the js stack: below where the stack runs out (about 1200 for the deepest
@@ -46,6 +49,68 @@ export class MacroEvaluator {
 
     registerTransform(onsym: symbol, transform: Transform) {
         this.#transformers.set(onsym, transform)
+    }
+
+    // Builtins can be shadowed: a local binding of one is renamed where it is in scope (see syntax.ts), and a top-level
+    // definition of one makes its name an ordinary global for this instance from then on (`redefined`). What the
+    // transformer itself emits refers to builtins by their `@name` twins, which code cannot bind, so neither can capture it
+    readonly #redefined = new Set<symbol>()
+
+    #internal(sym: symbol): boolean {
+        const c = sym.description?.charCodeAt(0)
+        return (c === 37 || c === 64) && Symbol.keyFor(sym) !== undefined
+    }
+
+    // whether a local binding of `sym` must be renamed: it names a builtin, or has a transformer, and is not syntax
+    shadows(sym: any): boolean {
+        if (typeof sym !== "symbol" || this.#internal(sym)) return false
+        const reserved = this.intrinsics.reserved.get(sym)
+        return reserved === "builtin" || (reserved === undefined && this.#transformers.has(sym))
+    }
+
+    isRedefined(sym: symbol): boolean {
+        return this.#redefined.has(sym)
+    }
+
+    // a top-level definition of `sym`: a builtin's name becomes an ordinary global. Whether it was one
+    redefine(sym: any): boolean {
+        if (typeof sym !== "symbol" || this.#internal(sym) || this.intrinsics.reserved.get(sym) !== "builtin") return false
+        this.#redefined.add(sym)
+        this.intrinsics.reserved.delete(sym)
+        return true
+    }
+
+    // a whole program: its top-level definitions (in top-level begins too) apply to all of it, so builtins they redefine
+    // are ordinary globals everywhere in it. As in a Racket module, such a name cannot be read before its definition has
+    // run: the program first binds it to Env.UNDEFINED (only where it is redefined for the first time, so a later program
+    // does not undo an earlier one's definition)
+    transformProgram(ast: any): any {
+        const fresh: symbol[] = []
+        const scan = (e: any) => {
+            if (!(e instanceof Cons)) return
+            const redefine = (sym: any) => { if (this.redefine(sym)) fresh.push(sym) }
+            if (e.car === OP_BEGIN) for (let p = e.cdr; p instanceof Cons; p = p.cdr) scan(p.car)
+            else if (e.car === OP_DEFINE && e.cdr instanceof Cons) redefine(e.cdr.car instanceof Cons ? e.cdr.car.car : e.cdr.car)
+            else if (e.car === DEFINE_VALUES && e.cdr instanceof Cons) {
+                let f = e.cdr.car
+                for (; f instanceof Cons; f = f.cdr) redefine(f.car)
+                redefine(f)
+            }
+        }
+        const stripped = this.#stripAt(ast)
+        scan(stripped)
+        if (fresh.length === 0) return this.transform(stripped)
+        const declare = fresh.map(sym => Cons.list(OP_DEFINE_GLOBAL, sym, Cons.list(UNBOUND)))
+        return this.transform(new Cons(OP_BEGIN, Cons.fromArray([...declare, stripped])))
+    }
+
+    // the transformer for an operator: none for a redefined builtin's name; a builtin's `@name` twin uses its builtin's
+    #transformerOf(op: symbol): Transform | undefined {
+        const own = this.#transformers.get(op)
+        if (own !== undefined) return this.#redefined.has(op) ? undefined : own
+        if (op.description?.charCodeAt(0) !== 64 || this.intrinsics.reserved.get(op) !== "builtin") return undefined
+        const key = Symbol.keyFor(op)
+        return key !== undefined ? this.#transformers.get(Symbol.for(key.slice(1))) : undefined
     }
 
     // a rewrite for calls whose operator is not a transformer keyword; returns null to leave the call alone
@@ -118,7 +183,7 @@ export class MacroEvaluator {
             }
 
             // recursively expand the macro (transformers that transform subforms themselves continue from this depth)
-            const transformer = typeof op === "symbol" ? this.#transformers.get(op) : undefined;
+            const transformer = typeof op === "symbol" ? this.#transformerOf(op) : undefined;
             if (transformer !== undefined || (typeof op !== "symbol" && this.#applicationTransform !== null)) {
                 const outer = this.#depth;
                 this.#depth = depth;

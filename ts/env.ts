@@ -2,6 +2,9 @@ import { hostError } from "./errors";
 
 // a global environment: a map of global bindings chained to a parent environment (e.g. user globals over the builtins)
 export class Env {
+    // bound to a name that is declared but not defined yet: lookups treat it as missing, and do not look further out
+    static readonly UNDEFINED: unique symbol = Symbol("undefined");
+
     #map: Map<symbol, any> = new Map();
     #parent: Env | null;
     #frozen: boolean;
@@ -31,7 +34,7 @@ export class Env {
         let curr: Env | null = this;
         while (curr !== null) {
             const val = curr.#map.get(key);
-            if (val !== undefined || curr.#map.has(key)) return val;
+            if (val !== undefined || curr.#map.has(key)) return val === Env.UNDEFINED ? missing : val;
             curr = curr.#parent;
         }
         return missing;
@@ -44,7 +47,7 @@ export class Env {
 
     has(key: symbol): boolean {
         for (let curr: Env | null = this; curr !== null; curr = curr.#parent) {
-            if (curr.#map.has(key)) return true;
+            if (curr.#map.has(key)) return curr.#map.get(key) !== Env.UNDEFINED;
         }
         return false;
     }

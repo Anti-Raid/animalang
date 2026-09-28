@@ -196,7 +196,8 @@ describe('Anima', () => {
             expect(() => run("(cadr '(1))")).toThrow("cadr: list is too short");
             expect(() => run("(cadr 5)")).toThrow("cadr: expected a pair but got 5");
             expect(() => run("(cadr 1 2)")).toThrow("cadr: expected exactly 1 args, got 2");
-            expect(() => run("(lambda (cddr) 1)")).toThrow("cannot bind builtin cddr");
+            expect(run("((lambda (cddr) cddr) 5)")).toBe("5");
+            expect(() => run("(lambda (%cddr) 1)")).toThrow("which is an intrinsic");
             expect(run("(first '(1 2 3))")).toBe("1");
             expect(run("(second '(1 2 3))")).toBe("2");
             expect(run("(third '(1 2 3))")).toBe("3");
@@ -633,14 +634,56 @@ describe('Anima', () => {
             expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(101);
         });
 
-        it('rejects binding reserved builtins', () => {
-            expect(() => run("(lambda (+) 1)")).toThrow("cannot bind builtin +");
-            expect(() => run("(let ((< 1)) <)")).toThrow("cannot bind builtin <");
-            expect(() => run("(define apply 1)")).toThrow("cannot bind builtin apply");
-            expect(() => run("(set! = 1)")).toThrow("cannot bind builtin =");
-            expect(() => run("(lambda (list) 1)")).toThrow("cannot bind builtin list");
-            expect(() => run("(lambda (car) car)")).toThrow("cannot bind builtin car");
-            expect(() => run("(define map 1)")).toThrow("cannot bind builtin map");
+        it('lets code shadow builtins, locally and at the top level', () => {
+            const fresh = (src: string) => s.stringify(evaluator.evaluateRaw(evaluator.compileRaw(src)))
+            // locally: a builtin's rewrites (inlining, direct calls) stop where its name is bound
+            expect(run(`(let ((map (lambda (f l) 'mine))) (map (lambda (x) x) '(1 2)))`)).toBe("mine")
+            expect(run(`((lambda (car) (car '(1 2))) cdr)`)).toBe("(2)")
+            expect(run(`(let ((+ -)) (+ 5 3))`)).toBe("2")
+            expect(run(`(define (f list) (list 3 4)) (f (lambda (a b) (* a b)))`)).toBe("12")
+            expect(run(`(let* ((apply 1) (apply (+ apply 1))) apply)`)).toBe("2")
+            expect(run(`(letrec ((filter (lambda (n) (if (= n 0) 'done (filter (- n 1)))))) (filter 3))`)).toBe("done")
+            expect(run(`(let loop ((cons 3) (acc 0)) (if (= cons 0) acc (loop (- cons 1) (+ acc cons))))`)).toBe("6")
+            expect(run(`(define (g) (define reverse 5) (+ reverse 1)) (g)`)).toBe("6")
+            expect(run(`(let-values (((car cdr) (values 1 2))) (+ car cdr))`)).toBe("3")
+            expect(run(`(do ((vector 0 (+ vector 1))) ((= vector 3) vector))`)).toBe("3")
+            expect(run(`(let ((length 0)) (let ((inc (lambda () (set! length (+ length 1))))) (inc) (inc) length))`)).toBe("2")
+            expect(run(`(let ((map 1)) (list map (let ((map 2)) map) map))`)).toBe("(1 2 1)")
+            // quoted data, quasiquote's literal parts and case's datums keep the name
+            expect(run(`(let ((map 1)) (list 'map \`(map ,map) (case 'map ((map) 'yes) (else 'no))))`)).toBe("(map (map 1) yes)")
+            // outside its binding the name is the builtin again, and still inlined
+            expect(run(`(list (let ((map 1)) map) (map (lambda (x) (* x 2)) '(1 2)))`)).toBe("(1 (2 4))")
+            // what the transformer emits still means the builtins, whatever the code around it binds
+            expect(run(`(let ((list 1) (cons 2) (vector 3) (car 4) (cdr 5) (null? 6) (reverse 7) (append 8) (eqv? 9) (call/cc 10) (call/ec 11) (with-exception-handler 12) (values 13))
+                          (%list \`(1 ,list ,@'(2 3)) (map (lambda (x) (+ x 1)) '(1 2)) (case 2 ((2) 'two) (else 'no)) (guard (e (#t e)) (raise 'boom)) \`#(,car)))`)).toBe("((1 1 2 3) (2 3) two boom #(4))")
+
+            expect(run(`(guard (list (#t (+ list 1))) (raise 1))`)).toBe("2")
+            expect(run(`(reset (+ 1 (shift car (car (car 10)))))`)).toBe("12")
+            expect(run(`(anima-macro twice (list 'begin (cadr orig) (cadr orig))) (let ((twice (lambda (x) (* x 2)))) (twice 5))`)).toBe("10")
+
+            // at the top level: the name is an ordinary global for the whole program, and for later ones
+            expect(fresh(`(define (early) (abs -3)) (define (abs x) (list 'mine x)) (early)`)).toBe("(mine -3)")
+            expect(fresh(`(define (map f l) 'mine) (map car '((1)))`)).toBe("mine")
+            expect(fresh(`(map (lambda (x) x) '(1))`)).toBe("mine")
+            fresh(`(define (list . xs) 'mine) (define (append . xs) 'mine) (define (cons a b) 'mine)`)
+            expect(fresh(`(let ((x 1)) (%list \`(a ,x ,@'(b)) (list 1) (cons 1 (cons 2 '()))))`)).toBe("((a 1 b) mine mine)")
+            expect(fresh(`(set! list 5) list`)).toBe("5")
+            expect(fresh(`(define-values (first second) (values 'a 'b)) (%list first second)`)).toBe("(a b)")
+            // as in a Racket module, a redefined builtin cannot be read before its definition has run, nor seen by the host
+            expect(() => fresh(`(define (early) (max 1 2)) (early) (define (max . xs) 'mine)`)).toThrow("Variable 'max' is not defined")
+            expect(evaluator.scope.has(Symbol.for("max"))).toBe(false)
+            expect(evaluator.scope.get(Symbol.for("max"))).toBeUndefined()
+            expect(fresh(`(define (max . xs) 'mine) (max 1)`)).toBe("mine")
+            // a later program keeps it
+            expect(fresh(`(max 2)`)).toBe("mine")
+
+            // syntax, intrinsics and the transformer's own names cannot be bound
+            expect(() => run("(lambda (if) 1)")).toThrow("if: bad syntax")
+            expect(() => run("(let ((guard 1)) guard)")).toThrow("guard: bad syntax")
+            expect(() => run("(lambda (%car) 1)")).toThrow("which is an intrinsic")
+            expect(() => run("(lambda (@car) 1)")).toThrow("cannot bind builtin @car")
+            expect(run("(let ((@map (lambda (f l) 'plain))) (@map (lambda (x) x) '(1)))")).toBe("plain")
+            expect(() => run("(set! = 1)")).toThrow("cannot bind builtin =")
         });
 
         it('comparisons', () => {

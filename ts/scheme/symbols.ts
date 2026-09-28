@@ -39,6 +39,7 @@ export const SCHEME_SPECIAL_FORMS: readonly symbol[] = [
     Symbol.for("let*-values"),
     OP_AT,
     OP_CASE_LAMBDA,
-    ...["when", "unless", "case", "do", "=>", "define-values", "delay", "delay-force", "parameterize", "case-lambda", "reset", "shift", "quasiquote", "unquote", "unquote-splicing"].map(name => Symbol.for(name)),
+    ...["when", "unless", "case", "do", "=>", "define-values", "delay", "delay-force", "parameterize", "case-lambda", "reset", "shift", "quasiquote", "unquote", "unquote-splicing",
+        "guard", "let/ec", "anima-macro", "with-continuation-mark"].map(name => Symbol.for(name)),
 ];
 
