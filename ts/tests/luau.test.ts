@@ -4,8 +4,9 @@ import { readFileSync, readdirSync } from 'fs';
 import { Lexer, unescapeLong, unescapeQuoted } from '../lua/syntax/lexer';
 import { parseLuau } from '../lua/syntax/parser';
 import { TOK_TEXT, Tok } from '../lua/syntax/tokens';
-import { dump } from '../lua/syntax/print';
-import { childNodes, type Comment, type ExprFunction, type Node, type Stat, type StatBlock, type StatLocal } from '../lua/syntax/ast';
+import { show } from '../lua/syntax/print';
+import { L, isForm, offsetOf, type Comment } from '../lua/syntax/ast';
+import type * as C from '../lua/syntax/ast';
 
 const kinds = (src: string) => {
     const lexer = new Lexer(src);
@@ -16,12 +17,27 @@ const kinds = (src: string) => {
     }
     return out.join(" ");
 };
-const ok = (src: string): StatBlock => {
+const ok = (src: string): C.Block => {
     const r = parseLuau(src);
     expect(r.errors).toEqual([]);
     return r.root;
 };
-const tree = (src: string) => ok(src).body.map(s => dump(s)).join(" ");
+const body = (block: C.Block): any[] => block.slice(1, -1);
+const tree = (src: string) => body(ok(src)).map(show).join(" ");
+// a form in full, offsets included, with locals numbered as they first appear (so it shows which are the same)
+const fingerprint = (root: C.Block): string => {
+    const ids = new Map<symbol, number>();
+    const write = (v: unknown): string => {
+        if (isForm(v)) return `(${v.map(write).join(" ")})`;
+        if (Array.isArray(v)) return `[${v.map(write).join(" ")}]`;
+        if (typeof v === "symbol" && !Object.values(L).includes(v as any)) {
+            if (!ids.has(v)) ids.set(v, ids.size);
+            return `$${ids.get(v)}`;
+        }
+        return typeof v === "symbol" ? v.description! : JSON.stringify(v);
+    };
+    return write(root);
+};
 const firstError = (src: string) => {
     const r = parseLuau(src), e = r.errors[0];
     if (e === undefined) return "";
@@ -87,53 +103,58 @@ describe("Luau lexer", () => {
 
 describe("Luau parser", () => {
     it("parses operators by Luau's priorities", () => {
-        expect(tree("x = 1 + 2 * 3")).toBe('(StatAssign (ExprGlobal name="x") (ExprBinary op="+" (ExprConstantNumber value=1) (ExprBinary op="*" (ExprConstantNumber value=2) (ExprConstantNumber value=3))))');
+        expect(tree("x = 1 + 2 * 3")).toBe('(assign [(global "x")] [(+ 1 (* 2 3))])');
         // ^ and .. are right associative; unary operators bind looser than ^
-        expect(tree("x = 2 ^ 3 ^ 2")).toBe('(StatAssign (ExprGlobal name="x") (ExprBinary op="^" (ExprConstantNumber value=2) (ExprBinary op="^" (ExprConstantNumber value=3) (ExprConstantNumber value=2))))');
-        expect(tree("x = -y ^ 2")).toBe('(StatAssign (ExprGlobal name="x") (ExprUnary op="-" (ExprBinary op="^" (ExprGlobal name="y") (ExprConstantNumber value=2))))');
-        expect(tree("x = a .. b .. c")).toBe('(StatAssign (ExprGlobal name="x") (ExprBinary op=".." (ExprGlobal name="a") (ExprBinary op=".." (ExprGlobal name="b") (ExprGlobal name="c"))))');
-        expect(tree("x = a or b and c == d")).toBe('(StatAssign (ExprGlobal name="x") (ExprBinary op="or" (ExprGlobal name="a") (ExprBinary op="and" (ExprGlobal name="b") (ExprBinary op="==" (ExprGlobal name="c") (ExprGlobal name="d")))))');
-        expect(tree("x = not a == b")).toBe('(StatAssign (ExprGlobal name="x") (ExprBinary op="==" (ExprUnary op="not" (ExprGlobal name="a")) (ExprGlobal name="b")))');
-        expect(tree("x = a // b % c")).toBe('(StatAssign (ExprGlobal name="x") (ExprBinary op="%" (ExprBinary op="//" (ExprGlobal name="a") (ExprGlobal name="b")) (ExprGlobal name="c")))');
+        expect(tree("x = 2 ^ 3 ^ 2")).toBe('(assign [(global "x")] [(^ 2 (^ 3 2))])');
+        expect(tree("x = -y ^ 2")).toBe('(assign [(global "x")] [(neg (^ (global "y") 2))])');
+        expect(tree("x = a .. b .. c")).toBe('(assign [(global "x")] [(.. (global "a") (.. (global "b") (global "c")))])');
+        expect(tree("x = a or b and c == d")).toBe('(assign [(global "x")] [(or (global "a") (and (global "b") (== (global "c") (global "d"))))])');
+        expect(tree("x = not a == b")).toBe('(assign [(global "x")] [(== (not (global "a")) (global "b"))])');
+        expect(tree("x = a // b % c")).toBe('(assign [(global "x")] [(% (// (global "a") (global "b")) (global "c"))])');
     });
 
     it("parses calls, indexing and methods", () => {
-        expect(tree(`a.b[c]:d("s")`)).toBe('(StatExpr (ExprCall self=true (ExprIndexName index="d" (ExprIndexExpr (ExprIndexName index="b" (ExprGlobal name="a")) (ExprGlobal name="c"))) (ExprConstantString value="s")))');
-        expect(tree(`f "s" { 1 } [[r]]`)).toBe('(StatExpr (ExprCall (ExprCall (ExprCall (ExprGlobal name="f") (ExprConstantString value="s")) (ExprTable (ExprConstantNumber value=1))) (ExprConstantString value="r")))');
-        expect(tree(`(f)(1)`)).toBe('(StatExpr (ExprCall (ExprGroup (ExprGlobal name="f")) (ExprConstantNumber value=1)))');
-        expect(tree(`f<<number, string>>(1)`)).toBe('(StatExpr (ExprCall (ExprGlobal name="f") (ExprConstantNumber value=1)))');
+        expect(tree(`a.b[c]:d("s")`)).toBe('(method (index (index (global "a") "b") (global "c")) "d" "s")');
+        expect(tree(`f "s" { 1 } [[r]]`)).toBe('(call (call (call (global "f") "s") (table 1)) "r")');
+        expect(tree(`(f)(1)`)).toBe('(call (one (global "f")) 1)');
+        expect(tree(`f<<number, string>>(1)`)).toBe('(call (global "f") 1)');
     });
 
     it("parses tables, functions and the other expressions", () => {
-        expect(tree(`t = { 1, k = 2, [3] = 4; f = function() end }`)).toBe('(StatAssign (ExprGlobal name="t") (ExprTable (ExprConstantNumber value=1) (ExprConstantString value="k") (ExprConstantNumber value=2) (ExprGlobal name="k") (ExprConstantNumber value=3) (ExprConstantNumber value=4) (ExprConstantString value="f") (ExprFunction (StatBlock))))'.replace('(ExprGlobal name="k") ', ''));
-        const fn = ok(`t = { f = function() end }`).body[0] as any;
-        expect((fn.values[0].items[0].value as ExprFunction).debugName).toBe("f");
-        expect(tree(`x = if a then 1 elseif b then 2 else 3`)).toBe('(StatAssign (ExprGlobal name="x") (ExprIfElse (ExprGlobal name="a") (ExprConstantNumber value=1) (ExprIfElse (ExprGlobal name="b") (ExprConstantNumber value=2) (ExprConstantNumber value=3))))');
-        expect(tree("x = `a{b}c{d}`")).toBe('(StatAssign (ExprGlobal name="x") (ExprInterpString (ExprGlobal name="b") (ExprGlobal name="d")))');
-        const interp = (ok("x = `a{b}c{d}e`").body[0] as any).values[0];
-        expect(interp.strings).toEqual(["a", "c", "e"]);
-        expect(tree(`x = y :: number`)).toBe('(StatAssign (ExprGlobal name="x") (ExprGroup (ExprGlobal name="y")))');
-        expect(tree(`x = #t, -1, ..., nil, true`)).toBe('(StatAssign (ExprGlobal name="x") (ExprUnary op="#" (ExprGlobal name="t")) (ExprUnary op="-" (ExprConstantNumber value=1)) (ExprVarargs) (ExprConstantNil) (ExprConstantBool value=true))');
-        expect(tree(`x = 0x1F, 0b101, 1_000, .5, 1e3`)).toBe('(StatAssign (ExprGlobal name="x") (ExprConstantNumber value=31) (ExprConstantNumber value=5) (ExprConstantNumber value=1000) (ExprConstantNumber value=0.5) (ExprConstantNumber value=1000))');
+        expect(tree(`t = { 1, k = 2, [3] = 4; f = function() end }`)).toBe('(assign [(global "t")] [(table 1 (field "k" 2) (pair 3 4) (field "f" (function [] false (block) "f")))])');
+        expect(tree(`x = if a then 1 elseif b then 2 else 3`)).toBe('(assign [(global "x")] [(ifx (global "a") 1 (ifx (global "b") 2 3))])');
+        expect(tree("x = `a{b}c{d}e`")).toBe('(assign [(global "x")] [(interp "a" (global "b") "c" (global "d") "e")])');
+        expect(tree(`x = y :: number`)).toBe('(assign [(global "x")] [(one (global "y"))])');
+        expect(tree(`x = #t, -1, ..., nil, true`)).toBe('(assign [(global "x")] [(# (global "t")) (neg 1) (...) nil true])');
+        expect(tree(`x = 0x1F, 0b101, 1_000, .5, 1e3`)).toBe('(assign [(global "x")] [31 5 1000 0.5 1000])');
     });
 
     it("parses every statement", () => {
-        expect(tree(`local a: number, b = 1, 2`)).toBe('(StatLocal vars=[a b] (ExprConstantNumber value=1) (ExprConstantNumber value=2))');
-        expect(tree(`const k = 1`)).toBe('(StatLocal vars=[k] isConst=true (ExprConstantNumber value=1))');
-        expect(tree(`a, b.c = 1, 2 x += 1 y ..= "s"`)).toBe('(StatAssign (ExprGlobal name="a") (ExprIndexName index="c" (ExprGlobal name="b")) (ExprConstantNumber value=1) (ExprConstantNumber value=2)) (StatCompoundAssign op="+" (ExprGlobal name="x") (ExprConstantNumber value=1)) (StatCompoundAssign op=".." (ExprGlobal name="y") (ExprConstantString value="s"))');
-        expect(tree(`if a then elseif b then else end`)).toBe('(StatIf (ExprGlobal name="a") (StatBlock) (StatIf (ExprGlobal name="b") (StatBlock) (StatBlock)))');
-        expect(tree(`while a do break end repeat continue until b`)).toBe('(StatWhile (ExprGlobal name="a") (StatBlock (StatBreak))) (StatRepeat (ExprGlobal name="b") (StatBlock (StatContinue)))');
-        expect(tree(`for i = 1, 10, 2 do end for k, v in pairs(t) do end`)).toBe('(StatFor var=i (ExprConstantNumber value=1) (ExprConstantNumber value=10) (ExprConstantNumber value=2) (StatBlock)) (StatForIn vars=[k v] (ExprCall (ExprGlobal name="pairs") (ExprGlobal name="t")) (StatBlock))');
-        expect(tree(`do local x end return`)).toBe('(StatBlock (StatLocal vars=[x])) (StatReturn)');
-        expect(tree(`function a.b:c(x, ...) end`)).toBe('(StatFunction (ExprIndexName index="c" (ExprIndexName index="b" (ExprGlobal name="a"))) (ExprFunction self=self args=[x] vararg=true (StatBlock)))');
-        expect(tree(`local function f<T>(x: T): T return x end`)).toBe('(StatLocalFunction name=f (ExprFunction args=[x] (StatBlock (StatReturn (ExprLocal local=x)))))');
-        expect(tree(`@native @checked function f() end`)).toBe('(StatFunction (ExprGlobal name="f") (ExprFunction (StatBlock)))');
-        expect(tree(`@[deprecated { use = "g" }] local function f() end`)).toBe('(StatLocalFunction name=f (ExprFunction (StatBlock)))');
-        expect(tree(`f(); g()`)).toBe('(StatExpr (ExprCall (ExprGlobal name="f"))) (StatExpr (ExprCall (ExprGlobal name="g")))');
+        expect(tree(`local a: number, b = 1, 2`)).toBe('(local [a b] [1 2])');
+        expect(tree(`const k = 1`)).toBe('(local [k] [1])');
+        expect(tree(`a, b.c = 1, 2 x += 1 y ..= "s"`)).toBe('(assign [(global "a") (index (global "b") "c")] [1 2]) (opset + (global "x") 1) (opset .. (global "y") "s")');
+        expect(tree(`if a then elseif b then else end`)).toBe('(if (global "a") (block) (if (global "b") (block) (block)))');
+        expect(tree(`while a do break end repeat continue until b`)).toBe('(while (global "a") (block (break))) (repeat (block (continue)) (global "b"))');
+        expect(tree(`for i = 1, 10, 2 do end for k, v in pairs(t) do end`)).toBe('(for i 1 10 2 (block)) (forin [k v] [(call (global "pairs") (global "t"))] (block))');
+        expect(tree(`do local x end return`)).toBe('(block (local [x] [])) (return)');
+        expect(tree(`function a.b:c(x, ...) end`)).toBe('(assign [(index (index (global "a") "b") "c")] [(function [self x] true (block) "c")])');
+        expect(tree(`local function f<T>(x: T): T return x end`)).toBe('(localfn f (function [x] false (block (return x)) "f"))');
+        expect(tree(`@native @checked function f() end`)).toBe('(assign [(global "f")] [(function [] false (block) "f")])');
+        expect(tree(`@[deprecated { use = "g" }] local function f() end`)).toBe('(localfn f (function [] false (block) "f"))');
+        expect(tree(`f(); g()`)).toBe('(call (global "f")) (call (global "g"))');
+    });
+
+    it("ends every form with where it starts", () => {
+        const [local, call] = body(ok(`local a = 1
+  print(a + 2)`));
+        expect(offsetOf(local as C.Form)).toBe(0);
+        const [, , sum] = call as C.Call;
+        expect(offsetOf(call as C.Form)).toBe(14);
+        expect(offsetOf(sum as C.Form)).toBe(20);
     });
 
     it("keeps its contextual keywords usable as names", () => {
-        expect(tree(`local type = 1 type = 2 continue(type) export = typeof`)).toBe('(StatLocal vars=[type] (ExprConstantNumber value=1)) (StatAssign (ExprLocal local=type) (ExprConstantNumber value=2)) (StatExpr (ExprCall (ExprGlobal name="continue") (ExprLocal local=type))) (StatAssign (ExprGlobal name="export") (ExprGlobal name="typeof"))');
+        expect(tree(`local type = 1 type = 2 continue(type) export = typeof`)).toBe('(local [type] [1]) (assign [type] [2]) (call (global "continue") type) (assign [(global "export")] [(global "typeof")])');
     });
 
     it("resolves names to the locals they refer to", () => {
@@ -143,20 +164,22 @@ describe("Luau parser", () => {
             repeat local y = 1 until y
             for i = 1, 2 do end
             return x, i`);
-        const [first, fn, second, repeat, , ret] = root.body as any[];
-        const outer = (first as StatLocal).vars[0];
-        const inFn = fn.func.body.body[0].list[0];
-        expect(inFn.local).toBe(outer);
+        const [first, fn, second, repeat, , ret] = body(root) as any[];
+        const outer = first[1][0];
+        expect(typeof outer).toBe("symbol");
+        // f's body returns the outer x
+        expect(body(fn[2][3])[0][1]).toBe(outer);
         // the new x is in scope after its own declaration, and shadows the first
-        expect(second.values[0].local).toBe(outer);
-        expect(ret.list[0].local).toBe(second.vars[0]);
+        expect(second[2][0]).toBe(outer);
+        expect(second[1][0]).not.toBe(outer);
+        expect(ret[1]).toBe(second[1][0]);
         // a repeat's condition sees its body's locals; a for's variable ends with it
-        expect(repeat.condition.local).toBe(repeat.body.body[0].vars[0]);
-        expect(ret.list[1].kind).toBe("ExprGlobal");
-        // a local function sees itself; self is a local of methods
-        const rec = ok(`local function f() return f end function t:m() return self end`).body as any[];
-        expect(rec[0].func.body.body[0].list[0].local).toBe(rec[0].name);
-        expect(rec[1].func.body.body[0].list[0].local).toBe(rec[1].func.self);
+        expect(repeat[2]).toBe(body(repeat[1])[0][1][0]);
+        expect(ret[2][0]).toBe(L.GLOBAL);
+        // a local function sees itself; self is a method's first parameter
+        const [rec, method] = body(ok(`local function f() return f end function t:m() return self end`)) as any[];
+        expect(body(rec[2][3])[0][1]).toBe(rec[1]);
+        expect(body(method[2][0][3])[0][1]).toBe(method[2][0][1][0]);
     });
 
     it("checks types but keeps none", () => {
@@ -165,10 +188,10 @@ describe("Luau parser", () => {
             "(a: number, string) -> (boolean, ...any)", "<T, U...>(T, U...) -> ()", "typeof(x)", `"lit" | true`,
             "mod.Type<number, (string)>", "(number)",
         ];
-        for (const t of types) expect(tree(`type T = ${t} local x: ${t} = 1`), t).toBe('(StatLocal vars=[x] (ExprConstantNumber value=1))');
+        for (const t of types) expect(tree(`type T = ${t} local x: ${t} = 1`), t).toBe('(local [x] [1])');
         expect(tree(`export type P<T = string, U... = ...number> = T; type function f(t) return t end`)).toBe("");
-        expect(tree(`local function f<T>(a: T, ...: number): (T, ...number) return a end`)).toBe('(StatLocalFunction name=f (ExprFunction args=[a] vararg=true (StatBlock (StatReturn (ExprLocal local=a)))))');
-        expect(tree(`local y = f<<\nnumber>>(1)`)).toBe('(StatLocal vars=[y] (ExprCall (ExprGlobal name="f") (ExprConstantNumber value=1)))');
+        expect(tree(`local function f<T>(a: T, ...: number): (T, ...number) return a end`)).toBe('(localfn f (function [a] true (block (return a)) "f"))');
+        expect(tree(`local y = f<<\nnumber>>(1)`)).toBe('(local [y] [(call (global "f") 1)])');
     });
 
     it("reports the errors Luau does, where it does", () => {
@@ -222,9 +245,9 @@ describe("Luau parser", () => {
     it("recovers from errors and keeps going", () => {
         const r = parseLuau(`local x = (1 +\nprint("next")\nlocal y = 2`);
         expect(r.errors.length).toBeGreaterThan(0);
-        expect((r.root.body[r.root.body.length - 1] as Stat).kind).toBe("StatLocal");
-        const assign = parseLuau(`(a) = 1`).root.body[0] as any;
-        expect(assign.vars[0].kind).toBe("ExprError");
+        expect(body(r.root).at(-1)![0]).toBe(L.LOCAL);
+        const [assign] = body(parseLuau(`(a) = 1`).root) as any[];
+        expect(assign[1][0][0]).toBe(L.ERROR);
     });
 
     it("stops at 100 errors unless told not to", () => {
@@ -247,28 +270,13 @@ describe("Luau parser", () => {
         expect(r.lineCount).toBe(3);
     });
 
-    it("parses Luau's own conformance scripts as Luau does", () => {
+    it("parses Luau's own conformance scripts as it always has", () => {
         const dir = new URL("./luau/conformance/", import.meta.url);
-        const expected = JSON.parse(readFileSync(new URL("./luau/luau-ast.json", import.meta.url), "utf8"));
+        const expected = JSON.parse(readFileSync(new URL("./luau/forms.json", import.meta.url), "utf8"));
         for (const file of readdirSync(dir).sort()) {
-            const src = readFileSync(new URL(file, dir), "utf8");
-            const r = parseLuau(src);
+            const r = parseLuau(readFileSync(new URL(file, dir), "utf8"));
             expect(r.errors, file).toEqual([]);
-            const want = expected[file];
-            if (want === undefined) continue;
-            const at = (from: number, to: number) => {
-                const a = r.lines.pos(from), b = r.lines.pos(to);
-                return `${a.line},${a.column} - ${b.line},${b.column}`;
-            };
-            const got: string[] = [];
-            const walk = (n: Node) => {
-                got.push(`Ast${n.kind}@${at(n.from, n.to)}`);
-                for (const c of childNodes(n)) walk(c);
-            };
-            walk(r.root);
-            got.sort();
-            expect(got.length, file).toBe(want.nodes);
-            expect(createHash("sha1").update(got.join("\n")).digest("hex"), file).toBe(want.sha1);
+            expect(createHash("sha1").update(fingerprint(r.root)).digest("hex"), file).toBe(expected[file]);
         }
     });
 });

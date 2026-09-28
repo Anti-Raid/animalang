@@ -1,9 +1,9 @@
 // Luau's parser, after Luau's Parser.cpp (function names and error messages follow it): recursive descent, expressions by
-// precedence climbing, errors collected rather than thrown (with error nodes in the tree), and names resolved to the
-// locals they refer to as they are parsed
+// precedence climbing, errors collected rather than thrown (with error forms in the tree), and names resolved to the
+// locals they refer to as they are parsed. It makes prefix forms (see ast.ts)
 import { Lexer, unescapeLong, unescapeQuoted } from "./lexer";
 import { TOK_TEXT, Tok, describe, describeKind, isReserved } from "./tokens";
-import { Local } from "./ast";
+import { L } from "./ast";
 import type * as C from "./ast";
 
 export type ParseOptions = {
@@ -23,36 +23,36 @@ class Fatal {
 }
 
 // the operator each token kind is, if any, by kind
-const BINARY: (C.BinaryOp | undefined)[] = TOK_TEXT.map(() => undefined);
-const COMPOUND: (C.BinaryOp | undefined)[] = TOK_TEXT.map(() => undefined);
-const UNARY: (C.UnaryOp | undefined)[] = TOK_TEXT.map(() => undefined);
+const BINARY: (C.BinaryHead | undefined)[] = TOK_TEXT.map(() => undefined);
+const COMPOUND: (C.BinaryHead | undefined)[] = TOK_TEXT.map(() => undefined);
+const UNARY: (C.UnaryHead | undefined)[] = TOK_TEXT.map(() => undefined);
 // a binary operator binds while its left priority is above the limit; the right one parses its right side
 const LEFT = new Uint8Array(TOK_TEXT.length), RIGHT = new Uint8Array(TOK_TEXT.length);
-const binary = (kind: Tok, op: C.BinaryOp, left: number, right: number, compound?: Tok) => {
+const binary = (kind: Tok, op: C.BinaryHead, left: number, right: number, compound?: Tok) => {
     BINARY[kind] = op;
     LEFT[kind] = left;
     RIGHT[kind] = right;
     if (compound !== undefined) COMPOUND[compound] = op;
 };
-binary(Tok.Plus, "+", 6, 6, Tok.PlusAssign);
-binary(Tok.Minus, "-", 6, 6, Tok.MinusAssign);
-binary(Tok.Star, "*", 7, 7, Tok.StarAssign);
-binary(Tok.Slash, "/", 7, 7, Tok.SlashAssign);
-binary(Tok.FloorDiv, "//", 7, 7, Tok.FloorDivAssign);
-binary(Tok.Percent, "%", 7, 7, Tok.PercentAssign);
-binary(Tok.Caret, "^", 10, 9, Tok.CaretAssign);
-binary(Tok.Concat, "..", 5, 4, Tok.ConcatAssign);
-binary(Tok.Ne, "~=", 3, 3);
-binary(Tok.Eq, "==", 3, 3);
-binary(Tok.Lt, "<", 3, 3);
-binary(Tok.Le, "<=", 3, 3);
-binary(Tok.Gt, ">", 3, 3);
-binary(Tok.Ge, ">=", 3, 3);
-binary(Tok.And, "and", 2, 2);
-binary(Tok.Or, "or", 1, 1);
-UNARY[Tok.Not] = "not";
-UNARY[Tok.Minus] = "-";
-UNARY[Tok.Hash] = "#";
+binary(Tok.Plus, L.ADD, 6, 6, Tok.PlusAssign);
+binary(Tok.Minus, L.SUB, 6, 6, Tok.MinusAssign);
+binary(Tok.Star, L.MUL, 7, 7, Tok.StarAssign);
+binary(Tok.Slash, L.DIV, 7, 7, Tok.SlashAssign);
+binary(Tok.FloorDiv, L.IDIV, 7, 7, Tok.FloorDivAssign);
+binary(Tok.Percent, L.MOD, 7, 7, Tok.PercentAssign);
+binary(Tok.Caret, L.POW, 10, 9, Tok.CaretAssign);
+binary(Tok.Concat, L.CONCAT, 5, 4, Tok.ConcatAssign);
+binary(Tok.Ne, L.NE, 3, 3);
+binary(Tok.Eq, L.EQ, 3, 3);
+binary(Tok.Lt, L.LT, 3, 3);
+binary(Tok.Le, L.LE, 3, 3);
+binary(Tok.Gt, L.GT, 3, 3);
+binary(Tok.Ge, L.GE, 3, 3);
+binary(Tok.And, L.AND, 2, 2);
+binary(Tok.Or, L.OR, 1, 1);
+UNARY[Tok.Not] = L.NOT;
+UNARY[Tok.Minus] = L.NEG;
+UNARY[Tok.Hash] = L.LEN;
 const UNARY_PRIORITY = 8;
 
 type Span = { from: number, to: number };
@@ -63,13 +63,25 @@ type Match = { kind: Tok, from: number, to: number };
 // what a type list held: how many types, whether any is named, whether a pack ends it
 type TypeList = { types: number, named: boolean, tail: boolean };
 type FunctionState = { vararg: boolean, loopDepth: number };
+// what @deprecated's checks need of an item of the table it is given
+type ItemInfo = { key: string | null, keyFrom: number, keyTo: number, value: C.Expr, valueFrom: number, valueTo: number };
 
 const isTypeFollow = (k: Tok) => k === Tok.Pipe || k === Tok.Question || k === Tok.Amp;
-const isStatLast = (s: C.Stat) => s.kind === "StatBreak" || s.kind === "StatContinue" || s.kind === "StatReturn";
-const isConstantLiteral = (e: C.Expr) =>
-    e.kind === "ExprConstantNil" || e.kind === "ExprConstantBool" || e.kind === "ExprConstantNumber" || e.kind === "ExprConstantString";
-const isLiteralTable = (e: C.Expr): boolean =>
-    e.kind === "ExprTable" && e.items.every(i => i.kind !== "general" && (isConstantLiteral(i.value) || isLiteralTable(i.value)));
+// (no list starts with a head)
+const isHead = (e: unknown, head: symbol): boolean => Array.isArray(e) && e[0] === head;
+const isStatLast = (s: C.Stat) => s[0] === L.BREAK || s[0] === L.CONTINUE || s[0] === L.RETURN;
+const isConstantLiteral = (e: C.Expr) => typeof e === "number" || typeof e === "string" || typeof e === "boolean" || e === L.NIL;
+const isLiteralTable = (e: C.Expr): boolean => {
+    if (!isHead(e, L.TABLE)) return false;
+    const t = e as C.Table;
+    for (let i = 1; i < t.length - 1; i++) {
+        const item = t[i] as C.Expr | C.Field | C.Pair;
+        if (isHead(item, L.PAIR)) return false;
+        const value = isHead(item, L.FIELD) ? (item as C.Field)[2] : item as C.Expr;
+        if (!isConstantLiteral(value) && !isLiteralTable(value)) return false;
+    }
+    return true;
+};
 const ATTRIBUTES: ReadonlySet<string> = new Set(["checked", "native", "deprecated"]);
 const NO_TYPES: TypeList = { types: 0, named: false, tail: false };
 
@@ -80,20 +92,29 @@ class Parser {
     // the span of the previous token
     #prevFrom = 0;
     #prevTo = 0;
+    // the span of the expression just parsed (forms keep only where they start)
+    #exprFrom = 0;
+    #exprTo = 0;
     readonly #errors: C.ParseError[] = [];
     readonly #comments: C.Comment[] = [];
     readonly #hotComments: C.HotComment[] = [];
-    readonly #locals = new Map<string, Local>();
-    readonly #localStack: Local[] = [];
+    readonly #locals = new Map<string, C.Local>();
+    readonly #localStack: C.Local[] = [];
+    readonly #localNames: string[] = [];
     // what each local on the stack shadows, to restore when it goes out of scope
-    readonly #shadowed: (Local | undefined)[] = [];
+    readonly #shadowed: (C.Local | undefined)[] = [];
+    readonly #consts = new Set<C.Local>();
     readonly #functions: FunctionState[] = [{ vararg: true, loopDepth: 0 }];
     // the locals of the type function being parsed, which may not refer to any other
-    #typeFunctionLocals: Set<Local> | null = null;
+    #typeFunctionLocals: Set<C.Local> | null = null;
     // of the last simple type parsed: whether it was a type pack (and one of one type), and where it starts
     #isPack = false;
     #singlePack = false;
     #typeFrom = 0;
+    // set for the next table constructor to describe its items to (for attributes' arguments)
+    #itemInfo: ItemInfo[] | null = null;
+    // the table that last described its items
+    #itemInfoOf: unknown = null;
     #endMismatchSuspect: Match;
     // tokens that stop the search for a missing closing token, with how many parsers above want them
     readonly #recoveryStop = new Map<Tok, number>([[Tok.Eof, 1]]);
@@ -106,7 +127,7 @@ class Parser {
     }
 
     parse(): C.ParseResult {
-        let root: C.StatBlock;
+        let root: C.Block;
         try {
             root = this.#parseChunk();
         } catch (e) {
@@ -114,7 +135,7 @@ class Parser {
             if (e instanceof Fatal) this.#errors.push({ from: e.from, to: e.to, message: e.message });
             else if (e instanceof RangeError) this.#errors.push({ from: l.from, to: l.to, message: "Exceeded allowed recursion depth; the program is nested too deeply to parse" });
             else throw e;
-            root = { kind: "StatBlock", from: l.from, to: l.to, body: [] };
+            root = [L.BLOCK, l.from];
         }
         const lines = this.#lexer.lines;
         return {
@@ -165,6 +186,13 @@ class Parser {
         this.#recoveryStop.set(kind, (this.#recoveryStop.get(kind) ?? 0) + delta);
     }
 
+    // an expression, with its span
+    #expr<T extends C.Expr>(e: T, from: number, to: number): T {
+        this.#exprFrom = from;
+        this.#exprTo = to;
+        return e;
+    }
+
     // --- errors ---
 
     #report(from: number, to: number, message: string): void {
@@ -179,14 +207,14 @@ class Parser {
         this.#report(this.#lexer.from, this.#lexer.to, message);
     }
 
-    #exprError(from: number, to: number, message: string): C.ExprError {
+    #exprError(from: number, to: number, message: string): C.ErrorForm {
         this.#report(from, to, message);
-        return { kind: "ExprError", from, to };
+        return this.#expr([L.ERROR, from], from, to);
     }
 
-    #statError(from: number, to: number, message: string): C.StatError {
+    #statError(from: number, to: number, message: string): C.ErrorForm {
         this.#report(from, to, message);
-        return { kind: "StatError", from, to };
+        return [L.ERROR, from];
     }
 
     #expectAndConsume(kind: Tok, context: string | null): boolean {
@@ -306,11 +334,13 @@ class Parser {
         return i === -1 || i >= b;
     }
 
-    #pushLocal(b: Binding): Local {
-        const local = new Local(b.name, b.from, b.to, b.isConst);
+    #pushLocal(b: Binding): C.Local {
+        const local = Symbol(b.name);
         this.#shadowed.push(this.#locals.get(b.name));
         this.#locals.set(b.name, local);
         this.#localStack.push(local);
+        this.#localNames.push(b.name);
+        if (b.isConst) this.#consts.add(local);
         this.#typeFunctionLocals?.add(local);
         return local;
     }
@@ -321,11 +351,12 @@ class Parser {
 
     #restoreLocals(n: number): void {
         for (let i = this.#localStack.length - 1; i >= n; i--) {
-            const name = this.#localStack[i].name, shadowed = this.#shadowed[i];
+            const name = this.#localNames[i], shadowed = this.#shadowed[i];
             if (shadowed !== undefined) this.#locals.set(name, shadowed);
             else this.#locals.delete(name);
         }
         this.#localStack.length = n;
+        this.#localNames.length = n;
         this.#shadowed.length = n;
     }
 
@@ -336,36 +367,31 @@ class Parser {
         return k === Tok.Eof || k === Tok.Else || k === Tok.ElseIf || k === Tok.End || k === Tok.Until;
     }
 
-    #parseChunk(): C.StatBlock {
+    #parseChunk(): C.Block {
         const block = this.#parseBlock();
         if (!this.#at(Tok.Eof)) this.#expectAndConsumeFail(Tok.Eof, null);
         return block;
     }
 
-    #parseBlock(): C.StatBlock {
+    #parseBlock(): C.Block {
         const n = this.#saveLocals();
         const block = this.#parseBlockNoScope();
         this.#restoreLocals(n);
         return block;
     }
 
-    #parseBlockNoScope(): C.StatBlock {
-        const body: C.Stat[] = [];
+    #parseBlockNoScope(): C.Block {
+        const block: unknown[] = [L.BLOCK];
         const from = this.#prevTo;
         while (!this.#blockFollow()) {
             const stat = this.#parseStat();
-            if (stat === null) {
-                if (this.#at(Tok.Semicolon)) this.#take();
-                continue;
-            }
-            if (this.#at(Tok.Semicolon)) {
-                this.#take();
-                stat.to = this.#prevTo;
-            }
-            body.push(stat);
+            if (this.#at(Tok.Semicolon)) this.#take();
+            if (stat === null) continue;
+            block.push(stat);
             if (isStatLast(stat)) break;
         }
-        return { kind: "StatBlock", from, to: this.#lexer.from, body };
+        block.push(from);
+        return block as C.Block;
     }
 
     // a statement, or null for one only types have (type aliases and functions)
@@ -385,27 +411,28 @@ class Parser {
         const start = this.#lexer.from;
         // an assignment (lvalue = ...) or a call statement, told apart after the expression
         const expr = this.#parsePrimaryExpr(true);
-        if (expr.kind === "ExprCall") return { kind: "StatExpr", from: expr.from, to: expr.to, expr };
+        const from = this.#exprFrom, to = this.#exprTo;
+        if (isHead(expr, L.CALL) || isHead(expr, L.METHOD)) return expr as C.Call | C.Method;
         if (this.#at(Tok.Comma) || this.#at(Tok.Assign)) return this.#parseAssignment(expr);
         const op = COMPOUND[this.#cur.kind];
         if (op !== undefined) return this.#parseCompoundAssignment(expr, op);
 
         // neither: a context-sensitive keyword
-        const ident = expr.kind === "ExprGlobal" ? expr.name : expr.kind === "ExprLocal" ? expr.local.name : null;
+        const ident = isHead(expr, L.GLOBAL) ? (expr as C.Global)[1] : typeof expr === "symbol" && expr !== L.NIL ? expr.description : null;
         if (ident === "type") return this.#parseTypeAlias();
         if (ident === "export" && this.#isName("type")) {
             this.#take();
             return this.#parseTypeAlias();
         }
-        if (ident === "continue") return this.#parseContinue(expr.from, expr.to);
-        if (ident === "const") return this.#parseLocal(expr.from, null, true);
+        if (ident === "continue") return this.#parseContinue(from, to);
+        if (ident === "const") return this.#parseLocal(from, null, true);
 
         // the lexer could not move at all: skip the token, as statements are parsed in a loop
         if (start === this.#lexer.from) this.#take();
-        return this.#statError(expr.from, expr.to, "Incomplete statement: expected assignment or a function call");
+        return this.#statError(from, to, "Incomplete statement: expected assignment or a function call");
     }
 
-    #parseIf(): C.StatIf {
+    #parseIf(): C.If {
         const start = this.#lexer.from;
         this.#take(); // if / elseif
         const condition = this.#parseExpr();
@@ -413,27 +440,24 @@ class Parser {
         this.#expectAndConsume(Tok.Then, "if statement");
         const thenBody = this.#parseBlock();
 
-        let elseBody: C.StatBlock | C.StatIf | null = null;
-        let end: number;
+        let elseBody: C.Block | C.If | null = null;
         if (this.#at(Tok.ElseIf)) {
             elseBody = this.#parseIf();
-            end = elseBody.to;
         } else {
             let matchThenElse = matchThen;
             if (this.#at(Tok.Else)) {
                 matchThenElse = this.#match();
                 this.#take();
                 const block = this.#parseBlock();
-                block.from = matchThenElse.to;
+                block[block.length - 1] = matchThenElse.to;
                 elseBody = block;
             }
-            end = this.#lexer.to;
             this.#expectMatchEndAndConsume(Tok.End, matchThenElse);
         }
-        return { kind: "StatIf", from: start, to: end, condition, thenBody, elseBody };
+        return [L.IF, condition, thenBody, elseBody, start];
     }
 
-    #parseWhile(): C.StatWhile {
+    #parseWhile(): C.While {
         const start = this.#lexer.from;
         this.#take();
         const condition = this.#parseExpr();
@@ -442,12 +466,11 @@ class Parser {
         this.#fn().loopDepth++;
         const body = this.#parseBlock();
         this.#fn().loopDepth--;
-        const end = this.#lexer.to;
         this.#expectMatchEndAndConsume(Tok.End, matchDo);
-        return { kind: "StatWhile", from: start, to: end, condition, body };
+        return [L.WHILE, condition, body, start];
     }
 
-    #parseRepeat(): C.StatRepeat {
+    #parseRepeat(): C.Repeat {
         const matchRepeat = this.#match();
         this.#take();
         // the body's locals are in scope in the condition
@@ -458,17 +481,16 @@ class Parser {
         this.#expectMatchEndAndConsume(Tok.Until, matchRepeat);
         const condition = this.#parseExpr();
         this.#restoreLocals(n);
-        return { kind: "StatRepeat", from: matchRepeat.from, to: condition.to, condition, body };
+        return [L.REPEAT, body, condition, matchRepeat.from];
     }
 
-    // do block end: the block itself, with the keywords
-    #parseDo(): C.StatBlock {
+    // do block end: the block itself
+    #parseDo(): C.Block {
         const matchDo = this.#match();
         this.#take();
         const body = this.#parseBlock();
-        body.from = matchDo.from;
-        const end = this.#lexer.to;
-        if (this.#expectMatchEndAndConsume(Tok.End, matchDo)) body.to = end;
+        body[body.length - 1] = matchDo.from;
+        this.#expectMatchEndAndConsume(Tok.End, matchDo);
         return body;
     }
 
@@ -476,15 +498,15 @@ class Parser {
         const from = this.#lexer.from, to = this.#lexer.to;
         this.#take();
         if (this.#fn().loopDepth === 0) return this.#statError(from, to, "break statement must be inside a loop");
-        return { kind: "StatBreak", from, to };
+        return [L.BREAK, from];
     }
 
     #parseContinue(from: number, to: number): C.Stat {
         if (this.#fn().loopDepth === 0) return this.#statError(from, to, "continue statement must be inside a loop");
-        return { kind: "StatContinue", from, to };
+        return [L.CONTINUE, from];
     }
 
-    #parseFor(): C.StatFor | C.StatForIn {
+    #parseFor(): C.For | C.ForIn {
         const start = this.#lexer.from;
         this.#take();
         const first = this.#parseBinding(false);
@@ -507,9 +529,8 @@ class Parser {
             const body = this.#parseBlock();
             this.#fn().loopDepth--;
             this.#restoreLocals(n);
-            const end = this.#lexer.to;
             this.#expectMatchEndAndConsume(Tok.End, matchDo);
-            return { kind: "StatFor", from: start, to: end, var: variable, init, limit, step, body };
+            return [L.FOR, variable, init, limit, step, body, start];
         }
 
         const names: Binding[] = [first];
@@ -528,42 +549,45 @@ class Parser {
         const body = this.#parseBlock();
         this.#fn().loopDepth--;
         this.#restoreLocals(n);
-        const end = this.#lexer.to;
         this.#expectMatchEndAndConsume(Tok.End, matchDo);
-        return { kind: "StatForIn", from: start, to: end, vars, values, body };
+        return [L.FORIN, vars, values, body, start];
     }
 
     // funcname ::= Name {'.' Name} [':' Name], as a chain of index expressions
     #parseFunctionName(): { expr: C.Expr, hasSelf: boolean, debugName: string | null } {
         let debugName = this.#at(Tok.Name) ? this.#cur.text : null;
         let expr = this.#parseNameExpr("function name");
+        const from = this.#exprFrom;
         while (this.#at(Tok.Dot)) {
             this.#take();
             const name = this.#parseName("field name");
             debugName = name.name;
-            expr = { kind: "ExprIndexName", from: expr.from, to: name.to, expr, index: name.name };
+            expr = this.#expr([L.INDEX, expr, name.name, from], from, name.to);
         }
         let hasSelf = false;
         if (this.#at(Tok.Colon)) {
             this.#take();
             const name = this.#parseName("method name");
             debugName = name.name;
-            expr = { kind: "ExprIndexName", from: expr.from, to: name.to, expr, index: name.name };
+            expr = this.#expr([L.INDEX, expr, name.name, from], from, name.to);
             hasSelf = true;
         }
         return { expr, hasSelf, debugName };
     }
 
     #isLValue(e: C.Expr): boolean {
-        return (e.kind === "ExprLocal" && !e.local.isConst) || e.kind === "ExprGlobal" || e.kind === "ExprIndexExpr" || e.kind === "ExprIndexName";
+        if (typeof e === "symbol") return e !== L.NIL && !this.#consts.has(e);
+        return isHead(e, L.GLOBAL) || isHead(e, L.INDEX);
     }
 
-    #lvalueError(e: C.Expr): C.ExprError {
-        if (e.kind === "ExprLocal" && e.local.isConst) return this.#exprError(e.from, e.to, `Variable '${e.local.name}' is constant and may not be reassigned`);
-        return this.#exprError(e.from, e.to, "Assigned expression must be a variable or a field");
+    // an expression that cannot be assigned, just parsed
+    #lvalueError(e: C.Expr): C.ErrorForm {
+        const from = this.#exprFrom, to = this.#exprTo;
+        if (typeof e === "symbol" && this.#consts.has(e)) return this.#exprError(from, to, `Variable '${e.description}' is constant and may not be reassigned`);
+        return this.#exprError(from, to, "Assigned expression must be a variable or a field");
     }
 
-    #parseFunctionStat(attributes: Span | null, start: number): C.StatFunction {
+    #parseFunctionStat(attributes: Span | null, start: number): C.Assign {
         const matchFunction = this.#match();
         this.#take();
         let { expr, hasSelf, debugName } = this.#parseFunctionName();
@@ -571,10 +595,10 @@ class Parser {
         this.#stop(Tok.End, 1);
         const func = this.#parseFunctionBody(hasSelf, matchFunction, debugName, null, attributes, false).func;
         this.#stop(Tok.End, -1);
-        return { kind: "StatFunction", from: start, to: func.to, name: expr, func };
+        return [L.ASSIGN, [expr], [func], start];
     }
 
-    #validateAttribute(from: number, to: number, name: string, seen: string[], args: C.Expr[]): void {
+    #validateAttribute(from: number, to: number, name: string, seen: string[], args: C.Expr[], argSpans: number[], items: ItemInfo[] | null): void {
         if (!ATTRIBUTES.has(name)) {
             this.#report(from, to, name === "" ? "Attribute name is missing" : `Invalid attribute '@${name}'`);
             return;
@@ -583,17 +607,16 @@ class Parser {
         seen.push(name);
         if (name === "deprecated" && args.length > 0) {
             if (args.length > 1) this.#report(from, to, "@deprecated can be parametrized only by 1 argument");
-            else if (args[0].kind !== "ExprTable") this.#report(args[0].from, args[0].to, "Unknown argument type for @deprecated");
-            else for (const item of args[0].items) {
-                if (item.kind === "record") {
-                    const key = item.key.value;
-                    if (key !== "use" && key !== "reason") {
-                        this.#report(item.key.from, item.key.to, `Unknown argument '${key}' for @deprecated. Only string constants for 'use' and 'reason' are allowed`);
-                    } else if (item.value.kind !== "ExprConstantString") {
-                        this.#report(item.value.from, item.value.to, `Only constant string allowed as value for '${key}'`);
+            else if (!isHead(args[0], L.TABLE) || items === null) this.#report(argSpans[0], argSpans[1], "Unknown argument type for @deprecated");
+            else for (const item of items) {
+                if (item.key !== null) {
+                    if (item.key !== "use" && item.key !== "reason") {
+                        this.#report(item.keyFrom, item.keyTo, `Unknown argument '${item.key}' for @deprecated. Only string constants for 'use' and 'reason' are allowed`);
+                    } else if (typeof item.value !== "string") {
+                        this.#report(item.valueFrom, item.valueTo, `Only constant string allowed as value for '${item.key}'`);
                     }
                 } else {
-                    this.#report(item.value.from, item.value.to, "Only constants keys 'use' and 'reason' are allowed for @deprecated attribute");
+                    this.#report(item.valueFrom, item.valueTo, "Only constants keys 'use' and 'reason' are allowed for @deprecated attribute");
                 }
             }
         }
@@ -606,7 +629,7 @@ class Parser {
         while (this.#at(Tok.Attribute) || this.#at(Tok.AttributeOpen)) {
             if (this.#at(Tok.Attribute)) {
                 const from = this.#lexer.from, to = this.#lexer.to;
-                this.#validateAttribute(from, to, this.#lexer.text, seen, []);
+                this.#validateAttribute(from, to, this.#lexer.text, seen, [], [], null);
                 this.#take();
                 first ??= { from, to };
                 continue;
@@ -618,14 +641,14 @@ class Parser {
                     const name = this.#parseName("attribute name");
                     const k = this.#cur.kind;
                     if (k === Tok.RawString || k === Tok.String || k === Tok.LBrace || k === Tok.LParen) {
-                        const { args, argsFrom, argsTo } = this.#parseCallList();
+                        const { args, argSpans, items, argsFrom, argsTo } = this.#parseCallList();
                         for (const arg of args) {
                             if (!isConstantLiteral(arg) && !isLiteralTable(arg)) this.#report(argsFrom, argsTo, "Only literals can be passed as arguments for attributes");
                         }
-                        this.#validateAttribute(name.from, name.to, name.name, seen, args);
+                        this.#validateAttribute(name.from, name.to, name.name, seen, args, argSpans, items);
                         first ??= { from: name.from, to: argsTo };
                     } else {
-                        this.#validateAttribute(name.from, name.to, name.name, seen, []);
+                        this.#validateAttribute(name.from, name.to, name.name, seen, [], [], null);
                         first ??= name;
                     }
                     if (!this.#at(Tok.Comma)) break;
@@ -671,7 +694,7 @@ class Parser {
             this.#stop(Tok.End, 1);
             const { func, local } = this.#parseFunctionBody(false, matchFunction, name.name, name, attributes, isConst);
             this.#stop(Tok.End, -1);
-            return { kind: "StatLocalFunction", from: start, to: func.to, name: local!, func, isConst };
+            return [L.LOCALFN, local!, func, start];
         }
         if (attributes !== null) {
             return this.#statError(this.#lexer.from, this.#lexer.to, `Expected 'function' after local declaration with attribute, but got ${this.#describe()} instead`);
@@ -685,26 +708,24 @@ class Parser {
             this.#take();
             this.#parseExprList(values);
         }
+        const end = values.length === 0 ? this.#prevTo : this.#exprTo;
         const vars = names.map(b => this.#pushLocal(b));
-        const end = values.length === 0 ? this.#prevTo : values[values.length - 1].to;
-        const node: C.StatLocal = { kind: "StatLocal", from: start, to: end, vars, values, isConst };
         // a const that definitely gets no value (`const x`, `const a, b = 1`) can only ever be nil
         if (isConst) {
             const last = values[values.length - 1];
-            const enough = (last !== undefined && (last.kind === "ExprCall" || last.kind === "ExprVarargs")) || values.length === vars.length;
+            const enough = (last !== undefined && (isHead(last, L.CALL) || isHead(last, L.METHOD) || isHead(last, L.VARARGS))) || values.length === vars.length;
             if (!enough) this.#report(start, end, "Missing initializer in const declaration");
         }
-        return node;
+        return [L.LOCAL, vars, values, start];
     }
 
-    #parseReturn(): C.StatReturn {
+    #parseReturn(): C.Return {
+        const ret: unknown[] = [L.RETURN];
         const start = this.#lexer.from;
-        let end = this.#lexer.to;
         this.#take();
-        const list: C.Expr[] = [];
-        if (!this.#blockFollow() && !this.#at(Tok.Semicolon)) this.#parseExprList(list);
-        if (list.length > 0) end = list[list.length - 1].to;
-        return { kind: "StatReturn", from: start, to: end, list };
+        if (!this.#blockFollow() && !this.#at(Tok.Semicolon)) this.#parseExprList(ret as C.Expr[]);
+        ret.push(start);
+        return ret as C.Return;
     }
 
     // type Name ['<' generics '>'] '=' Type, or a type function (`type` already taken)
@@ -730,9 +751,10 @@ class Parser {
         return null;
     }
 
-    #parseAssignment(initial: C.Expr): C.StatAssign {
-        const first = this.#isLValue(initial) ? initial : this.#lvalueError(initial);
-        const vars: C.Expr[] = [first];
+    // `initial` just parsed
+    #parseAssignment(initial: C.Expr): C.Assign {
+        const start = this.#exprFrom;
+        const vars: C.Expr[] = [this.#isLValue(initial) ? initial : this.#lvalueError(initial)];
         while (this.#at(Tok.Comma)) {
             this.#take();
             const e = this.#parsePrimaryExpr(true);
@@ -741,19 +763,21 @@ class Parser {
         this.#expectAndConsume(Tok.Assign, "assignment");
         const values: C.Expr[] = [];
         this.#parseExprList(values);
-        return { kind: "StatAssign", from: first.from, to: values[values.length - 1].to, vars, values };
+        return [L.ASSIGN, vars, values, start];
     }
 
-    #parseCompoundAssignment(initial: C.Expr, op: C.BinaryOp): C.StatCompoundAssign {
+    // `initial` just parsed
+    #parseCompoundAssignment(initial: C.Expr, op: C.BinaryHead): C.OpSet {
+        const start = this.#exprFrom;
         const target = this.#isLValue(initial) ? initial : this.#lvalueError(initial);
         this.#take();
         const value = this.#parseExpr();
-        return { kind: "StatCompoundAssign", from: target.from, to: value.to, op, var: target, value };
+        return [L.OPSET, op, target, value, start];
     }
 
     // funcbody ::= ['<' generics '>'] '(' [parlist] ')' [':' ReturnType] block 'end'
     #parseFunctionBody(hasSelf: boolean, matchFunction: Match, debugName: string | null, localName: Name | null, attributes: Span | null, isConst: boolean):
-        { func: C.ExprFunction, local: Local | null } {
+        { func: C.Func, local: C.Local | null } {
         const start = attributes ?? matchFunction;
         this.#parseGenericTypeList(false);
         const matchParen = this.#match();
@@ -769,21 +793,20 @@ class Parser {
         const local = localName !== null ? this.#pushLocal({ name: localName.name, from: localName.from, to: localName.to, isConst }) : null;
         const n = this.#saveLocals();
         this.#functions.push({ vararg, loopDepth: 0 });
-        const self = hasSelf ? this.#pushLocal({ name: "self", from: start.from, to: start.to, isConst: false }) : null;
-        const vars = args.map(b => this.#pushLocal(b));
+        const params: C.Local[] = hasSelf ? [this.#pushLocal({ name: "self", from: start.from, to: start.to, isConst: false })] : [];
+        for (const b of args) params.push(this.#pushLocal(b));
         const body = this.#parseBlock();
         this.#functions.pop();
         this.#restoreLocals(n);
         const end = this.#lexer.to;
         this.#expectMatchEndAndConsume(Tok.End, matchFunction);
-        const func: C.ExprFunction = ({
-            kind: "ExprFunction", from: start.from, to: end, self, args: vars, vararg, body, debugName,
-        });
-        return { func, local };
+        return { func: this.#expr([L.FUNCTION, params, vararg, body, debugName, start.from], start.from, end), local };
     }
 
-    #parseExprList(result: C.Expr[]): void {
+    // with `spans`, each expression's span too
+    #parseExprList(result: C.Expr[], spans: number[] | null = null): void {
         result.push(this.#parseExpr());
+        spans?.push(this.#exprFrom, this.#exprTo);
         while (this.#at(Tok.Comma)) {
             this.#take();
             if (this.#at(Tok.RParen)) {
@@ -791,6 +814,7 @@ class Parser {
                 break;
             }
             result.push(this.#parseExpr());
+            spans?.push(this.#exprFrom, this.#exprTo);
         }
     }
 
@@ -1204,12 +1228,12 @@ class Parser {
         let uop = UNARY[this.#cur.kind];
         if (uop === undefined && this.#at(Tok.Char) && this.#cur.text === "!") {
             this.#reportHere("Unexpected '!'; did you mean 'not'?");
-            uop = "not";
+            uop = L.NOT;
         }
         if (uop !== undefined) {
             this.#take();
             const sub = this.#parseExpr(UNARY_PRIORITY);
-            expr = { kind: "ExprUnary", from: start, to: sub.to, op: uop, expr: sub };
+            expr = this.#expr([uop, sub, start], start, this.#exprTo);
         } else {
             expr = this.#parseAssertionExpr();
         }
@@ -1217,7 +1241,7 @@ class Parser {
         while (op !== undefined && LEFT[op] > limit) {
             this.#take();
             const right = this.#parseExpr(RIGHT[op]);
-            expr = { kind: "ExprBinary", from: start, to: right.to, op: BINARY[op]!, left: expr, right };
+            expr = this.#expr([BINARY[op]!, expr, right, start], start, this.#exprTo);
             op = this.#binaryOp(limit);
         }
         return expr;
@@ -1225,13 +1249,13 @@ class Parser {
 
     #parseNameExpr(context: string): C.Expr {
         const name = this.#parseNameOpt(context);
-        if (name === null) return { kind: "ExprError", from: this.#lexer.from, to: this.#lexer.to };
+        if (name === null) return this.#expr([L.ERROR, this.#lexer.from], this.#lexer.from, this.#lexer.to);
         const local = this.#locals.get(name.name);
         if (local !== undefined) {
-            if (this.#typeFunctionLocals !== null && !this.#typeFunctionLocals.has(local)) return this.#exprError(this.#lexer.from, this.#lexer.to, `Type function cannot reference outer local '${local.name}'`);
-            return { kind: "ExprLocal", from: name.from, to: name.to, local };
+            if (this.#typeFunctionLocals !== null && !this.#typeFunctionLocals.has(local)) return this.#exprError(this.#lexer.from, this.#lexer.to, `Type function cannot reference outer local '${name.name}'`);
+            return this.#expr(local, name.from, name.to);
         }
-        return { kind: "ExprGlobal", from: name.from, to: name.to, name: name.name };
+        return this.#expr([L.GLOBAL, name.name, name.from], name.from, name.to);
     }
 
     // prefixexp ::= NAME | '(' expr ')'
@@ -1248,7 +1272,7 @@ class Parser {
         } else {
             this.#take();
         }
-        return { kind: "ExprGroup", from: start, to: end, expr };
+        return this.#expr([L.ONE, expr, start], start, end);
     }
 
     // primaryexp ::= prefixexp {'.' NAME | '[' exp ']' | ':' NAME funcargs | funcargs | '<<' types '>>'}
@@ -1256,14 +1280,14 @@ class Parser {
         const start = this.#lexer.from;
         let expr = this.#parsePrefixExpr();
         // where the expression so far ends, type arguments included
-        let end = expr.to;
+        let end = this.#exprTo;
         while (true) {
             const k = this.#cur.kind;
             if (k === Tok.Dot) {
                 const dot = this.#lexer.from;
                 this.#take();
                 const index = this.#parseIndexName(null, dot);
-                expr = { kind: "ExprIndexName", from: start, to: index.to, expr, index: index.name };
+                expr = this.#expr([L.INDEX, expr, index.name, start], start, index.to);
             } else if (k === Tok.LBracket) {
                 expr = this.#parseIndexExpr(start, expr);
             } else if (k === Tok.Colon) {
@@ -1274,36 +1298,39 @@ class Parser {
                     this.#reportAmbiguousCallError();
                     break;
                 }
-                expr = this.#parseFunctionArgs(expr, false, end);
+                expr = this.#parseFunctionArgs([L.CALL, expr], start, this.#exprTo, end, false);
             } else if (k === Tok.LBrace || k === Tok.RawString || k === Tok.String) {
-                expr = this.#parseFunctionArgs(expr, false, end);
+                expr = this.#parseFunctionArgs([L.CALL, expr], start, this.#exprTo, end, false);
             } else if (k === Tok.Lt && this.#lexer.lookahead().kind === Tok.Lt) {
+                // f<<T>> is f (a typeof in the types would leave its own span)
+                const from = this.#exprFrom, to = this.#exprTo;
                 end = this.#parseTypeInstantiationExpr();
+                this.#exprFrom = from;
+                this.#exprTo = to;
                 continue;
             } else {
                 break;
             }
-            end = expr.to;
+            end = this.#exprTo;
         }
         return expr;
     }
 
-    #parseIndexExpr(start: number, expr: C.Expr): C.ExprIndexExpr {
+    #parseIndexExpr(start: number, expr: C.Expr): C.Index {
         const matchBracket = this.#match();
         this.#take();
         const index = this.#parseExpr();
         const end = this.#lexer.to;
         this.#expectMatchAndConsume(Tok.RBracket, matchBracket, false);
-        return { kind: "ExprIndexExpr", from: start, to: end, expr, index };
+        return this.#expr([L.INDEX, expr, index, start], start, end);
     }
 
     #parseMethodCall(start: number, expr: C.Expr): C.Expr {
         const colon = this.#lexer.from;
         this.#take();
         const index = this.#parseIndexName("method name", colon);
-        const func: C.ExprIndexName = { kind: "ExprIndexName", from: start, to: index.to, expr, index: index.name };
         if (this.#at(Tok.Lt) && this.#lexer.lookahead().kind === Tok.Lt) this.#parseTypeInstantiationExpr();
-        return this.#parseFunctionArgs(func, true, func.to);
+        return this.#parseFunctionArgs([L.METHOD, expr, index.name], start, index.to, index.to, true);
     }
 
     // asexp ::= simpleexp ['::' Type]
@@ -1313,14 +1340,14 @@ class Parser {
         if (!this.#at(Tok.DoubleColon)) return expr;
         this.#take();
         const to = this.#parseType();
-        return { kind: "ExprGroup", from: start, to, expr };
+        return this.#expr([L.ONE, expr, start], start, to);
     }
 
     #parseNumber(): C.Expr {
         const from = this.#lexer.from, to = this.#lexer.to, text = this.#lexer.text, lexed = this.#lexer.value;
         this.#take();
         // the common case: a short run of digits, valued by the lexer
-        if (!Number.isNaN(lexed)) return { kind: "ExprConstantNumber", from, to, value: lexed };
+        if (!Number.isNaN(lexed)) return this.#expr(lexed, from, to);
         const s = text.indexOf("_") === -1 ? text : text.replace(/_/g, "");
         let value: number;
         const integer = (digits: string, base: 2 | 16): number | null => {
@@ -1343,7 +1370,7 @@ class Parser {
             if (!/^(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) return this.#exprError(from, to, "Malformed number");
             value = Number(s);
         }
-        return { kind: "ExprConstantNumber", from, to, value };
+        return this.#expr(value, from, to);
     }
 
     #parseAttributedFunction(from: number, to: number): C.Expr {
@@ -1362,14 +1389,13 @@ class Parser {
         switch (this.#cur.kind) {
             case Tok.Attribute: case Tok.AttributeOpen:
                 return this.#parseAttributedFunction(from, to);
-            case Tok.Nil: {
+            case Tok.Nil:
                 this.#take();
-                return { kind: "ExprConstantNil", from, to };
-            }
+                return this.#expr(L.NIL, from, to);
             case Tok.True: case Tok.False: {
                 const value = this.#at(Tok.True);
                 this.#take();
-                return { kind: "ExprConstantBool", from, to, value };
+                return this.#expr(value, from, to);
             }
             case Tok.Function: {
                 const matchFunction = this.#match();
@@ -1382,19 +1408,16 @@ class Parser {
                 return this.#parseString();
             case Tok.InterpBegin:
                 return this.#parseInterpString();
-            case Tok.BrokenString: {
+            case Tok.BrokenString:
                 this.#take();
                 return this.#exprError(from, to, "Malformed string; did you forget to finish it?");
-            }
-            case Tok.BrokenInterpDoubleBrace: {
+            case Tok.BrokenInterpDoubleBrace:
                 this.#take();
                 return this.#exprError(from, to, "Double braces are not permitted within interpolated strings; did you mean '\\{'?");
-            }
-            case Tok.Dots: {
+            case Tok.Dots:
                 this.#take();
-                if (this.#fn().vararg) return { kind: "ExprVarargs", from, to };
+                if (this.#fn().vararg) return this.#expr([L.VARARGS, from], from, to);
                 return this.#exprError(from, to, "Cannot use '...' outside of a vararg function");
-            }
             case Tok.LBrace:
                 return this.#parseTableConstructor();
             case Tok.If:
@@ -1403,51 +1426,61 @@ class Parser {
         return this.#parsePrimaryExpr(false);
     }
 
-    // the arguments of an attribute: '(' [explist] ')' | tableconstructor | STRING
-    #parseCallList(): { args: C.Expr[], argsFrom: number, argsTo: number } {
+    // the arguments of an attribute: '(' [explist] ')' | tableconstructor | STRING, with each one's span, and what the
+    // first one's items are if it is a table
+    #parseCallList(): { args: C.Expr[], argSpans: number[], items: ItemInfo[] | null, argsFrom: number, argsTo: number } {
+        const items: ItemInfo[] = [];
+        this.#itemInfo = items;
+        this.#itemInfoOf = null;
+        const args: C.Expr[] = [], argSpans: number[] = [];
+        let argsFrom: number, argsTo: number;
         if (this.#at(Tok.LParen)) {
-            const argsFrom = this.#lexer.to;
+            argsFrom = this.#lexer.to;
             const matchParen = this.#match();
             this.#take();
-            const args: C.Expr[] = [];
-            if (!this.#at(Tok.RParen)) this.#parseExprList(args);
-            const argsTo = this.#lexer.to;
+            if (!this.#at(Tok.RParen)) this.#parseExprList(args, argSpans);
+            argsTo = this.#lexer.to;
             this.#expectMatchAndConsume(Tok.RParen, matchParen, false);
-            return { args, argsFrom, argsTo };
+        } else if (this.#at(Tok.LBrace)) {
+            argsFrom = this.#lexer.to;
+            args.push(this.#parseTableConstructor());
+            argSpans.push(this.#exprFrom, this.#exprTo);
+            argsTo = this.#prevTo;
+        } else {
+            argsFrom = this.#lexer.from;
+            argsTo = this.#lexer.to;
+            args.push(this.#parseString());
+            argSpans.push(this.#exprFrom, this.#exprTo);
         }
-        if (this.#at(Tok.LBrace)) {
-            const argsFrom = this.#lexer.to;
-            const e = this.#parseTableConstructor();
-            return { args: [e], argsFrom, argsTo: this.#prevTo };
-        }
-        const argsFrom = this.#lexer.from, argsTo = this.#lexer.to;
-        return { args: [this.#parseString()], argsFrom, argsTo };
+        this.#itemInfo = null;
+        return { args, argSpans, items: this.#itemInfoOf === args[0] ? items : null, argsFrom, argsTo };
     }
 
-    // args ::= '(' [explist] ')' | tableconstructor | STRING
-    // the call of `func`, which ends at `funcEnd` (after any type arguments)
-    #parseFunctionArgs(func: C.Expr, self: boolean, funcEnd: number): C.Expr {
+    // args ::= '(' [explist] ')' | tableconstructor | STRING, into `call` (its head and function, or object and method
+    // name); `from` to `funcTo` is what is called, and `funcEnd` where it ends, type arguments included
+    #parseFunctionArgs(call: unknown[], from: number, funcTo: number, funcEnd: number, self: boolean): C.Expr {
         const k = this.#cur.kind;
+        let to: number;
         if (k === Tok.LParen) {
             if (!this.#sameLine(funcEnd, this.#lexer.from)) this.#reportAmbiguousCallError();
             const matchParen = this.#match();
             this.#take();
-            const args: C.Expr[] = [];
-            if (!this.#at(Tok.RParen)) this.#parseExprList(args);
-            const end = this.#lexer.to;
+            if (!this.#at(Tok.RParen)) this.#parseExprList(call as C.Expr[]);
+            to = this.#lexer.to;
             this.#expectMatchAndConsume(Tok.RParen, matchParen, false);
-            return { kind: "ExprCall", from: func.from, to: end, func, args, self };
+        } else if (k === Tok.LBrace) {
+            call.push(this.#parseTableConstructor());
+            to = this.#exprTo;
+        } else if (k === Tok.RawString || k === Tok.String) {
+            call.push(this.#parseString());
+            to = this.#exprTo;
+        } else if (self && !this.#sameLine(funcEnd, this.#lexer.from)) {
+            return this.#exprError(from, funcTo, "Expected function call arguments after '('");
+        } else {
+            return this.#exprError(from, this.#lexer.from, `Expected '(', '{' or <string> when parsing function call, got ${this.#describe()}`);
         }
-        if (k === Tok.LBrace) {
-            const arg = this.#parseTableConstructor();
-            return { kind: "ExprCall", from: func.from, to: arg.to, func, args: [arg], self };
-        }
-        if (k === Tok.RawString || k === Tok.String) {
-            const arg = this.#parseString();
-            return { kind: "ExprCall", from: func.from, to: arg.to, func, args: [arg], self };
-        }
-        if (self && !this.#sameLine(funcEnd, this.#lexer.from)) return this.#exprError(func.from, func.to, "Expected function call arguments after '('");
-        return this.#exprError(func.from, this.#lexer.from, `Expected '(', '{' or <string> when parsing function call, got ${this.#describe()}`);
+        call.push(from);
+        return this.#expr(call as C.Call | C.Method, from, to);
     }
 
     #reportAmbiguousCallError(): void {
@@ -1455,11 +1488,13 @@ class Parser {
     }
 
     // tableconstructor ::= '{' [field {fieldsep field} [fieldsep]] '}'
-    #parseTableConstructor(): C.ExprTable {
+    #parseTableConstructor(): C.Table {
+        const info = this.#itemInfo;
+        this.#itemInfo = null;
         const start = this.#lexer.from;
         const matchBrace = this.#match();
         this.#expectAndConsume(Tok.LBrace, "table literal");
-        const items: C.TableItem[] = [];
+        const table: unknown[] = [L.TABLE];
         while (!this.#at(Tok.RBrace)) {
             if (this.#at(Tok.LBracket)) {
                 const matchBracket = this.#match();
@@ -1467,16 +1502,20 @@ class Parser {
                 const key = this.#parseExpr();
                 this.#expectMatchAndConsume(Tok.RBracket, matchBracket, false);
                 this.#expectAndConsume(Tok.Assign, "table field");
-                items.push({ kind: "general", key, value: this.#parseExpr() });
+                const value = this.#parseExpr();
+                info?.push({ key: null, keyFrom: 0, keyTo: 0, value, valueFrom: this.#exprFrom, valueTo: this.#exprTo });
+                table.push([L.PAIR, key, value, matchBracket.from]);
             } else if (this.#at(Tok.Name) && this.#lexer.lookahead().kind === Tok.Assign) {
                 const name = this.#parseName("table field");
                 this.#expectAndConsume(Tok.Assign, "table field");
-                const key: C.ExprConstantString = { kind: "ExprConstantString", from: name.from, to: name.to, value: name.name };
                 const value = this.#parseExpr();
-                if (value.kind === "ExprFunction") value.debugName = name.name;
-                items.push({ kind: "record", key, value });
+                if (isHead(value, L.FUNCTION)) (value as C.Func)[4] = name.name;
+                info?.push({ key: name.name, keyFrom: name.from, keyTo: name.to, value, valueFrom: this.#exprFrom, valueTo: this.#exprTo });
+                table.push([L.FIELD, name.name, value, name.from]);
             } else {
-                items.push({ kind: "list", key: null, value: this.#parseExpr() });
+                const value = this.#parseExpr();
+                info?.push({ key: null, keyFrom: 0, keyTo: 0, value, valueFrom: this.#exprFrom, valueTo: this.#exprTo });
+                table.push(value);
             }
             if (this.#at(Tok.Comma) || this.#at(Tok.Semicolon)) this.#take();
             else if (this.#at(Tok.LBracket) || this.#at(Tok.Name)) this.#reportHere("Expected ',' after table constructor element");
@@ -1484,11 +1523,13 @@ class Parser {
         }
         let end = this.#lexer.to;
         if (!this.#expectMatchAndConsume(Tok.RBrace, matchBrace, false)) end = this.#prevTo;
-        return { kind: "ExprTable", from: start, to: end, items };
+        table.push(start);
+        if (info !== null) this.#itemInfoOf = table;
+        return this.#expr(table as C.Table, start, end);
     }
 
     // ifelseexp ::= 'if' exp 'then' exp {'elseif' exp 'then' exp} 'else' exp
-    #parseIfElseExpr(): C.ExprIfElse {
+    #parseIfElseExpr(): C.IfExpr {
         const start = this.#lexer.from;
         this.#take(); // if / elseif
         const condition = this.#parseExpr();
@@ -1501,7 +1542,7 @@ class Parser {
             this.#expectAndConsume(Tok.Else, "if then else expression");
             falseExpr = this.#parseExpr();
         }
-        return { kind: "ExprIfElse", from: start, to: falseExpr.to, condition, trueExpr, falseExpr };
+        return this.#expr([L.IFX, condition, trueExpr, falseExpr, start], start, this.#exprTo);
     }
 
     // a string token's value (null if an escape is malformed)
@@ -1515,13 +1556,12 @@ class Parser {
         const from = this.#lexer.from, to = this.#lexer.to;
         const value = this.#parseCharArray();
         if (value === null) return this.#exprError(from, to, "String literal contains malformed escape sequence");
-        return { kind: "ExprConstantString", from, to, value };
+        return this.#expr(value, from, to);
     }
 
     // stringinterp ::= INTERP_BEGIN exp {INTERP_MID exp} INTERP_END
     #parseInterpString(): C.Expr {
-        const strings: string[] = [];
-        const expressions: C.Expr[] = [];
+        const interp: unknown[] = [L.INTERP];
         const start = this.#lexer.from;
         let endFrom = start, endTo = this.#lexer.to;
         while (true) {
@@ -1531,21 +1571,21 @@ class Parser {
             const chars = unescapeQuoted(this.#lexer.text);
             this.#take();
             if (chars === null) return this.#exprError(start, endTo, "Interpolated string literal contains malformed escape sequence");
-            strings.push(chars);
+            interp.push(chars);
             if (kind === Tok.InterpEnd || kind === Tok.InterpSimple) break;
 
             const k = this.#cur.kind;
             if (k === Tok.InterpMid || k === Tok.InterpEnd) {
                 this.#take();
-                expressions.push(this.#exprError(endFrom, endTo, "Malformed interpolated string, expected expression inside '{}'"));
+                interp.push(this.#exprError(endFrom, endTo, "Malformed interpolated string, expected expression inside '{}'"));
                 break;
             }
             if (k === Tok.BrokenString) {
                 this.#take();
-                expressions.push(this.#exprError(endFrom, endTo, "Malformed interpolated string; did you forget to add a '`'?"));
+                interp.push(this.#exprError(endFrom, endTo, "Malformed interpolated string; did you forget to add a '`'?"));
                 break;
             }
-            expressions.push(this.#parseExpr());
+            interp.push(this.#parseExpr());
 
             switch (this.#cur.kind) {
                 case Tok.InterpBegin: case Tok.InterpMid: case Tok.InterpEnd:
@@ -1556,17 +1596,18 @@ class Parser {
                 case Tok.BrokenString:
                 case Tok.Eof: {
                     if (this.#at(Tok.BrokenString)) this.#take();
-                    const node: C.ExprInterpString = { kind: "ExprInterpString", from: start, to: this.#prevTo, strings, expressions };
+                    interp.push(start);
                     const top = this.#lexer.inInterpolation;
                     if (top === true) this.#report(this.#prevFrom, this.#prevTo, "Malformed interpolated string; did you forget to add a '}'?");
                     else if (top === null) this.#report(this.#prevFrom, this.#prevTo, "Malformed interpolated string; did you forget to add a '`'?");
-                    return node;
+                    return this.#expr(interp as C.Interp, start, this.#prevTo);
                 }
                 default:
                     return this.#exprError(endFrom, endTo, `Malformed interpolated string, got ${this.#describe()}`);
             }
         }
-        return { kind: "ExprInterpString", from: start, to: endTo, strings, expressions };
+        interp.push(start);
+        return this.#expr(interp as C.Interp, start, endTo);
     }
 
     // '<' '<' TypeParams '>' '>'

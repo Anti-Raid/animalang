@@ -1,21 +1,11 @@
-// `dump` shows a tree compactly
-import { Local, childNodes, type Node } from "./ast";
+// `show` writes a form as an s-expression, without its offset: 1 + 2 * 3 is (+ 1 (* 2 3))
+import { L, isForm } from "./ast";
 
-// (Kind field=value ... child ...): names, operators, values and the locals a node binds or refers to
-const SHOWN = new Set(["name", "op", "value", "index", "isConst", "self", "vararg"]);
-export const dump = (node: Node): string => {
-    const parts: string[] = [node.kind];
-    const show = (key: string, v: any): string | null => {
-        if (v instanceof Local) return `${key}=${v.name}`;
-        if (Array.isArray(v) && v.length > 0 && v.every(x => x instanceof Local)) return `${key}=[${v.map((l: Local) => l.name).join(" ")}]`;
-        if (SHOWN.has(key) && (typeof v === "string" || typeof v === "number" || v === true)) return `${key}=${typeof v === "string" ? JSON.stringify(v) : v}`;
-        return null;
-    };
-    for (const [key, v] of Object.entries(node)) {
-        if (key === "kind") continue;
-        const s = show(key, v);
-        if (s !== null) parts.push(s);
-    }
-    for (const c of childNodes(node)) parts.push(dump(c));
-    return `(${parts.join(" ")})`;
+export const show = (v: unknown): string => {
+    if (v === L.NIL) return "nil";
+    if (typeof v === "symbol") return v.description ?? "?";
+    if (typeof v === "string") return JSON.stringify(v);
+    if (isForm(v)) return `(${[v[0], ...v.slice(1, -1)].map(show).join(" ")})`;
+    if (Array.isArray(v)) return `[${v.map(show).join(" ")}]`;
+    return String(v);
 };
