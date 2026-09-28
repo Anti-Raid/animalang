@@ -1,0 +1,50 @@
+{
+  "basic.luau": {
+    "nodes": 9166,
+    "sha1": "7f0c4a6de77e36167e88bc3217dab4e142ce871b"
+  },
+  "closure.luau": {
+    "nodes": 1835,
+    "sha1": "4611cdb595555c5ec7af53b697ecb0d85a145ad1"
+  },
+  "calls.luau": {
+    "nodes": 1479,
+    "sha1": "ebafa83c5f42464b01ad07609b2e6619f3b38b37"
+  },
+  "constructs.luau": {
+    "nodes": 1554,
+    "sha1": "d43125dc3516ea6021a5c634675b8000651f5bc0"
+  },
+  "literals.luau": {
+    "nodes": 285,
+    "sha1": "dc45408a947a5644e721611882b686ce7cdbefac"
+  },
+  "locals.luau": {
+    "nodes": 494,
+    "sha1": "3cec868060f93b54661591dda42f0c1f1781242d"
+  },
+  "stringinterp.luau": {
+    "nodes": 227,
+    "sha1": "31778480e752c765be9ea5b2f0c794ae45c792b9"
+  },
+  "ifelseexpr.luau": {
+    "nodes": 341,
+    "sha1": "241fb86d27f8f81f4b16a9345ca85323c577ad76"
+  },
+  "tpack.luau": {
+    "nodes": 2051,
+    "sha1": "f4544fa14738fc189725339edf01cef553214361"
+  },
+  "attrib.luau": {
+    "nodes": 914,
+    "sha1": "75c10b766957ef8e65e84eb2453662bd239a367e"
+  },
+  "types.luau": {
+    "nodes": 145,
+    "sha1": "3899e237e835c6e9da1898e94e799faa69391df0"
+  },
+  "vararg.luau": {
+    "nodes": 986,
+    "sha1": "011305ad56edb1d8d61ac379b28281520872ffa4"
+  }
+}
