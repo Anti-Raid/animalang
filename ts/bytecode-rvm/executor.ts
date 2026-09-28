@@ -557,7 +557,12 @@ export class VMExecutor {
                 co.ctx.wind = new WindPoint(null, null, co.fin);
                 bottom = new Frame(raiseHelpers().coroutineFinally, [undefined, co.fin, undefined], 0, null, co.ctx);
             }
-            return this.invoke(co.ctx, co.proc, bottom, args, 0, args.length, false);
+            try {
+                return this.invoke(co.ctx, co.proc, bottom, args, 0, args.length, false);
+            } catch (err) {
+                // e.g. a wrong argument count: the coroutine dies with it, and its resumer gets it
+                return this.handleHostException(co.ctx, bottom, err);
+            }
         }
         // (%coroutine-raise co obj): the pending yield raises obj, under the coroutine's own handlers
         if (raising) return this.raise(co.ctx, frame, args[0], false, yieldMarks, yieldMframe);

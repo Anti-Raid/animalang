@@ -288,7 +288,8 @@ class Parser {
         }
         // on another line and column than what it closes: misleading indentation, a likely culprit for a later mismatch
         const at = this.#lexer.from, open = begin.from;
-        if (!this.#sameLine(open, at) && this.#column(at) !== this.#column(open) && !this.#sameLine(this.#endMismatchSuspect.from, open)) {
+        const lines = this.#lexer.lines;
+        if (!this.#sameLine(open, at) && this.#column(at) !== this.#column(open) && lines.line(this.#endMismatchSuspect.from) < lines.line(open)) {
             this.#endMismatchSuspect = begin;
         }
         this.#take();
@@ -324,14 +325,20 @@ class Parser {
         return { name: ERROR_NAME, from: this.#lexer.from, to: this.#lexer.from };
     }
 
-    // whether offsets a <= b are on one line: the text between them is usually short
+    // by the line table, not by scanning the source: a line can be a whole (minified) file
     #column(offset: number): number {
-        return offset === 0 ? 0 : offset - this.source.lastIndexOf("\n", offset - 1) - 1;
+        const lines = this.#lexer.lines;
+        return lines.column(offset, lines.line(offset));
     }
 
+    // offsets a <= b; most are a token or two apart, so those are scanned
     #sameLine(a: number, b: number): boolean {
-        const i = this.source.indexOf("\n", a);
-        return i === -1 || i >= b;
+        if (b - a < 64) {
+            for (let i = a; i < b; i++) if (this.source.charCodeAt(i) === 10) return false;
+            return true;
+        }
+        const lines = this.#lexer.lines;
+        return lines.line(a) === lines.line(b);
     }
 
     #pushLocal(b: Binding): C.Local {

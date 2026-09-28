@@ -509,6 +509,19 @@ describe('Anima', () => {
                         (list (coroutine-resume outer) (coroutine-status fresh))`)).toBe("(#t dead)")
         })
 
+        it('kills a coroutine whose first call fails, and raises the error in its resumer', () => {
+            // a wrong argument count: the coroutine is dead, not left running
+            expect(run(`(define bad (coroutine-create (lambda (x) x)))
+                        (list (try (lambda () (coroutine-resume bad)) (lambda (e) 'caught)) (coroutine-status bad)
+                              (try (lambda () (coroutine-resume bad 1)) (lambda (e) (error-message e))))`)).toBe('(caught dead "coroutine-resume: cannot resume a dead coroutine")')
+            // its finally thunk runs, and a coroutine that resumed it goes on as the running one
+            expect(run(`(define flog '())
+                        (define outer (coroutine-create (lambda ()
+                          (define inner (coroutine-create (lambda (x) x) (lambda () (set! flog (cons 'fin flog)))))
+                          (list (try (lambda () (coroutine-resume inner)) (lambda (e) 'caught)) (coroutine-status inner) (eq? (current-coroutine) outer)))))
+                        (list (coroutine-resume outer) flog)`)).toBe("((caught dead #t) (fin))")
+        })
+
         it('raising into a coroutine', () => {
             // the pending yield raises, under the coroutine's own handlers, and the coroutine goes on
             expect(run(`(define rc (coroutine-create (lambda () (coroutine-yield (try (lambda () (coroutine-yield 1)) (lambda (e) (list 'caught e)))) 'end)))
@@ -2000,6 +2013,8 @@ describe('Anima', () => {
         it('reads bigints written 123n, and refuses integers a double would round', () => {
             expect(run("(list 9007199254740993n (bigint? 9007199254740993n) (bigint? 9007199254740991) (bigint? 5) 123n (bigint? 123n) -99999999999999999999n)")).toBe("(9007199254740993 #t #f #f 123 #t -99999999999999999999)")
             expect(() => evaluator.compileRaw("9007199254740993")).toThrow("integer 9007199254740993 is too large for a double to hold exactly; write 9007199254740993n for a bigint")
+            // too large for a double at all
+            expect(() => evaluator.compileRaw("1" + "0".repeat(400))).toThrow(/^integer 10+ is too large for a double to hold exactly/)
             // one a double holds exactly is a double, however large
             expect(run("(list 9007199254740992 (bigint? 100000000000000000000) 1e20)")).toBe("(9007199254740992 #f 100000000000000000000)")
         })

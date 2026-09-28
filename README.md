@@ -77,7 +77,7 @@ cannot be reassigned or mutated whatsoever for sandboxing purposes.
 
 4. Anima does not support macros/custom syntax currently. Although compliant implementations *may* choose to additionally support this for future use, code written in Anima must *not* assume support for macros/custom syntax.
 
-5. It is not allowed for user-code to override a builtin using define. Compliant implementations of Anima should error if an attempt to do so is detected
+5. A top-level `define` of a builtin procedure's name redefines it from then on (see rule 1), and the name cannot be read before that definition has run. Special forms and `%` intrinsics cannot be redefined: compliant implementations of Anima should error if an attempt to do so is detected
 
 6. Like Scheme, all procedures in Anima (including builtin procedures that are *not* special forms) must be first class. Furthermore, both builtin
 and user-defined procedures must return `procedure` if type? is called on it.

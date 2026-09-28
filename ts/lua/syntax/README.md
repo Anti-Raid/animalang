@@ -37,5 +37,5 @@ Where it differs from Luau:
 - **Left out**: declaration files (`declare`), and Luau's syntax behind feature flags: `if local`, classes, `export` on
   values, integer literals (`1i`).
 
-Tests (`../../tests/luau.test.ts`) check Luau's first error for 41 broken inputs against what `luau-analyze` reports, and
+Tests (`../../tests/luau.test.ts`) check Luau's first error for 42 broken inputs against what `luau-analyze` reports, and
 check the forms of some of Luau's own conformance scripts (`../../tests/luau/`) against a record of them.

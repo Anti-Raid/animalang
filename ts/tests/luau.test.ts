@@ -224,6 +224,8 @@ describe("Luau parser", () => {
         ["type T = string | number & boolean", "(1,10): Mixing union and intersection types is not allowed; consider wrapping in parentheses."],
         ["const k", "(1,1): Missing initializer in const declaration"],
         ["const a, b = 1", "(1,1): Missing initializer in const declaration"],
+        // as Luau does: more values than names too
+        ["const a = 1, 2", "(1,1): Missing initializer in const declaration"],
         ["@foo function f() end", "(1,1): Invalid attribute '@foo'"],
         ["@[] function f() end", "(1,1): Attribute list cannot be empty"],
         ["local x: = 1", "(1,9): Expected type, got '='"],
