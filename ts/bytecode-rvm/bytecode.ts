@@ -49,6 +49,8 @@ export class ByteCode implements SerializableBytecode {
     public tailSuspends: number = 0;
     // the pack intrinsic a packed rest parameter is made with (see RestKind), or -1
     public restPos: number = -1;
+    // compiled with interrupt checks (see Intrinsics.setInterruptHandler)
+    public interrupts: boolean = false;
 
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
@@ -137,6 +139,7 @@ export class ByteCode implements SerializableBytecode {
         const copy = new ByteCode([], this.inst, this.numReg, this.lineTable, this.files, this.debug, this.table, this.intrinsics);
         copies.set(this, copy);
         copy.restPos = this.restPos;
+        copy.interrupts = this.interrupts;
         SHARED_INSTS.add(this.inst);
         copy.bind(table);
         copy.constants = this.constants.map(c => {
@@ -177,6 +180,7 @@ export class ByteCode implements SerializableBytecode {
         bs.writeValue(this.debug);
         bs.writeArray(this.intrinsics.flatMap(({ pos, name, leaf }) => [pos, name, leaf]));
         bs.writeValue(this.restPos);
+        bs.writeValue(this.interrupts);
     }
 
     // loaded code is bound to `table`, by name; without one, to the core operations (code that uses others needs a table)
@@ -190,6 +194,7 @@ export class ByteCode implements SerializableBytecode {
             const debug = bsr.read() as boolean;
             const flat = bsr.readArray();
             const restPos = bsr.read() as number;
+            const interrupts = bsr.read() as boolean;
             const intrinsics: UsedIntrinsic[] = [];
             for (let i = 0; i < flat.length; i += 3) intrinsics.push({ pos: flat[i], name: flat[i + 1], leaf: flat[i + 2] });
             if (table === null && intrinsics.some(used => CORE_INTRINSICS.byName(used.name) === undefined)) {
@@ -197,6 +202,7 @@ export class ByteCode implements SerializableBytecode {
             }
             const code = new ByteCode(constants, inst, numReg, lineTable, files, debug, null, intrinsics);
             code.restPos = restPos;
+            code.interrupts = interrupts;
             code.bind(table ?? CORE_INTRINSICS);
             return code;
         });

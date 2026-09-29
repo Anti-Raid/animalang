@@ -1,5 +1,5 @@
 import { ErrorObject, Env, VMError, unpackValues, type SourcePos } from "../common";
-import { type ExecutionMode, OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
+import { type ExecutionMode, OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, InterruptError, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 import { Intrinsics } from "./intrinsics";
 import { newIntrinsics } from "./core";
 import { CaseLambda } from "./bytecode";
@@ -43,6 +43,7 @@ export class AnimaVM {
     }
 
     public evaluateRaw(code: ByteCode, scope: Env): any {
+        if (this.intrinsics.interrupts && !code.interrupts) throw new Error("this code was compiled without interrupt checks, but interrupts are on: compile it again");
         const ctx = new ExecutionContext(this, scope);
         const topClosure = new Closure(new ClosureTemplate([], null, code, []), [], "top-level");
         return this.#run(ctx, this.executor.newFrame(ctx, topClosure, createRegs(code.numReg), null));
@@ -101,9 +102,12 @@ export class AnimaVM {
         try {
             return run();
         } catch (err) {
+            // a stop: the coroutines it left die
+            if (err instanceof InterruptError) this.executor.abortRunning();
             throw this.message(err);
         } finally {
             this.executor.running = running;
+            this.executor.dropPendingPause();
         }
     }
 

@@ -48,7 +48,7 @@ export class Anima {
     }
 
     // `base`: intrinsics (and reserved names) to start with, e.g. a front end's (made with newIntrinsics)
-    constructor(options: AnimaOptions, readonly maxSteps: number = 0, base?: Intrinsics) {
+    constructor(options: AnimaOptions, base?: Intrinsics) {
         this.#options = options
         this.#intrinsics = newIntrinsics(base)
         this.#vm = new AnimaVM(options.mode, this.#intrinsics)
@@ -60,6 +60,13 @@ export class Anima {
         if (this.#frontEnd !== null) throw new Error("this instance already has a front end")
         this.#frontEnd = frontEnd
         this.#scope = scope
+    }
+
+    // for an intrinsic that works long: an interrupt check of its own (see Intrinsics.setInterruptHandler), counting `work`
+    // against the instance's count. It returns to go on, throws an InterruptError to stop (which the intrinsic lets go),
+    // and a pause happens once the intrinsic has returned
+    checkInterrupt(work: number = 1): void {
+        this.#vm.executor.checkInterrupt(work)
     }
 
     // makes (name arg ...) call `fn` in code compiled from now on; names start with '%'

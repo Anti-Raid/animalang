@@ -12,7 +12,7 @@ import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGua
 import type { VMExecutor } from "../executor";
 import { OpCode } from "../interpreter";
 import { INSTRUCTION_LENGTHS, basicBlockStarts } from "../opcodes";
-import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
+import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
     markSet,
@@ -42,6 +42,7 @@ export const JIT_DEPS = {
     Env,
     Frame,
     Suspend,
+    InterruptError,
     EscapeContinuation,
     countControlSuspend,
     StackSnapshot,

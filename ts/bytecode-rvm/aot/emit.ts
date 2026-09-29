@@ -66,21 +66,29 @@ export const inlineDeps = (entry: Intrinsic, used: Set<string>): Readonly<Record
 // interpreter carries out the requests themselves. `args` are the arguments' registers (as js expressions): the count
 // was checked when compiling.
 //  - heap: resume code, after frame.ip is set (and, unless in tail position or `continues`, the live registers are
-//    spilled): statements that return the frame to run next, or with `continues`, set ctx.acc and carry on
+//    spilled): statements that return the frame to run next, or with `continues`, set ctx.acc and carry on. `spills`
+//    spills the live registers, for a `continues` operation that leaves the frame only sometimes
 //  - direct: direct code, after rip is set: statements that throw a Suspend, or set acc (return it, in tail position),
 //    or declare `proc` and `args` and then run `callArray`, which calls proc with args (see DirectEmitter.#callArray)
 //    or `call`, which calls `proc` (in scope) with args, leaving its value in acc
 //  - tailProc: in tail position, the first argument is what debug code records as the tail call
-export type ControlSite = { args: string[], isTail: boolean };
+// `resume`: the ip after the call, which the emitter stores (frame.ip, rip) before the template unless `setsResume`;
+// `loopCount`: in direct code, the call is at a loop's back-edge (its next instruction is ENDLOOP), where a function can
+// count in its local `ic` (a loop there runs within one call of the function)
+export type ControlSite = { args: string[], isTail: boolean, resume: number, loopCount: boolean };
 export type ControlAot = {
-    heap: (s: ControlSite) => string,
+    heap: (s: ControlSite, spills: string) => string,
     direct: (s: ControlSite, callArray: string, call: (args: string[], marks: string) => string) => string,
     continues?: boolean,
     tailProc?: boolean,
+    // the template stores the resume point itself, only on a path that needs it
+    setsResume?: boolean,
 };
 export const valuesOf = (args: string[]) => args.length === 1 ? args[0] : `packValues([${args.join(", ")}])`;
 export const resumeArgs = (name: string, args: string[]) => name === "%coroutine-resume" ? `[${args.slice(1).join(", ")}]` : `arrayArg("%coroutine-resume-array", ${args[1]}).slice()`;
 export const applyArgsOf = (name: string, args: string[]) => name === "%apply-fresh" ? `arrayArg("%apply", ${args[1]})` : `applyArgs([${args.slice(1).join(", ")}], 0, ${args.length - 1})`;
+// counting an interrupt check in the function's local `ic` (see %interrupt below)
+const LOOP_COUNT = "--ic < 0 && (ic = 255, (executor.interruptLeft -= 256) <= 0)";
 export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, ControlAot>([
     ["%call/cc", {
         heap: s => `return executor.callCC(ctx, ${s.args[0]}, frame, ${s.isTail});`,
@@ -130,6 +138,23 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
     ["%raise", {
         heap: s => `return executor.raise(ctx, frame, ${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"});`,
         direct: s => `throw Suspend.raise(${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"}, marks);`,
+    }],
+    // An interrupt check: the count, and only when it runs out, the handler (see VMExecutor.interruptSlow). Heap code
+    // counts every check. Direct code counts cheaply, as interrupts only have to come eventually:
+    //  - at a loop's back-edge it counts in its local `ic`, taking 256 from the instance's count once every 256 rounds (a
+    //    loop there runs within one call of the function)
+    //  - at a function's entry it counts only at even depths: a call from an odd depth lands at an even one, so between
+    //    counted checks runs at most about one function body (loops aside). A self tail call, which restarts the function
+    //    at the same depth, counts in `ic` on its own path (see #selfTailCount); a tail call to another function passes
+    //    depth + 1, so the depth alternates, and past the JS depth limit it goes on in heap code
+    //  - the slow path is a call of its own (executor.interruptDirect): written into the function, it slows it even
+    //    when it never runs
+    ["%interrupt", {
+        heap: (s, spills) => `if (--executor.interruptLeft <= 0) { frame.ip = ${s.resume}; const res = executor.interruptSlow(ctx); if (res !== undefined) { ${spills} return res.run(ctx, executor, frame, false); } }`,
+        // (a pause or stop in direct code throws: nothing comes back to keep)
+        direct: s => `if (${s.loopCount ? LOOP_COUNT : "(depth & 1) === 0 && --executor.interruptLeft <= 0"}) { rip = ${s.resume}; executor.interruptDirect(ctx, closure, marks, mframe); }`,
+        continues: true,
+        setsResume: true,
     }],
     ["%current-stack", {
         heap: s => `ctx.acc = new StackSnapshot(frameInfos(frame, ${s.args.length === 1 ? `stackSkip(${s.args[0]})` : "0"}));`,
@@ -531,11 +556,11 @@ export class ResumeEmitter extends FunctionEmitter {
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail };
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: false };
                     return this.emit(`
-                        frame.ip = ${term.resume};
+                        ${control.setsResume ? "" : `frame.ip = ${term.resume};`}
                         ${term.isTail || control.continues ? "" : this.#spills(live.spillsFor(term.resume))}
-                        ${control.heap(site)}
+                        ${control.heap(site, this.#spills(live.spillsFor(term.resume)))}
                         ${control.continues ? this.jump(term.resume, next) : ""}
                     `);
                 }
@@ -594,6 +619,13 @@ export class ResumeEmitter extends FunctionEmitter {
 
 // the frameless entry used by direct calls: arguments arrive as js arguments and the value is returned
 export class DirectEmitter extends FunctionEmitter {
+    // a self tail call restarts the function at the same depth, whose entry check may not count (see %interrupt), so it
+    // counts as a loop's back-edge does (a pause resumes the restarted call, whose arguments are in place)
+    #selfTailCount(): string {
+        if (!(this.table?.interrupts ?? false)) return "";
+        return `if (--ic < 0) { ic = 255; if ((executor.interruptLeft -= 256) <= 0) { rip = 0; executor.interruptDirect(ctx, closure, marks, mframe); } }`;
+    }
+
     protected readonly accExpr = "acc";
     protected readonly depthCheck = " && depth < MAX_JS_DEPTH";
     protected readonly marksVar = "marks";
@@ -663,11 +695,15 @@ export class DirectEmitter extends FunctionEmitter {
         const arity = closureArity.params + (closureArity.rest === "none" ? 0 : 1);
         const params = Array.from({ length: arity }, (_, i) => `, a${i}`).join("");
         const locals = Array.from({ length: this.numReg }, (_, i) => i < arity ? `r${i} = a${i}` : `r${i}`);
-        const allRegs = Array.from({ length: this.numReg }, (_, i) => `r${i}`).join(", ");
+        // a frame rebuilt from here resumes in heap code, which reads only the registers live where it can resume: reading
+        // the others here would make V8 keep every temporary boxed wherever the function could throw (a float loop ran
+        // three times slower)
+        const resumeLive = new Liveness(this.blocks, this.numReg).entryLive;
+        const allRegs = Array.from({ length: this.numReg }, (_, i) => resumeLive.has(i) ? `r${i}` : "undefined").join(", ");
         this.emit(`
             function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
                 const upvars = closure.upvars;
-                let ip = 0, rip = 0, acc, tmp${this.debug ? ", dip = 0" : ""};
+                let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
         `);
         // a parameter whose kind has no check (guard) the front end can write stays checked in the body
@@ -713,6 +749,8 @@ export class DirectEmitter extends FunctionEmitter {
         }
         this.emit(`
                 } catch (e) {
+                    // a stop leaves as it is: no frame needs rebuilding, and no handler may see it
+                    if (e instanceof InterruptError) throw e;
                     const sig = e instanceof Suspend ? e : Suspend.error(e);
                     sig.entered = closure;
                     if (rip === -1) {
@@ -960,9 +998,9 @@ export class DirectEmitter extends FunctionEmitter {
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail };
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: this.inst[term.resume] === OpCode.ENDLOOP };
                     return this.emit(`
-                        rip = ${term.isTail ? -1 : term.resume};
+                        ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}
                         ${control.direct(site, this.#callArray(term.isTail), (args, marks) => this.#callProc(args.join(", "), args.length, marks))}
                         ${term.isTail ? "" : this.jump(term.resume, next)}
                     `);
@@ -993,6 +1031,7 @@ export class DirectEmitter extends FunctionEmitter {
                         const proc = r${term.proc};
                         if (proc === closure) {
                             ${this.selfMoves(term)}
+                            ${this.#selfTailCount()}
                             ip = 0;
                             ${this.#specCheck !== null ? `spec = ${this.#specCheck};` : ""}
                             continue top;

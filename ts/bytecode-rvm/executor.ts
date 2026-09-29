@@ -7,10 +7,10 @@ import { AotCompiler } from "./aot/compiler";
 import { bindArgs, checkArity } from "./arity";
 import { ByteCode, CaseLambda, Closure, ClosureTemplate, createRegs } from "./bytecode";
 import type { VMHost } from "./bytecode";
-import { CORE_INTRINSICS, corePos, tracebackMessage } from "./coreops";
+import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, tracebackMessage } from "./coreops";
 import { BytecodeInterpreter, OpCode } from "./interpreter";
 import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
-import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
+import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
@@ -62,7 +62,82 @@ export class VMExecutor {
     // the coroutine running now, or null outside any
     public running: Coroutine | null = null;
 
+    // interrupt checks left before one calls the handler (see Intrinsics.setInterruptHandler)
+    public interruptLeft: number = INTERRUPT_INTERVAL;
+
     constructor(public vm: VMHost) {}
+
+    // --- interrupts ---
+
+    // an interrupt check: nothing, or what the handler asked for (a yield or a stop)
+    public interrupt(ctx: ExecutionContext): ControlRequest | undefined {
+        return --this.interruptLeft > 0 ? undefined : this.interruptSlow(ctx);
+    }
+
+    // the count ran out: it starts again, and the handler is called
+    public interruptSlow(ctx: ExecutionContext): ControlRequest | undefined {
+        this.interruptLeft = INTERRUPT_INTERVAL;
+        // a pause the handler asked for while an intrinsic ran (see checkInterrupt) happens now, if the code can pause
+        const pending = this.#pendingPause;
+        if (pending !== null) {
+            this.#pendingPause = null;
+            return ctx.coroutineYieldable ? pending : undefined;
+        }
+        const handler = this.vm.intrinsics.interruptHandler;
+        // code compiled with checks, run by an instance without interrupts
+        if (handler === -1) return undefined;
+        return this.#vetInterrupt(this.vm.intrinsics.fns[handler]([], 0, 0, ctx, this), ctx);
+    }
+
+    // what an interrupt handler returned, as what the check does: nothing, a pause or a stop
+    #vetInterrupt(res: any, ctx: ExecutionContext): ControlRequest | undefined {
+        if (!(res instanceof ControlRequest) || res instanceof InterruptRequest) return res instanceof InterruptRequest ? res : undefined;
+        if (!(res instanceof YieldRequest)) return new InterruptRequest(new Error("an interrupt handler can only continue (return a value), pause (hostYield) or stop (hostInterruptError)"));
+        if (!ctx.coroutineYieldable) return new InterruptRequest(new Error("an interrupt handler paused (hostYield) code that is not in a coroutine it can pause"));
+        return res;
+    }
+
+    #pendingPause: YieldRequest | null = null;
+
+    // An interrupt check a host intrinsic makes itself, as it works (Anima.checkInterrupt): `work` counts against the
+    // instance's count, and when that runs out the handler is called. A stop throws an InterruptError out of the
+    // intrinsic, as uncatchable as any; a pause cannot stop a JS function midway, so it happens at the next check of the
+    // code that called the intrinsic, which the count, run out, makes call no handler (if that code cannot pause there, or
+    // leaves for the host first, the pause is dropped)
+    public checkInterrupt(work: number = 1): void {
+        const handler = this.vm.intrinsics.interruptHandler;
+        if (handler === -1 || (this.interruptLeft -= work) > 0) return;
+        this.interruptLeft = INTERRUPT_INTERVAL;
+        const res = this.vm.intrinsics.fns[handler]([], 0, 0, undefined, this);
+        if (!(res instanceof ControlRequest)) return;
+        if (res instanceof InterruptRequest) throw new InterruptError(res.value);
+        if (!(res instanceof YieldRequest)) throw new InterruptError(new Error("an interrupt handler can only continue (return a value), pause (hostYield) or stop (hostInterruptError)"));
+        this.#pendingPause = res;
+        this.interruptLeft = 0;
+    }
+
+    public dropPendingPause(): void {
+        this.#pendingPause = null;
+    }
+
+    // the slow path of a check in direct code, a call of its own, as code the path is written into runs measurably slower:
+    // a yield or a stop is thrown
+    public interruptDirect(ctx: ExecutionContext, closure: Closure, marks: Marks, mframe: number): void {
+        const res = this.interruptSlow(ctx);
+        if (res !== undefined) res.direct(ctx, this, closure, marks, mframe, false);
+    }
+
+    // a stop is leaving: the coroutine running and those waiting on it, up to one resumed from outside the VM (or by a
+    // nested driver loop, which does the same for its own), die where they are
+    public abortRunning(): void {
+        for (let co = this.running; co !== null;) {
+            // one being closed has no resumer: whoever closed it is outside it, and goes on until the stop reaches it
+            const resumer: Resumer | null = co.detachResumer();
+            co.finish();
+            co = resumer?.ctx.coroutine ?? null;
+        }
+        this.running = null;
+    }
 
     // --- call protocol ---
 
@@ -315,7 +390,7 @@ export class VMExecutor {
         try {
             return this.invoke(ctx, proc, frame, [], 0, 0, false, marks, frame.mframe + 1);
         } catch (err) {
-            if (err instanceof EscapedError) throw err;
+            if (err instanceof EscapedError || err instanceof InterruptError) throw err;
             ctx.acc = new Caught(caughtValue(err, this.vm));
             return frame;
         }
@@ -437,7 +512,7 @@ export class VMExecutor {
 
     // `marks`/`mframe`: where the error happened, when that is not `frame` (a tail call that left no frame)
     public handleHostException(ctx: ExecutionContext, frame: Frame | null, err: any, marks?: Marks, mframe: number = 0): Frame | null {
-        if (err instanceof EscapedError) throw err;
+        if (err instanceof EscapedError || err instanceof InterruptError) throw err;
         if (err instanceof VMError) this.vm.message(err, errorPos(frame));
         if (err instanceof UnhandledError) {
             const co = ctx.coroutine;
@@ -448,6 +523,7 @@ export class VMExecutor {
                 try {
                     this.#unwindCoroutine(co);
                 } catch (thunkErr) {
+                    if (thunkErr instanceof InterruptError) throw thunkErr;
                     error = thunkErr instanceof UnhandledError ? thunkErr.error : thunkErr;
                 }
                 co.finish();
@@ -507,7 +583,7 @@ export class VMExecutor {
                 return this.handleHostException(ctx, caller, err, sig.marks, sig.mframe);
             }
         } catch (err) {
-            throw err instanceof EscapedError ? err : new EscapedError(err);
+            throw err instanceof EscapedError || err instanceof InterruptError ? err : new EscapedError(err);
         }
     }
 
@@ -582,6 +658,9 @@ export class VMExecutor {
             const frame = this.coResume(barrier, null, co, args, null, 0, raising);
             outer?.waitOn(null);
             if (frame !== null) this.#runLoop(barrier, frame);
+        } catch (err) {
+            if (err instanceof InterruptError) this.abortRunning();
+            throw err;
         } finally {
             this.nestedResumes--;
             outer?.wake();
@@ -619,6 +698,7 @@ export class VMExecutor {
         try {
             this.#unwindCoroutine(co);
         } catch (err) {
+            if (err instanceof InterruptError) throw err;
             throw new ReRaise(err instanceof UnhandledError ? err.error : err);
         } finally {
             co.finish();

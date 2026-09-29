@@ -347,6 +347,7 @@ export class IR {
         const restPos = packRest ? use(this.table.pack!.pos) : -1
         const code = new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
         code.restPos = restPos
+        code.interrupts = this.table.interrupts
         return code
     }
 }

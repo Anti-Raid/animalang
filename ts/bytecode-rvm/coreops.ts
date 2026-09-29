@@ -7,7 +7,7 @@ import { CaseLambda, type Closure } from "./bytecode";
 import type { VMExecutor } from "./executor";
 import { Intrinsics } from "./intrinsics";
 import type { InlineFn, IntrinsicFn, IntrinsicOptions } from "./intrinsics";
-import { Aborted, Coroutine, DIRECT_SUSPEND_LIMIT, formatTraceback, frameInfos, MAX_NESTED_RESUMES, StackSnapshot, Suspend, WindPoint } from "./values";
+import { Aborted, Coroutine, DIRECT_SUSPEND_LIMIT, formatTraceback, frameInfos, InterruptError, MAX_NESTED_RESUMES, StackSnapshot, Suspend, WindPoint } from "./values";
 import type { ExecutionContext, Frame } from "./values";
 // (%debug-frames k args) / (%debug-traceback k args): args is ([coroutine] [msg] [level]), k the caller's continuation
 // the frames %debug-frames / %debug-traceback describe: the stack snapshot they are given, or a coroutine's
@@ -254,6 +254,24 @@ export const hostYield = (...values: any[]): YieldRequest => {
     return r;
 };
 
+// An interrupt handler may return this to stop (see Intrinsics.setInterruptHandler): the evaluation ends with an InterruptError
+// carrying `value`, which no exception handler or dynamic-wind after-thunk sees
+export class InterruptRequest extends ControlRequest {
+    constructor(readonly value: any) {
+        super();
+    }
+
+    run(): Frame | null {
+        throw new InterruptError(this.value);
+    }
+
+    direct(): any {
+        throw new InterruptError(this.value);
+    }
+}
+
+export const hostInterruptError = (value: any): InterruptRequest => new InterruptRequest(value);
+
 // (%coroutine-resume co v ...), or with `raising`, (%coroutine-raise co obj): args is [obj], raised by the pending yield
 export class ResumeRequest extends ControlRequest {
     co: any = undefined;
@@ -448,6 +466,8 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         const res = regs[start + 1];
         return res instanceof Aborted ? new HostTail(regs[start], res.values) : res;
     }, { leaf: false });
+    // an interrupt check (see Intrinsics.setInterruptHandler), which the compiler puts in code itself; AOT code inlines the count
+    core("%interrupt", [0, 0], (regs, start, nargs, ctx, executor) => executor.interrupt(ctx), { context: true, leaf: false, tail: false });
     // (%apply proc arg ... array) compiles to these: %apply-fresh when the array is a new one nothing else holds
     control("%apply-array", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], applyArgs(regs, start + 1, nargs - 1)));
     control("%apply-fresh", [2, 2], (regs, start) => new HostTail(regs[start], arrayArg("%apply", regs[start + 1])));

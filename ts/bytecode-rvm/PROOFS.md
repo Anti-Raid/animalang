@@ -35,6 +35,7 @@ They mean what a store-based machine gives them:
   3. the other ("value") inits run in order, and each name is set after its init.
 - **A4: `%escape` stays in one function.** An `%escape` only targets a `%block` of the same function. `#compileEscape` rejects anything else (`Msg.EscapeFromLambda`).
 - **A5: a value init's continuation runs once.** The continuation of a `%letrec` value init is not invoked again after that init has returned. R6RS requires this (11.4.6), and without it a value's binding is effectively assigned. Only §3 relies on A5. §4 does not: it holds without A5, see 4.3.
+- **A6: interrupt checks are not calls.** The `(%interrupt)` checks the compiler adds (see Interrupts in the README) are added after lifting and the core forms' liveness analysis, which never see one; AOT liveness, which works on the bytecode, sees each as the host call it is. A check calls no procedure and captures no continuation: its handler can only continue, pause the running coroutine (which then resumes once, where it was) or stop the evaluation for good. So adding them changes nothing proved here.
 
 **Notation.**
 

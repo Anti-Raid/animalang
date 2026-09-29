@@ -324,7 +324,7 @@ export const catchHere = (e: any, tok: CatchToken, ctx: ExecutionContext): any =
     if (e instanceof Suspend && e.escape === tok) return e.escapeVal;
     // a pre-unwind handler has to run first, in heap code
     if (tok.pre !== null) return null;
-    if (!(e instanceof Suspend)) return e instanceof EscapedError ? null : new Caught(caughtValue(e, ctx.vm));
+    if (!(e instanceof Suspend)) return e instanceof EscapedError || e instanceof InterruptError ? null : new Caught(caughtValue(e, ctx.vm));
     if (e.action !== null) return null;
     const marks = e.marks !== undefined ? e.marks : e.innermost !== null ? e.innermost.marks : undefined;
     if (marks === undefined) return null;
@@ -390,6 +390,20 @@ export const MISSING = Symbol("missing");
 
 export class EscapedError {
     constructor(public readonly error: any) {}
+}
+
+// About how many interrupt checks pass between calls of the handler (see Intrinsics.setInterruptHandler): the VM's own
+// choice, which it may change. AOT code counts only some checks (see %interrupt in aot/emit.ts)
+export const INTERRUPT_INTERVAL = 65536;
+
+// An interrupt handler's stop (hostInterruptError): it leaves every evaluation it is in for the host, past exception
+// handlers and dynamic-wind after-thunks, which never see it; the coroutines it leaves die. `value` is what the handler
+// gave
+export class InterruptError extends Error {
+    constructor(readonly value: any) {
+        super(value instanceof Error ? value.message : typeof value === "string" ? value : "interrupted");
+        this.name = "InterruptError";
+    }
 }
 
 export type SuspendAction = (ctx: ExecutionContext, executor: VMExecutor, caller: Frame, sig: Suspend) => Frame | null;

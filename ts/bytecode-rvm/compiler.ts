@@ -325,7 +325,13 @@ export class Compiler {
 
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
+        const entry = lambdaNodes.length
         this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
+        // a function that calls can recurse without end: it checks for interrupts on entry (one that only loops checks in
+        // its loops)
+        if (this.intrinsics.interrupts && lambdaNodes.some(n => n.t === "Call" || n.t === "TailCall" || (n.t === "HostCall" && n.pos !== corePos("%interrupt")))) {
+            lambdaNodes.splice(entry, 0, this.#interruptCheck())
+        }
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
@@ -433,8 +439,14 @@ export class Compiler {
         opts.nodes.push({ t: "Loop", end })
         opts.nodes.push({ t: "Label", label: head })
         for (const e of expr.slice(1)) this.#compile(e, { ...opts, destReg: undefined, isTail: false })
+        if (this.intrinsics.interrupts) opts.nodes.push(this.#interruptCheck())
         opts.nodes.push({ t: "EndLoop", head })
         opts.nodes.push({ t: "Label", label: end })
+    }
+
+    // (%interrupt), which the compiler puts at loops' back-edges and the entries of functions that call
+    #interruptCheck(): Node {
+        return { t: "HostCall", pos: corePos("%interrupt"), startReg: 0, nargs: 0, isTail: false, destReg: undefined }
     }
 
     #nodesEndsInRet(nodes: Node[]) {

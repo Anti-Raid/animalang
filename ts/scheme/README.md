@@ -1,6 +1,6 @@
 # Scheme
 
-`createScheme(impl, maxSteps?)` (`index.ts`) makes an `Anima` instance that runs Scheme. The compiler and VM underneath know only the core forms and intrinsics (see `../bytecode-rvm/README.md`); everything Scheme adds is here:
+`createScheme(impl)` (`index.ts`) makes an `Anima` instance that runs Scheme. The compiler and VM underneath know only the core forms and intrinsics (see `../bytecode-rvm/README.md`); everything Scheme adds is here:
 
 1. **Intrinsics.** Every builtin procedure (`builtins.ts`) is registered on the instance as the leaf intrinsic `%name`, always first and in the same order, so the cached prelude finds them at the same positions in every instance. Lists are the table's sequences (see sequences in `../bytecode-rvm/README.md`): `%list` packs rest parameters into lists, and `%spread` makes the array `%apply` takes of a list. Pairs (`Cons`, `list.ts`) are Scheme's own data type: a `Datum`, which the VM compares, prints and serializes through its methods.
 2. **Reserved names and shadowing.** The surface keywords (`symbols.ts`: special forms like `if`, `lambda`, `cond`, `guard`, and `else`/`=>`) go into the instance's `Intrinsics.reserved` as syntax, which code cannot bind (`if: bad syntax`), and so do `%` intrinsics. Builtin procedures (the builtins' names and the prelude's exports) can be shadowed, while the compiler still never sees one bound:

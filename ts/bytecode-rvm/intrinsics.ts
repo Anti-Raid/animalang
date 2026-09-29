@@ -94,6 +94,8 @@ export class Intrinsics {
     // how the VM's and the compiler's messages are worded (see Msg): the front end's formatter, if it sets one
     #format: Formatter = opName
     #types: TypeSystem | null = null
+    // the interrupt handler's position, or -1 (see setInterruptHandler)
+    #interruptHandler: number = -1
     // the locals of the type system's deps in generated code, by name
     #typeDeps: Record<string, string> = {}
 
@@ -114,6 +116,7 @@ export class Intrinsics {
         this.#format = base.#format
         this.#types = base.#types
         this.#typeDeps = base.#typeDeps
+        this.#interruptHandler = base.#interruptHandler
     }
 
     get frozen(): boolean {
@@ -187,6 +190,27 @@ export class Intrinsics {
         }
         this.#types = types
         this.#typeDeps = Object.freeze(deps)
+        return this
+    }
+
+    // whether code compiled with this table checks for interrupts
+    get interrupts(): boolean {
+        return this.#interruptHandler !== -1
+    }
+
+    get interruptHandler(): number {
+        return this.#interruptHandler
+    }
+
+    // Code compiled with this table from now on checks for interrupts, and while it runs the VM calls the intrinsic
+    // `name` (registered already) eventually and again and again, whenever it chooses: no count or interval is promised.
+    // The handler continues by returning a value, pauses the running coroutine with hostYield, or stops with
+    // hostInterruptError. Turning interrupts on needs a table that is not frozen; the handler can be swapped at any time
+    setInterruptHandler(name: string): this {
+        if (this.#frozen && this.#interruptHandler === -1) throw new Error("cannot turn interrupts on: the intrinsics are frozen")
+        const entry = this.byName(name)
+        if (entry === undefined) throw new Error(`the interrupt handler '${name}' is not registered`)
+        this.#interruptHandler = entry.pos
         return this
     }
 
