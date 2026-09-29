@@ -4,7 +4,7 @@
 
 
 import { Liveness, windowRegs } from "./liveness";
-import { blockFacts, transfer, type Facts } from "./facts";
+import { blockFacts, transfer, type Facts, type Aliases } from "./facts";
 import { MAX_STRUCTURED_NESTING, STRUCTURE_MISMATCH } from "./types";
 import type { AotBlock, AotInst, AotTerm } from "./types";
 import type { Arity } from "../arity";
@@ -186,14 +186,16 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     // what is known of the registers at the instruction being emitted (see facts.ts): set at each block's start
     protected facts: Facts = new Map();
+    protected aliases: Aliases = new Map();
 
     protected startBlock(facts: Facts | undefined): void {
         this.facts = new Map(facts ?? []);
+        this.aliases = new Map();
     }
 
     protected emitInstWithFacts(inst: AotInst): void {
         this.emitInst(inst);
-        transfer(inst, this.facts, this.table, this.constants);
+        transfer(inst, this.facts, this.table, this.constants, this.aliases);
     }
 
     // a branch's condition: a known boolean as it is
@@ -246,9 +248,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     // the check that one more nested direct call is allowed (as `&& ...`)
     protected abstract readonly depthCheck: string;
-    // where the upvars are: a local in heap code; direct code reads its closure's where it uses them, as reading them on
-    // entry makes V8 check the closure on every call, even of a function that uses none
-    protected abstract readonly upvarsExpr: string;
+    // access/assignment to an upvar slot: in heap code reads the local `upvars`; in direct code reads hoisted `uv${idx}`
+    protected abstract upvarRef(idx: number): string;
+    protected abstract setUpvarExpr(idx: number, val: string): string;
 
     // where the running function's continuation marks and logical frame are
     protected abstract readonly marksVar: string;
@@ -313,9 +315,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "LoadInt":
                 return this.emit(`r${inst.dst} = ${inst.value};`);
             case "LoadUpvar":
-                return this.emit(`r${inst.dst} = ${this.upvarsExpr}[${inst.idx}]${inst.unbox ? ".val" : ""};`);
+                return this.emit(`r${inst.dst} = ${this.upvarRef(inst.idx)}${inst.unbox ? ".val" : ""};`);
             case "SetUpvar":
-                return this.emit(`${this.upvarsExpr}[${inst.idx}] = ${inst.box ? `new Box(r${inst.src})` : `r${inst.src}`};`);
+                return this.emit(`${this.setUpvarExpr(inst.idx, inst.box ? `new Box(r${inst.src})` : `r${inst.src}`)};`);
             case "FixUpvar":
                 return this.emit(`r${inst.clo}.upvars[${inst.idx}] = r${inst.src};`);
             case "LoadGlobal":
@@ -349,7 +351,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "SetBox":
                 return this.emit(`r${inst.dst}.val = r${inst.src};`);
             case "NewClosure": {
-                const captures = inst.captures.map(c => c.local ? `r${c.index}` : `${this.upvarsExpr}[${c.index}]`).join(", ");
+                const captures = inst.captures.map(c => c.local ? `r${c.index}` : this.upvarRef(c.index)).join(", ");
                 return this.emit(`r${inst.dst} = new Closure(CONSTANTS[${inst.tmpl}], [${captures}]);`);
             }
             case "MoveAcc":
@@ -406,7 +408,8 @@ export class ResumeEmitter extends FunctionEmitter {
     protected readonly endOfCode = "return null;";
     // resume functions run from the driver loop, at the base of the js stack
     protected readonly depthCheck = "";
-    protected readonly upvarsExpr = "upvars";
+    protected upvarRef(idx: number): string { return `upvars[${idx}]`; }
+    protected setUpvarExpr(idx: number, val: string): string { return `upvars[${idx}] = ${val}`; }
     protected readonly marksVar = "frame.marks";
     protected readonly mframeVar = "frame.mframe";
     readonly #liveness: Liveness;
@@ -632,7 +635,8 @@ export class DirectEmitter extends FunctionEmitter {
 
     protected readonly accExpr = "acc";
     protected readonly depthCheck = " && depth < MAX_JS_DEPTH";
-    protected readonly upvarsExpr = "closure.upvars";
+    protected upvarRef(idx: number): string { return `uv${idx}`; }
+    protected setUpvarExpr(idx: number, val: string): string { return `closure.upvars[${idx}] = uv${idx} = ${val}`; }
     protected readonly marksVar = "marks";
     protected readonly mframeVar = "mframe";
     // this function's own arity, when a call to its own closure can call it by name (no rest parameter)
@@ -705,10 +709,23 @@ export class DirectEmitter extends FunctionEmitter {
         // three times slower)
         const resumeLive = new Liveness(this.blocks, this.numReg).entryLive;
         const allRegs = Array.from({ length: this.numReg }, (_, i) => resumeLive.has(i) ? `r${i}` : "undefined").join(", ");
+        const usedUpvars = new Set<number>();
+        for (const b of this.blocks) {
+            for (const inst of b.insts) {
+                if (inst.k === "LoadUpvar" || inst.k === "SetUpvar") usedUpvars.add(inst.idx);
+                else if (inst.k === "NewClosure") {
+                    for (const c of inst.captures) if (!c.local) usedUpvars.add(c.index);
+                }
+            }
+        }
+        const uvDefs = usedUpvars.size > 0
+            ? `const upvars = closure.upvars;\nlet ${Array.from(usedUpvars).map(idx => `uv${idx} = upvars[${idx}]`).join(", ")};`
+            : "";
         this.emit(`
             function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
                 let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
+                ${uvDefs}
         `);
         // a parameter whose kind has no check (guard) the front end can write stays checked in the body
         const types = this.table?.types ?? null;
@@ -911,12 +928,16 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     // a tail call from direct code: stays direct when possible, otherwise suspends without rebuilding this frame
-    #tailCall(proc: string, start: number, nargs: number): string {
+    #tailCall(proc: string, start: number, nargs: number, site?: number): string {
         const args = this.argList(start, nargs);
+        const cache = site !== undefined ? `CC${site}` : null;
         return `
             rip = -1;
+            ${cache !== null ? `if (${proc} instanceof Closure && ${proc}.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
+                return ${cache}.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
+            }` : ""}
             if (${this.directGuard(proc, `${nargs}`)}) {
-                const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
+                ${cache !== null ? `${cache}.tmpl = ${proc}.tmpl; ${cache}.directFn = ${proc}.tmpl.code.directFn;\n` : ""}const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
                 return val;
             }
             if (${this.restGuard(proc, `${nargs}`)}) {
@@ -952,23 +973,26 @@ export class DirectEmitter extends FunctionEmitter {
         `;
     }
 
-    #call(procReg: number, start: number, nargs: number, resume: number): string {
+    #call(procReg: number, start: number, nargs: number, resume: number, site?: number): string {
         return `
             {
                 const proc = r${procReg};
                 rip = ${resume};
-                ${this.#callProc(this.argList(start, nargs), nargs)}
+                ${this.#callProc(this.argList(start, nargs), nargs, "marks", site)}
             }
         `;
     }
 
     // calls `proc` (in scope) with `args`, leaving the value in acc
-    #callProc(args: string, nargs: number, marksExpr: string = "marks"): string {
+    #callProc(args: string, nargs: number, marksExpr: string = "marks", site?: number): string {
+        const cache = site !== undefined ? `CC${site}` : null;
         return `
                 ${nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
                     acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
+                } else ` : ""}${cache !== null ? `if (proc instanceof Closure && proc.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
+                    acc = ${cache}.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
                 } else ` : ""}if (${this.directGuard("proc", `${nargs}`)}) {
-                    acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
+                    ${cache !== null ? `${cache}.tmpl = proc.tmpl; ${cache}.directFn = proc.tmpl.code.directFn;\n` : ""}acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
                 } else if (${this.restGuard("proc", `${nargs}`)}) {
                     acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
                 } else if (proc instanceof Closure && proc.tmpl.arity.pad) {
@@ -996,7 +1020,7 @@ export class DirectEmitter extends FunctionEmitter {
                 return this.emit(this.jump(term.body, next));
             case "Call":
                 return this.emit(`
-                    ${this.#call(term.proc, term.start, term.nargs, term.resume)}
+                    ${this.#call(term.proc, term.start, term.nargs, term.resume, term.at)}
                     ${this.jump(term.resume, next)}
                 `);
             case "HostCall": {
@@ -1028,7 +1052,7 @@ export class DirectEmitter extends FunctionEmitter {
                 `);
             }
             case "TailCall":
-                return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs)} }`);
+                return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs, term.at)} }`);
             case "MaybeSelfTailCall":
                 return this.emit(`
                     {
@@ -1040,7 +1064,7 @@ export class DirectEmitter extends FunctionEmitter {
                             ${this.#specCheck !== null ? `spec = ${this.#specCheck};` : ""}
                             continue top;
                         }
-                        ${this.#tailCall("proc", term.start, term.nargs)}
+                        ${this.#tailCall("proc", term.start, term.nargs, term.at)}
                     }
                 `);
             case "Return":

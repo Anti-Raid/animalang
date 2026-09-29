@@ -54,6 +54,12 @@ export type IntrinsicOptions = {
     returns?: Returns,
     // the kind its fast path wants its arguments to be: a version of a function for parameters of that kind reads it
     wants?: Kind,
+    // given known argument kinds, what they are known to hold if the intrinsic completes without throwing
+    refineArgs?: (known: ArgKinds) => ArgKinds,
+    // when a branch tests this intrinsic's result, what its arguments are known to hold on then/else edges
+    branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds },
+    // marks logical negation (e.g. %not) so a branch testing it transposes then and else
+    invertBranch?: boolean,
 }
 
 export type Intrinsic = {
@@ -71,6 +77,9 @@ export type Intrinsic = {
     readonly inline: InlineFn | undefined,
     // the local variable holding each dep in generated code (D<slot> for DEPS[slot])
     readonly deps: Readonly<Record<string, string>>,
+    readonly refineArgs?: (known: ArgKinds) => ArgKinds,
+    readonly branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds },
+    readonly invertBranch?: boolean,
 }
 
 // The intrinsics a compiler and VM are extended with: host functions called over a register window, inlined by AOT
@@ -149,6 +158,7 @@ export class Intrinsics {
         }
         const entry: Intrinsic = Object.freeze({
             name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, deps: Object.freeze(deps),
+            refineArgs: options.refineArgs, branchNarrow: options.branchNarrow, invertBranch: options.invertBranch,
         })
         this.entries.push(entry)
         this.fns.push(fn)

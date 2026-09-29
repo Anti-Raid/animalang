@@ -141,7 +141,7 @@ export class AotCompiler {
         let factory = variants?.find(v => v.types === types && this.#sameUses(v.uses, uses))?.factory;
         if (factory === undefined) {
             // parsing the source is most of the cost, so copies share the factory and only call it for their own functions
-            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl));
+            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "CALL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl));
             if (SHARED_INSTS.has(code.inst)) {
                 if (variants === undefined) this.#sources.set(code.inst, variants = []);
                 variants.push({ uses, types, factory });
@@ -149,7 +149,9 @@ export class AotCompiler {
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
-        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, code.table?.fns ?? [], code.table?.deps ?? []);
+        const callCache: Record<number, { tmpl: ClosureTemplate | null, directFn: DirectFn | null }> = {};
+        for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: null, directFn: null };
+        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 
     public static generateSource(code: ByteCode, tmpl?: ClosureTemplate): string {
@@ -165,17 +167,27 @@ export class AotCompiler {
             direct = out.toString();
         }
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
+        const callCaches = this.#callSites(code).map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("");
         // positions never change once registered, so each intrinsic's function and deps are read once, into locals
         const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
         const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
         const deps = [...usedDeps].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
-        return `${caches}${fns}${deps}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
+        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
     }
 
     static #globalLoads(code: ByteCode): number[] {
         const ips: number[] = [];
         for (let ip = 0; ip < code.inst.length; ip += INSTRUCTION_LENGTHS[code.inst[ip] as OpCode]) {
             if (code.inst[ip] === OpCode.LOADGLOBAL) ips.push(ip);
+        }
+        return ips;
+    }
+
+    static #callSites(code: ByteCode): number[] {
+        const ips: number[] = [];
+        for (let ip = 0; ip < code.inst.length; ip += INSTRUCTION_LENGTHS[code.inst[ip] as OpCode]) {
+            const op = code.inst[ip];
+            if (op === OpCode.CALL || op === OpCode.CALLHOST) ips.push(ip);
         }
         return ips;
     }

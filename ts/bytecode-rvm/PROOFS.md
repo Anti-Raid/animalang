@@ -323,3 +323,186 @@ Direct code never resumes in the middle of a function. When it suspends, it rebu
 | `executor.ts` `coResumeNested` | the running coroutine is restored even when resuming fails before the nested loop starts |
 | `core.ts` `CORE_FORMS` | drops `%call/ec`, now a core intrinsic |
 | `aot/liveness.ts`, `lift.ts`, `analysis.ts` | an unused import, an alias and an unused parameter removed |
+
+---
+
+## 6. Hoisting for Upvars in Direct Loops
+
+### 6.1 Context
+In Animalang's direct AOT entry (`direct$`), functions execute inside a structured JavaScript loop (`for (;;)`) or dispatch loop. Prior to this optimization, accessing an upvar in register VM bytecode (`LoadUpvar`, `SetUpvar`, `NewClosure`) emitted dynamic indexing `closure.upvars[idx]` on every access within hot loop bodies.
+
+### 6.2 Transformation
+For any function direct entry with closure $C$, let $\mathcal{U} = \{ i \in \mathbb{N} \mid \text{LoadUpvar}(i) \lor \text{SetUpvar}(i) \lor \text{NewClosure}(\dots, \text{capture}(i)) \in \text{Insts} \}$.
+If $\mathcal{U} \neq \emptyset$:
+1. In the function prologue (outside all loops):
+   $$\text{const } upvars = C.upvars;$$
+   $$\text{let } uv_i = upvars[i] \quad (\forall i \in \mathcal{U})$$
+2. In bytecode instruction emission:
+   - $\text{LoadUpvar}(dst, i) \implies r_{dst} = uv_i$
+   - $\text{SetUpvar}(src, i) \implies C.upvars[i] = uv_i = r_{src}$
+   - $\text{NewClosure}(dst, \dots, capture(i)) \implies \text{reads } uv_i$
+
+### 6.3 Correctness Proof
+
+**Theorem 6 (Equivalence of Upvar Access Semantics).**
+*Under sequential execution within a single thread of execution of `direct$`, reading $uv_i$ yields the identical value as reading $C.upvars[i]$, and writing via $C.upvars[i] = uv_i = val$ preserves the heap closure state for all concurrent or subsequent readers.*
+
+*Proof.*
+1. **Initial State.**
+   At function entry ($t = 0$), $uv_i \leftarrow C.upvars[i]$. Hence, $\sigma_0(uv_i) = \sigma_0(C.upvars[i])$.
+2. **Read Invariance.**
+   Between writes, neither $uv_i$ nor $C.upvars[i]$ is mutated by local instructions. In JavaScript's single-threaded run-to-completion event loop, no external thread can mutate $C.upvars[i]$ during synchronous execution of `direct$`. Thus, $\sigma_t(uv_i) = \sigma_t(C.upvars[i])$ for all read times $t$.
+3. **Write Invariance.**
+   Whenever an upvar mutation occurs via $\text{SetUpvar}$, the emitted assignment executes compound assignment:
+   $$C.upvars[i] = uv_i = val$$
+   This updates the local shadow variable $uv_i$ and the heap array slot $C.upvars[i]$ atomically with the identical reference $val$.
+   Therefore, at any post-write time $t'$, $\sigma_{t'}(uv_i) = \sigma_{t'}(C.upvars[i]) = val$.
+4. **Escaping Closures.**
+   Any closure created via $\text{NewClosure}$ that captures upvar $i$ reads $uv_i$, which equals $C.upvars[i]$ at the moment of closure allocation. Any boxed upvar (`Box`) maintains its identity through reference equality of the `Box` instance, ensuring shared mutation across nested closures is preserved identically.
+5. **Suspension/Resume Frame Spill.**
+   If an exception or suspension (`Suspend`) unwinds the stack, `Frame` construction reads local registers $r_0, \dots, r_k$. Resume code reads from `upvars` (which has been kept synchronized via $C.upvars[i] = \dots$). □
+
+---
+
+## 7. Frontend-Controlled Flow-Sensitive Type Narrowing and Aliasing
+
+### 7.1 Abstract Domain and Lattice
+
+Let $\mathcal{R} = \{0, 1, \dots, N-1\}$ be the set of virtual registers in a function.
+Let $\mathcal{K}$ be the set of concrete kinds defined by the front-end's `TypeSystem` (e.g. `{"number", "bigint"}`) along with VM built-in kinds (e.g. `{"boolean"}`).
+
+We define the flat kind lattice $\mathbb{L} = \mathcal{K} \cup \{ \top, \bot \}$, where:
+- $\top$ represents an unknown kind (can be any value: number, bigint, boolean, object, null, pair, etc.).
+- $\bot$ represents unreachable or conflicting type states.
+- For all $k_1, k_2 \in \mathcal{K}$ with $k_1 \neq k_2$: $k_1 \not\sqsubseteq k_2$ and $k_2 \not\sqsubseteq k_1$.
+- The partial order is $\bot \sqsubseteq k \sqsubseteq \top$ for all $k \in \mathcal{K}$.
+
+The program type state is a mapping $\text{Facts} : \mathcal{R} \to \mathbb{L}$.
+The meet operator $\sqcap$ at control-flow join points is:
+$$(F_1 \sqcap F_2)(r) = \begin{cases}
+k & \text{if } F_1(r) = F_2(r) = k \\
+\top & \text{otherwise}
+\end{cases}$$
+
+Since $\mathcal{R}$ is finite and $\mathbb{L}$ has finite height $h = 2$, any monotone dataflow analysis over $(\text{Facts}, \sqcap)$ converges to a unique greatest fixed point in at most $2 \cdot |\mathcal{R}| \cdot |Blocks|$ steps.
+
+### 7.2 Language-Agnostic Extensibility (Frontend Inversion of Control)
+
+To ensure the compiler core (`bytecode-rvm/`) remains decoupled from front-end language specifics (a dynamic language, Luau, etc.), type inference and flow narrowing are governed by front-end hooks on `IntrinsicOptions`:
+1. `refineArgs?: (known: ArgKinds) => ArgKinds`: Declares what argument kinds can be inferred when an intrinsic completes execution without throwing an exception.
+2. `branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds }`: Declares what argument kinds hold on the truthy (`then`) and falsy (`else`) branches when a branch tests this intrinsic's result.
+3. `invertBranch?: boolean`: Marks logical negation operations (e.g. `%not`, Luau `not`) to transpose `then` and `else` branches recursively.
+
+### 7.3 Aliasing under Move Semantics
+
+Within a basic block, a copy instruction $r_{dst} = \text{Move } r_{src}$ establishes an equivalence relation $r_{dst} \sim r_{src}$.
+- Whenever an instruction overwrites register $r$, $r$ is removed from its equivalence class.
+- When any register $r$ in equivalence class $[r]_\sim$ is refined to a concrete kind $k \in \mathcal{K}$, all registers $r' \in [r]_\sim$ are soundly refined to $k$.
+
+**Lemma 7.1 (Soundness of Move Aliasing).**
+*Let $r_{dst} = \text{Move } r_{src}$ execute at state $\sigma$. At all subsequent program points prior to any reassignment of $r_{dst}$ or $r_{src}$, $\sigma(r_{dst}) \equiv \sigma(r_{src})$.*
+*Proof.* In the register VM, `Move` copies the reference from $r_{src}$ to $r_{dst}$. Until overwritten, both virtual registers evaluate to the identical underlying JavaScript value. Thus, any type property $P(v)$ that holds for $v \in \llbracket k \rrbracket$ holds equally for both registers. □
+
+### 7.4 Intra-Block Transfer Theorem
+
+**Theorem 7 (Soundness of Operand and Result Refinement).**
+*Let $I$ be an `IntCall` instruction for intrinsic $E$ with argument window $W = [start, start + nargs)$ and destination $dst$.*
+*If $I$ completes execution without throwing an exception, and $E$ declares $\text{refineArgs}$:*
+1. $\forall i \in [0, nargs)$, if $\text{refineArgs}(known)[i] = k \in \mathcal{K}$, then $\text{typeof}(W[i]) \in \llbracket k \rrbracket$.
+2. $\text{resultKind}(E, \text{refineArgs}(known)) = k_{res} \implies \text{typeof}(dst) \in \llbracket k_{res} \rrbracket$.
+
+*Proof.*
+1. By the contract of the frontend declaring $\text{refineArgs}$, an intrinsic either succeeds or throws on type mismatch. If it completes without throwing, the frontend's runtime invariants guarantee that each operand satisfied the requirements for the fast/narrowed path.
+2. By soundness of $E$'s declared `returns` / `resultKind` over the refined argument types, the destination register receives a value in $\llbracket k_{res} \rrbracket$. □
+
+### 7.5 Flow-Sensitive Branch Refinement Theorem
+
+**Theorem 8 (Soundness of Flow-Sensitive Branch Narrowing).**
+*Let basic block $B$ terminate in $\text{Branch}(cond, then, else)$.*
+*Let $cond$ be produced by instruction $I_{cond}$ within $B$ (modulo `Move` aliasing).*
+1. If $I_{cond}$ has `invertBranch = true`, swapping the `then` and `else` branches of the operand condition is semantics-preserving.
+2. If $I_{cond}$ has `branchNarrow`, applying `then` kinds to $W$ on edge $\to then$ and `else` kinds to $W$ on edge $\to else$ is sound.
+
+*Proof.*
+1. In the VM semantics, `#f` (JS `false`) is the sole falsy value; all others are truthy. An intrinsic with `invertBranch = true` maps falsy to truthy and truthy to falsy. Therefore, testing $cond$ is truthy iff the inner condition is falsy.
+2. If control flows to $then$, $I_{cond}$ evaluated to a truthy value. By the frontend's `branchNarrow` specification, this outcome only occurs when operands satisfy `then` kinds. Conversely, if control flows to $else$, $I_{cond}$ evaluated to `false`, establishing `else` kinds. □
+
+### 7.6 Semantics Preservation of Defensive Guard Elimination
+
+**Theorem 9 (Elimination of Inline Guards).**
+*When $\text{Facts}$ establishes that all arguments to an inlined intrinsic have $F(r) = wants$, emitting the raw arithmetic/relational expression without defensive type checks (`typeof r === "number"`) preserves program semantics and eliminates V8 Maglev/TurboFan deoptimizations.*
+
+*Proof.*
+By Theorems 7 and 8, $F(r) = k \implies \text{typeof}(v_r) \equiv k$ at runtime with probability 1.
+The defensive guard `guarded(checks, expr, slow)` evaluates $\bigwedge \text{typeof } a_i === \text{"number"}$.
+Since each check evaluates unconditionally to `true`, omitting the branch and emitting `expr` directly produces identical values, effects, and exceptions. Furthermore, V8's JIT compiler avoids generating bailout checkpoints (`deopt-eager` / type feedback mismatches) and avoids boxing unboxed floating point numbers into HeapNumbers. □
+
+---
+
+## 8. Monomorphic Direct Call Caching (Devirtualization)
+
+### 8.1 Context
+In Animalang's direct entry (`direct$`), non-self function calls currently execute a multi-branch dispatch on every invocation:
+1. `proc instanceof Closure`
+2. `proc.tmpl.code.directArity === nargs || proc.tmpl.code.directPad`
+3. `depth < MAX_JS_DEPTH`
+4. Dynamic property load: `proc.tmpl.code.directFn(...)`
+
+This requires up to six property dereferences across three heap objects (`proc` $\to$ `tmpl` $\to$ `code` $\to$ `directFn`) and polymorphic dispatch checks on every call.
+
+### 8.2 Transformation
+For each call site $S$, maintain a monomorphic inline cache `(CC_tmpl, CC_directFn)`:
+1. Fast path:
+   $$\text{if } (proc \text{ instanceof Closure } \&\&\ proc.tmpl === CC\_tmpl \ \&\&\ CC\_tmpl.code.directArity !== -1 \ \&\&\ depth < MAX\_JS\_DEPTH)$$
+   $$\quad acc = CC\_directFn(ctx, proc, executor, depth + 1, \dots);$$
+2. Fallback path:
+   If the fast path condition fails, execute the full dispatch chain. If the callee is a closure with matching direct arity, update the cache:
+   $$CC\_tmpl = proc.tmpl; \quad CC\_directFn = proc.tmpl.code.directFn;$$
+
+### 8.3 Correctness Proof
+
+**Theorem 10 (Equivalence of Cached Direct Calls).**
+*Let $S$ be a call site with argument count $nargs$. If $proc \text{ instanceof Closure}$, $proc.tmpl \equiv CC\_tmpl$, $CC\_tmpl.code.directArity \ne -1$, and $depth < MAX\_JS\_DEPTH$, then invoking $CC\_directFn$ with $(ctx, proc, executor, depth + 1, \dots)$ produces identical effects, returns, and exceptions to executing the full direct dispatch chain.*
+
+*Proof.*
+1. **Template Invariance.** In the VM model, a `ClosureTemplate` structure and its direct entry implementation `directFn` are immutable once generated.
+2. **Arity Conformance and Non-Deoptimized State.** The cache entry $(CC\_tmpl, CC\_directFn)$ is populated only after verifying that $CC\_tmpl.code.directArity \equiv nargs$ (or $CC\_tmpl.code.directPad$ is true). At any subsequent call where $proc.tmpl \equiv CC\_tmpl$ and $CC\_tmpl.code.directArity \ne -1$, $proc$ shares the verified arity without having suffered direct execution revocation.
+3. **Target Function Identity.** By definition of `Closure`, $proc.tmpl.code.directFn \equiv CC\_directFn$.
+4. **Depth Invariance.** The stack depth bound $depth < MAX\_JS\_DEPTH$ is evaluated identically on the fast path and on the full guard chain, preserving termination and recursion limit guarantees.
+5. **Fallback Safety.** If $proc$ is not a `Closure`, if $proc.tmpl \not\equiv CC\_tmpl$, or if the procedure was deoptimized ($CC\_tmpl.code.directArity \equiv -1$), the fast path is bypassed, and the original complete dispatch chain executes without alteration.
+
+$\blacksquare$
+
+### 8.4 Structural Stability & JIT Safety Invariants
+
+**Lemma 8.1 (V8 Shape Stability and Context Avoidance).**
+*Allocating cache entries as fields in a fixed object $CC_{ip} = \{ tmpl: null, directFn: null \}$ passed through `CALL_CACHE` preserves a monomorphic hidden class (Shape/Map) across execution, avoiding mutable context-slot deoptimizations.*
+
+*Proof.*
+In V8 and modern JavaScript engines, mutable closure-captured variables (e.g. `let CC_tmpl`) allocated in an outer activation context are accessed via dynamic scope-chain lookups (`Context::get`) whenever reassigned, which prevents TurboFan from constant-folding or direct-offset loading.
+By allocating `CALL_CACHE[ip]` as an object literal instantiated before compilation and passed as a `const` reference $CC_{ip}$ in the factory closure:
+1. The object $\{ tmpl, directFn \}$ has a single transition tree and monomorphic Map throughout its entire lifecycle.
+2. Property reads $CC_{ip}.tmpl$ and $CC_{ip}.directFn$ compile to single memory-offset dereferences (`mov rax, [rcx + 12]`) without scope-chain traversal.
+3. Mutations $CC_{ip}.tmpl = \dots$ and $CC_{ip}.directFn = \dots$ occur in-place on pre-allocated object fields without altering the hidden class. □
+
+**Lemma 8.2 (Polymorphism Prevention via Instanceof Guard).**
+*Evaluating $proc \text{ instanceof Closure}$ prior to accessing $proc.tmpl$ prevents megamorphic inline cache transitions in V8.*
+
+*Proof.*
+If an inline cache fast path dereferences $proc.tmpl$ directly on arbitrary values, non-closure arguments (primitives, vectors, host objects, or `CaseLambda`) cause V8's LoadIC to observe multiple disparate hidden classes (or primitive wrapper objects), quickly transitioning the IC state from monomorphic to megamorphic.
+By guarding with $proc \text{ instanceof Closure}$ first:
+1. If $proc$ is not an instance of `Closure`, the branch immediately short-circuits.
+2. The property access $proc.tmpl$ is executed strictly and exclusively when $proc$ is known to be an instance of `Closure`.
+3. Consequently, V8's type feedback registers only the `Closure` hidden class, preserving monomorphic property access throughout JIT compilation. □
+
+**Lemma 8.3 (Control Transfer Bailout Invariance under `countControlSuspend`).**
+*When a procedure's direct execution incurs repeated control suspensions (continuations, escapes, or exceptions) exceeding `DIRECT_SUSPEND_LIMIT`, the VM signals intentional deoptimization to heap frames by setting `code.directArity = -1; code.directRestArity = -1; code.directPad = false;`. Including $CC\_tmpl.code.directArity \ne -1$ in the inline cache fast path ensures that deoptimized functions are never re-entered via direct entry, preserving the VM's suspension bailout invariant.*
+
+*Proof.*
+Under `countControlSuspend(code)` (`values.ts`), once $code.controlSuspends \ge DIRECT\_SUSPEND\_LIMIT$, direct mode execution is permanently revoked for that `ByteCode` instance by assigning $code.directArity = -1$.
+Direct invocations of such procedures force heap frame allocation (`executor.callOther` / `callDirectRest`), avoiding repeated JavaScript exception unwinding (`Suspend.raise`).
+If the inline cache did not inspect $CC\_tmpl.code.directArity \ne -1$, cached call sites would bypass the arity guard and directly invoke $CC\_directFn$, executing direct entry and throwing uncaught `Suspend` exceptions on every suspension.
+By guarding $CC\_tmpl.code.directArity \ne -1$ directly on the fast path, any template demoted by `countControlSuspend` fails the fast path check and routes to the heap frame fallback, restoring efficient resumption semantics. □
+
+
+

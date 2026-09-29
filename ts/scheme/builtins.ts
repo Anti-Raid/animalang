@@ -18,6 +18,9 @@ export type SchemeBuiltin = {
     readonly inline?: InlineFn,
     // what it always returns (or else throws), for the AOT compiler's type facts
     readonly returns?: Returns,
+    readonly refineArgs?: (known: ArgKinds) => ArgKinds,
+    readonly branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds },
+    readonly invertBranch?: boolean,
 }
 
 const builtin = (name: string, min: number, max: number, fn: IntrinsicFn, inline?: InlineFn): SchemeBuiltin => ({ name, min, max, fn, inline });
@@ -118,8 +121,8 @@ const vectorIndex = (name: string, vec: any[], k: any): number => {
     return k;
 };
 
-const predicate = (name: string, test: (val: any) => boolean, inline?: (a: string, slow: string, d: Readonly<Record<string, string>>) => string): SchemeBuiltin =>
-    ({ ...builtin(name, 1, 1, (regs, start) => test(regs[start]), inline && unaryInline(inline)), returns: "boolean" });
+const predicate = (name: string, test: (val: any) => boolean, inline?: (a: string, slow: string, d: Readonly<Record<string, string>>) => string, branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds }): SchemeBuiltin =>
+    ({ ...builtin(name, 1, 1, (regs, start) => test(regs[start]), inline && unaryInline(inline)), returns: "boolean", branchNarrow });
 
 // a one-argument operation on a table
 const onTable = (name: string, op: (tbl: Table) => any, inline?: (t: string) => string): SchemeBuiltin =>
@@ -279,7 +282,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     predicate("number?", isNum, a => `(typeof ${a} === "number" || typeof ${a} === "bigint")`),
     predicate("integer?", isExactInteger, a => `(Number.isInteger(${a}) || typeof ${a} === "bigint")`),
     predicate("exact-integer?", isExactInteger, a => `(Number.isInteger(${a}) || typeof ${a} === "bigint")`),
-    predicate("bigint?", val => typeof val === "bigint", a => `typeof ${a} === "bigint"`),
+    predicate("bigint?", val => typeof val === "bigint", a => `typeof ${a} === "bigint"`, () => ({ then: ["bigint"] })),
     predicate("positive?", val => isNum(val) && val > 0, a => `(typeof ${a} === "number" ? ${a} > 0 : typeof ${a} === "bigint" && ${a} > 0n)`),
     predicate("negative?", val => isNum(val) && val < 0, a => `(typeof ${a} === "number" ? ${a} < 0 : typeof ${a} === "bigint" && ${a} < 0n)`),
     predicate("zero?", val => isNum(val) && val == 0, a => `(${a} === 0 || ${a} === 0n)`),
@@ -288,7 +291,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     predicate("infinite?", val => typeof val === "number" && (val === Infinity || val === -Infinity), a => `(${a} === Infinity || ${a} === -Infinity)`),
     predicate("finite?", val => typeof val === "bigint" || (typeof val === "number" && Number.isFinite(val)), a => `(Number.isFinite(${a}) || typeof ${a} === "bigint")`),
     predicate("nan?", val => typeof val === "number" && Number.isNaN(val), a => `Number.isNaN(${a})`),
-    predicate("boolean?", val => typeof val === "boolean", a => `typeof ${a} === "boolean"`),
+    predicate("boolean?", val => typeof val === "boolean", a => `typeof ${a} === "boolean"`, () => ({ then: ["boolean"] })),
     predicate("void?", val => typeof val === "undefined", a => `${a} === undefined`),
     predicate("symbol?", val => typeof val === "symbol", a => `typeof ${a} === "symbol"`),
     predicate("string?", val => typeof val === "string", a => `typeof ${a} === "string"`),
@@ -492,6 +495,25 @@ const RETURNS: Readonly<Record<string, Returns>> = {
 
 // the builtins whose fast paths want numbers (a function's version for number parameters reads them)
 const NUMERIC = new Set(["+", "-", "*", "/", "modulo", "remainder", "quotient", "=", "<", "<=", ">", ">="]);
+const NUMERIC_CMP = new Set(["=", "<", "<=", ">", ">="]);
+
+const refineNumeric = (known: ArgKinds): ArgKinds => {
+    if (known.some(k => k === "number")) return known.map(() => "number");
+    if (known.some(k => k === "bigint")) return known.map(() => "bigint");
+    return known;
+};
+
+const branchNumericCmp = (known: ArgKinds) => {
+    if (known.some(k => k === "number")) {
+        const nums = known.map(() => "number");
+        return { then: nums, else: nums };
+    }
+    if (known.some(k => k === "bigint")) {
+        const bigs = known.map(() => "bigint");
+        return { then: bigs, else: bigs };
+    }
+    return {};
+};
 
 // Scheme's kinds: doubles are "number", bigints "bigint" (booleans the VM knows itself)
 export const SCHEME_TYPES: TypeSystem = {
@@ -515,8 +537,18 @@ const spreadList = (lst: any, into: any[] = []): any[] => {
 // the same positions in every instance). Lists are the table's sequences: rest parameters are lists (%list packs them),
 // and %spread makes the array %apply takes of one
 export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
-    for (const { name, min, max, fn, inline, returns } of SCHEME_BUILTINS) {
-        intrinsics.register(`%${name}`, fn, { args: [min, max], leaf: true, inline, deps: inline === undefined ? undefined : INLINE_DEPS, returns: returns ?? RETURNS[name], wants: NUMERIC.has(name) ? "number" : undefined });
+    for (const { name, min, max, fn, inline, returns, refineArgs, branchNarrow, invertBranch } of SCHEME_BUILTINS) {
+        intrinsics.register(`%${name}`, fn, {
+            args: [min, max],
+            leaf: true,
+            inline,
+            deps: inline === undefined ? undefined : INLINE_DEPS,
+            returns: returns ?? RETURNS[name],
+            wants: NUMERIC.has(name) ? "number" : undefined,
+            refineArgs: refineArgs ?? (NUMERIC.has(name) ? refineNumeric : undefined),
+            branchNarrow: branchNarrow ?? (NUMERIC_CMP.has(name) ? branchNumericCmp : undefined),
+            invertBranch: invertBranch ?? (name === "not" ? true : undefined),
+        });
     }
     intrinsics.register("%list", (regs, start, nargs) => {
         let tail: Cons | null = null;
