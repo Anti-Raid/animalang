@@ -246,6 +246,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     // the check that one more nested direct call is allowed (as `&& ...`)
     protected abstract readonly depthCheck: string;
+    // where the upvars are: a local in heap code; direct code reads its closure's where it uses them, as reading them on
+    // entry makes V8 check the closure on every call, even of a function that uses none
+    protected abstract readonly upvarsExpr: string;
 
     // where the running function's continuation marks and logical frame are
     protected abstract readonly marksVar: string;
@@ -310,9 +313,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "LoadInt":
                 return this.emit(`r${inst.dst} = ${inst.value};`);
             case "LoadUpvar":
-                return this.emit(`r${inst.dst} = upvars[${inst.idx}]${inst.unbox ? ".val" : ""};`);
+                return this.emit(`r${inst.dst} = ${this.upvarsExpr}[${inst.idx}]${inst.unbox ? ".val" : ""};`);
             case "SetUpvar":
-                return this.emit(`upvars[${inst.idx}] = ${inst.box ? `new Box(r${inst.src})` : `r${inst.src}`};`);
+                return this.emit(`${this.upvarsExpr}[${inst.idx}] = ${inst.box ? `new Box(r${inst.src})` : `r${inst.src}`};`);
             case "FixUpvar":
                 return this.emit(`r${inst.clo}.upvars[${inst.idx}] = r${inst.src};`);
             case "LoadGlobal":
@@ -346,7 +349,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "SetBox":
                 return this.emit(`r${inst.dst}.val = r${inst.src};`);
             case "NewClosure": {
-                const captures = inst.captures.map(c => c.local ? `r${c.index}` : `upvars[${c.index}]`).join(", ");
+                const captures = inst.captures.map(c => c.local ? `r${c.index}` : `${this.upvarsExpr}[${c.index}]`).join(", ");
                 return this.emit(`r${inst.dst} = new Closure(CONSTANTS[${inst.tmpl}], [${captures}]);`);
             }
             case "MoveAcc":
@@ -403,6 +406,7 @@ export class ResumeEmitter extends FunctionEmitter {
     protected readonly endOfCode = "return null;";
     // resume functions run from the driver loop, at the base of the js stack
     protected readonly depthCheck = "";
+    protected readonly upvarsExpr = "upvars";
     protected readonly marksVar = "frame.marks";
     protected readonly mframeVar = "frame.mframe";
     readonly #liveness: Liveness;
@@ -628,6 +632,7 @@ export class DirectEmitter extends FunctionEmitter {
 
     protected readonly accExpr = "acc";
     protected readonly depthCheck = " && depth < MAX_JS_DEPTH";
+    protected readonly upvarsExpr = "closure.upvars";
     protected readonly marksVar = "marks";
     protected readonly mframeVar = "mframe";
     // this function's own arity, when a call to its own closure can call it by name (no rest parameter)
@@ -702,7 +707,6 @@ export class DirectEmitter extends FunctionEmitter {
         const allRegs = Array.from({ length: this.numReg }, (_, i) => resumeLive.has(i) ? `r${i}` : "undefined").join(", ");
         this.emit(`
             function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
-                const upvars = closure.upvars;
                 let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
         `);
