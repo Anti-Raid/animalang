@@ -7,10 +7,9 @@ import type * as Lib from "./bench-entry";
 const BUNDLE = "../.bench/anima.js";
 const bundle = await import(/* @vite-ignore */ BUNDLE);
 
-const { createScheme, impl, implAot, ASTStringifier, IProcedure, hostTailFrom, dumpFull, readFull } = bundle as unknown as typeof Lib;
-type Anima = Lib.Anima;
+const { createScheme, impl, ASTStringifier, IProcedure, hostTailFrom } = bundle as unknown as typeof Lib;
 type AnimaOptions = Lib.AnimaOptions;
-type ByteCode = Lib.ByteCode;
+type Code = Lib.Code;
 
 // --- the only part that follows the intrinsics API as it changes ---
 const makeInstance = (vmImpl: AnimaOptions) => {
@@ -24,7 +23,6 @@ const makeInstance = (vmImpl: AnimaOptions) => {
     anima.registerIntrinsic("%bench-call-or", (regs, s, n) => regs[s] instanceof IProcedure ? hostTailFrom(regs[s], regs, s + 1, n - 1) : regs[s], { args: [1, Infinity] });
     return anima;
 };
-const loadSetup = (anima: Anima, dumped: Uint32Array) => readFull(dumped, anima.intrinsics);
 // -------------------------------------------------------------------
 
 const SETUP = `
@@ -107,12 +105,12 @@ const GROUPS: [group: string, calls: Record<string, string>][] = [
     }],
 ];
 
-const MODES: [mode: string, vmImpl: AnimaOptions][] = [["interp", impl], ["aot", implAot]];
+const MODES: [mode: string, vmImpl: AnimaOptions][] = [["aot", impl]];
 
 const printer = new ASTStringifier();
 const stringify = (v: any): string => printer.stringify(v);
 
-// every workload is run once per mode up front; the modes must agree, so a broken workload fails loudly
+// every workload is run once up front, so a broken one fails before timing
 const prepared = MODES.map(([mode, vmImpl]) => {
     const anima = makeInstance(vmImpl);
     anima.evaluateRaw(anima.compileRaw(SETUP));
@@ -122,30 +120,20 @@ const prepared = MODES.map(([mode, vmImpl]) => {
     })] as const);
     return { mode, vmImpl, anima, groups };
 });
-for (const { mode, groups } of prepared.slice(1)) {
-    groups.forEach(([group, runs], g) => runs.forEach((run, i) => {
-        const expected = prepared[0].groups[g][1][i].result;
-        if (run.result !== expected) throw new Error(`${group} / ${run.name}: ${mode} gave ${run.result}, interp gave ${expected}`);
-    }));
-}
 
 const OPTS = { time: 1000, warmupTime: 300 };
 
 for (const { mode, anima, groups } of prepared) {
     for (const [group, runs] of groups) {
         describe(`${mode}: ${group}`, () => {
-            for (const { name, bc } of runs) bench(name, () => { anima.evaluateRaw(bc as ByteCode); }, OPTS);
+            for (const { name, bc } of runs) bench(name, () => { anima.evaluateRaw(bc as Code); }, OPTS);
         });
     }
 }
 
 for (const { mode, vmImpl, anima } of prepared) {
-    describe(`${mode}: startup, compile, load`, () => {
-        const compiled = anima.compileRaw(SETUP) as ByteCode;
-        const dumped = dumpFull(compiled);
+    describe(`${mode}: startup, compile`, () => {
         bench("new instance", () => { createScheme(vmImpl); }, OPTS);
         bench("compile setup program", () => { anima.compileRaw(SETUP); }, OPTS);
-        bench("dump + load setup program", () => { loadSetup(anima, dumpFull(compiled)); }, OPTS);
-        bench("load setup program", () => { loadSetup(anima, dumped); }, OPTS);
     });
 }

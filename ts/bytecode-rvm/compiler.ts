@@ -209,7 +209,7 @@ export class Compiler {
 
     // compiles both if calls as well as code that is converted into if calls
     // (%if c1 e1 c2 e2 ... [else]): the first ei whose ci is true, else `else` (or <#void>). One chain whatever the number
-    // of clauses: IF c1 L1; e1; ELSE end; L1: <c2>; ELSEIF c2 L2; e2; ELSE end; L2: ...; else; ENDIF; end:
+    // of clauses: If c1 L1; e1; Else end; L1: <c2>; If (elseif) c2 L2; e2; Else end; L2: ...; else; EndIf; end:
     #compileIfCall(expr: any[], opts: CmpOpts) {
         const args = expr.slice(1)
         if (args.length < 2) {
@@ -341,7 +341,7 @@ export class Compiler {
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
     }
 
-    // (%let-values ((formals expr) ...) body ...): every expr is evaluated and spread into registers (UNPACK), then
+    // (%let-values ((formals expr) ...) body ...): every expr is evaluated and spread into registers (Unpack), then
     // all the variables are bound in a block, as in %let
     // clauses are [params, rest, init]
     #compileLetValues(expr: any[], opts: CmpOpts, strict: boolean) {
@@ -602,7 +602,7 @@ export class Compiler {
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
-    // (%apply %intrinsic arg ... lst): the argument count is only known at run time, so APPLYINT checks it there
+    // (%apply %intrinsic arg ... lst): the argument count is only known at run time, so IntApply checks it there
     #compileApplyIntrinsic(intrinsic: Intrinsic, argExprs: any[], opts: CmpOpts) {
         if (!intrinsic.leaf) throw new VMError(Msg.ApplyNonLeaf, [intrinsic.name]);
         const nargs = argExprs.length;
@@ -693,7 +693,7 @@ export class Compiler {
 
     // (%letrec ((name init) ...) body ...): the names are bound first, so the inits can refer to any of them. The lambdas
     // are made first, all at once; the other inits then run in order. A name that is never assigned holds its value
-    // directly, and the upvars captured before it existed are filled in once it does (FIXUPVAR); an assigned name (or
+    // directly, and the upvars captured before it existed are filled in once it does (FixUpvar); an assigned name (or
     // one a closure may copy before its init has run, see lateValues) is a box
     #compileLetrec(expr: any[], opts: CmpOpts) {
         const ascope = opts.analyzer.scopeMap.get(expr)

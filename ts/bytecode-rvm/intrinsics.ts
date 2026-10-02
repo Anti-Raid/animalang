@@ -23,22 +23,22 @@ export type TypeSystem = {
 // `known`: for each argument, its kind when certain (see aot/facts.ts), so the template may skip checking it
 export type InlineFn = (args: string[], slow: string, tmp: string, d: Readonly<Record<string, string>>, known: ArgKinds) => string | null;
 
-// Reads only regs[start .. start+nargs), and never writes to regs or keeps it: in the interpreter it is the caller's live
-// register file. A non-leaf may return hostTail(proc, ...args) instead of a value. `ctx` and `executor` (the running
+// Reads only regs[start .. start+nargs), and never writes to regs or keeps it: in heap code it is the caller's frame's
+// registers. A non-leaf may return hostTail(proc, ...args) instead of a value. `ctx` and `executor` (the running
 // ExecutionContext and VMExecutor) are only passed to an intrinsic registered with `context` (the core operations)
 export type IntrinsicFn = (regs: any[], start: number, nargs: number, ctx?: any, executor?: any) => any
 
 export type IntrinsicOptions = {
     // [min, max] argument counts, checked at compile time
     args?: [number, number],
-    // never calls back into the VM (never returns a tail request): CALLINT, and not a call for the boxing analysis
+    // never calls back into the VM (never returns a tail request): an IntCall, and not a call for the boxing analysis
     leaf?: boolean,
     // AOT template: (argument expressions, the direct call, a scratch variable, the deps' local names) => js expression,
     // or null to make the direct call. Argument expressions are plain variables, so they may be repeated
     inline?: InlineFn,
     // values the inline template refers to, by name: the template reads them as ${d.name}
     deps?: Record<string, unknown>,
-    // needs the execution context: called with (regs, start, nargs, ctx, executor) (CALLCTX), and its inline template may
+    // needs the execution context: called with (regs, start, nargs, ctx, executor), and its inline template may
     // use `ctx` and `executor`. Only for the VM's core operations: they are the same in every table, so code compiled
     // against one calls them the same way in any other
     context?: boolean,
@@ -91,7 +91,7 @@ export type FactRules = Pick<Intrinsic, "returns" | "wants" | "refineArgs" | "br
 
 export class Intrinsics {
     readonly entries: Intrinsic[] = []
-    // entries[i].fn, by position: what CALLINT/CALLHOST operands index
+    // entries[i].fn, by position: what instructions' `pos` index
     readonly fns: IntrinsicFn[] = []
     // every dep value, once: generated code reads DEPS[slot]
     readonly deps: unknown[] = []

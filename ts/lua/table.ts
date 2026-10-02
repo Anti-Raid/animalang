@@ -1,4 +1,4 @@
-import { BSReader, DATUM, type BS, type Datum } from "../common";
+import { DATUM, type Datum } from "../common";
 import { hostError } from "../errors";
 
 const isArrayKey = (key: any): key is number => typeof key === "number" && Number.isInteger(key) && key >= 1;
@@ -125,19 +125,6 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         return true;
     }
 
-    get bsid() {
-        return "LuaTable";
-    }
-
-    dump(w: BS): void {
-        w.writeU32(this.#frozen ? 1 : 0);
-        w.writeU32(this.size);
-        for (const [k, v] of this.entries()) {
-            w.writeValue(k);
-            w.writeValue(v);
-        }
-    }
-
     equals(other: any, equal: (a: any, b: any) => boolean): boolean {
         if (!(other instanceof LuaTable) || other.size !== this.size) return false;
         for (const [k, v] of this.entries()) {
@@ -159,12 +146,3 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
 }
 
 const MISSING = Symbol("missing");
-
-BSReader.registerType("LuaTable", r => {
-    const frozen = r.readU32() === 1;
-    const size = r.readU32();
-    const t = new LuaTable();
-    for (let i = 0; i < size; i++) t.set(r.read(), r.read());
-    t.frozen = frozen;
-    return t;
-});

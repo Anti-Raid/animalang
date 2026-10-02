@@ -1,12 +1,11 @@
 import { Env, CORE_LAMBDA } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
-import type { CaseLambda } from "./bytecode-rvm/bytecode"
+import type { CaseLambda } from "./bytecode-rvm/code"
 import { newIntrinsics } from "./bytecode-rvm/core"
 import { Compiler } from "./bytecode-rvm/compiler"
 import { AnimaVM } from "./bytecode-rvm/vm"
-import type { ByteCode, Closure } from "./bytecode-rvm/exec"
+import type { Code, Closure } from "./bytecode-rvm/exec"
 import type { AnimaOptions } from "./bytecode-rvm/meta"
-import { deepPrint } from "./bytecode-rvm/utils"
 
 // A language on top of the core: reads source into its syntax tree and lowers that to the core forms
 export interface FrontEnd {
@@ -51,7 +50,7 @@ export class Anima {
     constructor(options: AnimaOptions, base?: Intrinsics) {
         this.#options = options
         this.#intrinsics = newIntrinsics(base)
-        this.#vm = new AnimaVM(options.mode, this.#intrinsics)
+        this.#vm = new AnimaVM(this.#intrinsics)
         this.#comp = new Compiler(this.#intrinsics, options.debug)
     }
 
@@ -80,7 +79,7 @@ export class Anima {
         return this
     }
 
-    public evaluateRaw(code: ByteCode): any {
+    public evaluateRaw(code: Code): any {
         return this.#vm.evaluateRaw(code, this.#scope)
     }
 
@@ -131,10 +130,6 @@ export class Anima {
     // the front end's syntax tree, or core forms if there is no front end
     compileRawAst(ast: any) {
         return this.#comp.compile(this.#frontEnd !== null ? this.#frontEnd.transform(ast) : ast)
-    }
-
-    deepPrint(bc: ByteCode) {
-        deepPrint(bc)
     }
 
     #requireFrontEnd(): FrontEnd {

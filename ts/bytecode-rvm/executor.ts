@@ -1,15 +1,14 @@
 // VMExecutor: calls, returns, continuations, dynamic-wind, exception delivery and coroutines, and the driver loop that
-// runs heap frames through the interpreter or AOT code
+// runs heap frames through their AOT code
 import { Env, ErrorObject, IProcedure, Msg, TRY_CALL, UnhandledError, VMError, packValues, vmError } from "../common";
 import { BARRIER, Caught, EXCEPTION_HANDLERS, Handlers, MarkEntry, markFirst, markSet, reentersBarrier } from "../marks";
 import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
 import { bindArgs, checkArity } from "./arity";
-import { ByteCode, CaseLambda, Closure, ClosureTemplate, createRegs } from "./bytecode";
-import type { VMHost } from "./bytecode";
+import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
+import type { VMHost } from "./code";
 import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, tracebackMessage } from "./coreops";
-import { BytecodeInterpreter, OpCode } from "./interpreter";
-import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
+import { OP_SIZE, type DistributiveOmit, type Op } from "./ops";
 import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
@@ -19,27 +18,27 @@ import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuat
 export let helpers: { handlerReturned: Closure, escapeWith: Closure, prompt: Closure, coroutineFinally: Closure } | null = null;
 export const raiseHelpers = () => helpers ??= {
     handlerReturned: helperClosure(1, [new ErrorObject(vmError(Msg.HandlerReturned))], [
-        OpCode.LOADCONST, 0, 0,
-        OpCode.CALLHOST, corePos("%raise"), 0, 1, 0,
-        OpCode.RETURN, 0,
+        { k: "LoadConst", dst: 0, idx: 0 },
+        { k: "HostCall", pos: corePos("%raise"), start: 0, nargs: 1, tail: false },
+        { k: "Return", src: 0 },
     ]),
     escapeWith: helperClosure(3, [], [
-        OpCode.MOVEACC, 1,
-        OpCode.CALLINT, corePos("%make-caught"), 2, 1, 1,
-        OpCode.CALL, 0, 2, 1, 1,
+        { k: "MoveAcc", dst: 1 },
+        { k: "IntCall", pos: corePos("%make-caught"), dst: 2, start: 1, nargs: 1 },
+        { k: "Call", proc: 0, start: 2, nargs: 1, tail: true },
     ]),
     // a prompt (%call-with-prompt): r0 the tag, r1 the body thunk, r2 the handler, r4 the wind it was installed in. The
     // body's value, or what an abort to it hands it (an Aborted), goes to %prompt-finish, in tail position
     prompt: helperClosure(5, [], [
-        OpCode.CALL, 1, 3, 0, 0,
-        OpCode.MOVEACC, 3,
-        OpCode.CALLHOST, corePos("%prompt-finish"), 2, 2, 1,
+        { k: "Call", proc: 1, start: 3, nargs: 0, tail: false },
+        { k: "MoveAcc", dst: 3 },
+        { k: "HostCall", pos: corePos("%prompt-finish"), start: 2, nargs: 2, tail: true },
     ], "prompt"),
     coroutineFinally: helperClosure(3, [], [
-        OpCode.MOVEACC, 0,
-        OpCode.CALLCTX, corePos("%end-wind"), 2, 0, 0,
-        OpCode.CALL, 1, 0, 0, 0,
-        OpCode.RETURN, 0,
+        { k: "MoveAcc", dst: 0 },
+        { k: "IntCall", pos: corePos("%end-wind"), dst: 2, start: 0, nargs: 0 },
+        { k: "Call", proc: 1, start: 0, nargs: 0, tail: false },
+        { k: "Return", src: 0 },
     ], "coroutine-finally"),
 };
 
@@ -48,11 +47,13 @@ const escapeTarget = (tok: EscapeContinuation, from: Frame | null): Frame | null
     for (let f = from; f !== null; f = f.parent) if (f.escape === owner) return f;
     return null;
 };
-export const helperClosure = (numReg: number, constants: any[], inst: number[], name: string = "raise"): Closure => {
+export const helperClosure = (numReg: number, constants: any[], body: DistributiveOmit<Op, "ip">[], name: string = "raise"): Closure => {
+    let ip = 0;
+    const ops = body.map(op => { const full = { ...op, ip } as Op; ip += OP_SIZE[op.k]; return full; });
     const positions = new Set<number>();
-    for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip]]) for (const off of INTRINSIC_OPERANDS[inst[ip]]) positions.add(inst[ip + off]);
+    for (const op of ops) if (op.k === "HostCall" || op.k === "IntCall" || op.k === "IntApply") positions.add(op.pos);
     const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
-    const code = new ByteCode(constants, new Uint32Array(inst), numReg, undefined, undefined, false, CORE_INTRINSICS, used);
+    const code = new Code(constants, ops, ip, numReg, undefined, undefined, false, CORE_INTRINSICS, used);
     code.internal = true;
     return new Closure(new ClosureTemplate([], null, code, [], name), [], name);
 };
@@ -739,12 +740,8 @@ export class VMExecutor {
     // --- driver loop ---
 
     #runLoop(ctx: ExecutionContext, frame: Frame): void {
-        if (this.vm.mode === "aot") {
-            // compiled code already had its nested templates compiled with it
-            if (frame.code.resumeFn === null) AotCompiler.compileAll(frame.code, frame.closure.tmpl);
-            AotCompiler.run(ctx, frame, this);
-        } else {
-            BytecodeInterpreter.run(ctx, frame, this);
-        }
+        // compiled code already had its nested templates compiled with it
+        if (frame.code.resumeFn === null) AotCompiler.compileAll(frame.code, frame.closure.tmpl);
+        AotCompiler.run(ctx, frame, this);
     }
 }

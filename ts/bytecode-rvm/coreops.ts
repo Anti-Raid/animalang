@@ -3,7 +3,7 @@
 import { ErrorObject, Msg, MultipleValues, packValues, unpackValues, vmError } from "../common";
 import { BARRIER, Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markValues } from "../marks";
 import type { Marks } from "../marks";
-import { CaseLambda, type Closure } from "./bytecode";
+import { CaseLambda, type Closure } from "./code";
 import type { VMExecutor } from "./executor";
 import { Intrinsics } from "./intrinsics";
 import type { InlineFn, IntrinsicFn, IntrinsicOptions } from "./intrinsics";
@@ -35,10 +35,10 @@ export const markSetArg = (who: string, set: any): Marks => {
 };
 
 // What an intrinsic that is not a leaf may return instead of a value: a transfer of control the VM carries out where the
-// intrinsic was called (CALLHOST), as if the call site were that operation. The VM carries it out at once, reading its
+// intrinsic was called (HostCall), as if the call site were that operation. The VM carries it out at once, reading its
 // fields before running anything else, so the core operations reuse one request of each kind (`of`) rather than
 // allocating one per call, which shows in tight coroutine loops. This is how the VM's control operations
-// (%call/cc, %raise, the coroutine operations, applying a procedure) are intrinsics rather than opcodes, and how host
+// (%call/cc, %raise, the coroutine operations, applying a procedure) are intrinsics rather than instructions, and how host
 // intrinsics call back into the VM (HostTail)
 export abstract class ControlRequest {
     // for a request made in tail position, what debug code records as the tail call (see recordTailMark)
@@ -47,7 +47,7 @@ export abstract class ControlRequest {
     }
 
     // carried out by heap code, in `frame`, whose ip is already past the call: a non-tail request leaves its value in
-    // ctx.acc (read by the MOVEACC that follows), a tail one hands it to frame's caller. Returns the frame to run next
+    // ctx.acc (read by the MoveAcc that follows), a tail one hands it to frame's caller. Returns the frame to run next
     abstract run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null;
 
     // carried out by direct code, which has no heap frame (its resume point is already recorded): the value, or a Suspend
@@ -485,7 +485,7 @@ export const corePos = (name: string): number => {
 };
 
 
-// an intrinsic's argument count checked at run time (for APPLYINT, whose count the compiler cannot know)
+// an intrinsic's argument count checked at run time (for IntApply, whose count the compiler cannot know)
 export const applyIntrinsic = (fn: IntrinsicFn, name: string, min: number, max: number, args: any[], ctx: ExecutionContext, executor: VMExecutor): any => {
     if (args.length < min || args.length > max) throw vmError(Msg.Arity, name, min, max, args.length);
     return fn(args, 0, args.length, ctx, executor);

@@ -9,7 +9,7 @@ import type { ArgKinds, InlineFn, IntrinsicFn, Intrinsics, Returns, TypeSystem }
 
 // Scheme's builtins, one entry each: registered as the leaf intrinsic %name (with its AOT template, if any), called
 // directly as (name arg ...) (see SCHEME_ALIASES) and as a value through the prelude's $name wrapper. The argument count
-// is always within [min, max] when a builtin runs: the compiler checks direct calls and APPLYINT applied ones
+// is always within [min, max] when a builtin runs: the compiler checks direct calls and IntApply checks applied ones
 export type SchemeBuiltin = {
     readonly name: string,
     readonly min: number,

@@ -35,7 +35,7 @@ They mean what a store-based machine gives them:
   3. the other ("value") inits run in order, and each name is set after its init.
 - **A4: `%escape` stays in one function.** An `%escape` only targets a `%block` of the same function. `#compileEscape` rejects anything else (`Msg.EscapeFromLambda`).
 - **A5: a value init's continuation runs once.** The continuation of a `%letrec` value init is not invoked again after that init has returned. R6RS requires this (11.4.6), and without it a value's binding is effectively assigned. Only §3 relies on A5. §4 does not: it holds without A5, see 4.3.
-- **A6: interrupt checks are not calls.** The `(%interrupt)` checks the compiler adds (see Interrupts in the README) are added after lifting and the core forms' liveness analysis, which never see one; AOT liveness, which works on the bytecode, sees each as the host call it is. A check calls no procedure and captures no continuation: its handler can only continue, pause the running coroutine (which then resumes once, where it was) or stop the evaluation for good. So adding them changes nothing proved here.
+- **A6: interrupt checks are not calls.** The `(%interrupt)` checks the compiler adds (see Interrupts in the README) are added after lifting and the core forms' liveness analysis, which never see one; AOT liveness, which works on the instructions, sees each as the host call it is. A check calls no procedure and captures no continuation: its handler can only continue, pause the running coroutine (which then resumes once, where it was) or stop the evaluation for good. So adding them changes nothing proved here.
 
 **Notation.**
 
@@ -269,9 +269,9 @@ Resume code (`ResumeEmitter`) keeps registers in JS locals `ri`.
 **Soundness conditions of the dataflow.**
 
 - **(S1) Successors.**
-  - Every successor ip is a block start. `basicBlockStarts` adds every ip operand, including the targets of `ELSE` and `JUMP`, and the ip after every instruction that splits: `IF`, `ELSEIF`, `BLOCK`, `LOOP`, `ENDLOOP`, `JUMP`, and a non-tail `CALL` or `CALLHOST`.
-  - `ENDIF` does not split, but its successor, the next ip, is always a start: `#compileIfCall` puts the chain's end label right after it, and at least one `ELSE` jumps there.
-  - `RETURN` has no successor. Anything after it that is reachable is the target of a jump, and so a start.
+  - Every successor ip is a block start. `blockStarts` adds every jump target, including the targets of `Else` and `Jump`, and the ip after every instruction that splits: `If`, `Block`, `Loop`, `EndLoop`, `Jump`, and a non-tail `Call` or `HostCall`.
+  - `EndIf` does not split, but its successor, the next ip, is always a start: `#compileIfCall` puts the chain's end label right after it, and at least one `Else` jumps there.
+  - `Return` has no successor. Anything after it that is reachable is the target of a jump, and so a start.
   - A block without a terminator falls through to the next start (`{ k: "Jump", target: ip }`).
   - Each terminator lists every place control can go next:
     - `Branch`: both ways;
@@ -329,7 +329,7 @@ Direct code never resumes in the middle of a function. When it suspends, it rebu
 ## 6. Hoisting for Upvars in Direct Loops
 
 ### 6.1 Context
-In Animalang's direct AOT entry (`direct$`), functions execute inside a structured JavaScript loop (`for (;;)`) or dispatch loop. Prior to this optimization, accessing an upvar in register VM bytecode (`LoadUpvar`, `SetUpvar`, `NewClosure`) emitted dynamic indexing `closure.upvars[idx]` on every access within hot loop bodies.
+In Animalang's direct AOT entry (`direct$`), functions execute inside a structured JavaScript loop (`for (;;)`) or dispatch loop. Prior to this optimization, accessing an upvar through the VM's instructions (`LoadUpvar`, `SetUpvar`, `NewClosure`) emitted dynamic indexing `closure.upvars[idx]` on every access within hot loop bodies.
 
 ### 6.2 Transformation
 For any function direct entry with closure $C$, let $\mathcal{U} = \{ i \in \mathbb{N} \mid \text{LoadUpvar}(i) \lor \text{SetUpvar}(i) \lor \text{NewClosure}(\dots, \text{capture}(i)) \in \text{Insts} \}$.
@@ -337,7 +337,7 @@ If $\mathcal{U} \neq \emptyset$:
 1. In the function prologue (outside all loops):
    $$\text{const } upvars = C.upvars;$$
    $$\text{let } uv_i = upvars[i] \quad (\forall i \in \mathcal{U})$$
-2. In bytecode instruction emission:
+2. In instruction emission:
    - $\text{LoadUpvar}(dst, i) \implies r_{dst} = uv_i$
    - $\text{SetUpvar}(src, i) \implies C.upvars[i] = uv_i = r_{src}$
    - $\text{NewClosure}(dst, \dots, capture(i)) \implies \text{reads } uv_i$
@@ -427,7 +427,7 @@ Within a basic block, a copy instruction $r_{dst} = \text{Move } r_{src}$ establ
 1. In the VM semantics, `#f` (JS `false`) is the sole falsy value; all others are truthy. An intrinsic with `invertBranch = true` maps falsy to truthy and truthy to falsy. Therefore, testing $cond$ is truthy iff the inner condition is falsy.
 2. If control flows to $then$, $I_{cond}$ evaluated to a truthy value. By the frontend's `branchNarrow` specification, this outcome only occurs when operands satisfy `then` kinds. Conversely, if control flows to $else$, $I_{cond}$ evaluated to `false`, establishing `else` kinds. Since no register of $W$ is written between $I_{cond}$ and the branch, each still holds the operand $I_{cond}$ tested, so the kinds hold of the registers on each edge. □
 
-The kinds apply only under the table the code was compiled with: sharing code or generated source with another table (`ByteCode.runsWith`, the AOT source cache) requires the same `returns`, `wants`, `refineArgs`, `branchNarrow` and `invertBranch` for every intrinsic used (`Intrinsics.sameFacts`).
+The kinds apply only under the table the code was compiled with: sharing code or generated source with another table (`Code.runsWith`, the AOT source cache) requires the same `returns`, `wants`, `refineArgs`, `branchNarrow` and `invertBranch` for every intrinsic used (`Intrinsics.sameFacts`).
 
 ### 7.6 Semantics Preservation of Defensive Guard Elimination
 
@@ -501,7 +501,7 @@ By guarding with $proc \text{ instanceof Closure}$ first:
 *When a procedure's direct execution incurs repeated control suspensions (continuations, escapes, or exceptions) exceeding `DIRECT_SUSPEND_LIMIT`, the VM signals intentional deoptimization to heap frames by setting `code.directArity = -1; code.directRestArity = -1; code.directPad = false;`. Including $CC\_tmpl.code.directArity \ne -1$ in the inline cache fast path ensures that deoptimized functions are never re-entered via direct entry, preserving the VM's suspension bailout invariant.*
 
 *Proof.*
-Under `countControlSuspend(code)` (`values.ts`), once $code.controlSuspends \ge DIRECT\_SUSPEND\_LIMIT$, direct mode execution is permanently revoked for that `ByteCode` instance by assigning $code.directArity = -1$.
+Under `countControlSuspend(code)` (`values.ts`), once $code.controlSuspends \ge DIRECT\_SUSPEND\_LIMIT$, direct mode execution is permanently revoked for that `Code` instance by assigning $code.directArity = -1$.
 Direct invocations of such procedures force heap frame allocation (`executor.callOther` / `callDirectRest`), avoiding repeated JavaScript exception unwinding (`Suspend.raise`).
 If the inline cache did not inspect $CC\_tmpl.code.directArity \ne -1$, cached call sites would bypass the arity guard and directly invoke $CC\_directFn$, executing direct entry and throwing uncaught `Suspend` exceptions on every suspension.
 By guarding $CC\_tmpl.code.directArity \ne -1$ directly on the fast path, any template demoted by `countControlSuspend` fails the fast path check and routes to the heap frame fallback, restoring efficient resumption semantics. □

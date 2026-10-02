@@ -2,13 +2,14 @@ import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
-import { ByteCode } from '../bytecode-rvm/vm';
+import { Code } from '../bytecode-rvm/vm';
 import { Anima } from '../anima';
-import { impl, implAot, implDebug, implAotDebug } from '../bytecode-rvm/meta';
+import { impl, implDebug } from '../bytecode-rvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Anima', () => {
     let evaluator: Anima
     let s = new ASTStringifier()
@@ -141,7 +142,8 @@ describe('Anima', () => {
 })
 })
 
-describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s", (_mode, vmImpl) => {
+describe("debug", () => {
+    const vmImpl = implDebug
     let evaluator: Anima;
     beforeEach(() => { evaluator = createScheme(vmImpl) });
     const runFile = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src, "t.anima"));

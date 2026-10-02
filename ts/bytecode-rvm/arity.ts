@@ -3,7 +3,7 @@ import { Msg, vmError } from "../common";
 
 // How a procedure takes its arguments, for closures and intrinsics alike: between `min` and `max` of them. A closure's
 // first `min` arguments are its positional parameters; with a `rest` parameter, the others are bound to it, as a plain
-// array, or "packed" into the sequence of the table's pack intrinsic (ByteCode.restPos)
+// array, or "packed" into the sequence of the table's pack intrinsic (Code.restPos)
 export type RestKind = "none" | "array" | "packed";
 
 // `params`: how many positional parameters; `pad`: missing ones are <#void> and extra arguments are dropped (or go to

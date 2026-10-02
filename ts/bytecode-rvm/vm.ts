@@ -1,8 +1,8 @@
 import { ErrorObject, Env, VMError, unpackValues, type SourcePos } from "../common";
-import { type ExecutionMode, OpCode, CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, BytecodeInterpreter, ByteCode, Closure, ClosureTemplate, Coroutine, InterruptError, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
+import { CodeEmitter, AotCompiler, ExecutionContext, Frame, VMContinuation, VMExecutor, Code, Closure, ClosureTemplate, Coroutine, InterruptError, ReRaise, createRegs, frameInfos, formatTraceback } from "./exec";
 import { Intrinsics } from "./intrinsics";
 import { newIntrinsics } from "./core";
-import { CaseLambda } from "./bytecode";
+import { CaseLambda } from "./code";
 
 export {
     CodeEmitter,
@@ -11,21 +11,14 @@ export {
     Frame,
     VMContinuation,
     VMExecutor,
-    BytecodeInterpreter,
-    ByteCode,
-    OpCode,
+    Code,
     Coroutine
 };
 
-export type { ExecutionMode };
-
 export class AnimaVM {
     readonly executor: VMExecutor;
-    public mode: ExecutionMode;
-
-    // the intrinsics this VM's compiler compiles against (code carries the table it was compiled or loaded with)
-    constructor(mode: ExecutionMode = "interp", readonly intrinsics: Intrinsics = newIntrinsics()) {
-        this.mode = mode;
+    // the intrinsics this VM's compiler compiles against (code carries the table it was compiled with)
+    constructor(readonly intrinsics: Intrinsics = newIntrinsics()) {
         this.executor = new VMExecutor(this);
     }
 
@@ -42,7 +35,7 @@ export class AnimaVM {
         return err;
     }
 
-    public evaluateRaw(code: ByteCode, scope: Env): any {
+    public evaluateRaw(code: Code, scope: Env): any {
         if (this.intrinsics.interrupts && !code.interrupts) throw new Error("this code was compiled without interrupt checks, but interrupts are on: compile it again");
         const ctx = new ExecutionContext(this, scope);
         const topClosure = new Closure(new ClosureTemplate([], null, code, []), [], "top-level");
@@ -113,11 +106,8 @@ export class AnimaVM {
 
     #run(ctx: ExecutionContext, frame: Frame): any {
         return this.#entry(() => {
-            if (this.mode === "aot") {
-                AotCompiler.compileAll(frame.code, frame.closure.tmpl);
-                return AotCompiler.run(ctx, frame, this.executor);
-            }
-            return BytecodeInterpreter.run(ctx, frame, this.executor);
+            AotCompiler.compileAll(frame.code, frame.closure.tmpl);
+            return AotCompiler.run(ctx, frame, this.executor);
         });
     }
 }

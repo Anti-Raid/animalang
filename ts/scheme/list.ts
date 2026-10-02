@@ -1,4 +1,4 @@
-import { BSReader, DATUM, type BS, type Datum } from "../common";
+import { DATUM, type Datum } from "../common";
 
 // the length of an improper list: negative however many pairs are put in front of it (a small integer, so lengths stay
 // unboxed)
@@ -103,19 +103,6 @@ export class Cons implements Datum {
         return true;
     }
 
-    get bsid() {
-        return "Cons";
-    }
-
-    dump(w: BS): void {
-        let count = 0;
-        for (let curr: any = this; curr instanceof Cons; curr = curr.cdr) count++;
-        w.writeU32(count);
-        let curr: any = this;
-        for (; curr instanceof Cons; curr = curr.cdr) w.writeValue(curr.car);
-        w.writeValue(curr);
-    }
-
     equals(other: any, equal: (a: any, b: any) => boolean): boolean {
         if (!(other instanceof Cons) || other.length !== this.length) return false;
         let pa: any = this, pb: any = other;
@@ -141,15 +128,6 @@ export class Cons implements Datum {
     }
 }
 
-BSReader.registerType("Cons", r => {
-    const count = r.readU32();
-    const cars = new Array(count);
-    for (let i = 0; i < count; i++) cars[i] = r.read();
-    let tail: any = r.read();
-    for (let i = count - 1; i >= 0; i--) tail = new Cons(cars[i], tail);
-    return tail;
-});
-
 // the pairs being printed or compared right now: mutable pairs can be circular
 const PRINTING = new Set<MCons>();
 const COMPARING = new Map<MCons, Set<MCons>>();
@@ -160,14 +138,6 @@ export class MCons implements Datum {
 
     get [DATUM](): true {
         return true;
-    }
-
-    get bsid() {
-        return "MCons";
-    }
-
-    dump(): void {
-        throw new Error("a mutable pair cannot be serialized");
     }
 
     // equal contents; a pair of pairs met again while comparing them is taken as equal (so circular ones compare)

@@ -2,16 +2,16 @@ import { MissingVarError, Env, ErrorObject, OpaqueValue, TRY_CALL } from '../com
 import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
-import { ByteCode, AnimaVM, OpCode } from '../bytecode-rvm/vm';
-import { Closure, INSTRUCTION_LENGTHS } from '../bytecode-rvm/exec';
+import { Code, AnimaVM } from '../bytecode-rvm/vm';
+import { Closure, listing } from '../bytecode-rvm/exec';
 import { Anima } from '../anima';
-import { impl, implAot } from '../bytecode-rvm/meta';
-import { dumpFull, readFull, stringifyInst } from '../bytecode-rvm/utils';
-import { registerTestIntrinsics } from './helpers';
+import { impl } from '../bytecode-rvm/meta';
+import { opKinds, registerTestIntrinsics } from './helpers';
 import { hostYield } from '../bytecode-rvm/exec';
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Anima', () => {
     let evaluator: Anima
     let s = new ASTStringifier()
@@ -637,14 +637,14 @@ describe('Anima', () => {
             expect(run("(usem)")).toBe("5");
 
             const bc = evaluator.compileRaw("(+ gx 1)");
-            const vm = new AnimaVM("aot");
+            const vm = new AnimaVM();
             const scopeA = new Env(); scopeA.set(Symbol.for("gx"), 1);
             const scopeB = new Env(); scopeB.set(Symbol.for("gx"), 10);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeB)).toBe(11);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
+            expect(vm.evaluateRaw(bc as Code, scopeA)).toBe(2);
+            expect(vm.evaluateRaw(bc as Code, scopeB)).toBe(11);
+            expect(vm.evaluateRaw(bc as Code, scopeA)).toBe(2);
             scopeA.set(Symbol.for("gx"), 100);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(101);
+            expect(vm.evaluateRaw(bc as Code, scopeA)).toBe(101);
         });
 
         it('lets code shadow builtins, locally and at the top level', () => {
@@ -968,14 +968,10 @@ describe('Anima', () => {
             expect(run(`(define (fw-loop n . xs) (if (= n 0) (apply %+ xs) (fw-loop (- n 1) n 1))) (fw-loop 3)`)).toBe("2")
             expect(() => run(`(define (fw-one . xs) (apply %car xs)) (fw-one 1 2)`)).toThrow("%car: expected exactly 1 args, got 2")
 
-            const bc = evaluator.compileRaw(`(define (fw-t . xs) (apply %+ xs))`) as ByteCode
+            const bc = evaluator.compileRaw(`(define (fw-t . xs) (apply %+ xs))`) as Code
             const fn = bc.constants.find((c: any) => c instanceof Closure)!
             expect(fn.tmpl.rest).toBe("array")
-            const ops: OpCode[] = []
-            for (let ip = 0; ip < fn.tmpl.code.inst.length; ip += INSTRUCTION_LENGTHS[fn.tmpl.code.inst[ip] as OpCode]) ops.push(fn.tmpl.code.inst[ip])
-            expect(ops).toContain(OpCode.APPLYINT)
-            const back = readFull(dumpFull(bc), evaluator.intrinsics) as ByteCode
-            expect(back.constants.find((c: any) => c instanceof Closure)!.tmpl.rest).toBe("array")
+            expect(opKinds(fn.tmpl.code)).toContain("IntApply")
         });
 
         it('keeps a rest list wherever the rest parameter is seen as a value', () => {
@@ -987,7 +983,7 @@ describe('Anima', () => {
             expect(run(`(define (nf-inner . xs) (let ((xs (list 5 6))) (apply %+ xs)) (apply %* xs)) (nf-inner 2 3)`)).toBe("6")
             // read as a value, captured by a nested lambda, or reassigned: the closure keeps the list path
             for (const src of [`(define (nf-t . xs) (apply %+ xs) xs)`, `(define (nf-t . xs) (lambda () (apply %+ xs)))`, `(define (nf-t . xs) (set! xs (cdr xs)) (apply %+ xs))`]) {
-                const bc = evaluator.compileRaw(src) as ByteCode
+                const bc = evaluator.compileRaw(src) as Code
                 expect(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.rest).toBe("packed")
             }
         });
@@ -1538,14 +1534,8 @@ describe('Anima', () => {
     });
 
     describe('%let', () => {
-        // whether a variable is boxed shows up as BOX instructions in the procedure's code
-        const boxesIn = (src: string): number => {
-            const closure = evaluator.evaluateRaw(evaluator.compileRaw(src))
-            const inst: Uint32Array = closure.tmpl.code.inst
-            let boxes = 0
-            for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) if (inst[ip] === OpCode.BOX) boxes++
-            return boxes
-        }
+        // whether a variable is boxed shows up as Box instructions in the procedure's code
+        const boxesIn = (src: string): number => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code).filter(k => k === "Box").length
 
         it('does not box variables that are only read inside a let', () => {
             expect(boxesIn(`(lambda (n) (let ((x 1)) (let* ((y (+ x n))) (+ x y n))))`)).toBe(0)
@@ -1614,13 +1604,7 @@ describe('Anima', () => {
         })
 
         it('lifts helpers that are only called, so no closure is made for them', () => {
-            const closuresIn = (src: string): number => {
-                const closure = evaluator.evaluateRaw(evaluator.compileRaw(src))
-                const inst: Uint32Array = closure.tmpl.code.inst
-                let made = 0
-                for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) if (inst[ip] === OpCode.NEWCLOSURE) made++
-                return made
-            }
+            const closuresIn = (src: string): number => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code).filter(k => k === "NewClosure").length
             expect(run(`(define (ll1 k) (define (helper x) (+ k x)) (helper 1)) (ll1 5)`)).toBe("6")
             expect(closuresIn(`(lambda (k) (define (helper x) (+ k x)) (helper 1))`)).toBe(0)
             // recursive and mutually recursive helpers receive themselves and each other
@@ -1822,11 +1806,8 @@ describe('Anima', () => {
 
         it('a local case-lambda calls its clauses directly', () => {
             const made = (src: string) => {
-                const closure = evaluator.evaluateRaw(evaluator.compileRaw(src))
-                const inst: Uint32Array = closure.tmpl.code.inst
-                const ops: number[] = []
-                for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) ops.push(inst[ip])
-                return { closures: ops.filter(op => op === OpCode.NEWCLOSURE).length, intrinsicCalls: ops.filter(op => op === OpCode.CALLINT).length }
+                const ops = opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code)
+                return { closures: ops.filter(k => k === "NewClosure").length, intrinsicCalls: ops.filter(k => k === "IntCall").length }
             }
             const local = `(lambda (k) (define f (case-lambda ((a) (+ a k)) ((a b) (f (+ a b))) ((a . r) (length r)))) (list (f 1) (f 1 2) (f 1 2 3 4)))`
             expect(run(`(${local} 10)`)).toBe("(11 13 3)")
@@ -1857,18 +1838,12 @@ describe('Anima', () => {
         })
 
         it('call/cc and call/ec whose k is only called in the body are blocks', () => {
-            const ops = (src: string) => {
-                const closure = evaluator.evaluateRaw(evaluator.compileRaw(src))
-                const inst: Uint32Array = closure.tmpl.code.inst
-                const out: number[] = []
-                for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) out.push(inst[ip])
-                return out
-            }
+            const ops = (src: string) => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code)
             for (const cc of ["call/cc", "call/ec", "call-with-current-continuation"]) {
                 expect(run(`(list (+ 1 (${cc} (lambda (k) (+ 10 (k 5))))) (${cc} (lambda (k) 7)) (${cc} (lambda (k) (if #t (k 'early) 'late))))`)).toBe("(6 7 early)")
                 // no escape continuation or continuation is made at all
                 const made = ops(`(lambda (x) (+ 1 (${cc} (lambda (k) (if (> x 0) (k x) 0)))))`)
-                expect(made).not.toContain(OpCode.CALLHOST)
+                expect(made).not.toContain("HostCall")
             }
             // several values, and none
             expect(run(`(list (call-with-values (lambda () (call/cc (lambda (k) (k 1 2)))) list) (call-with-values (lambda () (call/cc (lambda (k) (k)))) list))`)).toBe("((1 2) ())")
@@ -1982,11 +1957,9 @@ describe('Anima', () => {
             expect(run(`(define xs '(8 9)) (define r (cons 1 (cons 2 (cons 3 xs)))) (list r (length r) (length (cdr r)) (eq? (cdddr r) xs) (cons 1 (cons 2 '())) (length (cons 1 (cons 2 '()))) (cons 1 (cons 2 3)) (list? (cons 1 (cons 2 3))))`)).toBe("((1 2 3 8 9) 5 4 #t (1 2) 2 (1 2 . 3) #f)")
             // arguments are evaluated left to right, as the nested calls would be
             expect(run(`(define log '()) (define (n x) (set! log (cons x log)) x) (cons (n 1) (cons (n 2) (n '()))) (reverse log)`)).toBe("(1 2 ())")
-            const bc = evaluator.compileRaw(`(define (cc-f a b c) (cons a (cons b (cons c '()))))`) as ByteCode
+            const bc = evaluator.compileRaw(`(define (cc-f a b c) (cons a (cons b (cons c '()))))`) as Code
             const fn = bc.constants.find((c: any) => c instanceof Closure)!
-            const ops: OpCode[] = []
-            for (let ip = 0; ip < fn.tmpl.code.inst.length; ip += INSTRUCTION_LENGTHS[fn.tmpl.code.inst[ip] as OpCode]) ops.push(fn.tmpl.code.inst[ip])
-            expect(ops.filter(op => op === OpCode.CALLINT)).toHaveLength(1)
+            expect(opKinds(fn.tmpl.code).filter(k => k === "IntCall")).toHaveLength(1)
         })
 
         it('mutable pairs (mcons) are separate from lists', () => {
@@ -2046,11 +2019,6 @@ describe('Anima', () => {
             expect(() => run("(bigint 1.5)")).toThrow("bigint: expected an integer")
         })
 
-        it('survives serialization', () => {
-            const bc = evaluator.compileRaw("(list 123456789012345678901234567890n 7n)")
-            expect(s.stringify(evaluator.evaluateRaw(readFull(dumpFull(bc), evaluator.intrinsics) as ByteCode))).toBe("(123456789012345678901234567890 7)")
-        })
-
         it('keeps AOT type facts sound', () => {
             // a bigint accumulator is not known to be a number, though the loop adds to it like one
             expect(run("(define big 9007199254740993n) (define (bl n) (let loop ((i 0) (acc 0n)) (if (= i n) acc (loop (+ i 1) (+ acc big))))) (list (bl 3) (bigint? (bl 3)))")).toBe("(27021597764222979 #t)")
@@ -2080,10 +2048,10 @@ describe('Anima', () => {
             expect(run("(define (qf x) `(a ,x b c)) (list (qf 1) (qf 2) (eq? (cddr (qf 1)) (cddr (qf 2))) (length (qf 1)))")).toBe("((a 1 b c) (a 2 b c) #t 4)")
             expect(run("(define (qs xs) `(,@xs z)) (list (qs '(1 2)) (eq? (cddr (qs '(1 2))) (cdr (qs '(3)))))")).toBe("((1 2 z) #t)")
             // a vector with nothing spliced is made directly
-            const bc = evaluator.compileRaw("(define (qv x) `#(1 ,x 3))") as ByteCode
+            const bc = evaluator.compileRaw("(define (qv x) `#(1 ,x 3))") as Code
             const fn = bc.constants.find((c: any) => c instanceof Closure)!
-            expect(stringifyInst(fn.tmpl.code).some((l: string) => /pos=%vector,/.test(l))).toBe(true)
-            expect(stringifyInst(fn.tmpl.code).some((l: string) => /list->vector/.test(l))).toBe(false)
+            expect(listing(fn.tmpl.code).some(l => /pos=%vector,/.test(l))).toBe(true)
+            expect(listing(fn.tmpl.code).some(l => /list->vector/.test(l))).toBe(false)
             evaluator.evaluateRaw(bc)
             expect(run("(qv 2)")).toBe("#(1 2 3)")
         })
@@ -2168,8 +2136,6 @@ describe('Anima', () => {
         })
 
         it('expands deep but finite programs', () => {
-            // expansion does not depend on the backend, and AOT spends ~100ms generating code for the huge function
-            if (_mode === "aot") return
             const clauses = Array.from({ length: 1000 }, (_, i) => `((= x ${i}) ${i})`).join(" ")
             expect(run(`(define x 999) (cond ${clauses} (else -1))`)).toBe("999")
             expect(run(Array.from({ length: 500 }, () => "((lambda () ").join("") + "1" + "))".repeat(500))).toBe("1")

@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { createScheme } from '../scheme';
 import { ASTStringifier } from '../scheme/printer';
-import { impl, implAot } from '../bytecode-rvm/meta';
-import { dumpFull, readFull, stringifyInst } from '../bytecode-rvm/utils';
-import { ByteCode } from '../bytecode-rvm/vm';
+import { impl } from '../bytecode-rvm/meta';
+import { Code } from '../bytecode-rvm/vm';
+import { listing } from '../bytecode-rvm/exec';
 import { InterruptError, hostInterruptError, hostYield } from '../index';
 import type { Anima } from '../anima';
 
 const s = new ASTStringifier();
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("Interrupts (%s)", (_mode, vmImpl) => {
+describe("Interrupts", () => {
+    const vmImpl = impl
     // an instance whose code checks, calling `handler` now and then
     const make = (handler: (a: Anima) => any) => {
         const a = createScheme(vmImpl);
@@ -163,14 +164,14 @@ describe.each([["interp", impl], ["aot", implAot]] as const)("Interrupts (%s)", 
     it("checks only where code could run without end, and only when turned on", () => {
         const src = `(define (inc x) (+ x 1)) (define (twice f x) (f (f x))) (define (count n) (let loop ((i 0)) (if (= i n) i (loop (+ i 1)))))`;
         const checks = (a: Anima) => {
-            const bc = a.compileRaw(src) as ByteCode;
+            const bc = a.compileRaw(src) as Code;
             const all: string[] = [];
-            const walk = (code: ByteCode) => {
-                all.push(...stringifyInst(code));
+            const walk = (code: Code) => {
+                all.push(...listing(code));
                 // a closure with no upvars is made once, when compiled
                 for (const c of code.constants) {
                     const inner = c?.code ?? c?.tmpl?.code;
-                    if (inner instanceof ByteCode) walk(inner);
+                    if (inner instanceof Code) walk(inner);
                 }
             };
             walk(bc);
@@ -181,14 +182,13 @@ describe.each([["interp", impl], ["aot", implAot]] as const)("Interrupts (%s)", 
         expect(checks(make(() => undefined))).toBe(2);
     });
 
-    it("refuses code compiled before interrupts were turned on, and keeps the setting through serialization", () => {
+    it("refuses code compiled before interrupts were turned on", () => {
         const a = createScheme(vmImpl);
         a.registerIntrinsic("%tick", () => undefined, { args: [0, 0] });
-        const old = a.compileRaw(`(let loop () (loop))`) as ByteCode;
+        const old = a.compileRaw(`(let loop () (loop))`) as Code;
         a.intrinsics.setInterruptHandler("%tick");
         expect(() => a.evaluateRaw(old)).toThrow(/compiled without interrupt checks/);
-        const checked = a.compileRaw(`(+ 1 2)`) as ByteCode;
+        const checked = a.compileRaw(`(+ 1 2)`) as Code;
         expect(checked.interrupts).toBe(true);
-        expect((readFull(dumpFull(checked), a.intrinsics) as ByteCode).interrupts).toBe(true);
     });
 });

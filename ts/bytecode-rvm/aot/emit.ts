@@ -9,10 +9,12 @@ import { MAX_STRUCTURED_NESTING, STRUCTURE_MISMATCH } from "./types";
 import type { AotBlock, AotInst, AotTerm } from "./types";
 import type { Arity } from "../arity";
 import { CORE_COUNT } from "../coreops";
-import { OpCode } from "../interpreter";
 import { Intrinsics, type Intrinsic, type Kind } from "../intrinsics";
-import { INSTRUCTION_LENGTHS, NO_REG, UNPACK_REST } from "../opcodes";
+import { OP_SIZE, UNPACK_REST, type Op } from "../ops";
 import { DIRECT_SUSPEND_LIMIT } from "../values";
+
+// where a function's instructions are, for the structured code of its direct entry: their positions and its size
+export type Layout = { readonly ops: readonly Op[], readonly at: ReadonlyMap<number, Op>, readonly size: number };
 
 export const MAX_INDENT = 16;
 export const INDENTS = Array.from({ length: MAX_INDENT + 1 }, (_, i) => "    ".repeat(i));
@@ -63,7 +65,7 @@ export const inlineDeps = (entry: Intrinsic, used: Set<string>): Readonly<Record
 
 // AOT code for the core control operations: what carrying out their requests does (see ControlRequest), written out at
 // the call so there is no request to make and dispatch on, which shows in tight coroutine and call/cc loops. The
-// interpreter carries out the requests themselves. `args` are the arguments' registers (as js expressions): the count
+// other requests carry themselves out (ControlRequest.run). `args` are the arguments' registers (as js expressions): the count
 // was checked when compiling.
 //  - heap: resume code, after frame.ip is set (and, unless in tail position or `continues`, the live registers are
 //    spilled): statements that return the frame to run next, or with `continues`, set ctx.acc and carry on. `spills`
@@ -73,7 +75,7 @@ export const inlineDeps = (entry: Intrinsic, used: Set<string>): Readonly<Record
 //    or `call`, which calls `proc` (in scope) with args, leaving its value in acc
 //  - tailProc: in tail position, the first argument is what debug code records as the tail call
 // `resume`: the ip after the call, which the emitter stores (frame.ip, rip) before the template unless `setsResume`;
-// `loopCount`: in direct code, the call is at a loop's back-edge (its next instruction is ENDLOOP), where a function can
+// `loopCount`: in direct code, the call is at a loop's back-edge (its next instruction is EndLoop), where a function can
 // count in its local `ic` (a loop there runs within one call of the function)
 export type ControlSite = { args: string[], isTail: boolean, resume: number, loopCount: boolean };
 export type ControlAot = {
@@ -171,7 +173,7 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
 export abstract class FunctionEmitter extends CodeEmitter {
     constructor(
         protected readonly blocks: AotBlock[],
-        protected readonly inst: Uint32Array,
+        protected readonly layout: Layout,
         protected readonly numReg: number,
         protected readonly debug: boolean = false,
         // the table the code is bound to: its intrinsics are the hoisted locals I<pos>, their deps D<slot>
@@ -217,7 +219,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
         return `if (${req}.tailProc !== undefined) ${this.marksVar} = recordTailMark(${this.marksVar}, ${this.mframeVar}, tailName(${req}.tailProc));`;
     }
 
-    // the AOT code of a core control operation a CALLHOST calls, if it is one
+    // the AOT code of a core control operation a HostCall calls, if it is one
     protected controlOf(term: Extract<AotTerm, { k: "HostCall" }>): ControlAot | undefined {
         return term.pos < CORE_COUNT ? CONTROL_AOT.get(this.table!.entries[term.pos].name) : undefined;
     }
@@ -238,7 +240,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // a call of `fn` over the register window (followed by ctx and executor for an intrinsic that takes the context)
     protected abstract windowCall(fn: string, start: number, nargs: number, withContext?: boolean): string;
 
-    // where the value of the last call is (read by MOVEACC)
+    // where the value of the last call is (read by MoveAcc)
     protected abstract readonly accExpr: string;
 
     // statement recording where to resume before an instruction that may throw (heap mode only)
@@ -258,7 +260,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     protected emitSwitchBody(): void {
         for (let i = 0; i < this.blocks.length; i++) {
-            const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.inst.length;
+            const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.layout.size;
             this.emit(`case ${this.blocks[i].start}: {`);
             this.startBlock(undefined);
             for (const inst of this.blocks[i].insts) this.emitInstWithFacts(inst);
@@ -272,8 +274,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected jump(target: number, next: number): string {
-        if (target === next && target < this.inst.length) return "";
-        if (target >= this.inst.length) return this.endOfCode;
+        if (target === next && target < this.layout.size) return "";
+        if (target >= this.layout.size) return this.endOfCode;
         return `ip = ${target}; continue top;`;
     }
 
@@ -414,8 +416,8 @@ export class ResumeEmitter extends FunctionEmitter {
     protected readonly mframeVar = "frame.mframe";
     readonly #liveness: Liveness;
 
-    constructor(blocks: AotBlock[], inst: Uint32Array, numReg: number, debug: boolean = false, table: Intrinsics | null = null, usedDeps: Set<string> = new Set(), constants: readonly any[] = []) {
-        super(blocks, inst, numReg, debug, table, usedDeps, constants);
+    constructor(blocks: AotBlock[], layout: Layout, numReg: number, debug: boolean = false, table: Intrinsics | null = null, usedDeps: Set<string> = new Set(), constants: readonly any[] = []) {
+        super(blocks, layout, numReg, debug, table, usedDeps, constants);
         this.#liveness = new Liveness(blocks, numReg);
     }
     // follows jumps through empty blocks (left by loops and blocks) to where control really goes, saving dispatches
@@ -790,15 +792,15 @@ export class DirectEmitter extends FunctionEmitter {
         `);
     }
 
-    // direct-entry code never resumes mid-function, so compiled `if`s (IF c else ... ELSE end, else: ... ENDIF, end:) can be emitted as nested js if/else
+    // direct-entry code never resumes mid-function, so compiled `if`s (If c else ... Else end, else: ... EndIf, end:) can be emitted as nested js if/else
     #structuredBody(seed: Facts | null = null): string | null {
-        const body = new DirectEmitter(this.blocks, this.inst, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
+        const body = new DirectEmitter(this.blocks, this.layout, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
         body.#selfArity = this.#selfArity;
         body.#seed = seed;
         body.#specCheck = this.#specCheck;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {
-            body.#walk(index, 0, this.inst.length);
+            body.#walk(index, 0, this.layout.size);
         } catch (e) {
             if (e === STRUCTURE_MISMATCH) return null;
             throw e;
@@ -815,20 +817,25 @@ export class DirectEmitter extends FunctionEmitter {
     // the labels of the if chains being walked, by the ip of their end
     readonly #chains = new Map<number, string>();
 
-    // whether the else branch of the if ending at endIp starts an ELSEIF of the same chain (whose then branch ends with
-    // ELSE endIp; a nested if's chain has its own end)
+    // whether the else branch of the if ending at endIp starts an elseif If of the same chain (whose then branch ends with
+    // Else endIp; a nested if's chain has its own end)
     #hasElseIf(elseIp: number, endIp: number): boolean {
-        const inst = this.inst;
-        for (let ip = elseIp; ip < endIp - 1; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) {
-            if (inst[ip] !== OpCode.ELSEIF) continue;
-            const target = inst[ip + 2];
-            if (inst[target - 2] === OpCode.ELSE && inst[target - 1] === endIp) return true;
+        const { ops, at } = this.layout;
+        for (let i = ops.indexOf(at.get(elseIp)!); i >= 0 && i < ops.length && ops[i].ip < endIp - 1; i++) {
+            const op = ops[i];
+            if (op.k !== "If" || !op.elseif) continue;
+            if (this.#elseBefore(op.else) === endIp) return true;
         }
         return false;
     }
 
+    // the end of the if whose then branch an Else right before `ip` closes
+    #elseBefore(ip: number): number | undefined {
+        const op = this.layout.at.get(ip - OP_SIZE.Else);
+        return op?.k === "Else" ? op.end : undefined;
+    }
+
     #walk(index: Map<number, number>, from: number, stop: number): void {
-        const { blocks, inst } = this;
         let i = index.get(from);
         if (i === undefined) throw STRUCTURE_MISMATCH;
         if (++this.#nesting > MAX_STRUCTURED_NESTING) throw STRUCTURE_MISMATCH;
@@ -840,19 +847,19 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     #walkRegion(index: Map<number, number>, first: number, stop: number): void {
-        const { blocks, inst } = this;
+        const { blocks } = this;
         let i: number | undefined = first;
         while (i < blocks.length && blocks[i].start < stop) {
             const block = blocks[i];
-            const next = i + 1 < blocks.length ? blocks[i + 1].start : inst.length;
+            const next = i + 1 < blocks.length ? blocks[i + 1].start : this.layout.size;
             this.startBlock(this.entryFacts.get(block.start));
             for (const x of block.insts) this.emitInstWithFacts(x);
             const term = block.term;
             if (term.k === "Branch") {
                 const elseIp = term.else;
-                if (term.then !== next || inst[elseIp - 2] !== OpCode.ELSE) throw STRUCTURE_MISMATCH;
-                const endIp = inst[elseIp - 1];
-                if (inst[endIp - 1] !== OpCode.ENDIF) throw STRUCTURE_MISMATCH;
+                const endIp = this.#elseBefore(elseIp);
+                if (term.then !== next || endIp === undefined) throw STRUCTURE_MISMATCH;
+                if (this.layout.at.get(endIp - OP_SIZE.EndIf)?.k !== "EndIf") throw STRUCTURE_MISMATCH;
                 // a later clause of the chain being walked: a sibling of the first, leaving the chain's block when taken
                 if (term.elseif) {
                     const chain = this.#chains.get(endIp);
@@ -1026,7 +1033,7 @@ export class DirectEmitter extends FunctionEmitter {
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: this.inst[term.resume] === OpCode.ENDLOOP };
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: this.layout.at.get(term.resume)?.k === "EndLoop" };
                     return this.emit(`
                         ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}
                         ${control.direct(site, this.#callArray(term.isTail), (args, marks) => this.#callProc(args.join(", "), args.length, marks))}

@@ -4,11 +4,11 @@ import { ErrorObject, IProcedure, Msg, OpaqueValue, unpackValues, vmError } from
 import type { Env, Formatter, SourcePos } from "../common";
 import { Caught, EXCEPTION_HANDLERS, Handlers, TAIL_TRAIL, markFirst, markOwn } from "../marks";
 import type { Marks, TailTrail } from "../marks";
-import type { ByteCode, Closure, VMHost } from "./bytecode";
+import type { Code, Closure, VMHost } from "./code";
 import type { VMExecutor } from "./executor";
-import { UNPACK_REST, UNPACK_STRICT } from "./opcodes";
+import { UNPACK_REST, UNPACK_STRICT } from "./ops";
 
-// the values of `val` for UNPACK: checks the count when strict; missing values read as undefined (<#void>)
+// the values of `val` for Unpack: checks the count when strict; missing values read as undefined (<#void>)
 export const unpackForBinding = (val: any, count: number, flags: number): any[] => {
     const vals = unpackValues(val);
     if ((flags & UNPACK_STRICT) !== 0 && ((flags & UNPACK_REST) !== 0 ? vals.length < count : vals.length !== count)) {
@@ -263,7 +263,7 @@ export class VMContinuation extends IProcedure {
 
 // a function whose direct calls keep ending in a control transfer (call/cc, a continuation, a yield, an escape) or an
 // error pays for it every time: after DIRECT_SUSPEND_LIMIT of them, calls to it use heap frames, where those are cheap
-export const countControlSuspend = (code: ByteCode): void => {
+export const countControlSuspend = (code: Code): void => {
     if (++code.controlSuspends === DIRECT_SUSPEND_LIMIT) {
         code.directArity = -1;
         code.directRestArity = -1;
@@ -333,7 +333,7 @@ export const catchHere = (e: any, tok: CatchToken, ctx: ExecutionContext): any =
 };
 
 export class Frame {
-    public code: ByteCode;
+    public code: Code;
     public upvars: any[];
     public epoch: number;
     // in a frame a composable continuation reinstated: the wind points it copied, by the originals the frame's escape

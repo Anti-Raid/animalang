@@ -6,14 +6,14 @@ Anima is the custom (Scheme-inspired) language used in settings v2 in antiraid f
 
 The host API changed. Host functions now go through intrinsics only: there are no host callbacks anymore (`BuiltinFunction` is gone), and a JS function placed in scope is not a procedure Anima code can call.
 
-- **Creating an instance**: `new Anima(implRvm)` is now `createScheme(implRvm)` (or `implRvmAot`). `new Anima(options)` still exists, but makes a bare instance with no language: no reader, builtins or prelude.
+- **Creating an instance**: `new Anima(implRvm)` is now `createScheme(implRvm)` (or `implRvmDebug` for exact error positions and tail calls in tracebacks). Code always runs compiled to JS: there is no interpreter and no `implRvmAot`. `new Anima(options)` still exists, but makes a bare instance with no language: no reader, builtins or prelude.
 - **Registering host functions**: the global `registerHostIntrinsic(name, fn, options)` is now `anima.registerIntrinsic(name, fn, options)`. Each instance has its own intrinsics. Names start with `%`, and a name only works in code compiled after it is registered. `anima.freeze()` stops further registrations.
 - **The function signature is `fn(regs, start, nargs)`**: the arguments are `regs[start]` to `regs[start + nargs - 1]`. `registerHostIntrinsic` functions took `(...args)` and need porting; `BuiltinFunction` callbacks already had this signature. Do not keep `regs` after the call returns.
 - **Options**: `{ args: [min, max], leaf, inline, deps }`. The argument count is checked when code compiles. Set `leaf: true` for a function that only computes a value; it is cheaper to call and can have an inline template for AOT code.
 - **Calling back into Anima**: an intrinsic that is not a leaf calls an Anima procedure by returning `hostTail(proc, ...args)` (or `hostTailFrom(proc, regs, from, count)`) instead of calling it itself. The call then runs in the VM, so the procedure can yield, capture continuations and raise.
 - **Yielding from the host**: an intrinsic that is not a leaf yields the coroutine running it by returning `hostYield(...values)`; the values the coroutine is resumed with are the value of the call.
 - **Host functions as values**: an intrinsic is not a value. Wrap it in a procedure, e.g. `(define (clamp . args) (%apply %clamp args))` for a leaf, or a fixed-arity `(lambda (f x) (%with-double f x))` for any intrinsic.
-- **Serialized code** records the intrinsics it uses by name: load it with `readFull(bytes, anima.intrinsics)` into an instance that has registered them.
+- **Serialized code is gone**: `dumpFull` / `readFull` no longer exist. Compile from source in each instance.
 
 ```ts
 import { createScheme, implRvm, hostTail } from "animalang";

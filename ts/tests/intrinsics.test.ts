@@ -4,21 +4,20 @@ import { schemeFormat } from '../scheme/messages';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
-import { ByteCode, AotCompiler, OpCode } from '../bytecode-rvm/vm';
-import { Closure, CORE_COUNT, CORE_INTRINSICS, corePos, INSTRUCTION_LENGTHS } from '../bytecode-rvm/exec';
+import { Code, AotCompiler } from '../bytecode-rvm/vm';
+import { Closure, CORE_COUNT, CORE_INTRINSICS, OP_SIZE, corePos, listing } from '../bytecode-rvm/exec';
 import { Compiler } from '../bytecode-rvm/compiler';
 import { Intrinsics } from '../bytecode-rvm/intrinsics';
 import { Anima } from '../anima';
-import { impl, implAot } from '../bytecode-rvm/meta';
-import { dumpFull, readFull, stringifyInst } from '../bytecode-rvm/utils';
-import { OPCODES } from '../bytecode-rvm/opcodes';
+import { impl } from '../bytecode-rvm/meta';
 import { bindArgs, closureArity } from '../bytecode-rvm/arity';
 import { CORE_FORMS, hasCore, newIntrinsics } from '../bytecode-rvm/core';
 import { readdirSync, readFileSync } from 'fs';
-import { registerTestIntrinsics } from './helpers';
+import { opKinds, registerTestIntrinsics } from './helpers';
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Anima', () => {
     let evaluator: Anima
     let s = new ASTStringifier()
@@ -105,18 +104,16 @@ describe('Anima', () => {
             // branches keep tail position, and a variable assigned in them is seen after
             expect(run(`(define (ch-count n) (cond ((= n 0) 'done) ((< n 0) 'neg) (else (ch-count (- n 1))))) (ch-count 100000)`)).toBe("done")
             expect(run(`(define (ch-set x) (let ((r 0)) (%if (= x 1) (set! r 'one) (= x 2) (set! r 'two) (set! r 'many)) r)) (list (ch-set 1) (ch-set 2) (ch-set 7))`)).toBe("(one two many)")
-            const bc = evaluator.compileRaw(`(define (ch-f x) (cond ((= x 1) 'a) ((= x 2) 'b) (else 'c)))`) as ByteCode
-            const fn: ByteCode = bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code
-            const ops: OpCode[] = []
-            for (let ip = 0; ip < fn.inst.length; ip += INSTRUCTION_LENGTHS[fn.inst[ip] as OpCode]) ops.push(fn.inst[ip])
-            expect(ops.filter(op => op === OpCode.IF || op === OpCode.ELSEIF || op === OpCode.ENDIF)).toEqual([OpCode.IF, OpCode.ELSEIF, OpCode.ENDIF])
-            // however many clauses, in both modes
+            const bc = evaluator.compileRaw(`(define (ch-f x) (cond ((= x 1) 'a) ((= x 2) 'b) (else 'c)))`) as Code
+            const fn: Code = bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code
+            expect(opKinds(fn).filter(k => k === "If" || k === "ElseIf" || k === "EndIf")).toEqual(["If", "ElseIf", "EndIf"])
+            // however many clauses
             const clauses = Array.from({ length: 1000 }, (_, i) => `((= x ${i}) ${i})`).join(" ")
             expect(run(`(define (ch-big x) (cond ${clauses} (else -1))) (list (ch-big 0) (ch-big 999) (ch-big 1000))`)).toBe("(0 999 -1)")
         })
 
         it('compiles builtin calls to intrinsics, and passes builtins as the prelude procedures', () => {
-            const bc = evaluator.compileRaw(`(car (cons 1 2))`) as ByteCode
+            const bc = evaluator.compileRaw(`(car (cons 1 2))`) as Code
             expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%car", "%cons"])
             expect(run(`(car (cons 1 2))`)).toBe("1")
             expect(run(`(list (procedure? car) (map car '((1) (2))) (apply + '(1 2 3)) (apply list 1 '(2)) (apply values '(4)))`)).toBe("(#t (1 2) 6 (1 2) 4)")
@@ -185,10 +182,9 @@ describe('Anima', () => {
             expect(run([S("%let"), [[S("t3"), two]], list([S("t3"), 1], [S("t3")], [S("t3"), 1, 2, 3])])).toBe("(one (<#void> <#void>) (1 2))")
             expect(() => compile([S("%lambda"), [[S("pad")], [], null, 1], [[], [], null, 2]])).toThrow("a clause after a padded one would never run")
             expect(() => compile([S("%lambda"), [[S("nope")], [], null, 1]])).toThrow("unknown clause option nope")
-            // it survives serialization, and the host can call it
-            const bc = compile(f)
-            const loaded = evaluator.evaluateRaw(readFull(dumpFull(bc), evaluator.intrinsics) as ByteCode)
-            expect(s.stringify(evaluator.evaluateClosure(loaded, [5]))).toBe("(5 <#void>)")
+            // the host can call it
+            const made = evaluator.evaluateRaw(compile(f))
+            expect(s.stringify(evaluator.evaluateClosure(made, [5]))).toBe("(5 <#void>)")
         })
 
         it('has no language without a front end', () => {
@@ -229,55 +225,42 @@ describe('Anima', () => {
                 args: [1, 1], leaf: true, inline: ([a], _slow, _tmp, d) => `(${d.Missing}, ${a})`,
             })
             const bad = other.compileRaw(`(%test-bad-dep 1)`)
-            if (_mode === "aot") expect(() => other.evaluateRaw(bad)).toThrow("uses 'Missing', which is not in its deps")
-            else expect(s.stringify(other.evaluateRaw(bad))).toBe("1")
+            expect(() => other.evaluateRaw(bad)).toThrow("uses 'Missing', which is not in its deps")
         })
     });
 
 })
 })
 
-describe("Opcode spec", () => {
-    it("describes every opcode, and instruction lengths follow from it", () => {
-        const ops = Object.values(OpCode).filter((v): v is OpCode => typeof v === "number")
-        // the enum (in exec.ts, for the interpreter) and the spec list the same opcodes in the same order
-        expect(OPCODES.map(spec => spec.name)).toEqual(ops.map(op => OpCode[op]))
-        for (const op of ops) {
-            expect(INSTRUCTION_LENGTHS[op], OpCode[op]).toBe(1 + OPCODES[op].operands.length)
-            // a tail call's `tail` operand says whether the next instruction starts a block
-            expect(OPCODES[op].split === "nonTail", OpCode[op]).toBe(OPCODES[op].operands.some(([, kind]) => kind === "tail"))
-        }
-    })
-
-    it("disassembles from the spec", () => {
+describe("Instructions", () => {
+    it("are listed by kind and fields", () => {
         const anima = createScheme(impl)
         const bc = anima.compileRaw(`
             (define (ds-ap f . xs) (apply f 1 xs))
             (define (ds-sum . xs) (apply %+ xs))
             (define (ds-l f lst) (apply f lst))
-            (let-values (((a . b) (values 1 2))) (if a (car b) (ds-ap ds-sum 1 '(2))))`) as ByteCode
-        const lines = stringifyInst(bc)
-        const sum = stringifyInst(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-sum").tmpl.code)
-        const ap = stringifyInst(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-ap").tmpl.code)
-        expect(lines).toContain("0000: LOADCONST   dst=r1, const=c.fn(f . xs)")
-        expect(lines.some(line => /UNPACK +src=r\d+, start=r\d+, count=1, flags=rest\|strict/.test(line))).toBe(true)
-        expect(lines.some(line => /CALLINT +pos=%car, /.test(line))).toBe(true)
-        expect(lines.some(line => /LOADCONST +dst=r\d+, const=\(2\)$/.test(line))).toBe(true)
-        expect(lines.some(line => /CALL +proc=r\d+, start=r\d+, nargs=3, tail=tail$/.test(line))).toBe(true)
-        expect(sum.some(line => /APPLYINT +pos=%\+, dst=r\d+, start=r\d+, nargs=1$/.test(line))).toBe(true)
-        expect(ap.some(line => /CALLHOST +pos=%apply-array, start=r\d+, nargs=3, tail=tail$/.test(line))).toBe(true)
+            (let-values (((a . b) (values 1 2))) (if a (car b) (ds-ap ds-sum 1 '(2))))`) as Code
+        const lines = listing(bc)
+        const sum = listing(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-sum").tmpl.code)
+        const ap = listing(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-ap").tmpl.code)
+        expect(lines).toContain("0000: LoadConst   dst=r1, idx=c.fn(f . xs)")
+        expect(lines.some(line => /Unpack +src=r\d+, start=r\d+, count=1, flags=rest\|strict/.test(line))).toBe(true)
+        expect(lines.some(line => /IntCall +pos=%car, /.test(line))).toBe(true)
+        expect(lines.some(line => /LoadConst +dst=r\d+, idx=\(2\)$/.test(line))).toBe(true)
+        expect(lines.some(line => /Call +proc=r\d+, start=r\d+, nargs=3, tail=true$/.test(line))).toBe(true)
+        expect(sum.some(line => /IntApply +pos=%\+, dst=r\d+, start=r\d+, nargs=1$/.test(line))).toBe(true)
+        expect(ap.some(line => /HostCall +pos=%apply-array, start=r\d+, nargs=3, tail=true$/.test(line))).toBe(true)
         // a spread list is a new array, called with as it is
-        const l = stringifyInst(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-l").tmpl.code)
-        expect(l.some(line => /CALLHOST +pos=%apply-fresh, start=r\d+, nargs=2, tail=tail$/.test(line))).toBe(true)
-        // ips count by the spec's lengths
-        const ips = lines.filter(line => /^\d{4}:/.test(line)).map(line => +line.slice(0, 4))
-        for (let i = 1; i < ips.length; i++) expect(ips[i] - ips[i - 1]).toBe(INSTRUCTION_LENGTHS[bc.inst[ips[i - 1]] as OpCode])
+        const l = listing(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-l").tmpl.code)
+        expect(l.some(line => /HostCall +pos=%apply-fresh, start=r\d+, nargs=2, tail=true$/.test(line))).toBe(true)
+        // positions advance by each instruction's size
+        for (let i = 1; i < bc.ops.length; i++) expect(bc.ops[i].ip - bc.ops[i - 1].ip).toBe(OP_SIZE[bc.ops[i - 1].k])
     })
 
 })
 describe("Core operations", () => {
     it("are the first entries of every table, at the same positions", () => {
-        const a = createScheme(impl), b = createScheme(implAot)
+        const a = createScheme(impl), b = createScheme(impl)
         for (const table of [a.intrinsics, b.intrinsics, newIntrinsics(), newIntrinsics(a.intrinsics)]) {
             expect(hasCore(table)).toBe(true)
             expect(table.byName("%values")!.pos).toBe(corePos("%values"))
@@ -287,13 +270,14 @@ describe("Core operations", () => {
         expect(() => a.registerIntrinsic("%values", () => null)).toThrow("'%values' is already defined")
         expect(() => CORE_INTRINSICS.register("%x", () => null)).toThrow("frozen")
         expect(() => a.registerIntrinsic("%x", () => null, { context: true })).toThrow("only the VM's core operations do")
-        // leaves that take the context have their own opcode, so other intrinsic calls pass just the window
-        const ops = (a.compileRaw("(%coroutine-create (lambda () 1))") as ByteCode).inst
-        expect(Array.from(ops)).toContain(OpCode.CALLCTX)
+        // a leaf that takes the context is an IntCall like any other
+        const ops = (a.compileRaw("(%coroutine-create (lambda () 1))") as Code).ops
+        expect(ops.some(op => op.k === "IntCall" && op.pos === corePos("%coroutine-create"))).toBe(true)
     })
 
     it("compile and apply like any intrinsic", () => {
-        for (const vmImpl of [impl, implAot]) {
+        {
+            const vmImpl = impl
             const anima = createScheme(vmImpl)
             const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)))
             expect(run("(%list 1 2 3)")).toBe("(1 2 3)")
@@ -304,15 +288,14 @@ describe("Core operations", () => {
             expect(() => run("(%values->array 1 2)")).toThrow("%values->array: expected exactly 1 args, got 2")
         }
         const anima = createScheme(impl)
-        const bc = anima.compileRaw("(%values 1 2)") as ByteCode
-        expect(stringifyInst(bc).some(line => /CALLINT +pos=%values, /.test(line))).toBe(true)
-        // code that only uses core operations loads without a table
-        expect(new ASTStringifier().stringify(anima.evaluateRaw(readFull(dumpFull(bc)) as ByteCode))).toBe("(values 1 2)")
+        const bc = anima.compileRaw("(%values 1 2)") as Code
+        expect(listing(bc).some(line => /IntCall +pos=%values, /.test(line))).toBe(true)
     })
 })
 describe("Control operations", () => {
     it("are core intrinsics that return requests the VM carries out at the call", () => {
-        for (const vmImpl of [impl, implAot]) {
+        {
+            const vmImpl = impl
             const anima = createScheme(vmImpl)
             const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)))
             for (const name of ["%call/cc", "%raise", "%current-stack", "%coroutine-yield", "%coroutine-resume", "%coroutine-resume-array", "%apply-array"]) {
@@ -336,15 +319,15 @@ describe("Control operations", () => {
             expect(run("(let ((call/cc (lambda (f) 'mine))) (call/cc 1))")).toBe("mine")
         }
         // AOT code carries control operations out at the call, with no request object
-        const co = createScheme(impl).compileRaw("(define (co-f v) (+ 1 (%coroutine-yield v)))") as ByteCode
+        const co = createScheme(impl).compileRaw("(define (co-f v) (+ 1 (%coroutine-yield v)))") as Code
         const coTmpl = co.constants.find((c: any) => c instanceof Closure)!.tmpl
         const src = AotCompiler.generateSource(coTmpl.code, coTmpl)
         expect(src).toContain("executor.coYield(ctx, frame, r")
         expect(src).toContain("throw Suspend.yield(r")
         expect(src).not.toContain("res.run(")
-        const bc = createScheme(impl).compileRaw("(define (cc-f g) (%call/cc g))") as ByteCode
-        const lines = stringifyInst(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code)
-        expect(lines.some(line => /CALLHOST +pos=%call\/cc, start=r\d+, nargs=1, tail=tail$/.test(line))).toBe(true)
+        const bc = createScheme(impl).compileRaw("(define (cc-f g) (%call/cc g))") as Code
+        const lines = listing(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code)
+        expect(lines.some(line => /HostCall +pos=%call\/cc, start=r\d+, nargs=1, tail=true$/.test(line))).toBe(true)
     })
 })
 describe("Argument binding", () => {
@@ -369,7 +352,7 @@ describe("Argument binding", () => {
         expect(arityMessage("f", 1, Infinity, 0)).toBe("f: expected at least 1 args, got 0")
         expect(arityMessage("f", 2, 3, 4)).toBe("f: expected 2 to 3 args, got 4")
         const anima = createScheme(impl)
-        const tmpl = (anima.compileRaw("(define (ab-f a . r) r)") as ByteCode).constants.find((c: any) => c instanceof Closure)!.tmpl
+        const tmpl = (anima.compileRaw("(define (ab-f a . r) r)") as Code).constants.find((c: any) => c instanceof Closure)!.tmpl
         expect(tmpl.arity).toEqual({ min: 1, max: Infinity, rest: "packed", params: 1, pad: false })
         expect(() => anima.evaluateRaw(anima.compileRaw("(define (ab-g a b) a) (ab-g 1)"))).toThrow("ab-g: expected exactly 2 args, got 1")
         expect(() => anima.evaluateRaw(anima.compileRaw("(apply %car '(1 2))"))).toThrow("%car: expected exactly 1 args, got 2")

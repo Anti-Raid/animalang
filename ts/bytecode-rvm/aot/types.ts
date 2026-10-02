@@ -1,6 +1,6 @@
 // The AOT compiler's decoded instructions and block terminators
 import type { Arity } from "../arity";
-import type { UpVarLoc } from "../bytecode";
+import type { UpVarLoc } from "../code";
 import type { Intrinsic } from "../intrinsics";
 
 // `at` is the ip of the instruction an op or terminator was decoded from

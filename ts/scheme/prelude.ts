@@ -2,7 +2,7 @@ import { IProcedure, Env } from "../common";
 import { TWINNED } from "./transformer/syntax";
 import type { Compiler } from "../bytecode-rvm/compiler";
 import type { AnimaVM } from "../bytecode-rvm/vm";
-import type { ByteCode } from "../bytecode-rvm/exec";
+import type { Code } from "../bytecode-rvm/exec";
 import type { Intrinsics } from "../bytecode-rvm/intrinsics";
 import { ASP } from "./reader";
 import { toCore } from "./core";
@@ -132,10 +132,9 @@ export const STD_PRELUDE = `
 (%define-global $pcall (lambda (f . args) (%catch (lambda () (%values-cons #t (apply f args))) (lambda (e) (values #f e)))))
 `
 
-// compiled once, for every implementation (the prelude is never debug code, and AOT code is built from bytecode later, per
-// VM), and bound to the frozen Scheme base table, so the cache holds no instance's intrinsics; each instance runs its own
+// compiled once, for every instance (the prelude is never debug code, and its JS is generated later, per VM), and bound to the frozen Scheme base table, so the cache holds no instance's intrinsics; each instance runs its own
 // copy, bound by name, sharing the closures that call the same intrinsics through its table (every builtin's wrapper)
-let PRELUDE_CODE: ByteCode | null = null
+let PRELUDE_CODE: Code | null = null
 
 // Runs the prelude with `vm` and returns the scope of its $ exports (under their public names), which the instance's
 // code cannot rebind

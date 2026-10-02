@@ -1,15 +1,16 @@
 import { ASTStringifier } from '../scheme/printer';
 import { Msg } from '../common';
-import { stringifyInst } from '../bytecode-rvm/utils';
+import { listing } from '../bytecode-rvm/exec';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
-import { ByteCode } from '../bytecode-rvm/vm';
+import { Code } from '../bytecode-rvm/vm';
 import { Anima } from '../anima';
-import { impl, implAot } from '../bytecode-rvm/meta';
+import { impl } from '../bytecode-rvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Anima', () => {
     let evaluator: Anima
     let s = new ASTStringifier()
@@ -134,8 +135,8 @@ describe('Anima', () => {
             const base = evaluator.intrinsics.format
             evaluator.intrinsics.setFormatter((op, args, fmt, at) => op === Msg.ErrorInHandler ? "error in error handling" : base(op, args, fmt, at))
             expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (error-object-message r)) (lambda (e) (raise 'again)) #t)`)).toBe('"error in error handling"')
-            const bc = evaluator.compileRaw(`(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) #t)`) as ByteCode
-            expect(stringifyInst(bc).some(line => /CALLHOST +pos=%call-catching, start=r\d+, nargs=3, tail=-$/.test(line))).toBe(true)
+            const bc = evaluator.compileRaw(`(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) #t)`) as Code
+            expect(listing(bc).some(line => /HostCall +pos=%call-catching, start=r\d+, nargs=3, tail=false$/.test(line))).toBe(true)
         })
 
         it('delivers %raise to handlers, continuable or not', () => {
@@ -598,7 +599,6 @@ describe('Anima', () => {
         })
 
         it('keeps the structured direct entry in AOT', () => {
-            if (_mode !== "aot") return
             const f = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (n) (let ((i 0)) (%block d (%loop (%if (= i n) (%escape d i) (%begin)) (set! i (+ i 1))))))`))
             expect(f.tmpl.code.directFn).not.toBeNull()
         })
