@@ -6,7 +6,7 @@ import type { Arity, RestKind } from "./arity";
 import { CORE_INTRINSICS } from "./coreops";
 import type { VMExecutor } from "./executor";
 import type { OpCode } from "./interpreter";
-import type { Intrinsic, IntrinsicFn, Intrinsics } from "./intrinsics";
+import { Intrinsics, type Intrinsic, type IntrinsicFn } from "./intrinsics";
 import { INSTRUCTION_LENGTHS, INTRINSIC_OPERANDS } from "./opcodes";
 import type { ExecutionContext, Frame } from "./values";
 export type ExecutionMode = "interp" | "aot";
@@ -120,7 +120,7 @@ export class ByteCode implements SerializableBytecode {
             const theirs: Intrinsic | undefined = table.entries[pos];
             // a table copied from this code's (or from the same base) holds the very same entry
             if (theirs !== mine) {
-                if (theirs === undefined || theirs.name !== mine.name || theirs.fn !== mine.fn || theirs.leaf !== mine.leaf || theirs.inline !== mine.inline || theirs.returns !== mine.returns || theirs.wants !== mine.wants) return false;
+                if (theirs === undefined || theirs.name !== mine.name || theirs.fn !== mine.fn || theirs.leaf !== mine.leaf || theirs.inline !== mine.inline || !Intrinsics.sameFacts(theirs, mine)) return false;
                 for (const dep in mine.deps) if (theirs.deps[dep] !== mine.deps[dep]) return false;
                 for (const dep in theirs.deps) if (!(dep in mine.deps)) return false;
             }

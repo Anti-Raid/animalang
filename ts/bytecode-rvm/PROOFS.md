@@ -419,13 +419,15 @@ Within a basic block, a copy instruction $r_{dst} = \text{Move } r_{src}$ establ
 
 **Theorem 8 (Soundness of Flow-Sensitive Branch Narrowing).**
 *Let basic block $B$ terminate in $\text{Branch}(cond, then, else)$.*
-*Let $cond$ be produced by instruction $I_{cond}$ within $B$ (modulo `Move` aliasing).*
+*Let $cond$ be produced by instruction $I_{cond}$ within $B$ (modulo `Move` aliasing), with argument window $W$, and let no instruction of $B$ after $I_{cond}$ write a register of $W$ (`resolveBranchCondition` gives up otherwise).*
 1. If $I_{cond}$ has `invertBranch = true`, swapping the `then` and `else` branches of the operand condition is semantics-preserving.
 2. If $I_{cond}$ has `branchNarrow`, applying `then` kinds to $W$ on edge $\to then$ and `else` kinds to $W$ on edge $\to else$ is sound.
 
 *Proof.*
 1. In the VM semantics, `#f` (JS `false`) is the sole falsy value; all others are truthy. An intrinsic with `invertBranch = true` maps falsy to truthy and truthy to falsy. Therefore, testing $cond$ is truthy iff the inner condition is falsy.
-2. If control flows to $then$, $I_{cond}$ evaluated to a truthy value. By the frontend's `branchNarrow` specification, this outcome only occurs when operands satisfy `then` kinds. Conversely, if control flows to $else$, $I_{cond}$ evaluated to `false`, establishing `else` kinds. □
+2. If control flows to $then$, $I_{cond}$ evaluated to a truthy value. By the frontend's `branchNarrow` specification, this outcome only occurs when operands satisfy `then` kinds. Conversely, if control flows to $else$, $I_{cond}$ evaluated to `false`, establishing `else` kinds. Since no register of $W$ is written between $I_{cond}$ and the branch, each still holds the operand $I_{cond}$ tested, so the kinds hold of the registers on each edge. □
+
+The kinds apply only under the table the code was compiled with: sharing code or generated source with another table (`ByteCode.runsWith`, the AOT source cache) requires the same `returns`, `wants`, `refineArgs`, `branchNarrow` and `invertBranch` for every intrinsic used (`Intrinsics.sameFacts`).
 
 ### 7.6 Semantics Preservation of Defensive Guard Elimination
 

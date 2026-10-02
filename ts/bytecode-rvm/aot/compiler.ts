@@ -1,6 +1,6 @@
 // The AOT compiler: decodes bytecode into basic blocks, generates a function's JS source (see emit.ts) and builds it,
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
-import type { TypeSystem } from "../intrinsics";
+import { Intrinsics, type TypeSystem } from "../intrinsics";
 import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, packValues } from "../../common";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
 import { DirectEmitter, ResumeEmitter } from "./emit";
@@ -126,8 +126,8 @@ export class AotCompiler {
         for (let i = 0; i < a.length; i++) {
             const x = a[i], y = b[i];
             // name and bounds are written into the source of APPLYINT (IntApply / IntApplyRest)
-            // and what they return, which the type facts rely on
-            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max || x.returns !== y.returns || x.wants !== y.wants) return false;
+            // and the type facts rules, which the source relies on
+            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max || !Intrinsics.sameFacts(x, y)) return false;
             const dx = Object.entries(x.deps), dy = y.deps;
             if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
         }
@@ -135,7 +135,7 @@ export class AotCompiler {
     }
 
     public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns, wants } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns, wants }; });
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch }; });
         let variants = this.#sources.get(code.inst);
         const types = code.table?.types ?? null;
         let factory = variants?.find(v => v.types === types && this.#sameUses(v.uses, uses))?.factory;

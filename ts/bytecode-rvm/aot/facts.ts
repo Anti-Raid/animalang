@@ -132,6 +132,20 @@ const meet = (a: Facts, b: Facts): Facts => {
 
 const same = (a: Facts, b: Facts): boolean => a.size === b.size && [...a].every(([reg, kind]) => b.get(reg) === kind);
 
+const written = (inst: AotInst): number[] => {
+    switch (inst.k) {
+        case "Unpack": return windowRegs(inst.start, inst.count + 1);
+        case "MarkSave": return [inst.reg, inst.reg + 1];
+        case "LoadInt": case "LoadConst": case "Move": case "IntCall": case "IntApply": case "LoadUpvar": case "LoadGlobal":
+        case "Box": case "Unbox": case "NewClosure": case "MoveAcc": case "CurMarks":
+            return [inst.dst];
+        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "SetBox": case "SetMark": case "MarkRestore":
+            return [];
+    }
+};
+
+// the intrinsic call whose result a branch tests (through moves and invertBranch calls), if its arguments still hold
+// what it was called with at the branch
 const resolveBranchCondition = (
     condReg: number,
     insts: AotInst[],
@@ -139,6 +153,7 @@ const resolveBranchCondition = (
 ): { entry: Intrinsic; start: number; nargs: number; inverted: boolean } | null => {
     let curr = condReg;
     let inverted = false;
+    const later = new Set<number>();
     for (let i = insts.length - 1; i >= 0; i--) {
         const inst = insts[i];
         if (inst.k === "Move" && inst.dst === curr) {
@@ -148,14 +163,15 @@ const resolveBranchCondition = (
             if (entry?.invertBranch && inst.nargs === 1) {
                 inverted = !inverted;
                 curr = inst.start;
-            } else if (entry) {
+            } else if (entry && !windowRegs(inst.start, inst.nargs).some(r => later.has(r))) {
                 return { entry, start: inst.start, nargs: inst.nargs, inverted };
             } else {
                 return null;
             }
-        } else if ("dst" in inst && (inst as any).dst === curr) {
+        } else if (written(inst).includes(curr)) {
             return null;
         }
+        for (const r of written(inst)) later.add(r);
     }
     return null;
 };

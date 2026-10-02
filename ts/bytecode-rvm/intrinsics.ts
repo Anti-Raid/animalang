@@ -87,6 +87,8 @@ export type Intrinsic = {
 // stops further registrations. `taken` tells which names the compiler already defines. Every table the compiler and VM
 // use starts from CORE_INTRINSICS (exec.ts), the VM's own operations, so those are at the same positions in all of them
 // (see newIntrinsics in core.ts)
+export type FactRules = Pick<Intrinsic, "returns" | "wants" | "refineArgs" | "branchNarrow" | "invertBranch">;
+
 export class Intrinsics {
     readonly entries: Intrinsic[] = []
     // entries[i].fn, by position: what CALLINT/CALLHOST operands index
@@ -222,6 +224,11 @@ export class Intrinsics {
         if (entry === undefined) throw new Error(`the interrupt handler '${name}' is not registered`)
         this.#interruptHandler = entry.pos
         return this
+    }
+
+    // whether two entries give the type facts (aot/facts.ts) the same rules
+    static sameFacts(a: FactRules, b: FactRules): boolean {
+        return a.returns === b.returns && a.wants === b.wants && a.refineArgs === b.refineArgs && a.branchNarrow === b.branchNarrow && a.invertBranch === b.invertBranch;
     }
 
     // what an intrinsic returns given its arguments' kinds, if certain

@@ -5,6 +5,9 @@ import { createScheme } from '../scheme';
 import { ByteCode, AnimaVM, AotCompiler, OpCode } from '../bytecode-rvm/vm';
 import { CORE_INTRINSICS, Closure, corePos } from '../bytecode-rvm/exec';
 import { impl, implAot } from '../bytecode-rvm/meta';
+import { blockFacts } from '../bytecode-rvm/aot/facts';
+import type { AotBlock } from '../bytecode-rvm/aot/types';
+import { Intrinsics, type IntrinsicOptions } from '../bytecode-rvm/intrinsics';
 
 describe("JIT Compiler Runtime Compilation & Execution", () => {
     const animaScope = () => {
@@ -293,5 +296,38 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
 
         // Run 3
         expect(anima.evaluateClosure(fnClosure, [300])).toBe(305);
+    });
+
+    it("narrows on a branch only while the tested arguments are unchanged", () => {
+        const table = new Intrinsics();
+        const lt = table.register("%lt", (regs, s) => regs[s] < regs[s + 1], { args: [2, 2], leaf: true, branchNarrow: () => ({ then: ["number", "number"] }) });
+        const facts = (overwrite: boolean) => {
+            const blocks: AotBlock[] = [
+                {
+                    start: 0,
+                    insts: [{ k: "IntCall", pos: lt.pos, dst: 2, start: 0, nargs: 2 }, ...(overwrite ? [{ k: "MoveAcc" as const, dst: 1 }] : [])],
+                    term: { k: "Branch", cond: 2, then: 10, else: 20, elseif: false },
+                },
+                { start: 10, insts: [], term: { k: "Return", reg: 0 } },
+                { start: 20, insts: [], term: { k: "Return", reg: 0 } },
+            ];
+            return blockFacts(blocks, table, []).get(10)!;
+        };
+        expect([facts(false).get(0), facts(false).get(1)]).toEqual(["number", "number"]);
+        expect([facts(true).get(0), facts(true).get(1)]).toEqual([undefined, undefined]);
+    });
+
+    it("does not share code between tables whose intrinsics narrow differently", () => {
+        const fn = (regs: any[], s: number) => regs[s] < regs[s + 1];
+        const withNarrow = (opts: IntrinsicOptions) => {
+            const anima = createScheme(implAot);
+            anima.registerIntrinsic("%test-lt", fn, { args: [2, 2], leaf: true, ...opts });
+            return anima;
+        };
+        const narrow = () => ({ then: ["number", "number"] as const });
+        const a = withNarrow({ branchNarrow: narrow }), b = withNarrow({ branchNarrow: narrow }), c = withNarrow({ branchNarrow: () => ({}) });
+        const code = (a.evaluateRaw(a.compileRaw("(lambda (x y) (if (%test-lt x y) x y))")) as Closure).tmpl.code as ByteCode;
+        expect(code.runsWith(b.intrinsics)).toBe(true);
+        expect(code.runsWith(c.intrinsics)).toBe(false);
     });
 });
