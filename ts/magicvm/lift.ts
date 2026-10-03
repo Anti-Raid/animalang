@@ -97,7 +97,7 @@ export const splitCaseLambdas = (ast: any): any => {
             if (i === -1) needed = true;
             else map.set(node, names[i]);
         }
-        const bindings: [symbol, any][] = clauses.map((c, i) => [names[i], [CORE_LAMBDA, null, c]]);
+        const bindings: [symbol, any][] = clauses.map((c, i) => [names[i], [CORE_LAMBDA, caseLambda[1], c]]);
         const procedure: [symbol, any][] = needed ? [[name, [CORE_INTCALL, null, MAKE_CASE_LAMBDA, ...names]]] : [];
         return { bindings, procedure, map };
     };
