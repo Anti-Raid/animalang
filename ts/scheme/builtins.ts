@@ -651,15 +651,15 @@ export const SCHEME_ALIASES: ReadonlyMap<symbol, SchemeAlias> = new Map([
     alias("coroutine-yield", "%coroutine-yield", 0, Infinity),
 ]);
 
-// The prelude's first-class procedures for the aliases: a fixed-arity wrapper, or for a variadic builtin an %apply of the
-// rest arguments (the other variadic ones are defined in the prelude itself)
+// The prelude's first-class procedures for the aliases, in native-scheme: a fixed-arity wrapper, or for a variadic builtin
+// an %intapply of the rest arguments (the other variadic ones are defined in the prelude itself)
 export const ALIAS_WRAPPERS = [
     ...[...SCHEME_ALIASES].filter(([, { wrapper }]) => wrapper).map(([sym, { target, min, max }]) => {
         const name = Symbol.keyFor(sym)!, op = Symbol.keyFor(target)!;
-        if (min !== max) return `(define ($${name} . args) (%apply ${op} (%spread args)))`;
+        if (min !== max) return `(define ($${name} . args) (%intapply ${op} (%intcall %spread args)))`;
         const params = Array.from({ length: min }, (_, i) => ` a${i}`).join("");
-        return `(define ($${name}${params}) (${op}${params}))`;
+        return `(define ($${name}${params}) (%intcall ${op}${params}))`;
     }),
     "(define ($list . args) args)",
-    "(define ($values . args) (%apply %values (%spread args)))",
+    "(define ($values . args) (%intapply %values (%intcall %spread args)))",
 ].join("\n");

@@ -17,9 +17,9 @@ export const createScheme = (options: AnimaOptions): Anima => {
 
     const evaluator = new MacroEvaluator(options, intrinsics);
     registerCoreSyntax(evaluator);
-    evaluator.init(loadPrelude(evaluator.expandcmp, evaluator.expandvm, evaluator, intrinsics));
+    evaluator.init(loadPrelude(evaluator.expandcmp, evaluator.expandvm, intrinsics));
 
-    const publicScope = loadPrelude(anima.compiler, anima.vm, evaluator, intrinsics);
+    const publicScope = loadPrelude(anima.compiler, anima.vm, intrinsics);
     anima.attachFrontEnd({
         read: (source, file) => new ASP(source, true, file).parse(),
         transform: ast => toCore(evaluator.transformProgram(ast), intrinsics),

@@ -4,125 +4,125 @@ import type { Compiler } from "../bytecode-rvm/compiler";
 import type { AnimaVM } from "../bytecode-rvm/vm";
 import type { Code } from "../bytecode-rvm/exec";
 import type { Intrinsics } from "../bytecode-rvm/intrinsics";
-import { ASP } from "./reader";
-import { toCore } from "./core";
+import { readNative, transformNative } from "../native";
+import { schemeDatum } from "./core";
 import { ALIAS_WRAPPERS } from "./builtins";
 import { schemeBase } from "./base";
-import type { MacroEvaluator } from "./transformer/macro";
 
 export const stdPreludeScope = () => new Env()
 
+// in native-scheme (see native/README.md): calls are written out, (%call f x) and (%intcall %name x), so what each one
+// calls is plain; Scheme's own procedures are the intrinsics they alias
 export const STD_PRELUDE = `
-(define $coroutine-resume (lambda (co . vals) (%coroutine-resume-array co (%spread vals))))
-(define $coroutine-yield (lambda vals (%coroutine-yield (%apply %values (%spread vals)))))
-(define $call-with-values (lambda (producer consumer) (%apply consumer (%values->array (producer)))))
-
+(define $coroutine-resume (lambda (co . vals) (%intcall %coroutine-resume-array co (%intcall %spread vals))))
+(define $coroutine-yield (lambda vals (%intcall %coroutine-yield (%intapply %values (%intcall %spread vals)))))
+(define $call-with-values (lambda (producer consumer) (%apply consumer (%intcall %values->array (%call producer)))))
 
 (define ($apply proc . lst)
-    (%apply proc (%apply %apply-args (%spread lst))))
+    (%apply proc (%intapply %apply-args (%intcall %spread lst))))
 
 ;; iterative, so long lists need no deep recursion; the result is built reversed, then copied in order (reversing it in
 ;; place would change a list a continuation captured inside f still holds)
 (define ($map f list1 . more)
-    (if (null? more)
-        (let loop ((lst list1) (acc '()))
-            (if (null? lst)
-                (reverse acc)
-                (loop (cdr lst) (cons (f (car lst)) acc))))
-        (let loop ((lists (cons list1 more)) (acc '()))
-            (let ((cars (%map-cars lists)))
-                (if cars
-                    (loop (%map-cdrs lists) (cons (%apply f cars) acc))
-                    (reverse acc))))))
+    (%if (%intcall %null? more)
+        (named-let loop ((lst list1) (acc '()))
+            (%if (%intcall %null? lst)
+                (%intcall %reverse acc)
+                (%call loop (%intcall %cdr lst) (%intcall %cons (%call f (%intcall %car lst)) acc))))
+        (named-let loop ((lists (%intcall %cons list1 more)) (acc '()))
+            (let ((cars (%intcall %map-cars lists)))
+                (%if cars
+                    (%call loop (%intcall %map-cdrs lists) (%intcall %cons (%apply f cars) acc))
+                    (%intcall %reverse acc))))))
 
 (define ($for-each f list1 . more)
-    (if (null? more)
-        (let loop ((lst list1))
-            (unless (null? lst)
-                (f (car lst))
-                (loop (cdr lst))))
-        (let loop ((lists (cons list1 more)))
-            (let ((cars (%map-cars lists)))
+    (%if (%intcall %null? more)
+        (named-let loop ((lst list1))
+            (unless (%intcall %null? lst)
+                (%call f (%intcall %car lst))
+                (%call loop (%intcall %cdr lst))))
+        (named-let loop ((lists (%intcall %cons list1 more)))
+            (let ((cars (%intcall %map-cars lists)))
                 (when cars
                     (%apply f cars)
-                    (loop (%map-cdrs lists)))))))
+                    (%call loop (%intcall %map-cdrs lists)))))))
 
 (define ($filter pred lst)
-    (let loop ((lst lst) (acc '()))
-        (if (null? lst)
-            (reverse acc)
-            (loop (cdr lst) (if (pred (car lst)) (cons (car lst) acc) acc)))))
+    (named-let loop ((lst lst) (acc '()))
+        (%if (%intcall %null? lst)
+            (%intcall %reverse acc)
+            (%call loop (%intcall %cdr lst) (%if (%call pred (%intcall %car lst)) (%intcall %cons (%intcall %car lst) acc) acc)))))
 
 (define $current-continuation-marks
     (lambda () (%current-marks)))
 
 (define $continuation-mark-set-first
     (lambda (set key . none)
-        (%marks-first (if set set (%current-marks)) key (if (null? none) #f (car none)))))
+        (%intcall %marks-first (%if set set (%current-marks)) key (%if (%intcall %null? none) #f (%intcall %car none)))))
 
 (define $continuation-mark-set->list
-    (lambda (set key) (%vector->list (%marks->array set key))))
+    (lambda (set key) (%intcall %vector->list (%intcall %marks->array set key))))
 
 (define $current-coroutine
-    (lambda () (%current-coroutine #f)))
+    (lambda () (%intcall %current-coroutine #f)))
 
 (define $debug-frames
     (lambda args
-        (%vector->list (%debug-frames (%current-stack 1) (%list->vector args) #f))))
+        (%intcall %vector->list (%intcall %debug-frames (%intcall %current-stack 1) (%intcall %list->vector args) #f))))
 
 (define $debug-traceback
     (lambda args
-        (%debug-traceback (%current-stack 1) (%list->vector args))))
+        (%intcall %debug-traceback (%intcall %current-stack 1) (%intcall %list->vector args))))
 
 ; raising and catching are core forms (%raise, %catch) the VM delivers; handlers are a continuation mark under
 ; (%handler-key): handler procedures and catch tokens, innermost first
-(%define-global $raise-continuable (lambda (obj) (%raise obj #t)))
-(%define-global $with-exception-handler
+(define $raise-continuable (lambda (obj) (%intcall %raise obj #t)))
+(define $with-exception-handler
     (lambda (handler thunk)
-        (with-continuation-mark (%handler-key) (%push-handler handler (continuation-mark-set-first #f (%handler-key) '()))
-            (thunk))))
-(%define-global $try (lambda (thunk catch-proc) (%catch thunk catch-proc)))
-(%define-global $try-catch $try)
+        (%with-mark (%intcall %handler-key) (%intcall %push-handler handler (%intcall %marks-first (%current-marks) (%intcall %handler-key) '()))
+            (%call thunk))))
+(define $try (lambda (thunk catch-proc) (%catch thunk catch-proc)))
+(define $try-catch $try)
 ;; R7RS promises: forcing a delay-force chain replaces each promise's state with the next one's (sharing its box), so
 ;; the chain is forced in a loop, in constant space
 (define ($force p)
-    (if (promise? p)
-        (let loop ()
-            (if (%promise-done? p)
-                (%promise-value p)
-                (let ((next ((%promise-value p))))
-                    (unless (%promise-done? p) (%promise-update! next p))
-                    (loop))))
+    (%if (%intcall %promise? p)
+        (named-let loop ()
+            (%if (%intcall %promise-done? p)
+                (%intcall %promise-value p)
+                (let ((next (%call (%intcall %promise-value p))))
+                    (unless (%intcall %promise-done? p) (%intcall %promise-update! next p))
+                    (%call loop))))
         p))
 
 ;; R7RS parameters: a parameter's value is a continuation mark under its key (parameterize sets it), else its initial
 ;; value; the converter applies to both
 (define ($make-parameter value . converter)
-    (let* ((convert (if (null? converter) #f (car converter)))
-           (key (%parameter-key-new convert))
-           (init (if convert (convert value) value)))
-        (%parameter-bind! (lambda () (%marks-first (%current-marks) key init)) key)))
+    (let* ((convert (%if (%intcall %null? converter) #f (%intcall %car converter)))
+           (key (%intcall %parameter-key-new convert))
+           (init (%if convert (%call convert value) value)))
+        (%intcall %parameter-bind! (lambda () (%intcall %marks-first (%current-marks) key init)) key)))
 
 ;; the thunk runs under the barrier, not in tail position, so its continuation is inside it
 (define ($call-with-continuation-barrier thunk)
-    (%apply %values (%values->array (with-continuation-mark (%barrier-key) (vector) (thunk)))))
+    (%intapply %values (%intcall %values->array (%with-mark (%intcall %barrier-key) (%intcall %vector) (%call thunk)))))
 
 ;; Racket's delimited continuations over the VM's prompts (%call-with-prompt, %call/comp, %abort). A prompt's default
 ;; handler takes a thunk and calls it in tail position
 (define ($call-with-continuation-prompt proc . rest)
-    (let* ((tag (if (null? rest) (default-continuation-prompt-tag) (car rest)))
-           (more (if (null? rest) '() (cdr rest)))
-           (handler (if (or (null? more) (not (car more))) (lambda (thunk) (thunk)) (car more)))
-           (args (if (null? more) '() (cdr more))))
-        (%call-with-prompt tag (lambda () (apply proc args)) handler)))
+    (let* ((tag (%if (%intcall %null? rest) (%intcall %default-continuation-prompt-tag) (%intcall %car rest)))
+           (more (%if (%intcall %null? rest) '() (%intcall %cdr rest)))
+           (handler (%if (or (%intcall %null? more) (%intcall %not (%intcall %car more))) (lambda (thunk) (%call thunk)) (%intcall %car more)))
+           (args (%if (%intcall %null? more) '() (%intcall %cdr more))))
+        (%intcall %call-with-prompt tag (lambda () (%apply proc (%intcall %spread args))) handler)))
 
 (define ($abort-current-continuation tag . vals)
-    (%abort tag (%spread vals)))
+    (%intcall %abort tag (%intcall %spread vals)))
 
 (define ($call-with-composable-continuation proc . tag)
-    (%call/comp proc (if (null? tag) (default-continuation-prompt-tag) (car tag))))
+    (%intcall %call/comp proc (%if (%intcall %null? tag) (%intcall %default-continuation-prompt-tag) (%intcall %car tag))))
 
-(%define-global $pcall (lambda (f . args) (%catch (lambda () (%values-cons #t (apply f args))) (lambda (e) (values #f e)))))
+(define $pcall (lambda (f . args) (%catch (lambda () (%intcall %values-cons #t (%apply f (%intcall %spread args)))) (lambda (e) (%intcall %values #f e)))))
 `
 
 // compiled once, for every instance (the prelude is never debug code, and its JS is generated later, per VM), and bound to the frozen Scheme base table, so the cache holds no instance's intrinsics; each instance runs its own
@@ -143,10 +143,9 @@ const knownIn = (core: any): [string, any][] => {
 
 // Runs the prelude with `vm` and returns the scope of its $ exports (under their public names), which the instance's
 // code cannot rebind
-export const loadPrelude = (cmp: Compiler, vm: AnimaVM, evaluator: MacroEvaluator, intrinsics: Intrinsics): Env => {
+export const loadPrelude = (cmp: Compiler, vm: AnimaVM, intrinsics: Intrinsics): Env => {
     if (PRELUDE_CODE === null) {
-        const preludeAst = new ASP(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, true, "<prelude>").parse()
-        const core = toCore(evaluator.transform(preludeAst), evaluator.intrinsics)
+        const core = transformNative(readNative(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, "<prelude>", { datum: schemeDatum }))
         KNOWN = knownIn(core)
         const compiled = cmp.compile(core, false)
         PRELUDE_CODE = compiled.fresh(new Map(), schemeBase())
