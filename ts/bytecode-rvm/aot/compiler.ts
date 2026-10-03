@@ -1,19 +1,20 @@
-// The AOT compiler: decodes bytecode into basic blocks, generates a function's JS source (see emit.ts) and builds it,
+// The AOT compiler: splits a function's instructions into basic blocks, generates a function's JS source (resume.ts, direct.ts) and builds it,
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
-import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, Table, isTruthy, packValues } from "../../common";
-import { Cons } from "../../list";
-import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, markFirst, markSet, recordTailMark } from "../../marks";
-import { DirectEmitter, ResumeEmitter } from "./emit";
+import { Intrinsics, type TypeSystem } from "../intrinsics";
+import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, packValues } from "../../common";
+import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
+import { DirectEmitter } from "./direct";
+import { ResumeEmitter } from "./resume";
+import { Liveness } from "./liveness";
+import { structureOf } from "./structure";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
-import { Closure, ClosureTemplate, SHARED_INSTS } from "../bytecode";
-import type { ByteCode, DirectFn, ResumeFn } from "../bytecode";
-import { ControlRequest, HostTail, applyIntrinsic, raiseContinuable, restArrayArgs, stackSkip } from "../coreops";
+import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS } from "../code";
+import type { Code, DirectFn, ResumeFn } from "../code";
+import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
-import { OpCode } from "../interpreter";
-import { listToArray, listToValues, windowApplyArgs, windowRestArgs } from "../lists";
-import { INSTRUCTION_LENGTHS, basicBlockStarts } from "../opcodes";
-import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
+import { blockStarts, type Op } from "../ops";
+import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
     markSet,
@@ -25,27 +26,25 @@ export const JIT_DEPS = {
     restValues,
     IProcedure,
     ErrorObject,
-    isTruthy,
     Box,
     MissingVarError,
     Closure,
+    CaseLambda,
     WindPoint,
-    windowApplyArgs,
-    windowRestArgs,
-    restArrayArgs,
+    applyArgs,
+    arrayArg,
     raiseContinuable,
+    catchGuard,
     stackSkip,
     packValues,
-    listToValues,
-    listToArray,
-    Cons,
+    Handlers,
     MISSING,
     MAX_JS_DEPTH,
     MAX_NESTED_RESUMES,
-    Table,
     Env,
     Frame,
     Suspend,
+    InterruptError,
     EscapeContinuation,
     countControlSuspend,
     StackSnapshot,
@@ -66,7 +65,7 @@ export class AotCompiler {
 
         // one try around the loop: any error ends the run
         try {
-            if (frame.ip === 0 && frame.code.directArity === 0 && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
+            if (frame.ip === 0 && frame.code.directArity === 0 && !frame.code.internal && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
             while (frame !== null) {
                 const frameCtx: ExecutionContext = frame.ctx;
                 frame = executor.enter(frameCtx, frame);
@@ -94,7 +93,7 @@ export class AotCompiler {
         return executor.setRetVal(ctx, frame.parent, val);
     }
 
-    public static compileAll(code: ByteCode, tmpl?: ClosureTemplate): void {
+    public static compileAll(code: Code, tmpl?: ClosureTemplate): void {
         if (code.resumeFn === null) {
             this.compile(code, tmpl);
         }
@@ -107,229 +106,150 @@ export class AotCompiler {
         }
     }
 
-    public static compile(code: ByteCode, tmpl?: ClosureTemplate): ResumeFn {
+    public static compile(code: Code, tmpl?: ClosureTemplate): ResumeFn {
         const { resume, direct } = this.generateFunction(code, tmpl);
         code.resumeFn = resume;
         if (direct !== null && tmpl !== undefined) {
             code.directFn = direct;
-            if (tmpl.arity.rest === "none") code.directArity = tmpl.arity.min;
-            else code.directRestArity = tmpl.arity.min;
+            if (tmpl.arity.rest === "none") code.directArity = tmpl.arity.params;
+            else code.directRestArity = tmpl.arity.params;
+            code.directPad = tmpl.arity.pad && tmpl.arity.rest === "none";
         }
         return resume;
     }
 
-    // the compiled source of shared instruction arrays: copies of a ByteCode (ByteCode.fresh) only build their own functions.
+    // the compiled source of shared instruction lists: copies of a Code (Code.fresh) only build their own functions.
     // Source that calls intrinsics also depends on what they generate: their positions, inline templates and deps' locals.
     // Instances that register the same intrinsics the same way (e.g. from the same front end) share it
-    static readonly #sources = new WeakMap<Uint32Array, { uses: readonly SourceUse[], factory: Function }[]>();
+    static readonly #sources = new WeakMap<readonly Op[], { uses: readonly SourceUse[], types: TypeSystem | null, factory: Function }[]>();
 
     static #sameUses(a: readonly SourceUse[], b: readonly SourceUse[]): boolean {
         if (a.length !== b.length) return false;
         for (let i = 0; i < a.length; i++) {
             const x = a[i], y = b[i];
-            // name and bounds are written into the source of APPLYINT (IntApply / IntApplyRest)
-            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max) return false;
+            // name and bounds are written into the source of IntApply
+            // and the type facts rules, which the source relies on
+            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max || !Intrinsics.sameFacts(x, y)) return false;
             const dx = Object.entries(x.deps), dy = y.deps;
             if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
         }
         return true;
     }
 
-    public static generateFunction(code: ByteCode, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
-        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max }; });
-        let variants = this.#sources.get(code.inst);
-        let factory = variants?.find(v => this.#sameUses(v.uses, uses))?.factory;
+    public static generateFunction(code: Code, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch }; });
+        let variants = this.#sources.get(code.ops);
+        const types = code.table?.types ?? null;
+        let factory = variants?.find(v => v.types === types && this.#sameUses(v.uses, uses))?.factory;
         if (factory === undefined) {
             // parsing the source is most of the cost, so copies share the factory and only call it for their own functions
-            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl));
-            if (SHARED_INSTS.has(code.inst)) {
-                if (variants === undefined) this.#sources.set(code.inst, variants = []);
-                variants.push({ uses, factory });
+            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "CALL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl));
+            if (SHARED_OPS.has(code.ops)) {
+                if (variants === undefined) this.#sources.set(code.ops, variants = []);
+                variants.push({ uses, types, factory });
             }
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
-        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, code.table?.fns ?? [], code.table?.deps ?? []);
+        const callCache: Record<number, { tmpl: ClosureTemplate | null, directFn: DirectFn | null }> = {};
+        for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: null, directFn: null };
+        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 
-    public static generateSource(code: ByteCode, tmpl?: ClosureTemplate): string {
+    // called with each step's output when generating source: the blocks, their liveness, the resume and direct entries
+    static trace?: (step: string, output: unknown) => void;
+
+    static #step<T>(name: string, run: () => T): T {
+        const output = run();
+        this.trace?.(name, output);
+        return output;
+    }
+
+    public static generateSource(code: Code, tmpl?: ClosureTemplate): string {
         if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
-        const blocks = this.buildAot(code, tmpl);
+        const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
+        const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
         const usedDeps = new Set<string>();
-        const resume = new ResumeEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps);
-        resume.emitFunction();
-        let direct = "null";
-        if (tmpl !== undefined) {
-            const out = new DirectEmitter(blocks, code.inst, code.numReg, code.debug, code.table, usedDeps);
+        const structure = structureOf(code.ops);
+        const resume = this.#step("resume", () => {
+            const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
+            out.emitFunction();
+            return out.toString();
+        });
+        const direct = tmpl === undefined ? "null" : this.#step("direct", () => {
+            const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
             out.emitFunction(tmpl.arity);
-            direct = out.toString();
-        }
+            return out.toString();
+        });
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
+        const callCaches = this.#callSites(code).map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("");
         // positions never change once registered, so each intrinsic's function and deps are read once, into locals
         const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
         const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
         const deps = [...usedDeps].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
-        return `${caches}${fns}${deps}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
+        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${resume},\ndirect: ${direct}\n};`;
     }
 
-    static #globalLoads(code: ByteCode): number[] {
-        const ips: number[] = [];
-        for (let ip = 0; ip < code.inst.length; ip += INSTRUCTION_LENGTHS[code.inst[ip] as OpCode]) {
-            if (code.inst[ip] === OpCode.LOADGLOBAL) ips.push(ip);
-        }
-        return ips;
+    static #globalLoads(code: Code): number[] {
+        return code.ops.filter(op => op.k === "LoadGlobal").map(op => op.ip);
     }
 
-    public static buildAot(code: ByteCode, tmpl?: ClosureTemplate): AotBlock[] {
-        const inst = code.inst;
-        const starts = basicBlockStarts(inst);
+    static #callSites(code: Code): number[] {
+        return code.ops.filter(op => op.k === "Call" || op.k === "HostCall").map(op => op.ip);
+    }
+
+    public static buildAot(code: Code, tmpl?: ClosureTemplate): AotBlock[] {
+        const starts = blockStarts(code.ops);
         const blocks: AotBlock[] = [];
-
+        let o = 0;
         for (let b = 0; b < starts.length; b++) {
-            const end = b + 1 < starts.length ? starts[b + 1] : inst.length;
+            const end = b + 1 < starts.length ? starts[b + 1] : code.ops.length;
             const insts: AotInst[] = [];
             let term: AotTerm | null = null;
             let ip = starts[b];
-
+            while (o < code.ops.length && code.ops[o].ip < ip) o++;
             while (ip < end && term === null) {
-                const opIp = ip;
-                const numInsts = insts.length;
-                const opcode: OpCode = inst[ip++];
-                switch (opcode) {
-                    case OpCode.LOADCONST:
-                        insts.push({ k: "LoadConst", dst: inst[ip++], idx: inst[ip++] });
+                const op = code.ops[o++];
+                const at = op.ip;
+                ip = at + 1;
+                switch (op.k) {
+                    case "LoadConst": insts.push({ k: "LoadConst", dst: op.dst, idx: op.idx, at }); break;
+                    case "LoadInt": insts.push({ k: "LoadInt", dst: op.dst, value: op.value, at }); break;
+                    case "LoadUpvar": insts.push({ k: "LoadUpvar", dst: op.dst, idx: op.idx, unbox: op.unbox, at }); break;
+                    case "SetUpvar": insts.push({ k: "SetUpvar", src: op.src, idx: op.idx, box: op.box, at }); break;
+                    case "FixUpvar": insts.push({ k: "FixUpvar", clo: op.clo, idx: op.idx, src: op.src, at }); break;
+                    case "LoadGlobal": insts.push({ k: "LoadGlobal", dst: op.dst, sym: op.sym, ip: at, at }); break;
+                    case "SetGlobal": insts.push({ k: "SetGlobal", src: op.src, sym: op.sym, at }); break;
+                    case "Move": case "Box": case "Unbox": case "SetBox": insts.push({ k: op.k, dst: op.dst, src: op.src, at }); break;
+                    case "NewClosure": insts.push({ k: "NewClosure", dst: op.dst, tmpl: op.tmpl, captures: (code.constants[op.tmpl] as ClosureTemplate).upvarLocs, at }); break;
+                    case "MoveAcc": insts.push({ k: "MoveAcc", dst: op.dst, at }); break;
+                    case "Unpack": insts.push({ k: "Unpack", src: op.src, start: op.start, count: op.count, flags: op.flags, at }); break;
+                    case "SetMark": insts.push({ k: "SetMark", key: op.key, val: op.val, at }); break;
+                    case "MarkSave": case "MarkRestore": insts.push({ k: op.k, reg: op.reg, at }); break;
+                    case "CurMarks": insts.push({ k: "CurMarks", dst: op.dst, at }); break;
+                    case "InlineSite": insts.push({ k: "SetSite", site: op.site, at }); break;
+                    case "IntCall": case "IntApply": insts.push({ k: op.k, pos: op.pos, dst: op.dst, start: op.start, nargs: op.nargs, at }); break;
+                    case "If": term = { k: "Branch", cond: op.cond, then: ip, else: op.else, elseif: op.elseif, at }; break;
+                    case "Else": term = { k: "Jump", target: op.end, at }; break;
+                    case "EndIf": term = { k: "Jump", target: ip, at }; break;
+                    case "Block": case "Loop": term = { k: op.k, body: ip, end: op.end, at }; break;
+                    case "EndLoop": term = { k: "Jump", target: op.head, loopBack: true, at }; break;
+                    case "Jump": term = { k: "Jump", target: op.target, escape: true, at }; break;
+                    case "Call":
+                        term = !op.tail ? { k: "Call", proc: op.proc, start: op.start, nargs: op.nargs, resume: ip, at }
+                            : tmpl !== undefined && fitsArity(tmpl.arity, op.nargs)
+                            ? { k: "MaybeSelfTailCall", proc: op.proc, start: op.start, nargs: op.nargs, ip, arity: tmpl.arity, restPos: tmpl.code.restPos, at }
+                            : { k: "TailCall", proc: op.proc, start: op.start, nargs: op.nargs, ip, at };
                         break;
-                    case OpCode.LOADU32:
-                        insts.push({ k: "LoadInt", dst: inst[ip++], value: inst[ip++] });
-                        break;
-                    case OpCode.LOADUPVAR:
-                        insts.push({ k: "LoadUpvar", dst: inst[ip++], idx: inst[ip++], unbox: inst[ip++] !== 0 });
-                        break;
-                    case OpCode.SETUPVAR:
-                        insts.push({ k: "SetUpvar", src: inst[ip++], idx: inst[ip++], box: inst[ip++] !== 0 });
-                        break;
-                    case OpCode.LOADGLOBAL:
-                        insts.push({ k: "LoadGlobal", dst: inst[ip++], sym: inst[ip++], ip: opIp });
-                        break;
-                    case OpCode.SETGLOBAL:
-                        insts.push({ k: "SetGlobal", src: inst[ip++], sym: inst[ip++] });
-                        break;
-                    case OpCode.MOVE:
-                        insts.push({ k: "Move", dst: inst[ip++], src: inst[ip++] });
-                        break;
-                    case OpCode.BOX:
-                        insts.push({ k: "Box", dst: inst[ip++], src: inst[ip++] });
-                        break;
-                    case OpCode.UNBOX:
-                        insts.push({ k: "Unbox", dst: inst[ip++], src: inst[ip++] });
-                        break;
-                    case OpCode.SETBOX:
-                        insts.push({ k: "SetBox", dst: inst[ip++], src: inst[ip++] });
-                        break;
-                    case OpCode.NEWCLOSURE: {
-                        const dst = inst[ip++];
-                        const tmplIdx = inst[ip++];
-                        insts.push({ k: "NewClosure", dst, tmpl: tmplIdx, captures: (code.constants[tmplIdx] as ClosureTemplate).upvarLocs });
-                        break;
-                    }
-                    case OpCode.IF:
-                    case OpCode.ELSEIF: {
-                        const cond = inst[ip++];
-                        const elseIp = inst[ip++];
-                        term = { k: "Branch", cond, then: ip, else: elseIp, elseif: opcode === OpCode.ELSEIF };
-                        break;
-                    }
-                    case OpCode.ELSE:
-                        term = { k: "Jump", target: inst[ip++] };
-                        break;
-                    case OpCode.ENDIF:
-                        term = { k: "Jump", target: ip };
-                        break;
-                    case OpCode.BLOCK:
-                    case OpCode.LOOP: {
-                        const end = inst[ip++];
-                        term = { k: opcode === OpCode.BLOCK ? "Block" : "Loop", body: ip, end };
-                        break;
-                    }
-                    case OpCode.ENDLOOP:
-                        term = { k: "Jump", target: inst[ip++], loopBack: true };
-                        break;
-                    case OpCode.JUMP:
-                        term = { k: "Jump", target: inst[ip++], escape: true };
-                        break;
-                    case OpCode.CALL: {
-                        const procIdx = inst[ip++];
-                        const start = inst[ip++];
-                        const nargs = inst[ip++];
-                        const isTail = inst[ip++] !== 0;
-                        if (!isTail) {
-                            term = { k: "Call", proc: procIdx, start, nargs, resume: ip };
-                            break;
-                        }
-                        term = tmpl !== undefined && fitsArity(tmpl.arity, nargs)
-                            ? { k: "MaybeSelfTailCall", proc: procIdx, start, nargs, ip, arity: tmpl.arity }
-                            : { k: "TailCall", proc: procIdx, start, nargs, ip };
-                        break;
-                    }
-                    case OpCode.MOVEACC:
-                        insts.push({ k: "MoveAcc", dst: inst[ip++] });
-                        break;
-                    case OpCode.UNPACK:
-                        insts.push({ k: "Unpack", src: inst[ip++], start: inst[ip++], count: inst[ip++], flags: inst[ip++] });
-                        break;
-                    case OpCode.SETMARK:
-                        insts.push({ k: "SetMark", key: inst[ip++], val: inst[ip++] });
-                        break;
-                    case OpCode.MARKSAVE:
-                        insts.push({ k: "MarkSave", reg: inst[ip++] });
-                        break;
-                    case OpCode.MARKRESTORE:
-                        insts.push({ k: "MarkRestore", reg: inst[ip++] });
-                        break;
-                    case OpCode.CURMARKS:
-                        insts.push({ k: "CurMarks", dst: inst[ip++] });
-                        break;
-                    case OpCode.CALLINT:
-                    case OpCode.CALLCTX:
-                        insts.push({ k: "IntCall", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
-                        break;
-                    case OpCode.APPLYINT:
-                    case OpCode.APPLYINTR:
-                        insts.push({ k: inst[opIp] === OpCode.APPLYINT ? "IntApply" : "IntApplyRest", pos: inst[ip++], dst: inst[ip++], start: inst[ip++], nargs: inst[ip++] });
-                        break;
-                    case OpCode.CALLEC: {
-                        const proc = inst[ip++];
-                        term = { k: "CallEC", proc, tok: inst[ip++], resume: ip };
-                        break;
-                    }
-                    case OpCode.CALLCATCH: {
-                        const proc = inst[ip++];
-                        const tok = inst[ip++];
-                        term = { k: "CallCatch", proc, tok, pre: inst[ip++], resume: ip };
-                        break;
-                    }
-                    case OpCode.CALLHOST: {
-                        const pos = inst[ip++];
-                        const start = inst[ip++];
-                        const nargs = inst[ip++];
-                        term = { k: "HostCall", pos, start, nargs, isTail: inst[ip++] !== 0, resume: ip };
-                        break;
-                    }
-                    case OpCode.RETURN:
-                        term = { k: "Return", reg: inst[ip++] };
-                        break;
+                    case "HostCall": term = { k: "HostCall", pos: op.pos, start: op.start, nargs: op.nargs, isTail: op.tail, resume: ip, at }; break;
+                    case "Return": term = { k: "Return", reg: op.src, at }; break;
                     default: {
-                        const _: never = opcode;
-                        throw new Error(`Unhandled opcode in JIT: ${opcode}`);
+                        const _: never = op;
                     }
                 }
-                if (insts.length > numInsts) insts[insts.length - 1].at = opIp;
-                if (term !== null) term.at = opIp;
             }
-
             blocks.push({ start: starts[b], insts, term: term ?? { k: "Jump", target: ip } });
         }
-
         return blocks;
     }
 }

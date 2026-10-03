@@ -1,10 +1,6 @@
-import type { ExecutionMode } from "./exec";
+// How an instance compiles code: optimized (passes/cp0.ts), and as debug code (exact error positions and tail-call
+// trails in tracebacks) or not
+export type AnimaOptions = { readonly debug: boolean, readonly optimize: boolean };
 
-// How an instance compiles and runs code: interpreted, or compiled to JS ("aot"); and as debug code (exact error
-// positions and tail-call trails in tracebacks)
-export type AnimaOptions = { readonly mode: ExecutionMode, readonly debug: boolean };
-
-export const impl: AnimaOptions = { mode: "interp", debug: false };
-export const implAot: AnimaOptions = { mode: "aot", debug: false };
-export const implDebug: AnimaOptions = { mode: "interp", debug: true };
-export const implAotDebug: AnimaOptions = { mode: "aot", debug: true };
+export const impl: AnimaOptions = { debug: false, optimize: true };
+export const implDebug: AnimaOptions = { debug: true, optimize: false };

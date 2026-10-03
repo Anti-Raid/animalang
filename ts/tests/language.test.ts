@@ -1,15 +1,20 @@
-import { ASTStringifier, MissingVarError, Env } from '../common';
+import { MissingVarError, Env, ErrorObject, OpaqueValue, TRY_CALL } from '../common';
+import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
-import { ByteCode, AnimaVM, OpCode } from '../bytecode-rvm/vm';
-import { Closure, INSTRUCTION_LENGTHS } from '../bytecode-rvm/exec';
+import { Code, AnimaVM } from '../bytecode-rvm/vm';
+import { Closure, listing } from '../bytecode-rvm/exec';
 import { Anima } from '../anima';
-import { impl, implAot } from '../bytecode-rvm/meta';
-import { dumpFull, readFull } from '../bytecode-rvm/utils';
-import { registerTestIntrinsics } from './helpers';
+import { impl } from '../bytecode-rvm/meta';
+import { opKinds, registerTestIntrinsics } from './helpers';
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+// what the passes before the optimizer make of a procedure (its listing, as the optimizer would change it)
+const unoptimizedProc = (src: string) => { const a = createScheme({ debug: false, optimize: false }); return a.evaluateRaw(a.compileRaw(src)) }
+import { hostYield } from '../bytecode-rvm/exec';
+
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Anima', () => {
     let evaluator: Anima
     let s = new ASTStringifier()
@@ -33,11 +38,6 @@ describe('Anima', () => {
 
 
     describe('Primitives, Strings & Symbols', () => {
-        it('table-border is the array-part border and is inlined', () => {
-            expect(run(`(define (tb t) (table-border t)) (let ((t {1 "a" 2 "b" 3 "c"})) (table-set! t 2 <#void>) (list (tb t) (tb {}) (tb {"x" 1}) (table-size t)))`)).toBe("(1 0 0 2)")
-            expect(run(`(let ((t {})) (table-set! t 2 "b") (table-set! t 1 "a") (table-border t))`)).toBe("2")
-            expect(() => run(`(define (tb2 t) (table-border t)) (tb2 '())`)).toThrow("table-border requires a table")
-        })
         it('inlined n-ary arithmetic agrees with the builtins', () => {
             const outcome = (src: string) => {
                 try {
@@ -199,7 +199,8 @@ describe('Anima', () => {
             expect(() => run("(cadr '(1))")).toThrow("cadr: list is too short");
             expect(() => run("(cadr 5)")).toThrow("cadr: expected a pair but got 5");
             expect(() => run("(cadr 1 2)")).toThrow("cadr: expected exactly 1 args, got 2");
-            expect(() => run("(lambda (cddr) 1)")).toThrow("cannot bind builtin cddr");
+            expect(run("((lambda (cddr) cddr) 5)")).toBe("5");
+            expect(() => run("(lambda (%cddr) 1)")).toThrow("which is an intrinsic");
             expect(run("(first '(1 2 3))")).toBe("1");
             expect(run("(second '(1 2 3))")).toBe("2");
             expect(run("(third '(1 2 3))")).toBe("3");
@@ -385,6 +386,145 @@ describe('Anima', () => {
             expect(() => evaluator.coroutineResume(failing)).toThrow("nope");
         });
 
+        it('knows the current coroutine, from code and from the host', () => {
+            evaluator.registerIntrinsic("%test-current", () => evaluator.currentCoroutine(), { args: [0, 0], leaf: true })
+            expect(evaluator.currentCoroutine()).toBe(null)
+            expect(run(`(list (current-coroutine) (null? (%test-current)) ((car (list current-coroutine))) (%current-coroutine 'none))`)).toBe("(#f #t #f none)")
+            expect(run(`(define co (coroutine-create (lambda () (list (eq? (current-coroutine) co) (eq? (%test-current) co)))))
+                        (coroutine-resume co)`)).toBe("(#t #t)")
+            // nested: back in the outer one after the inner yields, returns or is closed
+            expect(run(`(define inner (coroutine-create (lambda () (coroutine-yield (eq? (%test-current) inner)) 'done)))
+                        (define outer (coroutine-create (lambda ()
+                            (let* ((a (coroutine-resume inner)) (b (eq? (%test-current) outer)) (c (coroutine-resume inner)) (d (eq? (current-coroutine) outer)))
+                              (list a b c d)))))
+                        (list (coroutine-resume outer) (null? (%test-current)))`)).toBe("((#t #t done #t) #t)")
+            expect(run(`(define dies (coroutine-create (lambda () (raise 'x))))
+                        (define outer2 (coroutine-create (lambda () (%catch (lambda () (coroutine-resume dies)) (lambda (e) (eq? (%test-current) outer2))))))
+                        (coroutine-resume outer2)`)).toBe("#t")
+            const co = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (coroutine-yield (eq? (%test-current) (current-coroutine))) (current-coroutine)))`))
+            expect(evaluator.coroutineResume(co).value).toBe(true)
+            expect(evaluator.currentCoroutine()).toBe(null)
+            expect(evaluator.coroutineResume(co).value).toBe(co)
+        })
+
+        it('calls a value whose TRY_CALL is a procedure', () => {
+            class Callable extends OpaqueValue { constructor(readonly proc: any) { super() } get typeName() { return "callable" } get [TRY_CALL]() { return this.proc } }
+            class Plain extends OpaqueValue { get typeName() { return "plain" } }
+            evaluator.registerIntrinsic("%test-callable", (regs, s) => new Callable(regs[s]), { args: [1, 1], leaf: true })
+            evaluator.registerIntrinsic("%test-with-field", (regs, s) => Object.assign(new Plain(), { [TRY_CALL]: regs[s] }), { args: [1, 1], leaf: true })
+            // a field set on the value itself
+            expect(run(`((%test-with-field (lambda (self x) (* x 2))) 21)`)).toBe("42")
+            expect(run(`(define t (%test-callable (lambda (self a b) (list 'called a b)))) (list (t 1 2) (apply t '(3 4)))`)).toBe("((called 1 2) (called 3 4))")
+            // hot, in tail position, and deeper than the js stack
+            expect(run(`(define inc (%test-callable (lambda (self n) (+ n 1)))) (define (hot i acc) (if (= i 0) acc (hot (- i 1) (inc acc)))) (hot 10000 0)`)).toBe("10000")
+            expect(run(`(define down (%test-callable (lambda (self n) (if (= n 0) 'bottom (self (- n 1)))))) (define (via n) (down n)) (via 20000)`)).toBe("bottom")
+            expect(run(`(define deep (%test-callable (lambda (self n) (if (= n 0) 0 (+ 1 (self (- n 1))))))) (deep 20000)`)).toBe("20000")
+            // padded and case-lambda procedures, and continuations still called as themselves
+            expect(run(`(define cl (%test-callable (case-lambda ((self) 'none) ((self a) a)))) (list (cl) (cl 5) (call/cc (lambda (k) ((%test-callable (lambda (self v) (k v))) 'out))))`)).toBe("(none 5 out)")
+            // <#void>, or what is not a procedure: the usual error
+            expect(() => run(`((%test-callable <#void>) 2)`)).toThrow("Attempted to call a non-procedure")
+            expect(() => run(`((%test-callable (%test-callable 1)) 2)`)).toThrow("Attempted to call a non-procedure")
+            expect(() => run(`(5 1)`)).toThrow("Attempted to call a non-procedure: 5")
+            expect(() => run(`({"call" 1} 2)`)).toThrow("Attempted to call a non-procedure")
+        })
+
+        it('yields from a host intrinsic with hostYield', () => {
+            evaluator.registerIntrinsic("%test-yield", (regs, s, n) => hostYield(...regs.slice(s, s + n)), { args: [0, Infinity] })
+            // the values it is resumed with are the call's value
+            expect(run(`(define co (coroutine-create (lambda () (list (%test-yield 1) (%test-yield 2)))))
+                        (list (coroutine-resume co) (coroutine-resume co 'a) (coroutine-resume co 'b) (coroutine-status co))`)).toBe("(1 2 (a b) dead)")
+            // in tail position: the caller's value, or with no caller left, the coroutine's
+            expect(run(`(define (y v) (%test-yield v)) (define co2 (coroutine-create (lambda () (list (y 1) 'after))))
+                        (list (coroutine-resume co2) (coroutine-resume co2 'r))`)).toBe("(1 (r after))")
+            expect(run(`(define co3 (coroutine-create (lambda () (%test-yield 1))))
+                        (list (coroutine-resume co3) (coroutine-resume co3 'x) (coroutine-status co3))`)).toBe("(1 x dead)")
+            // several values and none, in a loop hot enough for direct code
+            expect(run(`(define co4 (coroutine-create (lambda () (let loop ((i 0) (acc 0)) (if (= i 200) acc (loop (+ i 1) (+ acc (%test-yield i i))))))))
+                        (let loop ((n 1) (seen (call-with-values (lambda () (coroutine-resume co4)) list))) (if (= n 200) (list seen (coroutine-resume co4 1)) (loop (+ n 1) (call-with-values (lambda () (coroutine-resume co4 1)) list))))`)).toBe("((199 199) 200)")
+            expect(run(`(define co5 (coroutine-create (lambda () (%test-yield) 'done))) (call-with-values (lambda () (coroutine-resume co5)) list)`)).toBe("()")
+            // raised into at the yield, under the coroutine's handlers
+            expect(run(`(define co6 (coroutine-create (lambda () (%catch (lambda () (%test-yield 1)) (lambda (e) (list 'caught e))))))
+                        (list (coroutine-resume co6) (coroutine-raise co6 'boom))`)).toBe("(1 (caught boom))")
+            expect(() => run(`(%test-yield 1)`)).toThrow("coroutine-yield: not inside a coroutine")
+        })
+
+        it('lets the host suspend a coroutine on async work, then resume it or raise into it', async () => {
+            const pending: Promise<void>[] = []
+            let result: any = undefined
+            const settle = (r: { done: boolean, value: any }) => { if (r.done) result = r.value }
+            // (%test-await x): suspends the coroutine until the work settles; 'fail fails it
+            evaluator.registerIntrinsic("%test-await", (regs, s) => {
+                const co = evaluator.currentCoroutine()
+                const x = regs[s]
+                const work = new Promise<number>((resolve, reject) => setTimeout(() => x === Symbol.for("fail") ? reject(new Error("async boom")) : resolve(x * 2), 1))
+                pending.push(work.then(v => settle(evaluator.coroutineResume(co, v)), e => settle(evaluator.coroutineRaise(co, new ErrorObject(e)))))
+                return hostYield()
+            }, { args: [1, 1] })
+            const co = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda ()
+                (let* ((a (%test-await 21))
+                       (b (%catch (lambda () (%test-await 'fail)) (lambda (e) (error-object-message e))))
+                       (c (%test-await a)))
+                  (list a b c))))`))
+            settle(evaluator.coroutineResume(co))
+            let waits = 0
+            for (; pending.length > 0; waits++) {
+                expect(result).toBeUndefined()
+                expect(co.status).toBe("suspended")
+                await pending.shift()
+            }
+            expect(co.status).toBe("dead")
+            expect(waits).toBe(3)
+            expect(s.stringify(result)).toBe('(42 "async boom" 84)')
+
+            // an async failure nothing in the coroutine handles kills it, and the raise reports it to the host
+            const failing = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (%test-await 'fail) 'unreached))`))
+            evaluator.coroutineResume(failing)
+            const raised = pending.shift()!.then(() => "resolved", (e: any) => e.message)
+            expect(await raised).toBe("async boom")
+            expect(failing.status).toBe("dead")
+        })
+
+        it('knows whether it can yield', () => {
+            evaluator.registerIntrinsic("%test-yieldable", () => evaluator.coroutineYieldable(), { args: [0, 0], leaf: true })
+            expect(evaluator.coroutineYieldable()).toBe(false)
+            expect(run(`(list (coroutine-yieldable?) (coroutine-resume (coroutine-create (lambda () (coroutine-yieldable?)))))`)).toBe("(#f #t)")
+            expect(run(`(list (%test-yieldable) (coroutine-resume (coroutine-create (lambda () (%test-yieldable)))))`)).toBe("(#f #t)")
+            expect(run(`(define seen '())
+                        (define co (coroutine-create (lambda () (dynamic-wind (lambda () #f) (lambda () (coroutine-yield 1)) (lambda () (set! seen (list (coroutine-yieldable?) (%test-yieldable))))))))
+                        (coroutine-resume co) (coroutine-close co) seen`)).toBe("(#f #f)")
+        })
+
+        it('takes any procedure where the VM calls one itself', () => {
+            // dynamic-wind thunks run again by a continuation, and a coroutine's body
+            expect(run(`(define log '()) (define k #f) (define n 0)
+                        (dynamic-wind (case-lambda (() (set! log (cons 'in log))) ((x) x)) (lambda () (call/cc (lambda (c) (set! k c))) (set! n (+ n 1))) (case-lambda (() (set! log (cons 'out log))) ((x) x)))
+                        (when (< n 2) (k #f)) (reverse log)`)).toBe("(in out in out)")
+            expect(run(`(coroutine-resume (coroutine-create (case-lambda ((x) (list 'one x)) ((x y) 'two))) 5)`)).toBe("(one 5)")
+        })
+
+        it('keeps the running coroutine when a nested resume fails', () => {
+            evaluator.registerIntrinsic("%test-raise-into", (regs, s) => {
+                try { evaluator.coroutineRaise(regs[s], "boom") } catch { }
+                return evaluator.currentCoroutine()
+            }, { args: [1, 1], leaf: true })
+            expect(run(`(define fresh (coroutine-create (lambda () 1)))
+                        (define outer (coroutine-create (lambda () (eq? (%test-raise-into fresh) outer))))
+                        (list (coroutine-resume outer) (coroutine-status fresh))`)).toBe("(#t dead)")
+        })
+
+        it('kills a coroutine whose first call fails, and raises the error in its resumer', () => {
+            // a wrong argument count: the coroutine is dead, not left running
+            expect(run(`(define bad (coroutine-create (lambda (x) x)))
+                        (list (try (lambda () (coroutine-resume bad)) (lambda (e) 'caught)) (coroutine-status bad)
+                              (try (lambda () (coroutine-resume bad 1)) (lambda (e) (error-message e))))`)).toBe('(caught dead "coroutine-resume: cannot resume a dead coroutine")')
+            // its finally thunk runs, and a coroutine that resumed it goes on as the running one
+            expect(run(`(define flog '())
+                        (define outer (coroutine-create (lambda ()
+                          (define inner (coroutine-create (lambda (x) x) (lambda () (set! flog (cons 'fin flog)))))
+                          (list (try (lambda () (coroutine-resume inner)) (lambda (e) 'caught)) (coroutine-status inner) (eq? (current-coroutine) outer)))))
+                        (list (coroutine-resume outer) flog)`)).toBe("((caught dead #t) (fin))")
+        })
+
         it('raising into a coroutine', () => {
             // the pending yield raises, under the coroutine's own handlers, and the coroutine goes on
             expect(run(`(define rc (coroutine-create (lambda () (coroutine-yield (try (lambda () (coroutine-yield 1)) (lambda (e) (list 'caught e)))) 'end)))
@@ -500,24 +640,66 @@ describe('Anima', () => {
             expect(run("(usem)")).toBe("5");
 
             const bc = evaluator.compileRaw("(+ gx 1)");
-            const vm = new AnimaVM("aot");
+            const vm = new AnimaVM();
             const scopeA = new Env(); scopeA.set(Symbol.for("gx"), 1);
             const scopeB = new Env(); scopeB.set(Symbol.for("gx"), 10);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeB)).toBe(11);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(2);
+            expect(vm.evaluateRaw(bc as Code, scopeA)).toBe(2);
+            expect(vm.evaluateRaw(bc as Code, scopeB)).toBe(11);
+            expect(vm.evaluateRaw(bc as Code, scopeA)).toBe(2);
             scopeA.set(Symbol.for("gx"), 100);
-            expect(vm.evaluateRaw(bc as ByteCode, scopeA)).toBe(101);
+            expect(vm.evaluateRaw(bc as Code, scopeA)).toBe(101);
         });
 
-        it('rejects binding reserved builtins', () => {
-            expect(() => run("(lambda (+) 1)")).toThrow("cannot bind builtin +");
-            expect(() => run("(let ((< 1)) <)")).toThrow("cannot bind builtin <");
-            expect(() => run("(define apply 1)")).toThrow("cannot bind builtin apply");
-            expect(() => run("(set! = 1)")).toThrow("cannot bind builtin =");
-            expect(() => run("(lambda (list) 1)")).toThrow("cannot bind builtin list");
-            expect(() => run("(lambda (car) car)")).toThrow("cannot bind builtin car");
-            expect(() => run("(define map 1)")).toThrow("cannot bind builtin map");
+        it('lets code shadow builtins, locally and at the top level', () => {
+            const fresh = (src: string) => s.stringify(evaluator.evaluateRaw(evaluator.compileRaw(src)))
+            // locally: a builtin's rewrites (inlining, direct calls) stop where its name is bound
+            expect(run(`(let ((map (lambda (f l) 'mine))) (map (lambda (x) x) '(1 2)))`)).toBe("mine")
+            expect(run(`((lambda (car) (car '(1 2))) cdr)`)).toBe("(2)")
+            expect(run(`(let ((+ -)) (+ 5 3))`)).toBe("2")
+            expect(run(`(define (f list) (list 3 4)) (f (lambda (a b) (* a b)))`)).toBe("12")
+            expect(run(`(let* ((apply 1) (apply (+ apply 1))) apply)`)).toBe("2")
+            expect(run(`(letrec ((filter (lambda (n) (if (= n 0) 'done (filter (- n 1)))))) (filter 3))`)).toBe("done")
+            expect(run(`(let loop ((cons 3) (acc 0)) (if (= cons 0) acc (loop (- cons 1) (+ acc cons))))`)).toBe("6")
+            expect(run(`(define (g) (define reverse 5) (+ reverse 1)) (g)`)).toBe("6")
+            expect(run(`(let-values (((car cdr) (values 1 2))) (+ car cdr))`)).toBe("3")
+            expect(run(`(do ((vector 0 (+ vector 1))) ((= vector 3) vector))`)).toBe("3")
+            expect(run(`(let ((length 0)) (let ((inc (lambda () (set! length (+ length 1))))) (inc) (inc) length))`)).toBe("2")
+            expect(run(`(let ((map 1)) (list map (let ((map 2)) map) map))`)).toBe("(1 2 1)")
+            // quoted data, quasiquote's literal parts and case's datums keep the name
+            expect(run(`(let ((map 1)) (list 'map \`(map ,map) (case 'map ((map) 'yes) (else 'no))))`)).toBe("(map (map 1) yes)")
+            // outside its binding the name is the builtin again, and still inlined
+            expect(run(`(list (let ((map 1)) map) (map (lambda (x) (* x 2)) '(1 2)))`)).toBe("(1 (2 4))")
+            // what the transformer emits still means the builtins, whatever the code around it binds
+            expect(run(`(let ((list 1) (cons 2) (vector 3) (car 4) (cdr 5) (null? 6) (reverse 7) (append 8) (eqv? 9) (call/cc 10) (call/ec 11) (with-exception-handler 12) (values 13))
+                          (%list \`(1 ,list ,@'(2 3)) (map (lambda (x) (+ x 1)) '(1 2)) (case 2 ((2) 'two) (else 'no)) (guard (e (#t e)) (raise 'boom)) \`#(,car)))`)).toBe("((1 1 2 3) (2 3) two boom #(4))")
+
+            expect(run(`(guard (list (#t (+ list 1))) (raise 1))`)).toBe("2")
+            expect(run(`(reset (+ 1 (shift car (car (car 10)))))`)).toBe("12")
+            expect(run(`(anima-macro twice (list 'begin (cadr orig) (cadr orig))) (let ((twice (lambda (x) (* x 2)))) (twice 5))`)).toBe("10")
+
+            // at the top level: the name is an ordinary global for the whole program, and for later ones
+            expect(fresh(`(define (early) (abs -3)) (define (abs x) (list 'mine x)) (early)`)).toBe("(mine -3)")
+            expect(fresh(`(define (map f l) 'mine) (map car '((1)))`)).toBe("mine")
+            expect(fresh(`(map (lambda (x) x) '(1))`)).toBe("mine")
+            fresh(`(define (list . xs) 'mine) (define (append . xs) 'mine) (define (cons a b) 'mine)`)
+            expect(fresh(`(let ((x 1)) (%list \`(a ,x ,@'(b)) (list 1) (cons 1 (cons 2 '()))))`)).toBe("((a 1 b) mine mine)")
+            expect(fresh(`(set! list 5) list`)).toBe("5")
+            expect(fresh(`(define-values (first second) (values 'a 'b)) (%list first second)`)).toBe("(a b)")
+            // as in a Racket module, a redefined builtin cannot be read before its definition has run, nor seen by the host
+            expect(() => fresh(`(define (early) (max 1 2)) (early) (define (max . xs) 'mine)`)).toThrow("Variable 'max' is not defined")
+            expect(evaluator.scope.has(Symbol.for("max"))).toBe(false)
+            expect(evaluator.scope.get(Symbol.for("max"))).toBeUndefined()
+            expect(fresh(`(define (max . xs) 'mine) (max 1)`)).toBe("mine")
+            // a later program keeps it
+            expect(fresh(`(max 2)`)).toBe("mine")
+
+            // syntax, intrinsics and the transformer's own names cannot be bound
+            expect(() => run("(lambda (if) 1)")).toThrow("if: bad syntax")
+            expect(() => run("(let ((guard 1)) guard)")).toThrow("guard: bad syntax")
+            expect(() => run("(lambda (%car) 1)")).toThrow("which is an intrinsic")
+            expect(() => run("(lambda (@car) 1)")).toThrow("cannot bind builtin @car")
+            expect(run("(let ((@map (lambda (f l) 'plain))) (@map (lambda (x) x) '(1)))")).toBe("plain")
+            expect(() => run("(set! = 1)")).toThrow("cannot bind builtin =")
         });
 
         it('comparisons', () => {
@@ -774,42 +956,38 @@ describe('Anima', () => {
         });
 
         // a rest parameter only spread back into a call is bound to an array, never built as a list
-        it('forwards rest arguments that are only spread into %apply', () => {
-            expect(run(`(define (fw-sum . xs) (%apply %+ xs)) (list (fw-sum) (fw-sum 1 2 3) (apply fw-sum '(4 5)) (map fw-sum '(1 2) '(10 20)))`)).toBe("(0 6 9 (11 22))")
-            expect(run(`(define (fw-lead a . xs) (%apply %+ a 10 xs)) (fw-lead 1 2 3)`)).toBe("16")
+        it('forwards rest arguments that are only spread into apply', () => {
+            expect(run(`(define (fw-sum . xs) (apply %+ xs)) (list (fw-sum) (fw-sum 1 2 3) (apply fw-sum '(4 5)) (map fw-sum '(1 2) '(10 20)))`)).toBe("(0 6 9 (11 22))")
+            expect(run(`(define (fw-lead a . xs) (apply %+ a 10 xs)) (fw-lead 1 2 3)`)).toBe("16")
             // into procedures, in and out of tail position, and applied twice
-            expect(run(`(define (fw-list . xs) (%apply list 0 xs)) (fw-list 1 2)`)).toBe("(0 1 2)")
-            expect(run(`(define (fw-car . xs) (car (%apply list xs))) (fw-car 7 8)`)).toBe("7")
-            expect(run(`(define (fw-k a b c d e . r) (list a e r)) (define (fw-twice . xs) (list (%apply fw-k xs) (%apply fw-k xs) (%apply %* xs))) (fw-twice 1 2 3 4 5 6 7)`))
+            expect(run(`(define (fw-list . xs) (apply list 0 xs)) (fw-list 1 2)`)).toBe("(0 1 2)")
+            expect(run(`(define (fw-car . xs) (car (apply list xs))) (fw-car 7 8)`)).toBe("7")
+            expect(run(`(define (fw-k a b c d e . r) (list a e r)) (define (fw-twice . xs) (list (apply fw-k xs) (apply fw-k xs) (apply %* xs))) (fw-twice 1 2 3 4 5 6 7)`))
                 .toBe("((1 5 (6 7)) (1 5 (6 7)) 5040)")
-            // %apply-multi spreads the last argument as a list, as apply does
-            expect(run(`(define (fw-ap f . xs) (%apply-multi f xs)) (list (fw-ap + 1 2 '(3 4)) (fw-ap list '()))`)).toBe("(10 ())")
-            expect(() => run(`(define (fw-ap f . xs) (%apply-multi f xs)) (fw-ap + 1 2)`)).toThrow(/must be a list/)
+            // apply as a value spreads its last argument too
+            expect(run(`(define (fw-ap f . xs) (apply apply f xs)) (list (fw-ap + 1 2 '(3 4)) (fw-ap list '()))`)).toBe("(10 ())")
+            expect(() => run(`(define (fw-ap f . xs) (apply apply f xs)) (fw-ap + 1 2)`)).toThrow(/must be a list/)
             // a self tail call rebinds the rest array
-            expect(run(`(define (fw-loop n . xs) (if (= n 0) (%apply %+ xs) (fw-loop (- n 1) n 1))) (fw-loop 3)`)).toBe("2")
-            expect(() => run(`(define (fw-one . xs) (%apply %car xs)) (fw-one 1 2)`)).toThrow("%car: expected exactly 1 args, got 2")
+            expect(run(`(define (fw-loop n . xs) (if (= n 0) (apply %+ xs) (fw-loop (- n 1) n 1))) (fw-loop 3)`)).toBe("2")
+            expect(() => run(`(define (fw-one . xs) (apply %car xs)) (fw-one 1 2)`)).toThrow("%car: expected exactly 1 args, got 2")
 
-            const bc = evaluator.compileRaw(`(define (fw-t . xs) (%apply %+ xs))`) as ByteCode
+            const bc = evaluator.compileRaw(`(define (fw-t . xs) (apply %+ xs))`) as Code
             const fn = bc.constants.find((c: any) => c instanceof Closure)!
-            expect(fn.tmpl.restArray).toBe(true)
-            const ops: OpCode[] = []
-            for (let ip = 0; ip < fn.tmpl.code.inst.length; ip += INSTRUCTION_LENGTHS[fn.tmpl.code.inst[ip] as OpCode]) ops.push(fn.tmpl.code.inst[ip])
-            expect(ops).toContain(OpCode.APPLYINTR)
-            const back = readFull(dumpFull(bc), evaluator.intrinsics) as ByteCode
-            expect(back.constants.find((c: any) => c instanceof Closure)!.tmpl.restArray).toBe(true)
+            expect(fn.tmpl.rest).toBe("array")
+            expect(opKinds(fn.tmpl.code)).toContain("IntApply")
         });
 
         it('keeps a rest list wherever the rest parameter is seen as a value', () => {
-            expect(run(`(define (nf-read . xs) (%apply %+ xs) xs) (nf-read 1 2)`)).toBe("(1 2)")
-            expect(run(`(define (nf-cap . xs) (lambda () (%apply %+ xs))) ((nf-cap 1 2))`)).toBe("3")
-            expect(run(`(define (nf-set . xs) (set! xs (cdr xs)) (%apply %+ xs)) (nf-set 1 2 3)`)).toBe("5")
+            expect(run(`(define (nf-read . xs) (apply %+ xs) xs) (nf-read 1 2)`)).toBe("(1 2)")
+            expect(run(`(define (nf-cap . xs) (lambda () (apply %+ xs))) ((nf-cap 1 2))`)).toBe("3")
+            expect(run(`(define (nf-set . xs) (set! xs (cdr xs)) (apply %+ xs)) (nf-set 1 2 3)`)).toBe("5")
             // shadowed by a local of the same name: that one is a list, spread as a list
-            expect(run(`(define (nf-shadow . xs) (let ((xs (list 5 6))) (%apply %+ xs))) (nf-shadow 1)`)).toBe("11")
-            expect(run(`(define (nf-inner . xs) (let ((xs (list 5 6))) (%apply %+ xs)) (%apply %* xs)) (nf-inner 2 3)`)).toBe("6")
+            expect(run(`(define (nf-shadow . xs) (let ((xs (list 5 6))) (apply %+ xs))) (nf-shadow 1)`)).toBe("11")
+            expect(run(`(define (nf-inner . xs) (let ((xs (list 5 6))) (apply %+ xs)) (apply %* xs)) (nf-inner 2 3)`)).toBe("6")
             // read as a value, captured by a nested lambda, or reassigned: the closure keeps the list path
-            for (const src of [`(define (nf-t . xs) (%apply %+ xs) xs)`, `(define (nf-t . xs) (lambda () (%apply %+ xs)))`, `(define (nf-t . xs) (set! xs (cdr xs)) (%apply %+ xs))`]) {
-                const bc = evaluator.compileRaw(src) as ByteCode
-                expect(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.restArray).toBe(false)
+            for (const src of [`(define (nf-t . xs) (apply %+ xs) xs)`, `(define (nf-t . xs) (lambda () (apply %+ xs)))`, `(define (nf-t . xs) (set! xs (cdr xs)) (apply %+ xs))`]) {
+                const bc = evaluator.compileRaw(src) as Code
+                expect(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.rest).toBe("packed")
             }
         });
     });
@@ -1359,19 +1537,15 @@ describe('Anima', () => {
     });
 
     describe('%let', () => {
-        // whether a variable is boxed shows up as BOX instructions in the procedure's code
-        const boxesIn = (src: string): number => {
-            const closure = evaluator.evaluateRaw(evaluator.compileRaw(src))
-            const inst: Uint32Array = closure.tmpl.code.inst
-            let boxes = 0
-            for (let ip = 0; ip < inst.length; ip += INSTRUCTION_LENGTHS[inst[ip] as OpCode]) if (inst[ip] === OpCode.BOX) boxes++
-            return boxes
-        }
+        // whether a variable is boxed shows up as Box instructions in the procedure's code
+        const boxesIn = (src: string): number => opKinds(unoptimizedProc(src).tmpl.code).filter(k => k === "Box").length
 
         it('does not box variables that are only read inside a let', () => {
             expect(boxesIn(`(lambda (n) (let ((x 1)) (let* ((y (+ x n))) (+ x y n))))`)).toBe(0)
-            // captured by a real lambda: boxed
-            expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (+ x n))))`)).toBe(2)
+            // captured by a real lambda but never assigned: copied into the closure, not boxed
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (+ x n))))`)).toBe(0)
+            // captured and assigned (here inside the closure): boxed, so every sharer sees the assignment
+            expect(boxesIn(`(lambda (n) (let ((x 1)) (lambda () (set! x n) x)))`)).toBe(1)
             // assigned but never read after a call: a plain register
             expect(boxesIn(`(lambda (n) (let ((x 1)) (set! x n) x))`)).toBe(0)
             expect(boxesIn(`(lambda (f) (let ((x 1)) (f) (set! x 2) x))`)).toBe(0)
@@ -1381,6 +1555,116 @@ describe('Anima', () => {
             expect(boxesIn(`(lambda (f n) (let ((i 0)) (%block d (%loop (%if (= i n) (%escape d i) (%begin)) (f) (set! i (+ i 1))))))`)).toBe(1)
             // ... but with no calls in the loop it stays a register
             expect(boxesIn(`(lambda (n) (let ((i 0) (s 0)) (%block d (%loop (%if (= i n) (%escape d s) (%begin)) (set! s (+ s i)) (set! i (+ i 1))))))`)).toBe(0)
+        })
+
+        it('copies never-assigned variables into closures, one binding per iteration or call', () => {
+            expect(run(`(let loop ((i 0) (fs '())) (if (= i 3) (map (lambda (f) (f)) fs) (loop (+ i 1) (cons (lambda () i) fs))))`)).toBe("(2 1 0)")
+            expect(run(`(define (cap-collect n acc) (if (= n 0) acc (cap-collect (- n 1) (cons (lambda () n) acc)))) (map (lambda (f) (f)) (cap-collect 3 '()))`)).toBe("(1 2 3)")
+            expect(run(`(define (cap-adder x) (lambda (y) (+ x y))) (list ((cap-adder 1) 10) ((cap-adder 2) 10))`)).toBe("(11 12)")
+            expect(run(`(define (cap-counter) (let ((c 0)) (lambda () (set! c (+ c 1)) c))) (define cap-c (cap-counter)) (cap-c) (cap-c)`)).toBe("2")
+        })
+
+        it('binds letrecs of lambdas with %letrec, without boxes', () => {
+            expect(run(`(define (lr-parity n) (define (ev? k) (if (= k 0) #t (od? (- k 1)))) (define (od? k) (if (= k 0) #f (ev? (- k 1)))) (list (ev? n) (od? n))) (lr-parity 10)`)).toBe("(#t #f)")
+            expect(run(`(define (lr-deep n) (define (ev? k) (if (= k 0) #t (od? (- k 1)))) (define (od? k) (if (= k 0) #f (ev? (- k 1)))) (ev? n)) (lr-deep 100001)`)).toBe("#f")
+            expect(boxesIn(`(lambda (n) (letrec ((f (lambda (k) (if (= k 0) 0 (g (- k 1))))) (g (lambda (k) (f k)))) (f n)))`)).toBe(0)
+            expect(boxesIn(`(lambda (n) (define (f k) (if (= k 0) n (f (- k 1)))) (f n))`)).toBe(0)
+            // closures escaping the letrec keep their siblings, and capture outer variables too
+            expect(run(`(define (lr-pair) (letrec ((get (lambda () (other))) (other (lambda () 'me))) get)) ((lr-pair))`)).toBe("me")
+            expect(run(`(define (lr-outer z) (letrec ((f (lambda () (+ z (g)))) (g (lambda () z))) (f))) (lr-outer 3)`)).toBe("6")
+            expect(run(`(define (lr-fns) (letrec ((a (lambda () (list 'a (b)))) (b (lambda () 'b)) (c (lambda () (a)))) (list a b c))) (map (lambda (f) (f)) (lr-fns))`)).toBe("((a b) b (a b))")
+        })
+
+        it('binds values and lambdas together, filling values into closures once known', () => {
+            expect(run(`(define (lrv-add k) (define base 10) (define (add x) (+ base x)) (add k)) (lrv-add 5)`)).toBe("15")
+            expect(boxesIn(`(lambda (k) (define base 10) (define (add x) (+ base x)) (add k))`)).toBe(0)
+            // a helper defined before the value it reads
+            expect(run(`(define (lrv-fwd) (define (get) b) (define b 7) (get)) (lrv-fwd)`)).toBe("7")
+            expect(boxesIn(`(lambda () (define (get) b) (define b 7) (get))`)).toBe(0)
+            // a value computed with an earlier lambda
+            expect(run(`(define (lrv-sq) (define (sq x) (* x x)) (define nine (sq 3)) (list nine (sq 2))) (lrv-sq)`)).toBe("(9 4)")
+        })
+
+        it('boxes a letrec value that a closure may copy before it exists', () => {
+            // made by an earlier init
+            expect(run(`(define (lrv-early) (define a (list (lambda () b))) (define b 3) ((car a))) (lrv-early)`)).toBe("3")
+            // made by one of the letrec's lambdas, run by an earlier init
+            expect(run(`(define (lrv-mk) (define (mk) (lambda () b)) (define a (mk)) (define b 2) (a)) (lrv-mk)`)).toBe("2")
+            expect(boxesIn(`(lambda () (define (mk) (lambda () b)) (define a (mk)) (define b 2) (a))`)).toBe(1)
+            // its own init
+            expect(run(`(letrec ((x (list (lambda () x)))) (eq? ((car x)) x))`)).toBe("#t")
+        })
+
+        it('supports letrec*: each init sees the earlier values', () => {
+            expect(run(`(letrec* ((a 1) (b (+ a 1)) (f (lambda () (list a b (g)))) (g (lambda () 'g))) (f))`)).toBe("(1 2 g)")
+            expect(run(`(define lrs-log '()) (letrec* ((x (begin (set! lrs-log (cons 'x lrs-log)) 1)) (y (begin (set! lrs-log (cons 'y lrs-log)) (+ x 1)))) (list y lrs-log))`)).toBe("(2 (y x))")
+            expect(() => run(`(define (lrs-bad) (letrec* 1 2))`)).toThrow("letrec*")
+        })
+
+        it('runs letrec values in order, and lets them be assigned', () => {
+            expect(run(`(define lrv-log '()) (letrec ((a (begin (set! lrv-log (cons 'a lrv-log)) 1)) (b (begin (set! lrv-log (cons 'b lrv-log)) 2))) (list a b lrv-log))`)).toBe("(1 2 (b a))")
+            expect(run(`(letrec ((x 1) (f (lambda () x))) (set! x 5) (f))`)).toBe("5")
+        })
+
+        it('lifts helpers that are only called, so no closure is made for them', () => {
+            const closuresIn = (src: string): number => opKinds(unoptimizedProc(src).tmpl.code).filter(k => k === "NewClosure").length
+            expect(run(`(define (ll1 k) (define (helper x) (+ k x)) (helper 1)) (ll1 5)`)).toBe("6")
+            expect(closuresIn(`(lambda (k) (define (helper x) (+ k x)) (helper 1))`)).toBe(0)
+            // recursive and mutually recursive helpers receive themselves and each other
+            expect(run(`(define (ll2 n) (define (sum i acc) (if (= i 0) acc (sum (- i 1) (+ acc n)))) (list (sum 3 0) (sum 1 0))) (ll2 5)`)).toBe("(15 5)")
+            expect(closuresIn(`(lambda (n) (define (sum i acc) (if (= i 0) acc (sum (- i 1) (+ acc n)))) (sum 3 0))`)).toBe(0)
+            expect(run(`(define (ll3 d) (define (ev? k) (if (= k 0) d (od? (- k 1)))) (define (od? k) (if (= k 0) (not d) (ev? (- k 1)))) (list (ev? 4) (od? 4))) (ll3 #t)`)).toBe("(#t #f)")
+            expect(closuresIn(`(lambda (d) (define (ev? k) (if (= k 0) d (od? (- k 1)))) (define (od? k) (if (= k 0) (not d) (ev? (- k 1)))) (ev? 4))`)).toBe(0)
+            // calls from a closure that escapes, and rest parameters
+            expect(run(`(define (ll4 k) (define (h x) (+ k x)) (lambda (y) (h y))) ((ll4 10) 5)`)).toBe("15")
+            expect(run(`(define (ll5 k) (define (h . xs) (cons k xs)) (h 1 2)) (ll5 0)`)).toBe("(0 1 2)")
+        })
+
+        it('lifts named lets that are not loops, evaluating their initial values outside', () => {
+            expect(run(`(define (nl-copy l) (let copy ((l l)) (if (null? l) '() (cons (car l) (copy (cdr l)))))) (nl-copy '(1 2 3))`)).toBe("(1 2 3)")
+            // an initial value naming the loop means the variable around it
+            expect(run(`(define (nl-outer walk) (let walk ((n (walk))) (if (= n 0) 'done (list n (walk (- n 1)))))) (nl-outer (lambda () 2))`)).toBe("(2 (1 done))")
+        })
+
+        it('keeps helpers closures when lifting them would be wrong', () => {
+            // used as a value
+            expect(run(`(define (lk1 k) (define (h) k) h) ((lk1 7))`)).toBe("7")
+            // a free variable that is assigned
+            expect(run(`(define (lk2 k) (define (h) k) (set! k 9) (h)) (lk2 1)`)).toBe("9")
+            // a call where a free variable is shadowed, or inside a lifted helper that shadows it
+            expect(run(`(define (lk3 k) (define (h) k) (let ((k 100)) (h))) (lk3 1)`)).toBe("1")
+            expect(run(`(define (lk4 k) (define (g) k) (define (f) (let ((k 50)) (g))) (f)) (lk4 2)`)).toBe("2")
+            // a call with the wrong number of arguments still fails as a call of a closure
+            expect(() => run(`(define (lk5) (define (h x) x) (h)) (lk5)`)).toThrow()
+        })
+
+        it('lifts a helper called where one of its free variables is shadowed, as locals have names of their own', () => {
+            const closuresIn = (src: string): number => opKinds(unoptimizedProc(src).tmpl.code).filter(k => k === "NewClosure").length
+            expect(closuresIn(`(lambda (k) (define (h) k) (let ((k 100)) (h)))`)).toBe(0)
+            expect(run(`(define (lk6 k) (define (h) k) (let ((k 100)) (list (h) k))) (lk6 1)`)).toBe("(1 100)")
+        })
+
+        it('binds let* sequentially in one form', () => {
+            expect(run(`(let* ((a 1) (b (+ a 1)) (a (* b 10))) (list a b))`)).toBe("(20 2)")
+            expect(run(`(let* () 5)`)).toBe("5")
+            // an init naming a global that a later binding shadows still means the global
+            expect(run(`(define ls-g 5) (let* ((a ls-g) (ls-g 10) (b ls-g)) (list a ls-g b))`)).toBe("(5 10 10)")
+            expect(run(`(define ls-h 3) (define (ls-fwd) (let* ((a (lambda () ls-h)) (ls-h 9)) (list (a) ls-h))) (ls-fwd)`)).toBe("(3 9)")
+            expect(run(`(define (ls-cap n) (let* ((a n) (f (lambda () a)) (a 0)) (list (f) a))) (ls-cap 7)`)).toBe("(7 0)")
+            // a helper defined in a let* body is still lifted, and sees the let*'s names
+            expect(run(`(define (ls-lift n) (let* ((k (* n 2))) (define (h x) (+ k x)) (h 1))) (ls-lift 3)`)).toBe("7")
+        })
+
+        it('compiles very long let*s', () => {
+            const n = 5000
+            const binds = Array.from({ length: n }, (_, i) => `(x${i} ${i === 0 ? 1 : `(+ x${i - 1} 1)`})`).join(" ")
+            expect(run(`(define (ls-long) (let* (${binds}) x${n - 1})) (ls-long)`)).toBe(String(n))
+        })
+
+        it('keeps letrec semantics when the values are not all lambdas, or a name is assigned', () => {
+            expect(run(`(letrec ((x 1) (f (lambda () x))) (f))`)).toBe("1")
+            expect(run(`(letrec ((f (lambda () 1)) (g (lambda () (f)))) (set! f (lambda () 2)) (g))`)).toBe("2")
+            expect(boxesIn(`(lambda () (letrec ((f (lambda () 1)) (g (lambda () (f)))) (set! f (lambda () 2)) (g)))`)).toBe(1)
         })
 
         it('keeps location semantics for assigned variables across continuations', () => {
@@ -1446,9 +1730,9 @@ describe('Anima', () => {
         })
 
         it('%first-value truncates multiple values to the first (Lua)', () => {
-            expect(run(`(list (%first-value (values 1 2 3)) (%first-value 5) (%first-value (values)))`)).toBe("(1 5 <#void>)")
-            expect(run(`(define (two) (values 10 20)) (define (fv-sum) (+ (%first-value (two)) 1)) (fv-sum)`)).toBe("11")
-            expect(() => run(`(%first-value)`)).toThrow("%first-value: expected exactly 1 args, got 0")
+            expect(run(`(list (%first-value (values 1 2 3) 'none) (%first-value 5 'none) (%first-value (values) 'none) (%first-value (values) <#void>))`)).toBe("(1 5 none <#void>)")
+            expect(run(`(define (two) (values 10 20)) (define (fv-sum) (+ (%first-value (two) <#void>) 1)) (fv-sum)`)).toBe("11")
+            expect(() => run(`(%first-value 1)`)).toThrow("%first-value: expected exactly 2 args, got 1")
         })
 
         it('compiles without closures', () => {
@@ -1459,14 +1743,408 @@ describe('Anima', () => {
         })
     });
 
+    describe('R7RS syntax', () => {
+        it('when / unless run their body or give <#void>', () => {
+            expect(run(`(list (when #t 1 2) (when #f 1) (unless #f 3) (unless #t 4))`)).toBe("(2 <#void> 3 <#void>)")
+        })
+
+        it('case compares with eqv?, with else and =>', () => {
+            const src = (k: string) => `(case ${k} ((1 2 3) 'small) ((a b) => (lambda (x) (list 'sym x))) (else 'other))`
+            expect(run(`(list ${src("2")} ${src("'b")} ${src("9")})`)).toBe("(small (sym b) other)")
+            expect(run(`(case 5 ((1) 'one))`)).toBe("<#void>")
+            expect(run(`(case 5 (else => (lambda (x) (* x 2))))`)).toBe("10")
+            // the key is evaluated once
+            expect(run(`(define n 0) (case (begin (set! n (+ n 1)) n) ((9) 'no) ((8) 'no) (else n))`)).toBe("1")
+        })
+
+        it('cond takes => and test-only clauses', () => {
+            expect(run(`(define (find k) (if (= k 2) '(2 . b) #f)) (list (cond ((find 2) => cdr) (else 'none)) (cond ((find 3) => cdr) (else 'none)))`)).toBe("(b none)")
+            expect(run(`(list (cond (#f) (7)) (cond (#f)))`)).toBe("(7 <#void>)")
+            expect(run(`(cond (#f 1) ((+ 1 2) => (lambda (x) (* x x))))`)).toBe("9")
+        })
+
+        it('do loops with steps and results', () => {
+            expect(run(`(do ((i 0 (+ i 1)) (acc '() (cons i acc))) ((= i 4) acc))`)).toBe("(3 2 1 0)")
+            expect(run(`(let ((v (make-vector 3 0))) (do ((i 0 (+ i 1))) ((= i 3) v) (vector-set! v i (* i i))))`)).toBe("#(0 1 4)")
+            expect(run(`(do ((i 0 (+ i 1))) ((= i 2)))`)).toBe("<#void>")
+            // a long loop runs in constant space
+            expect(run(`(do ((i 0 (+ i 1)) (s 0 (+ s i))) ((= i 100000) s))`)).toBe("4999950000")
+        })
+
+        it('define-values at the top level and in bodies', () => {
+            expect(run(`(define-values (dv-a dv-b . dv-r) (values 1 2 3 4)) (list dv-a dv-b dv-r)`)).toBe("(1 2 (3 4))")
+            expect(run(`(define (dv-f) (define-values (x y) (values 1 2)) (define z (+ x y)) (list x y z)) (dv-f)`)).toBe("(1 2 3)")
+            expect(run(`(define-values all (values 5 6)) all`)).toBe("(5 6)")
+            expect(() => run(`(define-values (dv-p dv-q) (values 1))`)).toThrow()
+        })
+
+        it('delay, delay-force, make-promise and force', () => {
+            expect(run(`(define n 0) (define p (delay (begin (set! n (+ n 1)) n))) (list (force p) (force p) n (promise? p))`)).toBe("(1 1 1 #t)")
+            expect(run(`(list (force (make-promise 5)) (force 7) (promise? (make-promise (make-promise 1))))`)).toBe("(5 7 #t)")
+            // a delay-force chain is forced in constant space
+            expect(run(`(define (loop n) (delay-force (if (= n 0) (delay 'done) (loop (- n 1))))) (force (loop 100000))`)).toBe("done")
+            // a promise forced again while being forced keeps its first value (R7RS)
+            expect(run(`(define count 0) (define p (delay (begin (set! count (+ count 1)) (if (> count 5) count (force p))))) (list (force p) count)`)).toBe("(6 6)")
+            expect(() => run(`(force (delay-force 5))`)).toThrow("delay-force: the expression must give a promise")
+        })
+
+        it('parameters and parameterize', () => {
+            expect(run(`(define p (make-parameter 10)) (list (p) (parameterize ((p 20)) (p)) (p))`)).toBe("(10 20 10)")
+            // converters apply to the initial value and to parameterized ones
+            expect(run(`(define q (make-parameter 1 (lambda (x) (* x 10)))) (list (q) (parameterize ((q 2)) (q)))`)).toBe("(10 20)")
+            // procedures called from the body see it; an escape out of it restores the outer value
+            expect(run(`(define r (make-parameter 'outer)) (define (get) (r)) (list (parameterize ((r 'inner)) (get)) (call/ec (lambda (k) (parameterize ((r 'x)) (k (r))))) (r))`)).toBe("(inner x outer)")
+            // several at once, and the values are converted before any is set
+            expect(run(`(define a (make-parameter 1)) (define b (make-parameter 2 (lambda (x) (list x (a))))) (parameterize ((a 10) (b 20)) (list (a) (b)))`)).toBe("(10 (20 1))")
+            // a coroutine sees the parameters where it was resumed? no: where its body runs, i.e. its own continuation
+            expect(run(`(define c (make-parameter 0)) (define co (parameterize ((c 1)) (coroutine-create (lambda () (c))))) (parameterize ((c 2)) (coroutine-resume co))`)).toBe("0")
+            expect(() => run(`(parameterize ((car 1)) 1)`)).toThrow("parameterize: not a parameter")
+        })
+
+        it('case-lambda runs the first clause whose arity fits', () => {
+            const f = `(define f (case-lambda ((a) (list 'one a)) ((a b) (list 'two a b)) ((a . r) (list 'many a r))))`
+            expect(run(`${f} (list (f 1) (f 1 2) (f 1 2 3) (apply f '(9)) (map f '(1 2)) (procedure? f))`)).toBe("((one 1) (two 1 2) (many 1 (2 3)) (one 9) ((one 1) (one 2)) #t)")
+            expect(() => run(`${f} (f)`)).toThrow("f: no clause takes 0 args")
+            // clauses capture, and tail calls between them run in constant space
+            expect(run(`(define (make k) (case-lambda (() k) ((x) (+ x k)))) (define g (make 10)) (list (g) (g 5))`)).toBe("(10 15)")
+            expect(run(`(define h (case-lambda ((n) (h n 0)) ((n acc) (if (= n 0) acc (h (- n 1) (+ acc 1)))))) (h 100000)`)).toBe("100000")
+            // non-tail recursion through it goes deeper than the js stack
+            expect(run(`(define d (case-lambda ((n) (if (= n 0) 0 (+ 1 (d (- n 1))))))) (d 20000)`)).toBe("20000")
+            expect(() => evaluator.compileRaw(`(%case-lambda 5)`)).toThrow("%case-lambda clauses must be %lambda forms")
+        })
+
+        it('a local case-lambda calls its clauses directly', () => {
+            const made = (src: string) => {
+                const ops = opKinds(unoptimizedProc(src).tmpl.code)
+                return { closures: ops.filter(k => k === "NewClosure").length, intrinsicCalls: ops.filter(k => k === "IntCall").length }
+            }
+            const local = `(lambda (k) (define f (case-lambda ((a) (+ a k)) ((a b) (f (+ a b))) ((a . r) (length r)))) (list (f 1) (f 1 2) (f 1 2 3 4)))`
+            expect(run(`(${local} 10)`)).toBe("(11 13 3)")
+            // every call is resolved, so no procedure is made, and the clauses are lifted: nothing is made at all
+            expect(made(local)).toEqual({ closures: 0, intrinsicCalls: 1 })
+            // used as a value too: the procedure is made, from the same clauses
+            expect(run(`((lambda (k) (define f (case-lambda ((a) (+ a k)) ((a b) (* a b)))) (list (f 1) (map f '(1 2)) (apply f '(3 4)))) 10)`)).toBe("(11 (11 12) 12)")
+            // let and let* bindings, and a later let* binding of the name
+            expect(run(`(let ((g (case-lambda ((a) a) ((a b) b)))) (list (g 1) (g 1 2)))`)).toBe("(1 2)")
+            expect(run(`(let* ((x 5) (g (case-lambda ((a) (+ a x)) (() x))) (y (g 1)) (g (lambda (z) 'other))) (list y (g 9)))`)).toBe("(6 other)")
+            // a call no clause takes is left to fail as it would
+            expect(() => run(`(let ((h (case-lambda ((a) a) ((a b c) a)))) (h 1 2))`)).toThrow("no clause takes 2 args")
+            // one clause is a plain closure
+            expect(() => run(`(let ((h (case-lambda ((a) a)))) (h 1 2))`)).toThrow("h: expected exactly 1 args, got 2")
+            // shadowed, it is not the case-lambda
+            expect(run(`(let ((g (case-lambda ((a) 'clause)))) ((lambda (g) (g 1)) (lambda (x) 'shadow)))`)).toBe("shadow")
+            // assigned, it is left alone
+            expect(run(`(let ((g (case-lambda ((a) 1)))) (set! g (lambda (a) 2)) (g 0))`)).toBe("2")
+            // tail calls between clauses stay loops
+            expect(run(`((lambda () (define f (case-lambda ((n) (f n 0)) ((n acc) (if (= n 0) acc (f (- n 1) (+ acc 1)))))) (f 100000)))`)).toBe("100000")
+        })
+
+        it('boxes a letrec lambda name assigned after a call in an earlier init', () => {
+            // re-entering the first init must see f as assigned since, not as the register held when it was captured
+            expect(run(`(define g #f) (define r '())
+                        (letrec ((a (call/cc (lambda (c) (set! g c) 1))) (f (lambda () 1)) (b f))
+                          (set! r (cons (procedure? b) r)) (set! f 5) (when (< (length r) 2) (g 2)) r)`)).toBe("(#f #t)")
+        })
+
+        it('call/cc and call/ec whose k is only called in the body are blocks', () => {
+            const ops = (src: string) => opKinds(unoptimizedProc(src).tmpl.code)
+            for (const cc of ["call/cc", "call/ec", "call-with-current-continuation"]) {
+                expect(run(`(list (+ 1 (${cc} (lambda (k) (+ 10 (k 5))))) (${cc} (lambda (k) 7)) (${cc} (lambda (k) (if #t (k 'early) 'late))))`)).toBe("(6 7 early)")
+                // no escape continuation or continuation is made at all
+                const made = ops(`(lambda (x) (+ 1 (${cc} (lambda (k) (if (> x 0) (k x) 0)))))`)
+                expect(made).not.toContain("HostCall")
+            }
+            // several values, and none
+            expect(run(`(list (call-with-values (lambda () (call/cc (lambda (k) (k 1 2)))) list) (call-with-values (lambda () (call/cc (lambda (k) (k)))) list))`)).toBe("((1 2) ())")
+            // an escape from a body re-entered through a continuation captured in it lands where k would return
+            expect(run(`(define inner #f) (define n 0) (define r (call/cc (lambda (k) (call/cc (lambda (c) (set! inner c))) (set! n (+ n 1)) (if (< n 3) (k n) (k 'done))))) (if (< n 3) (inner #f) (list r n))`)).toBe("(done 3)")
+            // the body stays in tail position
+            expect(run(`(define (cc-loop n) (if (= n 0) 'done (call/cc (lambda (k) (cc-loop (- n 1)))))) (cc-loop 100000)`)).toBe("done")
+            // a k of its own in the body is not the continuation
+            expect(run(`(call/cc (lambda (k) (let ((k (lambda (x) (* x 100)))) (k 2))))`)).toBe("200")
+        })
+
+        it('call/ec and %catch hold their token in an escape frame', () => {
+            // a procedure that is not a literal lambda: a real escape continuation
+            expect(run(`(define (esc k) (+ 1 (k 5))) (list (call/ec esc) (call/ec (lambda (k) k)))`)).toBe("(5 <procedure>)")
+            expect(() => run(`(define saved (call/ec (lambda (k) k))) (saved 1)`)).toThrow("escape continuation invoked outside of its dynamic extent")
+            // an old token is dead even while its frame runs another %call/ec
+            expect(() => run(`(define old #f) (define (grab k) (set! old k) 1) (define (use k) (old 5)) (define (two) (+ (call/ec grab) (call/ec use))) (two)`)).toThrow("escape continuation invoked outside of its dynamic extent")
+            // escaped to after a yield, from frames rebuilt around the escape frame
+            expect(run(`(define (body k) (coroutine-yield 1) (k 'escaped) 'not)
+                        (define co (coroutine-create (lambda () (coroutine-yield (call/ec body)) 'end)))
+                        (list (coroutine-resume co) (coroutine-resume co) (coroutine-resume co))`)).toBe("(1 escaped end)")
+            expect(run(`(define co2 (coroutine-create (lambda () (%catch (lambda () (coroutine-yield 1) (raise 'late)) (lambda (e) (list 'caught e))))))
+                        (list (coroutine-resume co2) (coroutine-resume co2))`)).toBe("(1 (caught late))")
+            // re-entering the extent through a continuation makes k live again
+            expect(run(`(define again #f) (define n 0)
+                        (define (body k) (call/cc (lambda (c) (set! again c))) (set! n (+ n 1)) (k n))
+                        (define r (call/ec body))
+                        (if (< n 3) (again #f) (list r n))`)).toBe("(3 3)")
+            expect(run(`(%call-catching (lambda () 7))`)).toBe("7")
+            expect(() => run(`(%call-catching (lambda () 7) #f 5)`)).toThrow("%catch: guarded must be #t or #f")
+        })
+
+        it('keeps a real continuation when k is used any other way', () => {
+            // kept and re-entered later (multi-shot)
+            expect(run(`(define r '()) (define k2 #f) (set! r (cons (call/cc (lambda (k) (set! k2 k) 0)) r)) (if (< (length r) 3) (k2 (length r)) r)`)).toBe("(2 1 0)")
+            // called from a lambda, passed on, returned
+            expect(run(`(call/cc (lambda (k) (let ((f (lambda (x) (k x)))) (f 5) 'not)))`)).toBe("5")
+            expect(run(`(call/ec (lambda (k) (apply k '(6)) 'not))`)).toBe("6")
+            expect(run(`(procedure? (call/ec (lambda (k) k)))`)).toBe("#t")
+            // assigned
+            expect(run(`(call/cc (lambda (k) (set! k (lambda (x) (* x 2))) (k 21)))`)).toBe("42")
+        })
+
+        it('regressions found in a sweep', () => {
+            // the host can call a case-lambda
+            const f = evaluator.evaluateRaw(evaluator.compileRaw(`(case-lambda ((x) (* x 10)) ((x y) (+ x y)))`))
+            expect([evaluator.evaluateClosure(f, [4]), evaluator.evaluateClosure(f, [1, 2])]).toEqual([40, 3])
+            expect(() => evaluator.evaluateClosure(f, [])).toThrow("no clause takes 0 args")
+            // a pre of #f is no pre
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (list 'h r)) #f)`)).toBe("(h x)")
+            // messages show any value, symbols and lists too
+            expect(() => run(`(car 'sym)`)).toThrow("car: expected a pair but got sym")
+            expect(() => run(`(cadr '(1))`)).toThrow("cadr: list is too short")
+            expect(() => run(`(vector-ref (vector 1) 'k)`)).toThrow("vector-ref: index k out of bounds")
+            expect(() => run(`(apply + 1 '(2 . 3))`)).toThrow("apply: last argument must be a list but got (2 . 3)")
+            // an error while delivering another reaches the host worded
+            expect(() => run(`(%catch (lambda () (raise 'x)) (lambda (r) r) 5)`)).toThrow("Attempted to call a non-procedure: 5")
+        })
+
+        it('call-with-continuation-barrier stops re-entry but not escapes', () => {
+            expect(run(`(call-with-continuation-barrier (lambda () 5))`)).toBe("5")
+            expect(run(`(+ 1 (call/cc (lambda (k) (call-with-continuation-barrier (lambda () (k 1))))))`)).toBe("2")
+            // a continuation captured inside, called again inside, is fine
+            expect(run(`(call-with-continuation-barrier (lambda () (let ((n 0) (k #f)) (call/cc (lambda (c) (set! k c))) (set! n (+ n 1)) (if (< n 3) (k #f) n))))`)).toBe("3")
+            // called from outside, it would re-enter
+            expect(() => run(`(define saved #f) (define n 0) (call-with-continuation-barrier (lambda () (call/cc (lambda (k) (set! saved k))) (set! n (+ n 1)))) (if (< n 2) (saved #f) n)`)).toThrow("cannot re-enter a continuation barrier")
+            // re-entry is an error Anima code can catch
+            expect(run(`(define s2 #f) (call-with-continuation-barrier (lambda () (call/cc (lambda (k) (set! s2 k))))) (try (lambda () (if s2 (let ((k s2)) (set! s2 #f) (k 1)) 'done)) (lambda (e) (error-object-message e)))`)).toBe('"cannot re-enter a continuation barrier"')
+        })
+
+        it('R7RS error objects', () => {
+            expect(run(`(try (lambda () (error "bad thing:" 1 'x)) (lambda (e) (list (error-object? e) (error-object-message e) (error-object-irritants e))))`)).toBe('(#t "bad thing:" (1 x))')
+            expect(run(`(try (lambda () (car 1)) (lambda (e) (list (error-object? e) (error-object-irritants e))))`)).toBe("(#t ())")
+            expect(run(`(try (lambda () (raise 'sym)) (lambda (e) (error-object? e)))`)).toBe("#f")
+            expect(() => run(`(error "oops" 1 "two")`)).toThrow('oops 1 "two"')
+        })
+    });
+
+    describe('List procedures', () => {
+        it('append copies all but the last list', () => {
+            expect(run(`(list (append) (append '(1)) (append '(1 2) '(3) '() '(4 5)) (append '(1) 2) (append '() '()))`)).toBe("(() (1) (1 2 3 4 5) (1 . 2) ())")
+            expect(run(`(define tail '(3 4)) (define r (append '(1 2) tail)) (list (eq? (cddr r) tail) r)`)).toBe("(#t (1 2 3 4))")
+            expect(run(`(list (apply append '((1) (2) (3))) (map append '((1) (2)) '((a) (b))))`)).toBe("((1 2 3) ((1 a) (2 b)))")
+            expect(() => run(`(append '(1 . 2) '(3))`)).toThrow("append: expected a list")
+            expect(() => run(`(append 5 '(3))`)).toThrow("append: expected a list")
+        })
+
+        it('map, for-each and filter, inline and as procedures', () => {
+            // a literal lambda is inlined; anything else calls the prelude's procedure: the same results
+            expect(run(`(list (map (lambda (x) (* x 10)) '(1 2 3)) (let ((f (lambda (x) (* x 10)))) (map f '(1 2 3))) (map (lambda (x) x) '()))`)).toBe("((10 20 30) (10 20 30) ())")
+            expect(run(`(list (filter (lambda (x) (> x 2)) '(1 5 2 7)) (filter odd? '(1 2 3 4 5)) (filter odd? '()))`)).toBe("((5 7) (1 3 5) ())")
+            expect(run(`(define acc '()) (for-each (lambda (x) (set! acc (cons x acc))) '(1 2 3)) (for-each (lambda (a b) (set! acc (cons (+ a b) acc))) '(1 2) '(10 20)) acc`)).toBe("(22 11 3 2 1)")
+            // several lists stop at the shortest
+            expect(run(`(list (map + '(1 2 3) '(10 20)) (map list '(1 2) '(a b) '(x y)))`)).toBe("((11 22) ((1 a x) (2 b y)))")
+            // an inlined body may define, and sees the call site's variables
+            expect(run(`(define k 100) (map (lambda (x) (define y (* x 2)) (+ y k)) '(1 2))`)).toBe("(102 104)")
+            // long lists need no deep recursion
+            expect(run(`(define (mk n acc) (if (= n 0) acc (mk (- n 1) (cons n acc)))) (define xs (mk 100000 '())) (list (length (map (lambda (x) (+ x 1)) xs)) (length (map (let ((f (lambda (x) x))) f) xs)) (length (filter even? xs)))`)).toBe("(100000 100000 50000)")
+            expect(() => run(`(map + '(1 2) 5)`)).toThrow("map: expected a list")
+        })
+
+        it('lists know their length; improper ones are not lists', () => {
+            expect(run(`(list (length '()) (length '(1 2 3)) (length '(1 2 . 3)) (list? '(1 2)) (list? '(1 . 2)) (list? '()) (list? 5))`)).toBe("(0 3 2 #t #f #t #f)")
+            expect(run(`(define (mk n acc) (if (= n 0) acc (mk (- n 1) (cons n acc)))) (define xs (mk 100000 '())) (define (f l) (length l)) (list (f xs) (f (cdr xs)) (list? xs))`)).toBe("(100000 99999 #t)")
+        })
+
+        it('cons* and cons chains build a list in one go', () => {
+            expect(run(`(list (cons* 1 2 '(3 4)) (cons* 1 2 3) (cons* '(1)) (cons* 5) (length (cons* 1 2 '(3 4))) (length (cons* 1 2 3)))`)).toBe("((1 2 3 4) (1 2 . 3) (1) 5 4 2)")
+            expect(run(`(list (apply cons* '(1 2 (3))) (map cons* '(1 2) '((a) (b))))`)).toBe("((1 2 3) ((1 a) (2 b)))")
+            // a chain of conses is one list / cons*, with the same pairs and lengths
+            expect(run(`(define xs '(8 9)) (define r (cons 1 (cons 2 (cons 3 xs)))) (list r (length r) (length (cdr r)) (eq? (cdddr r) xs) (cons 1 (cons 2 '())) (length (cons 1 (cons 2 '()))) (cons 1 (cons 2 3)) (list? (cons 1 (cons 2 3))))`)).toBe("((1 2 3 8 9) 5 4 #t (1 2) 2 (1 2 . 3) #f)")
+            // arguments are evaluated left to right, as the nested calls would be
+            expect(run(`(define log '()) (define (n x) (set! log (cons x log)) x) (cons (n 1) (cons (n 2) (n '()))) (reverse log)`)).toBe("(1 2 ())")
+            const bc = evaluator.compileRaw(`(define (cc-f a b c) (cons a (cons b (cons c '()))))`) as Code
+            const fn = bc.constants.find((c: any) => c instanceof Closure)!
+            expect(opKinds(fn.tmpl.code).filter(k => k === "IntCall")).toHaveLength(1)
+        })
+
+        it('mutable pairs (mcons) are separate from lists', () => {
+            expect(run(`(define p (mcons 1 2)) (set-mcar! p 10) (set-mcdr! p '(3)) (list (mcar p) (mcdr p) (mpair? p) (pair? p) (list? p) (mpair? '(1)))`)).toBe("(10 (3) #t #f #f #f)")
+            expect(run(`(mcons 1 (mcons 2 '()))`)).toBe("(mcons 1 (mcons 2 ()))")
+            // equal? compares contents, eq? identity
+            expect(run(`(list (equal? (mcons 1 2) (mcons 1 2)) (eq? (mcons 1 2) (mcons 1 2)) (equal? (mcons 1 2) (cons 1 2)))`)).toBe("(#t #f #f)")
+            // circular ones print and compare
+            expect(run(`(define c (mcons 1 #f)) (set-mcdr! c c) c`)).toBe("(mcons 1 #<cycle>)")
+            expect(run(`(define a (mcons 1 #f)) (set-mcdr! a a) (define b (mcons 1 #f)) (set-mcdr! b b) (equal? a b)`)).toBe("#t")
+            expect(() => run(`(car (mcons 1 2))`)).toThrow("car: expected a pair")
+            expect(() => run(`(mcar '(1 2))`)).toThrow("mcar: expected a mutable pair")
+            expect(() => run(`(length (map (lambda (x) x) (mcons 1 '())))`)).toThrow()
+        })
+
+        it('map gives each continuation its own result (multi-shot call/cc inside f)', () => {
+            for (const f of ["(lambda (x) (if (= x 2) (call/cc (lambda (c) (set! k c) x)) x))", "(let ((g (lambda (x) (if (= x 2) (call/cc (lambda (c) (set! k c) x)) x)))) g)"]) {
+                expect(run(`(define k #f) (define results '()) (let ((r (map ${f} '(1 2 3)))) (set! results (cons r results)) (if (< (length results) 3) (k (* 10 (length results))) (reverse results)))`)).toBe("((1 2 3) (1 10 3) (1 20 3))")
+            }
+        })
+    });
+
+    describe('bigints', () => {
+        it('reads bigints written 123n, and refuses integers a double would round', () => {
+            expect(run("(list 9007199254740993n (bigint? 9007199254740993n) (bigint? 9007199254740991) (bigint? 5) 123n (bigint? 123n) -99999999999999999999n)")).toBe("(9007199254740993 #t #f #f 123 #t -99999999999999999999)")
+            expect(() => evaluator.compileRaw("9007199254740993")).toThrow("integer 9007199254740993 is too large for a double to hold exactly; write 9007199254740993n for a bigint")
+            // too large for a double at all
+            expect(() => evaluator.compileRaw("1" + "0".repeat(400))).toThrow(/^integer 10+ is too large for a double to hold exactly/)
+            // one a double holds exactly is a double, however large
+            expect(run("(list 9007199254740992 (bigint? 100000000000000000000) 1e20)")).toBe("(9007199254740992 #f 100000000000000000000)")
+        })
+
+        it('does arithmetic on two bigints or two doubles, not a mix', () => {
+            expect(run("(list (+ 1n 2n) (bigint? (+ 1n 2n)) (* 2n 3n) (- 5n) (- 10n 3n 2n) (* 2n) (+ 1n))")).toBe("(3 #t 6 -5 5 2 1)")
+            expect(run("(list (/ 6n 3n) (bigint? (/ 6n 3n)) (/ 1n) (quotient 7n 2n) (quotient -7 2) (modulo -7n 3n) (remainder -7n 3n))")).toBe("(2 #t 1 3 -3 2 -1)")
+            expect(run("(* 9007199254740993n 9007199254740993n)")).toBe("81129638414606699710187514626049")
+            expect(() => run("(+ 1n 2)")).toThrow("+: cannot mix a bigint and a double (convert with bigint or inexact)")
+            expect(() => run("(= 1n 1)")).toThrow("=: cannot mix a bigint and a double")
+            expect(() => run("(< 1 2n)")).toThrow("<: cannot mix")
+            expect(() => run("(modulo 7n 2)")).toThrow("modulo: cannot mix")
+            expect(() => run("(/ 7n 2n)")).toThrow("/: 7 / 2 is not a whole bigint (use quotient)")
+            expect(() => run("(/ 1n 0n)")).toThrow("division by zero")
+            expect(() => run("(modulo 1n 0n)")).toThrow("modulo: division by zero")
+            expect(() => run("(+ 1n 'x)")).toThrow("+ requires numbers")
+            // converting first
+            expect(run("(list (+ (bigint 1) 2n) (+ (inexact 1n) 2.5))")).toBe("(3 3.5)")
+        })
+
+        it('compares and tests', () => {
+            expect(run("(list (= 1n 1n) (= 2n 3n) (< 1n 2n) (> 3n 2n 1n) (<= 2n 2n) (zero? 0n) (positive? 5n) (negative? -5n) (even? 10n) (odd? 7n))")).toBe("(#t #f #t #t #t #t #t #t #t #t)")
+            expect(run("(list (number? 1n) (integer? 1n) (exact-integer? 2.0) (exact-integer? 2.5) (finite? 1n) (eqv? 5n 5n) (eq? 5n 5n) (equal? '(1n) (list 1n)) (eqv? 1 1n))")).toBe("(#t #t #t #f #t #t #t #t #f)")
+        })
+
+        it('converts', () => {
+            expect(run("(list (bigint 5) (bigint? (bigint 5)) (bigint \"123456789012345678901234567890\") (exact 4.0) (bigint? (exact 4.0)) (exact 1e20) (bigint? (exact 1e20)) (inexact 12n) (bigint? (inexact 12n)))")).toBe("(5 #t 123456789012345678901234567890 4 #f 100000000000000000000 #t 12 #f)")
+            expect(() => run("(exact 1.5)")).toThrow("exact: no exact integer")
+            expect(() => run("(bigint 1.5)")).toThrow("bigint: expected an integer")
+        })
+
+        it('keeps AOT type facts sound', () => {
+            // a bigint accumulator is not known to be a number, though the loop adds to it like one
+            expect(run("(define big 9007199254740993n) (define (bl n) (let loop ((i 0) (acc 0n)) (if (= i n) acc (loop (+ i 1) (+ acc big))))) (list (bl 3) (bigint? (bl 3)))")).toBe("(27021597764222979 #t)")
+            // bigint arguments take the checked version of a function specialized for numbers
+            expect(run("(define (sq1 a b) (+ (* a a) b)) (list (sq1 3037000500n 1n) (bigint? (sq1 3037000500n 1n)) (sq1 3 1))")).toBe("(9223372037000250001 #t 10)")
+            expect(() => run("(define (cnt n) (let loop ((i 0)) (if (< i n) (loop (+ i 1)) i))) (cnt 5n)")).toThrow("<: cannot mix")
+        })
+    });
+
+    describe('quasiquote', () => {
+        it('builds lists and vectors (R7RS examples)', () => {
+            expect(run("`(list ,(+ 1 2) 4)")).toBe("(list 3 4)")
+            expect(run("(let ((name 'a)) `(list ,name ',name))")).toBe("(list a (quote a))")
+            expect(run("`(a ,(+ 1 2) ,@(map (lambda (x) (* x x)) '(4 5 6)) b)")).toBe("(a 3 16 25 36 b)")
+            expect(run("`((foo ,(- 10 3)) ,@(cdr '(c)) . ,(car '(cons)))")).toBe("((foo 7) . cons)")
+            expect(run("`#(10 5 ,(* 2 1) ,@(map (lambda (x) (* x 2)) '(8 4)) 8)")).toBe("#(10 5 2 16 8 8)")
+            expect(run("`(1 ,@'() 2)")).toBe("(1 2)")
+            expect(run("(define xs '(3 4)) (list `(1 2 ,@xs) `(,@xs) `(0 . ,xs))")).toBe("((1 2 3 4) (3 4) (0 3 4))")
+            // nothing unquoted: a constant
+            expect(run("(list `(a b (c)) `sym `5 `#(1 2))")).toBe("((a b (c)) sym 5 #(1 2))")
+            // the spliced list is copied, except at the end
+            expect(run("(define ys '(1 2)) (list `(,@ys 3) (eq? (cdr `(0 ,@ys)) ys) (eq? `(,@ys 3) ys))")).toBe("((1 2 3) #t #f)")
+        })
+
+        it('builds only what changes', () => {
+            // the constant tail after the last unquote is one shared constant
+            expect(run("(define (qf x) `(a ,x b c)) (list (qf 1) (qf 2) (eq? (cddr (qf 1)) (cddr (qf 2))) (length (qf 1)))")).toBe("((a 1 b c) (a 2 b c) #t 4)")
+            expect(run("(define (qs xs) `(,@xs z)) (list (qs '(1 2)) (eq? (cddr (qs '(1 2))) (cdr (qs '(3)))))")).toBe("((1 2 z) #t)")
+            // a vector with nothing spliced is made directly
+            const bc = evaluator.compileRaw("(define (qv x) `#(1 ,x 3))") as Code
+            const fn = bc.constants.find((c: any) => c instanceof Closure)!
+            expect(listing(fn.tmpl.code).some(l => /pos=%vector,/.test(l))).toBe(true)
+            expect(listing(fn.tmpl.code).some(l => /list->vector/.test(l))).toBe(false)
+            evaluator.evaluateRaw(bc)
+            expect(run("(qv 2)")).toBe("#(1 2 3)")
+        })
+
+        it('nests levels', () => {
+            expect(run("`(a `(b ,(c ,(+ 1 2))))")).toBe("(a (quasiquote (b (unquote (c 3)))))")
+            expect(run("`(a `(b ,(foo ,(+ 1 3) d) e) f)")).toBe("(a (quasiquote (b (unquote (foo 4 d)) e)) f)")
+            expect(run("(let ((name1 'x) (name2 'y)) `(a `(b ,,name1 ,',name2 d) e))")).toBe("(a (quasiquote (b (unquote x) (unquote (quote y)) d)) e)")
+            expect(run("(let ((xs '(1 2))) `(a `(b ,@,@xs)))")).toBe("(a (quasiquote (b (unquote-splicing 1 2))))")
+        })
+
+        it('rejects unquotes outside a quasiquote', () => {
+            expect(() => run(",x")).toThrow("unquote: not in a quasiquote")
+            expect(() => run("`,@x")).toThrow("unquote-splicing: not in a list")
+            expect(() => run("`(1 ,@5 2)")).toThrow("append: expected a list")
+            // spliced last, it is checked too, and a splice in a list's tail is refused
+            expect(() => run("`(1 ,@5)")).toThrow("unquote-splicing: expected a list but got 5")
+            expect(() => run("`(1 ,@'(2 . 3))")).toThrow("unquote-splicing: expected a list")
+            expect(() => run("`(,@7)")).toThrow("unquote-splicing: expected a list")
+            expect(() => evaluator.compileRaw("(define (qt x) `(1 . ,@x))")).toThrow("unquote-splicing: not allowed in the tail of a list")
+            expect(() => evaluator.compileRaw("(define (qt x) `(1 unquote-splicing x))")).toThrow("unquote-splicing: not allowed in the tail of a list")
+            // one level in, it is data
+            expect(run("`(a `(b . ,@(c)))")).toBe("(a (quasiquote (b unquote-splicing (c))))")
+        })
+    });
+
+    describe('Delimited continuations', () => {
+        it('shift / reset', () => {
+            expect(run(`(+ 1 (reset (+ 10 (shift k (k (k 100))))))`)).toBe("121")
+            expect(run(`(reset (* 2 (shift k 5)))`)).toBe("5")
+            // multi-shot
+            expect(run(`(reset (list 1 (shift k (list (k 2) (k 3)))))`)).toBe("((1 2) (1 3))")
+            expect(run(`(define k1 #f) (define r (+ 1 (reset (* 2 (shift k (begin (set! k1 k) 0)))))) (list r (k1 5) (k1 10))`)).toBe("(1 10 20)")
+            // no prompt left: a continuation with no frames is the identity
+            expect(run(`(reset (shift k (k 7)))`)).toBe("7")
+            // many in a loop run in constant space
+            expect(run(`(let loop ((i 0) (acc 0)) (if (= i 20000) acc (loop (+ i 1) (+ acc (reset (+ 1 (shift k (k i))))))))`)).toBe("200010000")
+        })
+
+        it('prompts, tags and aborts', () => {
+            expect(run(`(call-with-continuation-prompt (lambda () (+ 1 (abort-current-continuation (default-continuation-prompt-tag) 5 6))) (default-continuation-prompt-tag) (lambda (a b) (list a b)))`)).toBe("(5 6)")
+            expect(run(`(call-with-continuation-prompt (lambda (x y) (+ x y)) (default-continuation-prompt-tag) #f 1 2)`)).toBe("3")
+            // an abort passes prompts with other tags
+            expect(run(`(define t (make-continuation-prompt-tag 'outer)) (call-with-continuation-prompt (lambda () (reset (+ 1 (abort-current-continuation t 'out)))) t (lambda (v) (list 'handled v)))`)).toBe("(handled out)")
+            // a composable continuation up to a tagged prompt
+            expect(run(`(define t2 (make-continuation-prompt-tag)) (define kk (call-with-continuation-prompt (lambda () (+ 100 (call-with-composable-continuation (lambda (k) (abort-current-continuation t2 k)) t2))) t2 (lambda (k) k))) (list (kk 1) (kk 2) (+ 1 (kk 3)))`)).toBe("(101 102 104)")
+            expect(() => run(`(abort-current-continuation (make-continuation-prompt-tag 'none) 1)`)).toThrow("no continuation prompt tagged")
+            expect(() => run(`(call-with-composable-continuation (lambda (k) k) (make-continuation-prompt-tag))`)).toThrow("no continuation prompt tagged")
+            expect(run(`(list (continuation-prompt-tag? (make-continuation-prompt-tag)) (continuation-prompt-tag? 1))`)).toBe("(#t #f)")
+        })
+
+        it('run dynamic-wind thunks leaving and re-entering', () => {
+            expect(run(`
+                (define log '())
+                (define (note x) (set! log (cons x log)))
+                (define k #f)
+                (reset (dynamic-wind (lambda () (note 'in)) (lambda () (shift c (set! k c)) (note 'body)) (lambda () (note 'out))))
+                (k 1)
+                (reverse log)`)).toBe("(in out in body out)")
+        })
+
+        it('carry marks, parameters and handlers along', () => {
+            // a parameterization inside the captured part comes with it; one outside it comes from where it is called
+            expect(run(`(define p (make-parameter 0)) (define k (reset (parameterize ((p 1)) (shift c c) (p)))) (list (k #f) (parameterize ((p 5)) (k #f)))`)).toBe("(1 1)")
+            expect(run(`(define q (make-parameter 0)) (define k (reset (shift c c) (q))) (list (k #f) (parameterize ((q 5)) (k #f)))`)).toBe("(0 5)")
+            // a try inside the captured part still catches, after it is reinstated
+            expect(run(`(define k (reset (try (lambda () (shift c c) (raise 'boom)) (lambda (e) (list 'caught e))))) (list (k 1) (k 2))`)).toBe("((caught boom) (caught boom))")
+            // and a call/ec inside it can still escape
+            expect(run(`(define k (reset (call/ec (lambda (esc) (shift c c) (esc 'escaped) 'not)))) (list (k 1) (k 2))`)).toBe("(escaped escaped)")
+            // with-exception-handler around the call site sees what the reinstated part raises
+            expect(run(`(define k (reset (shift c c) (raise-continuable 'r))) (with-exception-handler (lambda (e) (list 'handled e)) (lambda () (k 1)))`)).toBe("(handled r)")
+        })
+
+        it('cannot compose a continuation barrier', () => {
+            expect(() => run(`(define k (reset (call-with-continuation-barrier (lambda () (shift c c) 1)))) (k 1)`)).toThrow("cannot re-enter a continuation barrier")
+        })
+    });
+
     describe('Macro expansion limits', () => {
         it('stops a macro that keeps expanding into itself through a body', () => {
             expect(() => run(`(anima-macro self-ref (list 'lambda '() (list 'self-ref))) (self-ref)`)).toThrow(/nested too deeply|expansion limit/)
         })
 
         it('expands deep but finite programs', () => {
-            // expansion does not depend on the backend, and AOT spends ~100ms generating code for the huge function
-            if (_mode === "aot") return
             const clauses = Array.from({ length: 1000 }, (_, i) => `((= x ${i}) ${i})`).join(" ")
             expect(run(`(define x 999) (cond ${clauses} (else -1))`)).toBe("999")
             expect(run(Array.from({ length: 500 }, () => "((lambda () ").join("") + "1" + "))".repeat(500))).toBe("1")

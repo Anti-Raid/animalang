@@ -1,7 +1,8 @@
-import { Cons } from "../common";
+import { Cons } from "./list";
 import type { AnimaOptions } from "../bytecode-rvm/meta";
 import { Anima } from "../anima";
 import { ASP } from "./reader";
+import { toCore } from "./core";
 import { schemeBase } from "./base";
 import { loadPrelude } from "./prelude";
 import { OP_LAMBDA } from "./symbols";
@@ -10,18 +11,18 @@ import { registerCoreSyntax } from "./transformer/syntax";
 
 // A new instance running Scheme: its intrinsics (registered first, always in the same order), reserved names, reader,
 // macro expander and the prelude's procedures. The intrinsics stay open: register more before compiling code that uses them
-export const createScheme = (options: AnimaOptions, maxSteps: number = 0): Anima => {
-    const anima = new Anima(options, maxSteps, schemeBase());
+export const createScheme = (options: AnimaOptions): Anima => {
+    const anima = new Anima(options, schemeBase());
     const intrinsics = anima.intrinsics;
 
-    const evaluator = new MacroEvaluator(options, maxSteps, intrinsics);
+    const evaluator = new MacroEvaluator(options, intrinsics);
     registerCoreSyntax(evaluator);
     evaluator.init(loadPrelude(evaluator.expandcmp, evaluator.expandvm, evaluator, intrinsics));
 
     const publicScope = loadPrelude(anima.compiler, anima.vm, evaluator, intrinsics);
     anima.attachFrontEnd({
         read: (source, file) => new ASP(source, true, file).parse(),
-        transform: ast => evaluator.transform(ast),
+        transform: ast => toCore(evaluator.transformProgram(ast)),
         lambda: (params, body) => Cons.list(OP_LAMBDA, params, body),
     }, publicScope.chained());
     return anima;

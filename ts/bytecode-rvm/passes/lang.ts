@@ -1,0 +1,173 @@
+// The languages the compiler's passes read and write: the core forms (arrays, see compiler.ts), declared once by the
+// shape of each form, and a language as the forms it allows. A later language is an earlier one with forms removed or
+// added (`extend`). The shapes drive every traversal (`parts`, `mapExprs`) and the check of a pass's output (`check`)
+import { SOURCE_POS } from "../../common";
+import { CORE_FORMS } from "../core";
+import { bodyOf, clausesOf, namesOf } from "../lambda";
+
+// how a form's operands are laid out after its head:
+//  - quote: one datum, not an expression
+//  - lambda: clauses [options, params, rest, body ...], each binding its names in its body
+//  - let / letrec: [[name, init] ...], body ...; a letrec's names are bound in its inits too
+//  - let*: the same, each init seeing the names before it
+//  - let-values: [[params, rest, init] ...], body ...
+//  - assign: name, expr (%set!, %define-global)
+//  - label: name, expr ... (%block, %escape: the name is a label, not a variable)
+//  - exprs: every element is an expression, the head included (as in a call)
+export type Shape = "quote" | "lambda" | "let" | "letrec" | "let*" | "let-values" | "assign" | "label" | "exprs";
+
+export type Language = { readonly name: string, readonly forms: ReadonlyMap<symbol, Shape> };
+
+const language = (name: string, forms: Record<string, Shape>): Language =>
+    ({ name, forms: new Map(Object.entries(forms).map(([head, shape]) => [Symbol.for(head), shape])) });
+
+export const extend = (base: Language, name: string, change: { remove?: string[], add?: Record<string, Shape> }): Language => {
+    const forms = new Map(base.forms);
+    for (const head of change.remove ?? []) forms.delete(Symbol.for(head));
+    for (const [head, shape] of Object.entries(change.add ?? {})) forms.set(Symbol.for(head), shape);
+    return { name, forms };
+};
+
+// what a front end may give the compiler
+export const Lsrc = language("Lsrc", {
+    "%quote": "quote",
+    "%lambda": "lambda",
+    "%let": "let",
+    "%letrec": "letrec",
+    "%let*": "let*",
+    "%let-values": "let-values",
+    "%let-values/strict": "let-values",
+    "%set!": "assign",
+    "%define-global": "assign",
+    "%block": "label",
+    "%escape": "label",
+    "%if": "exprs",
+    "%begin": "exprs",
+    "%loop": "exprs",
+    "%with-mark": "exprs",
+    "%catch": "exprs",
+    "%current-marks": "exprs",
+    "%apply": "exprs",
+});
+
+export const keepPos = <T>(to: T, from: any): T => {
+    const pos = SOURCE_POS.get(from);
+    if (pos !== undefined && Array.isArray(to)) SOURCE_POS.set(to, pos);
+    return to;
+};
+
+// Each expression position in `e` with the names bound around it (beyond those around `e`), and how to rebuild `e`
+// from new expressions for them. For a %let* (`seq`), each position's names add to those of the positions before it
+// (see withBounds)
+export type Parts = { exprs: [any, symbol[]][], rebuild: (next: any[]) => any, seq?: boolean };
+
+export const parts = (lang: Language, e: any[]): Parts => {
+    const same = (exprs: [any, symbol[]][], rebuild: (next: any[]) => any): Parts => ({ exprs, rebuild: next => keepPos(rebuild(next), e) });
+    const op = e[0];
+    switch (lang.forms.get(op) ?? "exprs") {
+        case "quote":
+            return { exprs: [], rebuild: () => e };
+        case "lambda": {
+            const clauses = clausesOf(e);
+            const exprs = clauses.flatMap(c => bodyOf(c).map(x => [x, namesOf(c)] as [any, symbol[]]));
+            return same(exprs, next => {
+                let at = 0;
+                return [op, ...clauses.map(c => {
+                    const n = c.length - 3;
+                    at += n;
+                    return [c[0], c[1], c[2], ...next.slice(at - n, at)];
+                })];
+            });
+        }
+        case "let":
+        case "letrec": {
+            const bindings: [symbol, any][] = e[1];
+            const names = bindings.map(b => b[0]);
+            const inner = lang.forms.get(op) === "letrec" ? names : [];
+            return same([...bindings.map(b => [b[1], inner] as [any, symbol[]]), ...e.slice(2).map(x => [x, names] as [any, symbol[]])], next =>
+                [op, bindings.map((b, i) => keepPos([b[0], next[i]], b)), ...next.slice(bindings.length)]);
+        }
+        case "let*": {
+            const bindings: [symbol, any][] = e[1];
+            const body = e.slice(2);
+            const exprs: [any, symbol[]][] = [
+                ...bindings.map((b, i) => [b[1], i === 0 ? [] : [bindings[i - 1][0]]] as [any, symbol[]]),
+                ...body.map((x, i) => [x, i === 0 && bindings.length > 0 ? [bindings[bindings.length - 1][0]] : []] as [any, symbol[]]),
+            ];
+            return { exprs, seq: true, rebuild: next => keepPos([op, bindings.map((b, i) => keepPos([b[0], next[i]], b)), ...next.slice(bindings.length)], e) };
+        }
+        case "let-values": {
+            const clauses: [symbol[], symbol | null, any][] = e[1];
+            const names = clauses.flatMap(c => c[1] === null ? c[0] : [...c[0], c[1]]);
+            return same([...clauses.map(c => [c[2], []] as [any, symbol[]]), ...e.slice(2).map(x => [x, names] as [any, symbol[]])], next =>
+                [op, clauses.map((c, i) => [c[0], c[1], next[i]]), ...next.slice(clauses.length)]);
+        }
+        case "assign":
+            return same([[e[2], []]], next => [op, e[1], next[0]]);
+        case "label":
+            return same(e.slice(2).map(x => [x, []]), next => [op, e[1], ...next]);
+        case "exprs":
+            return same(e.map(x => [x, []]), next => next);
+    }
+};
+
+// each expression position of `p` with the names bound around it, given those around the form (`bound`, not changed).
+// A %let*'s positions share one growing set, so a long one costs no more than its length
+export function* withBounds(p: Parts, bound: ReadonlySet<symbol>): Generator<[any, ReadonlySet<symbol>]> {
+    if (p.seq) {
+        const running = new Set(bound);
+        for (const [x, added] of p.exprs) {
+            for (const name of added) running.add(name);
+            yield [x, running];
+        }
+        return;
+    }
+    for (const [x, names] of p.exprs) yield [x, names.length === 0 ? bound : new Set([...bound, ...names])];
+}
+
+// the expressions directly inside a form (not its binders, labels or quoted data)
+export const subExprs = (lang: Language, e: any[]): any[] => parts(lang, e).exprs.map(([x]) => x);
+
+// `e` with `f` applied to each expression directly inside it, rebuilt (with its position) only if one changed
+export const mapExprs = (lang: Language, e: any[], f: (x: any) => any): any[] => {
+    const p = parts(lang, e);
+    let changed = false;
+    const next = p.exprs.map(([x]) => {
+        const y = f(x);
+        if (y !== x) changed = true;
+        return y;
+    });
+    return changed ? p.rebuild(next) : e;
+};
+
+// why the form `e` is not laid out as its shape in `lang` says, or null if it is (its operands only, not their insides)
+export const malformed = (lang: Language, e: any[]): string | null => {
+    const isSyms = (x: any) => Array.isArray(x) && x.every(s => typeof s === "symbol");
+    switch (lang.forms.get(e[0])) {
+        case "quote":
+            return e.length === 2 ? null : "a quote of other than one datum";
+        case "lambda":
+            return e.slice(1).every(c => Array.isArray(c) && isSyms(c[0]) && isSyms(c[1]) && (c[2] === null || typeof c[2] === "symbol")) ? null : "a malformed clause";
+        case "let": case "letrec": case "let*":
+            return Array.isArray(e[1]) && e[1].every((b: any) => Array.isArray(b) && b.length === 2 && typeof b[0] === "symbol") ? null : "malformed bindings";
+        case "let-values":
+            return Array.isArray(e[1]) && e[1].every((c: any) => Array.isArray(c) && c.length === 3 && isSyms(c[0]) && (c[1] === null || typeof c[1] === "symbol")) ? null : "malformed bindings";
+        case "assign": case "label":
+            return typeof e[1] === "symbol" ? null : "a name that is not a symbol";
+        default:
+            return null;
+    }
+};
+
+// Checks that `e` is in `lang`: no core form it does not allow, and each form laid out as its shape says. For tests and
+// debugging: a pass whose output fails it left a form its output language removed, or built one wrongly
+export const check = (lang: Language, e: any): void => {
+    if (!Array.isArray(e)) return;
+    const fail = (why: string) => { throw new Error(`internal error: not ${lang.name}: ${why} in (${String(e[0]?.description ?? e[0])} ...)`); };
+    const op = e[0];
+    if (!lang.forms.has(op) && typeof op === "symbol" && CORE_FORMS.has(op)) fail("a form the language does not have");
+    const why = malformed(lang, e);
+    if (why !== null) fail(why);
+    if (lang.forms.get(op) === "quote") return;
+    for (const x of subExprs(lang, e)) check(lang, x);
+};

@@ -1,11 +1,11 @@
-import { Env, Cons, CORE_LAMBDA } from "./common"
+import { Env, CORE_LAMBDA } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
+import type { CaseLambda } from "./bytecode-rvm/code"
 import { newIntrinsics } from "./bytecode-rvm/core"
 import { Compiler } from "./bytecode-rvm/compiler"
 import { AnimaVM } from "./bytecode-rvm/vm"
-import type { ByteCode, Closure } from "./bytecode-rvm/exec"
+import type { Code, Closure } from "./bytecode-rvm/exec"
 import type { AnimaOptions } from "./bytecode-rvm/meta"
-import { deepPrint } from "./bytecode-rvm/utils"
 
 // A language on top of the core: reads source into its syntax tree and lowers that to the core forms
 export interface FrontEnd {
@@ -47,11 +47,11 @@ export class Anima {
     }
 
     // `base`: intrinsics (and reserved names) to start with, e.g. a front end's (made with newIntrinsics)
-    constructor(options: AnimaOptions, readonly maxSteps: number = 0, base?: Intrinsics) {
+    constructor(options: AnimaOptions, base?: Intrinsics) {
         this.#options = options
         this.#intrinsics = newIntrinsics(base)
-        this.#vm = new AnimaVM(options.mode, this.#intrinsics)
-        this.#comp = new Compiler(this.#intrinsics, options.debug)
+        this.#vm = new AnimaVM(this.#intrinsics)
+        this.#comp = new Compiler(this.#intrinsics, options.debug, options.optimize)
     }
 
     // gives the instance a language: `scope` is where its code runs
@@ -59,6 +59,13 @@ export class Anima {
         if (this.#frontEnd !== null) throw new Error("this instance already has a front end")
         this.#frontEnd = frontEnd
         this.#scope = scope
+    }
+
+    // for an intrinsic that works long: an interrupt check of its own (see Intrinsics.setInterruptHandler), counting `work`
+    // against the instance's count. It returns to go on, throws an InterruptError to stop (which the intrinsic lets go),
+    // and a pause happens once the intrinsic has returned
+    checkInterrupt(work: number = 1): void {
+        this.#vm.executor.checkInterrupt(work)
     }
 
     // makes (name arg ...) call `fn` in code compiled from now on; names start with '%'
@@ -72,11 +79,11 @@ export class Anima {
         return this
     }
 
-    public evaluateRaw(code: ByteCode): any {
+    public evaluateRaw(code: Code): any {
         return this.#vm.evaluateRaw(code, this.#scope)
     }
 
-    public evaluateClosure(code: Closure, args: any[]): any {
+    public evaluateClosure(code: Closure | CaseLambda, args: any[]): any {
         return this.#vm.evaluateClosure(code, this.#scope, args)
     }
 
@@ -93,6 +100,14 @@ export class Anima {
         this.#vm.closeCoroutine(co)
     }
 
+    public currentCoroutine(): any {
+        return this.#vm.currentCoroutine()
+    }
+
+    public coroutineYieldable(): boolean {
+        return this.#vm.coroutineYieldable()
+    }
+
     public traceback(co: any, msg?: string): string {
         return this.#vm.traceback(co, msg)
     }
@@ -101,8 +116,9 @@ export class Anima {
         return this.compileAstToClosure(this.#requireFrontEnd().read(s), args, globals)
     }
 
+    // without a front end, `args` is the lambda's parameters (an array of symbols) and `bast` its body, a core form
     compileAstToClosure(bast: any, args: any, globals: Env): Closure {
-        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : Cons.list(CORE_LAMBDA, args, bast)
+        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : [CORE_LAMBDA, [[], args, null, bast]]
         const bc = this.compileRawAst(ast)
         return this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
     }
@@ -114,10 +130,6 @@ export class Anima {
     // the front end's syntax tree, or core forms if there is no front end
     compileRawAst(ast: any) {
         return this.#comp.compile(this.#frontEnd !== null ? this.#frontEnd.transform(ast) : ast)
-    }
-
-    deepPrint(bc: ByteCode) {
-        deepPrint(bc)
     }
 
     #requireFrontEnd(): FrontEnd {

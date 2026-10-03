@@ -1,7 +1,8 @@
 import { ConstPool, type SourcePos } from "../common";
-import { ByteCode, Closure, ClosureTemplate, NO_REG, OpCode, corePos, UNPACK_REST, UNPACK_STRICT, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import { Code, Closure, ClosureTemplate, type InlineSite, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
-import { OPCODES } from "./opcodes";
+import type { RestKind } from "./arity";
+import { UNPACK_REST, UNPACK_STRICT, returnedFrom, type DistributiveOmit, type Op } from "./ops";
 
 let nextLabelId = 0;
 
@@ -14,7 +15,7 @@ export type JumpCond = "True" | "False"
 export type Node = {
     t: "LoadValue",
     destReg: number,
-    constant: any // will later on become a LOADCONST or a LOADU32
+    constant: any // will later on become a LoadConst or a LoadInt
 } | {
     t: "Move",
     destReg: number,
@@ -29,6 +30,12 @@ export type Node = {
     srcReg: number,
     upvarIdx: number,
     andBox: boolean
+} | {
+    // reg[closureReg].upvars[upvarIdx] = reg[srcReg]
+    t: "FixUpvar",
+    closureReg: number,
+    upvarIdx: number,
+    srcReg: number
 } | {
     t: "LoadGlobal",
     destReg: number,
@@ -89,12 +96,6 @@ export type Node = {
     destReg: number,
     srcReg: number
 } | {
-    t: "CallEC" | "CallCatch",
-    procReg: number,
-    tokReg: number,
-    preReg?: number,
-    destReg?: number
-} | {
     // start of a %block whose escapes jump to `end`
     t: "Block",
     end: JumpLabel
@@ -131,7 +132,7 @@ export type Node = {
     t: "CurrentMarks",
     destReg: number
 } | {
-    // an intrinsic that is not a leaf: may return a tail request (CALLHOST)
+    // an intrinsic that is not a leaf: may return a tail request
     t: "HostCall",
     pos: number,
     startReg: number,
@@ -139,16 +140,14 @@ export type Node = {
     isTail: boolean,
     destReg?: number
 } | {
-    // (%apply %intrinsic arg ... lst) of a leaf intrinsic (APPLYINT)
+    // (%apply %intrinsic arg ... array) of a leaf intrinsic
     t: "IntApply",
     pos: number,
     destReg: number,
     startReg: number,
-    nargs: number,
-    // the last argument is a forwarded rest array (APPLYINTR)
-    restArray: boolean
+    nargs: number
 } | {
-    // a leaf intrinsic (CALLINT)
+    // a leaf intrinsic
     t: "IntCall",
     pos: number,
     destReg: number,
@@ -159,197 +158,155 @@ export type Node = {
     t: "Jump",
     label: JumpLabel
 } | {
+    // reg[destReg] = the accumulator (the result of the call the code was entered from; VM helper code only)
+    t: "MoveAcc",
+    destReg: number
+} | {
+    // the code up to the matching InlineExit is the body of `name`, inlined at `at` (in tail position if `tail`):
+    // tracebacks show it as that procedure's frame (emits nothing; see Code.inlines)
+    t: "InlineEnter",
+    name: string,
+    at: SourcePos | null,
+    tail: boolean
+} | {
+    t: "InlineExit"
+} | {
+    // where a function's body starts, after its parameters are set up (emits nothing; see passes/interrupts.ts)
+    t: "FunctionEntry"
+} | {
     // marks where the following code came from (goes into the line table, emits nothing)
     t: "Pos",
     pos: SourcePos
 }
 
+// a function's code from its IR nodes (see Op)
+export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, lowerTemplate: (t: ClosureTemplateIR) => ClosureTemplate) => {
+    const ops: Op[] = []
+    let ip = 0
+    const push = (op: DistributiveOmit<Op, "ip">): Op => {
+        const full = op as Op
+        full.ip = ip
+        ops.push(full)
+        ip++
+        return full
+    }
+    const lineTable: number[] = []
+    const files: string[] = []
+    const used = new Map<number, UsedIntrinsic>()
+    const use = (pos: number): number => {
+        if (!used.has(pos)) {
+            const entry = table.entries[pos]
+            used.set(pos, { pos, name: entry.name, leaf: entry.leaf })
+        }
+        return pos
+    }
+    const labels = new Map<JumpLabel, number>()
+    const inlines: InlineSite[] = []
+    const open: number[] = []
+    // code that runs inlined procedures starts (and a self tail call restarts it) outside any: its first instruction,
+    // after the positions it starts at
+    let reset = nodes.some(n => n.t === "InlineEnter")
+    const fixups: [op: any, field: string, label: JumpLabel][] = []
+    const jump = (op: Op, field: string, label: JumpLabel) => fixups.push([op, field, label])
+    for (const node of nodes) {
+        if (reset && node.t !== "Pos") {
+            push({ k: "InlineSite", site: -1 })
+            reset = false
+        }
+        switch (node.t) {
+            case "LoadValue": {
+                const v = node.constant
+                if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) push({ k: "LoadInt", dst: node.destReg, value: v })
+                else push({ k: "LoadConst", dst: node.destReg, idx: cpool.push(v) })
+                break
+            }
+            case "LoadUpvar": push({ k: "LoadUpvar", dst: node.destReg, idx: node.upvarIdx, unbox: node.andUnbox }); break
+            case "SetUpvar": push({ k: "SetUpvar", src: node.srcReg, idx: node.upvarIdx, box: node.andBox }); break
+            case "FixUpvar": push({ k: "FixUpvar", clo: node.closureReg, idx: node.upvarIdx, src: node.srcReg }); break
+            case "LoadGlobal": push({ k: "LoadGlobal", dst: node.destReg, sym: cpool.push(node.sym) }); break
+            case "SetGlobal": push({ k: "SetGlobal", src: node.srcReg, sym: cpool.push(node.sym) }); break
+            case "Label": labels.set(node.label, ip); break
+            case "FunctionEntry": break
+            case "InlineEnter": {
+                const site = inlines.push({ start: ip, end: ip, name: node.name, at: node.at, tail: node.tail, parent: open.length > 0 ? open[open.length - 1] : -1 }) - 1
+                open.push(site)
+                push({ k: "InlineSite", site })
+                break
+            }
+            case "InlineExit": {
+                const site = open.pop()!
+                inlines[site].end = ip
+                push({ k: "InlineSite", site: returnedFrom(site) })
+                break
+            }
+            case "If": case "ElseIf": jump(push({ k: "If", cond: node.reg, else: -1, elseif: node.t === "ElseIf" }), "else", node.elseLabel); break
+            case "Else": jump(push({ k: "Else", end: -1 }), "end", node.endLabel); break
+            case "EndIf": push({ k: "EndIf" }); break
+            case "SetMark": push({ k: "SetMark", key: node.keyReg, val: node.valReg }); break
+            case "MarkSave": push({ k: "MarkSave", reg: node.reg }); break
+            case "MarkRestore": push({ k: "MarkRestore", reg: node.reg }); break
+            case "CurrentMarks": push({ k: "CurMarks", dst: node.destReg }); break
+            case "HostCall":
+                push({ k: "HostCall", pos: use(node.pos), start: node.startReg, nargs: node.nargs, tail: node.isTail })
+                if (!node.isTail && node.destReg !== undefined) push({ k: "MoveAcc", dst: node.destReg })
+                break
+            case "MoveAcc": push({ k: "MoveAcc", dst: node.destReg }); break
+            case "IntCall": push({ k: "IntCall", pos: use(node.pos), dst: node.destReg, start: node.startReg, nargs: node.nargs }); break
+            case "IntApply": push({ k: "IntApply", pos: use(node.pos), dst: node.destReg, start: node.startReg, nargs: node.nargs }); break
+            case "Unpack": push({ k: "Unpack", src: node.srcReg, start: node.startReg, count: node.count, flags: (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0) }); break
+            case "Block": case "Loop": jump(push({ k: node.t, end: -1 }), "end", node.end); break
+            case "EndLoop": jump(push({ k: "EndLoop", head: -1 }), "head", node.head); break
+            case "Jump": jump(push({ k: "Jump", target: -1 }), "target", node.label); break
+            case "Call":
+                push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: false })
+                if (node.destReg !== undefined) push({ k: "MoveAcc", dst: node.destReg })
+                break
+            case "TailCall": push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: true }); break
+            case "Return": push({ k: "Return", src: node.reg }); break
+            case "NewClosure": {
+                const ct = lowerTemplate(node.template)
+                // a closure that captures nothing is made once, as a constant
+                if (ct.upvarLocs.length === 0) push({ k: "LoadConst", dst: node.destReg, idx: cpool.mutPush(Closure.fromTemplate(ct)) })
+                else push({ k: "NewClosure", dst: node.destReg, tmpl: cpool.mutPush(ct) })
+                break
+            }
+            case "Box": case "SetBox": case "Unbox": case "Move": push({ k: node.t, dst: node.destReg, src: node.srcReg }); break
+            case "Pos": {
+                let fileIdx = files.indexOf(node.pos.file)
+                if (fileIdx === -1) fileIdx = files.push(node.pos.file) - 1
+                const n = lineTable.length
+                if (n > 0 && lineTable[n - 4] === ip) lineTable.length = n - 4
+                const m = lineTable.length
+                if (m > 0 && lineTable[m - 3] === fileIdx && lineTable[m - 2] === node.pos.line && lineTable[m - 1] === node.pos.col) break
+                lineTable.push(ip, fileIdx, node.pos.line, node.pos.col)
+                break
+            }
+            default: { const _: never = node }
+        }
+    }
+    for (const [op, field, label] of fixups) {
+        const target = labels.get(label)
+        if (target === undefined) throw new Error(`unresolved label ${label.id}`)
+        op[field] = target
+    }
+    return { ops, lineTable: new Uint32Array(lineTable), files, used, use, inlines }
+}
+
 export class IR {
-    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false) {}
+    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false, private readonly assumed: ReadonlySet<number> = new Set()) {}
 
-    lower(nodes: Node[], numRegs: number): ByteCode {
+    lower(nodes: Node[], numRegs: number, packRest: boolean = false): Code {
         const cpool = new ConstPool()
-        const inst: number[] = []
-        // an instruction, with as many operands as OPCODES says it has
-        const emit = (op: OpCode, ...operands: number[]): number => {
-            if (operands.length !== OPCODES[op].operands.length) throw new Error(`internal error: ${OpCode[op]} takes ${OPCODES[op].operands.length} operands, got ${operands.length}`)
-            return inst.push(op, ...operands)
-        }
-
-        const lineTable: number[] = []
-        const files: string[] = []
-        const jumpIdxs: Map<number, JumpLabel> = new Map()
-        // the intrinsics used (the bytecode's metadata), by position
-        const used = new Map<number, UsedIntrinsic>()
-        const use = (pos: number): number => {
-            if (!used.has(pos)) {
-                const entry = this.table.entries[pos]
-                used.set(pos, { pos, name: entry.name, leaf: entry.leaf })
-            }
-            return pos
-        }
-        const resolvedLabels: Map<JumpLabel, number> = new Map()
-        for(let i = 0; i < nodes.length; i++) {
-            const node = nodes[i]
-
-            switch (node.t) {
-                case "LoadValue": {
-                    const v = node.constant
-
-                    if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) {
-                        emit(OpCode.LOADU32, node.destReg, v);
-                    } else {
-                        emit(OpCode.LOADCONST, node.destReg, cpool.push(v))
-                    }
-                    continue
-                }
-                case "LoadUpvar": {
-                    emit(OpCode.LOADUPVAR, node.destReg, node.upvarIdx, node.andUnbox ? 1 : 0)
-                    break
-                }
-                case "SetUpvar": {
-                    emit(OpCode.SETUPVAR, node.srcReg, node.upvarIdx, node.andBox ? 1 : 0)
-                    break
-                }
-                case "LoadGlobal": {
-                    emit(OpCode.LOADGLOBAL, node.destReg, cpool.push(node.sym))
-                    break
-                }
-                case "SetGlobal": {
-                    emit(OpCode.SETGLOBAL, node.srcReg, cpool.push(node.sym))
-                    break
-                }
-                case "Label": {
-                    resolvedLabels.set(node.label, inst.length)
-                    break
-                }
-                case "If": {
-                    const jidx = emit(OpCode.IF, node.reg, -1) - 1
-                    jumpIdxs.set(jidx, node.elseLabel)
-                    break
-                }
-                case "ElseIf": {
-                    const jidx = emit(OpCode.ELSEIF, node.reg, -1) - 1
-                    jumpIdxs.set(jidx, node.elseLabel)
-                    break
-                }
-                case "Else": {
-                    const jidx = emit(OpCode.ELSE, -1) - 1
-                    jumpIdxs.set(jidx, node.endLabel)
-                    break
-                }
-                case "EndIf": {
-                    emit(OpCode.ENDIF)
-                    break
-                }
-                case "SetMark":
-                    emit(OpCode.SETMARK, node.keyReg, node.valReg)
-                    break
-                case "MarkSave":
-                    emit(OpCode.MARKSAVE, node.reg)
-                    break
-                case "MarkRestore":
-                    emit(OpCode.MARKRESTORE, node.reg)
-                    break
-                case "CurrentMarks":
-                    emit(OpCode.CURMARKS, node.destReg)
-                    break
-                case "HostCall":
-                    emit(OpCode.CALLHOST, use(node.pos), node.startReg, node.nargs, node.isTail ? 1 : 0)
-                    if (!node.isTail && node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
-                    break
-                case "IntCall":
-                    emit(this.table.entries[node.pos].context ? OpCode.CALLCTX : OpCode.CALLINT, use(node.pos), node.destReg, node.startReg, node.nargs)
-                    break
-                case "IntApply":
-                    emit(node.restArray ? OpCode.APPLYINTR : OpCode.APPLYINT, use(node.pos), node.destReg, node.startReg, node.nargs)
-                    break
-                case "Unpack": {
-                    emit(OpCode.UNPACK, node.srcReg, node.startReg, node.count, (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0))
-                    break
-                }
-                case "Block":
-                case "Loop":
-                case "EndLoop":
-                case "Jump": {
-                    const op = { Block: OpCode.BLOCK, Loop: OpCode.LOOP, EndLoop: OpCode.ENDLOOP, Jump: OpCode.JUMP }[node.t]
-                    const jidx = emit(op, -1) - 1
-                    jumpIdxs.set(jidx, node.t === "EndLoop" ? node.head : node.t === "Jump" ? node.label : node.end)
-                    break
-                }
-                case "Call": {
-                    emit(OpCode.CALL, node.procReg, node.startReg, node.nargs, 0)
-                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg)
-                    break
-                }
-                case "TailCall": {
-                    emit(OpCode.CALL, node.procReg, node.startReg, node.nargs, 1)
-                    break
-                }
-                case "Return": {
-                    emit(OpCode.RETURN, node.reg)
-                    break
-                }
-                case "NewClosure": {
-                    const closureBc = this.lower(node.template.code, node.template.numRegs)
-                    const ct = new ClosureTemplate(node.template.params, node.template.remParams, closureBc, node.template.upvarLocs, node.template.name, node.template.restArray)
-                    if(ct.upvarLocs.length === 0) {
-                        // We can just directly push the template as a raw constant in the pool
-                        const cidx = cpool.mutPush(Closure.fromTemplate(ct))
-                        emit(OpCode.LOADCONST, node.destReg, cidx)
-                    } else {
-                        const ctidx = cpool.mutPush(ct)
-                        emit(OpCode.NEWCLOSURE, node.destReg, ctidx)
-                    }
-                    break
-                }
-                case "Box": {
-                    emit(OpCode.BOX, node.destReg, node.srcReg)
-                    break
-                }
-                case "SetBox": {
-                    emit(OpCode.SETBOX, node.destReg, node.srcReg)
-                    break
-                }
-                case "Unbox": {
-                    emit(OpCode.UNBOX, node.destReg, node.srcReg)
-                    break
-                }
-                case "Move": {
-                    emit(OpCode.MOVE, node.destReg, node.srcReg)
-                    break
-                }
-                case "CallEC":
-                case "CallCatch": {
-                    if (node.t === "CallEC") emit(OpCode.CALLEC, node.procReg, node.tokReg);
-                    else emit(OpCode.CALLCATCH, node.procReg, node.tokReg, node.preReg ?? NO_REG);
-                    if (node.destReg !== undefined) emit(OpCode.MOVEACC, node.destReg);
-                    emit(OpCode.CALLINT, use(corePos("%end-escape")), node.tokReg, node.tokReg, 1);
-                    break;
-                }
-                case "Pos": {
-                    let fileIdx = files.indexOf(node.pos.file);
-                    if (fileIdx === -1) fileIdx = files.push(node.pos.file) - 1;
-                    const n = lineTable.length;
-                    if (n > 0 && lineTable[n - 4] === inst.length) lineTable.length = n - 4;
-                    const m = lineTable.length;
-                    if (m > 0 && lineTable[m - 3] === fileIdx && lineTable[m - 2] === node.pos.line && lineTable[m - 1] === node.pos.col) break;
-                    lineTable.push(inst.length, fileIdx, node.pos.line, node.pos.col);
-                    break;
-                }
-                default:
-                    let _: never = node;
-            }
-        }
-
-        for(const [jump, label] of jumpIdxs) {
-            const resolvedOffset = resolvedLabels.get(label)
-            if(resolvedOffset === undefined) throw new Error(`unresolved label ${label.id}`)
-            if(inst[jump] !== -1) throw new Error(`inst[jump] !== -1`)
-            inst[jump] = resolvedOffset
-        }
-
-        return new ByteCode(cpool.constants, new Uint32Array(inst), numRegs, new Uint32Array(lineTable), files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
+        const lowerTemplate = (t: ClosureTemplateIR) =>
+            new ClosureTemplate(t.params, t.remParams, this.lower(t.code, t.numRegs, t.rest === "packed"), t.upvarLocs, t.name, t.rest, t.pad)
+        const { ops, lineTable, files, used, use, inlines } = lowerOps(nodes, this.table, cpool, lowerTemplate)
+        for (const pos of this.assumed) use(pos)
+        const restPos = packRest ? use(this.table.pack!.pos) : -1
+        const code = new Code(cpool.constants, ops, numRegs, lineTable, files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
+        code.restPos = restPos
+        code.interrupts = this.table.interrupts
+        code.inlines = inlines
+        return code
     }
 }
 
@@ -361,7 +318,7 @@ export class ClosureTemplateIR {
     numRegs: number;
     upvarLocs: UpVarLoc[] // what upvars do we need to capture
 
-    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public restArray: boolean = false) {
+    constructor(params: symbol[], remParams: symbol | null, code: Node[], numRegs: number, upvarLocs: UpVarLoc[], public name: string | null = null, public rest: RestKind = "array", public pad: boolean = false) {
         this.params = params
         this.remParams = remParams
         this.code = code

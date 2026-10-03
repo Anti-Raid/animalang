@@ -3,20 +3,20 @@ import type { UpVarLoc } from "./exec";
 export type Resolve = { type: "Global" } | { type: "Local", index: number } | { type: "Upvar", index: number }
 
 export class VariableMetadata {
-    // a captured variable is shared with a closure. An assigned one must be a single location for continuations, which
-    // restore a frame's registers when re-entered: that is only visible if it is read after a call (where a continuation
-    // may be captured) before being assigned again, so otherwise it can stay a plain register
-    get isBoxed() { return this.isCaptured || (this.mutable && this.liveAcrossCall) }
+    // only an assigned variable can need a box: a closure sharing it must see the assignments (one that is never assigned
+    // is copied into the closure instead), and so must continuations, which restore a frame's registers when re-entered;
+    // that is only visible if it is read after a call (where one may be captured) before being assigned again
+    get isBoxed() { return this.mutable && (this.isCaptured || this.liveAcrossCall) }
 
     // set by AstAnalysis's second pass
     liveAcrossCall: boolean = false
 
-    // a lambda's rest parameter, and whether it is read anywhere but as the list of an %apply / %apply-multi
+    // a lambda's rest parameter, and whether it is read anywhere but spread as the last argument of an %apply
     isRestParam: boolean = false
     readOutsideApply: boolean = false
 
-    // a rest parameter only ever spread back into a call never needs to be a list: the closure receives its rest
-    // arguments as a plain array instead (ClosureTemplate.restArray), which only APPLY/APPLYINTR ever see
+    // a rest parameter only ever spread back into a call is never packed: the closure receives its rest arguments as a
+    // plain array instead, which only %apply ever sees
     get forwardsRest() { return this.isRestParam && !this.mutable && !this.isCaptured && !this.readOutsideApply }
 
     constructor(public mutable: boolean = false, public isCaptured: boolean = false, ) {}
@@ -26,9 +26,13 @@ export class VariableMetadata {
 export class AnalysisScope {
     #vals = new Map<symbol, VariableMetadata>()
     outer: AnalysisScope | null;
+    // every variable defined in this scope and the scopes inside it, by name (locals have names of their own, see
+    // passes/rename.ts)
+    readonly variables: Map<symbol, VariableMetadata>;
 
     constructor(outer: AnalysisScope | null, readonly isFunction: boolean = true) {
         this.outer = outer;
+        this.variables = outer?.variables ?? new Map();
     }
 
     dbgPrint() {
@@ -38,7 +42,9 @@ export class AnalysisScope {
     }
 
     define(sym: symbol) {
-        this.#vals.set(sym, new VariableMetadata());
+        const meta = new VariableMetadata();
+        this.#vals.set(sym, meta);
+        this.variables.set(sym, meta);
     }
 
     getVarinfo(sym: symbol): VariableMetadata | null {
@@ -67,7 +73,7 @@ export class AnalysisScope {
         return meta !== null;
     }
 
-    // a read as the spread list of an %apply, which a forwarded rest parameter allows
+    // a read spread as the last argument of an %apply, which a forwarded rest parameter allows
     readApplyList(sym: symbol) {
         this.#use(sym);
     }
@@ -122,11 +128,22 @@ export class CompilerScope {
     regAlloc: RegAlloc = new RegAlloc();
 
     outer: CompilerScope | null;
-    upvars: UpVarLoc[] = [];
+    // the variables a lambda captures, in upvar order (see passes/closures.ts)
+    readonly captures: readonly symbol[];
 
-    constructor(outer: CompilerScope | null) {
+    constructor(outer: CompilerScope | null, captures: readonly symbol[] = []) {
         this.outer = outer;
-        this.upvars = []
+        this.captures = captures;
+    }
+
+    // where the closure finds each captured variable when it is made: a register of the function around it, or one of
+    // that function's own upvars
+    get upvars(): UpVarLoc[] {
+        return this.captures.map(sym => {
+            const at = this.outer!.resolve(sym);
+            if (at.type === "Global") throw new Error(`internal error: captured ${String(sym.description)} is not a variable around the lambda`);
+            return { local: at.type === "Local", index: at.index };
+        });
     }
 
     get numRegs() {
@@ -169,40 +186,13 @@ export class CompilerScope {
 
     // Returns the result of resolving
     resolve(sym: symbol): Resolve {
-        // Check if its a local
         const index = this.currBlock.resolve(sym)
         if (index !== null) return { type: 'Local', index }
-        // Check if its global
         if (!this.outer) return { type: "Global" }
-        
-        // Ask parent to try resolving it as a upvar
-        const parentResolved = this.outer.resolve(sym)
-        if (parentResolved.type === 'Local') {
-            return { 
-                type: 'Upvar', 
-                index: this.#recordUpvar({ local: true, index: parentResolved.index }) 
-            };
-        } 
-    
-        if (parentResolved.type === 'Upvar') {
-            return { 
-                type: 'Upvar', 
-                index: this.#recordUpvar({ local: false, index: parentResolved.index }) 
-            };
-        }
-
-        return parentResolved // global
-    }
-
-    // Records a upvar from parent scope
-    #recordUpvar(upvar: UpVarLoc) {
-        // Check if we already captured this exact upvalue to avoid duplicates
-        const existingIdx = this.upvars.findIndex(u => u.index === upvar.index && u.local === upvar.local);
-        if (existingIdx !== -1) {
-            //console.log("recorded upvar", upvar, "at index:", existingIdx);
-            return existingIdx;
-        }
-        return this.upvars.push(upvar) - 1;
+        const upvar = this.captures.indexOf(sym)
+        if (upvar !== -1) return { type: "Upvar", index: upvar }
+        if (this.outer.resolve(sym).type !== "Global") throw new Error(`internal error: ${String(sym.description)} is used but not captured`)
+        return { type: "Global" }
     }
 }
 

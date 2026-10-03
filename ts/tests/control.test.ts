@@ -1,13 +1,16 @@
-import { ASTStringifier } from '../common';
+import { ASTStringifier } from '../scheme/printer';
+import { Msg } from '../common';
+import { listing } from '../bytecode-rvm/exec';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
-import { ByteCode } from '../bytecode-rvm/vm';
+import { Code } from '../bytecode-rvm/vm';
 import { Anima } from '../anima';
-import { impl, implAot } from '../bytecode-rvm/meta';
+import { impl } from '../bytecode-rvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Anima', () => {
     let evaluator: Anima
     let s = new ASTStringifier()
@@ -111,6 +114,31 @@ describe('Anima', () => {
     });
 
     describe('The exception model (%raise / %catch)', () => {
+        it('a guarded %catch catches errors in its pre too (xpcall)', () => {
+            const xp = (thunk: string, pre: string, guarded = "#t") => `(%catch ${thunk} (lambda (r) (list 'handled r)) ${pre} ${guarded})`
+            // pre's value is what the handler gets; no error, no pre
+            expect(run(xp(`(lambda () (raise 'x))`, `(lambda (e) (list 'pre e))`))).toBe("(handled (pre x))")
+            expect(run(xp(`(lambda () 7)`, `(lambda (e) 'never)`))).toBe("7")
+            // an error in pre comes to the same %catch, as an error object
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (list (error-object? r) (error-object-message r))) (lambda (e) (raise 'again)) #t)`)).toBe('(#t "error in error handling: again")')
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (error-object-message r)) (lambda (e) (car 1)) #t)`)).toMatch(/^"error in error handling: car: expected a pair/)
+            // unguarded, it goes to the handlers outside
+            expect(run(`(%catch (lambda () ${xp(`(lambda () (raise 'x))`, `(lambda (e) (raise 'again))`, "#f")}) (lambda (r) (list 'outer r)))`)).toBe("(outer again)")
+            // pre's own handlers still come first
+            expect(run(xp(`(lambda () (raise 'x))`, `(lambda (e) (try (lambda () (raise 'y)) (lambda (e2) 'recovered)))`))).toBe("(handled recovered)")
+            // in any mode, from inside calls and in tail position
+            expect(run(`(define (deep n) (if (= n 0) (raise 'bottom) (+ 1 (deep (- n 1))))) ${xp(`(lambda () (deep 50))`, `(lambda (e) (raise 'bad))`)}`)).toMatch(/^\(handled <error: error in error handling: bad>\)$/)
+            expect(() => evaluator.compileRaw(`(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) 5)`)).toThrow("%catch: guarded must be #t or #f")
+        })
+
+        it('words an error in a guarded pre through the formatter', () => {
+            const base = evaluator.intrinsics.format
+            evaluator.intrinsics.setFormatter((op, args, fmt, at) => op === Msg.ErrorInHandler ? "error in error handling" : base(op, args, fmt, at))
+            expect(run(`(%catch (lambda () (raise 'x)) (lambda (r) (error-object-message r)) (lambda (e) (raise 'again)) #t)`)).toBe('"error in error handling"')
+            const bc = evaluator.compileRaw(`(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) #t)`) as Code
+            expect(listing(bc).some(line => /HostCall +pos=%call-catching, start=r\d+, nargs=3, tail=false$/.test(line))).toBe(true)
+        })
+
         it('delivers %raise to handlers, continuable or not', () => {
             expect(run(`(with-exception-handler (lambda (e) (* e 2)) (lambda () (+ 1 (%raise 20 #t))))`)).toBe("41")
             expect(run(`(%catch (lambda () (with-exception-handler (lambda (e) 'ignored) (lambda () (%raise 'x)))) (lambda (e) (error-message e)))`)).toBe('"handler returned on non-continuable exception"')
@@ -148,6 +176,13 @@ describe('Anima', () => {
                     (lambda () (set! trace (cons 'after trace)))))
                 (list res trace)
             `)).toBe('(42 (after body before))');
+        });
+
+        it('runs %dynamic-wind as a core operation: its count checked, any values kept, in tail position too', () => {
+            expect(() => evaluator.compileRaw(`(%dynamic-wind (lambda () 1) (lambda () 2))`)).toThrow("%dynamic-wind: expected exactly 3 args, got 2");
+            expect(run(`(call-with-values (lambda () (%dynamic-wind (lambda () #f) (lambda () (values 1 2)) (lambda () #f))) list)`)).toBe("(1 2)");
+            expect(run(`(define (dw-tail n) (if (= n 0) 'done (%dynamic-wind (lambda () #f) (lambda () (dw-tail (- n 1))) (lambda () #f)))) (dw-tail 3000)`)).toBe("done");
+            expect(() => run(`(%dynamic-wind 5 (lambda () 1) (lambda () 2))`)).toThrow();
         });
 
         it('re-executes before and after thunks when jumping with continuations', () => {
@@ -194,7 +229,7 @@ describe('Anima', () => {
                         (with-exception-handler
                             (lambda (err) (k (error-message err)))
                             (lambda () undefined-variable-xyz))))
-            `)).toContain("Variable 'Symbol(undefined-variable-xyz)' is not defined");
+            `)).toContain("Variable 'undefined-variable-xyz' is not defined");
         });
 
         it('supports raise-continuable where handler returns to call site', () => {
@@ -561,7 +596,9 @@ describe('Anima', () => {
         })
 
         it('rejects escapes that leave a lambda or name no block', () => {
-            expect(() => run(`(%block k (map (lambda (x) (%escape k x)) '(1)))`)).toThrow("cannot escape to block k from inside a lambda")
+            expect(() => run(`(%block k (apply (lambda (x) (%escape k x)) '(1)))`)).toThrow("cannot escape to block k from inside a lambda")
+            // map inlines a literal lambda, so escaping from its body is fine
+            expect(run(`(%block k (map (lambda (x) (%escape k (* x 10))) '(1 2)))`)).toBe("10")
             expect(() => run(`(%escape nope 1)`)).toThrow("no enclosing block named nope")
             expect(() => run(`(%block 5 1)`)).toThrow("%block requires a block name symbol")
             // a let is an inlined lambda, so escaping through it is fine
@@ -569,7 +606,6 @@ describe('Anima', () => {
         })
 
         it('keeps the structured direct entry in AOT', () => {
-            if (_mode !== "aot") return
             const f = evaluator.evaluateRaw(evaluator.compileRaw(`(lambda (n) (let ((i 0)) (%block d (%loop (%if (= i n) (%escape d i) (%begin)) (set! i (+ i 1))))))`))
             expect(f.tmpl.code.directFn).not.toBeNull()
         })
