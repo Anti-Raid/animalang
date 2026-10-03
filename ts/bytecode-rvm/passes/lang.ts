@@ -140,31 +140,34 @@ export const mapExprs = (lang: Language, e: any[], f: (x: any) => any): any[] =>
     return changed ? p.rebuild(next) : e;
 };
 
+// why the form `e` is not laid out as its shape in `lang` says, or null if it is (its operands only, not their insides)
+export const malformed = (lang: Language, e: any[]): string | null => {
+    const isSyms = (x: any) => Array.isArray(x) && x.every(s => typeof s === "symbol");
+    switch (lang.forms.get(e[0])) {
+        case "quote":
+            return e.length === 2 ? null : "a quote of other than one datum";
+        case "lambda":
+            return e.slice(1).every(c => Array.isArray(c) && isSyms(c[0]) && isSyms(c[1]) && (c[2] === null || typeof c[2] === "symbol")) ? null : "a malformed clause";
+        case "let": case "letrec": case "let*":
+            return Array.isArray(e[1]) && e[1].every((b: any) => Array.isArray(b) && b.length === 2 && typeof b[0] === "symbol") ? null : "malformed bindings";
+        case "let-values":
+            return Array.isArray(e[1]) && e[1].every((c: any) => Array.isArray(c) && c.length === 3 && isSyms(c[0]) && (c[1] === null || typeof c[1] === "symbol")) ? null : "malformed bindings";
+        case "assign": case "label":
+            return typeof e[1] === "symbol" ? null : "a name that is not a symbol";
+        default:
+            return null;
+    }
+};
+
 // Checks that `e` is in `lang`: no core form it does not allow, and each form laid out as its shape says. For tests and
 // debugging: a pass whose output fails it left a form its output language removed, or built one wrongly
 export const check = (lang: Language, e: any): void => {
     if (!Array.isArray(e)) return;
     const fail = (why: string) => { throw new Error(`internal error: not ${lang.name}: ${why} in (${String(e[0]?.description ?? e[0])} ...)`); };
     const op = e[0];
-    const shape = lang.forms.get(op);
-    if (shape === undefined && typeof op === "symbol" && CORE_FORMS.has(op)) fail("a form the language does not have");
-    const isSyms = (x: any) => Array.isArray(x) && x.every(s => typeof s === "symbol");
-    switch (shape) {
-        case "quote":
-            if (e.length !== 2) fail("a quote of other than one datum");
-            return;
-        case "lambda":
-            for (const c of e.slice(1)) if (!Array.isArray(c) || !isSyms(c[0]) || !isSyms(c[1]) || (c[2] !== null && typeof c[2] !== "symbol")) fail("a malformed clause");
-            break;
-        case "let": case "letrec": case "let*":
-            if (!Array.isArray(e[1]) || !e[1].every((b: any) => Array.isArray(b) && b.length === 2 && typeof b[0] === "symbol")) fail("malformed bindings");
-            break;
-        case "let-values":
-            if (!Array.isArray(e[1]) || !e[1].every((c: any) => Array.isArray(c) && c.length === 3 && isSyms(c[0]) && (c[1] === null || typeof c[1] === "symbol"))) fail("malformed bindings");
-            break;
-        case "assign": case "label":
-            if (typeof e[1] !== "symbol") fail("a name that is not a symbol");
-            break;
-    }
+    if (!lang.forms.has(op) && typeof op === "symbol" && CORE_FORMS.has(op)) fail("a form the language does not have");
+    const why = malformed(lang, e);
+    if (why !== null) fail(why);
+    if (lang.forms.get(op) === "quote") return;
     for (const x of subExprs(lang, e)) check(lang, x);
 };

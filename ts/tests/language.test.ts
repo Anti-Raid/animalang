@@ -1635,6 +1635,12 @@ describe('Anima', () => {
             expect(() => run(`(define (lk5) (define (h x) x) (h)) (lk5)`)).toThrow()
         })
 
+        it('lifts a helper called where one of its free variables is shadowed, as locals have names of their own', () => {
+            const closuresIn = (src: string): number => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code).filter(k => k === "NewClosure").length
+            expect(closuresIn(`(lambda (k) (define (h) k) (let ((k 100)) (h)))`)).toBe(0)
+            expect(run(`(define (lk6 k) (define (h) k) (let ((k 100)) (list (h) k))) (lk6 1)`)).toBe("(1 100)")
+        })
+
         it('binds let* sequentially in one form', () => {
             expect(run(`(let* ((a 1) (b (+ a 1)) (a (* b 10))) (list a b))`)).toBe("(20 2)")
             expect(run(`(let* () 5)`)).toBe("5")

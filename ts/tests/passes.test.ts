@@ -51,12 +51,12 @@ describe("The compiler's passes", () => {
         const seen: string[] = [];
         anima.compiler.trace = (name, output) => {
             seen.push(name);
-            if (name === "block-escapes" || name === "split-case-lambdas" || name === "lift-lambdas") check(Lsrc, output);
+            if (name === "rename" || name === "block-escapes" || name === "split-case-lambdas" || name === "lift-lambdas") check(Lsrc, output);
         };
         anima.compileRaw(`
             (define (f . xs) (let* ((a 1) (b (+ a 1))) (call/cc (lambda (k) (if (null? xs) (k b) a)))))
             (define (g n) (define h (case-lambda ((x) x) ((x y) (+ x y)))) (letrec ((loop (lambda (i) (if (= i n) (h i) (loop (+ i 1)))))) (loop 0)))
             (let-values (((a . b) (values 1 2))) (g 3))`);
-        expect(seen).toEqual(["block-escapes", "split-case-lambdas", "lift-lambdas", "resolve", "call-liveness", "generate", "interrupts", "lower"]);
+        expect(seen).toEqual(["rename", "block-escapes", "split-case-lambdas", "lift-lambdas", "resolve", "call-liveness", "generate", "interrupts", "lower"]);
     });
 });

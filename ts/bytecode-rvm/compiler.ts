@@ -7,6 +7,7 @@ import { PAD, bodyOf, clausesOf, isPadded, isSingleLambda, optionsOf, paramsOf, 
 import { corePos, type Code } from "./exec";
 import { runPass, type Pass, type PassContext } from "./passes/pass";
 import { interruptsPass, type FunctionIR } from "./passes/interrupts";
+import { renamePass } from "./passes/rename";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
@@ -83,7 +84,8 @@ export class Compiler {
     compile(trExpr: any, debug: boolean = this.debug): Code {
         const ctx: PassContext = { intrinsics: this.intrinsics, debug, trace: this.trace }
         try {
-            const escaped = runPass(escapesPass, trExpr, ctx)
+            const renamed = runPass(renamePass, trExpr, ctx)
+            const escaped = runPass(escapesPass, renamed, ctx)
             const split = runPass(caseLambdasPass, escaped, ctx)
             const lifted = runPass(liftPass, split, ctx)
             const analyzed = runPass(callLivenessPass, runPass(resolvePass, lifted, ctx), ctx)
