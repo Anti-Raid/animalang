@@ -118,8 +118,9 @@ describe("The optimizer", () => {
         // a padded clause (Lua): missing parameters <#void>, extra arguments evaluated and dropped
         const S = Symbol.for;
         const anima = make(true);
-        const padded = [S("%lambda"), [[S("pad")], [S("a"), S("b")], null, [S("%list"), S("a"), S("b")]]];
-        const program = [S("%let"), [[S("f"), padded]], [S("%list"), [S("f"), 1], [S("f"), 1, 2, [S("%list"), 3]]]];
+        const list = (...xs: any[]) => [S("%intcall"), S("%list"), ...xs];
+        const padded = [S("%lambda"), [[S("pad")], [S("a"), S("b")], null, list(S("a"), S("b"))]];
+        const program = [S("%let"), [[S("f"), padded]], list([S("%call"), S("f"), 1], [S("%call"), S("f"), 1, 2, list(3)])];
         expect(s.stringify(anima.evaluateRaw(anima.compiler.compile(program)))).toBe("((1 <#void>) (1 2))");
     });
 

@@ -1,4 +1,4 @@
-import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
+import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_CALL, CORE_INTCALL, CORE_INTAPPLY, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
 import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -239,25 +239,37 @@ export class Compiler {
                 case OP_APPLY:
                     this.#compileApply(expr, opts)
                     return
-            }
-
-            const intrinsic = this.intrinsics.get(operator)
-            if (intrinsic !== undefined && intrinsic.leaf) {
-                this.#compileRuntimeOp(expr, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
-                    this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "IntCall", pos: intrinsic.pos, destReg, startReg: start, nargs }))
-                })
-                return
-            }
-            if (intrinsic !== undefined) {
-                this.#compileRuntimeOp(expr, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
-                    // an intrinsic whose value is that of the call itself (see `tail`) is a call and then a return
-                    opts.nodes.push({ t: "HostCall", pos: intrinsic.pos, startReg: start, nargs, isTail: opts.isTail && intrinsic.tail, destReg: dest })
-                })
-                return
+                case CORE_INTAPPLY:
+                    this.#compileIntApply(expr, opts)
+                    return
+                case CORE_CALL:
+                    if (expr.length < 2) throw new VMError(Msg.FormArgs, ["%call", "a procedure", 0])
+                    this.#compileNormalCall(expr.slice(1), opts)
+                    return
+                case CORE_INTCALL: {
+                    const intrinsic = this.#intrinsicNamed("%intcall", expr)
+                    const call = expr.slice(1)
+                    if (intrinsic.leaf) {
+                        this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                            this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "IntCall", pos: intrinsic.pos, destReg, startReg: start, nargs }))
+                        })
+                        return
+                    }
+                    this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                        // an intrinsic whose value is that of the call itself (see `tail`) is a call and then a return
+                        opts.nodes.push({ t: "HostCall", pos: intrinsic.pos, startReg: start, nargs, isTail: opts.isTail && intrinsic.tail, destReg: dest })
+                    })
+                    return
+                }
             }
         }
+        throw new VMError(Msg.BareCall, [operator])
+    }
 
-        this.#compileNormalCall(expr, opts)
+    #intrinsicNamed(form: string, expr: any[]): Intrinsic {
+        const intrinsic = typeof expr[1] === "symbol" ? this.intrinsics.get(expr[1]) : undefined
+        if (intrinsic === undefined) throw new VMError(Msg.UnknownIntrinsic, [form, expr[1]])
+        return intrinsic
     }
 
     #compileBegin(expr: any[], opts: CmpOpts) {
@@ -594,19 +606,23 @@ export class Compiler {
         const procExpr = expr[1];
         const argExprs = expr.slice(2);
         argExprs[argExprs.length - 1] = this.#forwarded(argExprs[argExprs.length - 1], opts);
-        const intrinsic = typeof procExpr === "symbol" ? this.intrinsics.get(procExpr) : undefined;
-        if (intrinsic !== undefined) {
-            this.#compileApplyIntrinsic(intrinsic, argExprs, opts);
-            return;
-        }
         this.#compileApplyCall(procExpr, argExprs, opts, argExprs.length === 1 && this.#isFresh(argExprs[0]) ? "%apply-fresh" : "%apply-array");
     }
 
-    // a call of an intrinsic that returns a new array, or an %apply of one
+    #compileIntApply(expr: any[], opts: CmpOpts) {
+        if (expr.length < 3) {
+            throw new VMError(Msg.FormArgs, ["%intapply", "at least 2 arguments (intrinsic, ...args, array)", expr.length - 1]);
+        }
+        const intrinsic = this.#intrinsicNamed("%intapply", expr);
+        const argExprs = expr.slice(2);
+        argExprs[argExprs.length - 1] = this.#forwarded(argExprs[argExprs.length - 1], opts);
+        this.#compileApplyIntrinsic(intrinsic, argExprs, opts);
+    }
+
+    // a call of an intrinsic that returns a new array, or an %intapply of one
     #isFresh(expr: any): boolean {
-        if (!Array.isArray(expr) || typeof expr[0] !== "symbol") return false
-        const op = expr[0] === OP_APPLY && typeof expr[1] === "symbol" ? expr[1] : expr[0]
-        return this.intrinsics.get(op)?.fresh === true
+        if (!Array.isArray(expr) || (expr[0] !== CORE_INTCALL && expr[0] !== CORE_INTAPPLY) || typeof expr[1] !== "symbol") return false
+        return this.intrinsics.get(expr[1])?.fresh === true
     }
 
     // applying a procedure is a call of the core operation %apply-array (or %apply-fresh) over [proc, arg ..., array]
@@ -622,7 +638,7 @@ export class Compiler {
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
-    // (%apply %intrinsic arg ... lst): the argument count is only known at run time, so IntApply checks it there
+    // (%intapply %intrinsic arg ... lst): the argument count is only known at run time, so IntApply checks it there
     #compileApplyIntrinsic(intrinsic: Intrinsic, argExprs: any[], opts: CmpOpts) {
         if (!intrinsic.leaf) throw new VMError(Msg.ApplyNonLeaf, [intrinsic.name]);
         const nargs = argExprs.length;
@@ -635,7 +651,7 @@ export class Compiler {
     // (spread x) of a forwarded rest parameter is x itself (see VariableMetadata.forwardsRest)
     #forwarded(expr: any, opts: CmpOpts): any {
         if (!isSpreadOf(expr, this.intrinsics)) return expr
-        const sym = expr[1]
+        const sym = expr[2]
         return opts.scope.resolve(sym).type === "Local" && opts.forwards.has(sym) ? sym : expr
     }
 

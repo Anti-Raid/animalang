@@ -33,6 +33,7 @@ export enum Msg {
     EmptyForm, IfArgs, QuoteArgs, FormArgs, LambdaForm, SetTarget, EscapeNoBlock, EscapeFromLambda,
     BadSyntax, ParamNotSymbol, DuplicateParam, CannotBindBuiltin, CannotBindIntrinsic, IntrinsicAsValue, ApplyNonLeaf,
     NoClause, LambdaOption, UnreachableClause, BarrierReentry, NoPrompt, ErrorInHandler, CatchGuard,
+    BareCall, UnknownIntrinsic,
 }
 
 export type Formatter = (op: Msg, args: readonly any[], fmt: Formatter, at: SourcePos | null) => string;
@@ -107,6 +108,10 @@ export const CORE_LAMBDA = Symbol.for("%lambda");
 export const CORE_QUOTE = Symbol.for("%quote");
 export const CORE_BEGIN = Symbol.for("%begin");
 export const CORE_SET = Symbol.for("%set!");
+// (%call proc arg ...), (%intcall %name arg ...), (%intapply %name arg ... seq): every call is one of these
+export const CORE_CALL = Symbol.for("%call");
+export const CORE_INTCALL = Symbol.for("%intcall");
+export const CORE_INTAPPLY = Symbol.for("%intapply");
 // structured control flow within one function: (%block name body ...), (%escape name [expr]), (%loop body ...)
 export const CORE_BLOCK = Symbol.for("%block");
 export const CORE_ESCAPE = Symbol.for("%escape");
@@ -142,6 +147,9 @@ export const SPECIAL_FORMS = new Set([
     CORE_QUOTE,
     CORE_BEGIN,
     CORE_SET,
+    CORE_CALL,
+    CORE_INTCALL,
+    CORE_INTAPPLY,
     CORE_BLOCK,
     CORE_ESCAPE,
     CORE_LOOP,

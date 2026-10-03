@@ -5,14 +5,14 @@
 //  - a call of a foldable intrinsic on constants is its value (if it does not throw), and an %if on a constant test its
 //    branch (only #f is false)
 //  - what is computed only for its effects, and has none, is dropped: an unused binding of such a value too
-//  - ((%lambda (x ...) body) arg ...) is (%let ((x arg) ...) body), and a call of a local lambda is its body so bound,
+//  - (%call (%lambda (x ...) body) arg ...) is (%let ((x arg) ...) body), and a call of a local lambda is its body so bound,
 //    when the lambda is called once and used no other way (its binding then goes), or is small, within a total budget.
 //    A %letrec's lambdas are not inlined in their own group, so a self tail call stays a loop
 // Nothing is moved past anything else, and a call that could fail or have an effect is never dropped or run early. Forms
 // whose binders code generation rejects, and lambdas that escape to a %block outside them, are left as they are, so their
 // errors stay. Globals are never inlined or
 // propagated: they can be changed
-import { CORE_BEGIN, CORE_BLOCK, CORE_ESCAPE, CORE_IF, CORE_LAMBDA, CORE_LET, CORE_LOOP, CORE_QUOTE, SOURCE_POS, SPECIAL_FORMS } from "../../common";
+import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LOOP, CORE_QUOTE, SOURCE_POS, SPECIAL_FORMS } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED, isLetrecLambda, isPadded, unwrapBoxed } from "../lambda";
@@ -56,12 +56,19 @@ const asConst = (v: any): any => typeof v === "symbol" || (typeof v === "object"
 
 const children = (e: any): any[] => Array.isArray(e) && e[0] !== CORE_QUOTE ? subExprs(Lconv, e) : [];
 
+// what a form's head and intrinsic name add to its size, as when a call was (f arg ...) and an intrinsic's (%name arg ...)
+const headWeight = (x: any): number => {
+    if (!Array.isArray(x) || x[0] === CORE_CALL) return 0;
+    if (x[0] === CORE_INTAPPLY) return 2;
+    return x[0] === CORE_INTCALL || Lconv.forms.get(x[0]) === "exprs" ? 1 : 0;
+};
+
 // how many forms `e` has, counting up to just past `limit`
 const sizeOf = (e: any, limit: number): number => {
     let n = 0;
     const walk = (x: any) => {
         if (n > limit) return;
-        n++;
+        n += 1 + headWeight(x);
         for (const y of children(x)) walk(y);
     };
     walk(e);
@@ -86,7 +93,7 @@ const usesIn = (es: readonly any[], sym: symbol): number => {
 
 // whether every use of `sym` in `es` is as the operator of a call
 const onlyCalledIn = (es: readonly any[], sym: symbol): boolean => {
-    const walk = (x: any): boolean => x !== sym && children(x).every((y, i) => i === 0 && y === sym && x[0] === sym ? true : walk(y));
+    const walk = (x: any): boolean => x !== sym && children(x).every((y, i) => i === 0 && y === sym && x[0] === CORE_CALL ? true : walk(y));
     return es.every(walk);
 };
 
@@ -147,7 +154,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     const prepare = (lambda: any): any[] | null => {
         let closed = prepared.get(lambda);
         if (closed === undefined) {
-            closed = [...freeIn(lambda, new Set(), new Set())].every(sym => isCoreForm(sym) || intrinsics.get(sym) !== undefined);
+            closed = freeIn(lambda, new Set(), new Set()).size === 0;
             prepared.set(lambda, closed);
         }
         if (!closed) return null;
@@ -157,7 +164,9 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         return converted.ast;
     };
 
-    const intrinsicOf = (op: any) => typeof op === "symbol" && !isCoreForm(op) ? intrinsics.get(op) : undefined;
+    const intrinsicOf = (name: any) => typeof name === "symbol" ? intrinsics.get(name) : undefined;
+    const PACK = intrinsics.pack !== undefined ? Symbol.for(intrinsics.pack.name) : ARRAY;
+    const isIntCall = (e: any, name: symbol) => Array.isArray(e) && e[0] === CORE_INTCALL && e[1] === name;
     const canBind = (n: any) => typeof n === "symbol" && !SPECIAL_FORMS.has(n) && intrinsics.reserved.get(n) === undefined && !isCoreForm(n) && intrinsics.get(n) === undefined;
     // binders code generation accepts (any other form fails to compile, so is left as it is)
     const validBinders = (names: any[]) => names.every(canBind) && new Set(names).size === names.length;
@@ -173,8 +182,8 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         if (op === UNBOX) return e.length === 2 && locals.has(e[1]);
         if (op === BOX) return e.length === 2 && effectFree(e[1]);
         if (op === CORE_BEGIN) return e.slice(1).every(effectFree);
-        const entry = intrinsicOf(op);
-        if (entry?.effectFree && e.length - 1 >= entry.min && e.length - 1 <= entry.max && e.slice(1).every(effectFree)) {
+        const entry = op === CORE_INTCALL ? intrinsicOf(e[1]) : undefined;
+        if (entry?.effectFree && e.length - 2 >= entry.min && e.length - 2 <= entry.max && e.slice(2).every(effectFree)) {
             assumed.add(entry.pos);
             return true;
         }
@@ -215,15 +224,15 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
 
     // the elements of a sequence made of locals and constants (by the table's pack, or %array where it has none), or null
     const sequenceOf = (e: any): any[] | null => {
-        if (!Array.isArray(e) || e[0] !== (intrinsics.pack !== undefined ? Symbol.for(intrinsics.pack.name) : ARRAY)) return null;
-        return e.slice(1).every(x => isConst(x) || (typeof x === "symbol" && locals.has(x))) ? e.slice(1) : null;
+        if (!isIntCall(e, PACK)) return null;
+        return e.slice(2).every((x: any) => isConst(x) || (typeof x === "symbol" && locals.has(x))) ? e.slice(2) : null;
     };
     // what %apply takes last: an array, or of the table's own sequences, what its spread makes of one
     const elementsOf = (last: any): any[] | null => {
-        if (intrinsics.pack === undefined) return Array.isArray(last) && last[0] === ARRAY ? last.slice(1) : null;
-        if (intrinsics.spread === undefined || !Array.isArray(last) || last[0] !== Symbol.for(intrinsics.spread.name) || last.length !== 2) return null;
-        const packed = last[1];
-        return Array.isArray(packed) && packed[0] === Symbol.for(intrinsics.pack.name) ? packed.slice(1) : null;
+        if (intrinsics.pack === undefined) return isIntCall(last, ARRAY) ? last.slice(2) : null;
+        if (intrinsics.spread === undefined || !isIntCall(last, Symbol.for(intrinsics.spread.name)) || last.length !== 3) return null;
+        const packed = last[2];
+        return isIntCall(packed, PACK) ? packed.slice(2) : null;
     };
 
     // the bindings still needed: those with an init that may do something, and those the body or a needed binding's init
@@ -341,12 +350,25 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 const elems = elementsOf(next[next.length - 1]);
                 if (elems === null) return next;
                 // (%apply f x ... ys) of a sequence made right there: a call of f with x ... and the elements
-                const call = keepPos([next[1], ...next.slice(2, -1), ...elems], e);
-                const entry = intrinsicOf(next[1]);
-                if (entry !== undefined && (!entry.leaf || call.length - 1 < entry.min || call.length - 1 > entry.max)) return next;
-                if (entry === undefined && typeof next[1] === "symbol" && isCoreForm(next[1])) return next;
-                return walkCall(call, ctx, k);
+                return walkCall(keepPos([CORE_CALL, next[1], ...next.slice(2, -1), ...elems], e), ctx, k);
             }
+            case CORE_INTAPPLY: {
+                if (e.length < 3 || typeof e[1] !== "symbol") break;
+                const next = keepPos([op, e[1], ...e.slice(2).map((x: any) => value(x))], e);
+                const elems = elementsOf(next[next.length - 1]);
+                const entry = intrinsicOf(e[1]);
+                if (elems === null || entry === undefined) return next;
+                // an applied intrinsic whose count does not fit is left to fail when it runs
+                const call = keepPos([CORE_INTCALL, e[1], ...next.slice(2, -1), ...elems], e);
+                if (call.length - 2 < entry.min || call.length - 2 > entry.max) return next;
+                return walkIntrinsic(call, ctx, k);
+            }
+            case CORE_CALL:
+                if (e.length < 2) break;
+                return walkCall(e, ctx, k);
+            case CORE_INTCALL:
+                if (intrinsicOf(e[1]) === undefined) break;
+                return walkIntrinsic(e, ctx, k);
             // an inlined body's tail position is its procedure's
             case INLINED:
             case TAIL_INLINED: {
@@ -355,11 +377,8 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 return items.length === 0 || (items.length === 1 && isConst(items[0])) ? asExpr(items, e) : keepPos([op, e[1], ...items], e);
             }
         }
-        if (shape !== undefined || isCoreForm(op)) {
-            const next = mapExprs(Lconv, e, x => x === op ? x : value(x));
-            return ctx === "effect" && (op === BOX || op === UNBOX) && effectFree(next) ? VOID : next;
-        }
-        return walkCall(e, ctx, k);
+        const next = mapExprs(Lconv, e, x => value(x));
+        return ctx === "effect" && (op === BOX || op === UNBOX) && effectFree(next) ? VOID : next;
     };
 
     // the variable `sym` is a copy of, if it is one
@@ -395,46 +414,48 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     const inlined = (name: string, lambda: any[], call: any[], ctx: Ctx, k: K): any => {
         const [, params, rest] = lambda[1];
         // a lambda passed keeps its own name (the compiler names a lambda after the variable it is bound to)
-        const own = call.slice(1).map((x: any) => Array.isArray(x) && x[0] === CORE_LAMBDA ? [Symbol(lambdaName(x)), x] : null);
-        const args = call.slice(1).map((x: any, i: number) => own[i]?.[0] ?? x);
+        const own = call.slice(2).map((x: any) => Array.isArray(x) && x[0] === CORE_LAMBDA ? [Symbol(lambdaName(x)), x] : null);
+        const args = call.slice(2).map((x: any, i: number) => own[i]?.[0] ?? x);
         const extra = args.slice(params.length).map((x: any) => [Symbol("arg"), x]);
         const bindings = [...params.map((p: symbol, i: number) => [p, i < args.length ? args[i] : VOID]), ...extra];
         const marked = keepPos([k.tail ? TAIL_INLINED : INLINED, Symbol(name), ...lambda[1].slice(3)], call);
-        const packed = rest === null ? marked : keepPos([CORE_LET, [[rest, [intrinsics.pack !== undefined ? Symbol.for(intrinsics.pack.name) : ARRAY, ...extra.map((b: any[]) => b[0])]]], marked], call);
+        const packed = rest === null ? marked : keepPos([CORE_LET, [[rest, [CORE_INTCALL, PACK, ...extra.map((b: any[]) => b[0])]]], marked], call);
         const bound = keepPos([CORE_LET, bindings, packed], call);
         const lambdas = own.filter(b => b !== null);
         return walk(lambdas.length === 0 ? bound : keepPos([CORE_LET, lambdas, bound], call), ctx, k);
     };
 
-    const walkCall = (e: any[], ctx: Ctx, k: K): any => {
-        const op = e[0];
-        const entry = intrinsicOf(op);
-        if (entry !== undefined) {
-            const args = e.slice(1).map(x => walk(x, "value", notTail(k)));
-            if (entry.foldable && args.length >= entry.min && args.length <= entry.max && args.every(isConst)) {
-                try {
-                    const folded = entry.fn(args.map(constValue), 0, args.length);
-                    assumed.add(entry.pos);
-                    return ctx === "effect" ? VOID : asConst(folded);
-                } catch {
-                    // left to throw when it runs
-                }
+    const walkIntrinsic = (e: any[], ctx: Ctx, k: K): any => {
+        const entry = intrinsicOf(e[1])!;
+        const args = e.slice(2).map(x => walk(x, "value", notTail(k)));
+        if (entry.foldable && args.length >= entry.min && args.length <= entry.max && args.every(isConst)) {
+            try {
+                const folded = entry.fn(args.map(constValue), 0, args.length);
+                assumed.add(entry.pos);
+                return ctx === "effect" ? VOID : asConst(folded);
+            } catch {
+                // left to throw when it runs
             }
-            // the empty sequence, when it is no new object (as an empty list is not)
-            if (entry === intrinsics.pack && args.length === 0) {
-                const empty = entry.fn([], 0, 0);
-                if (typeof empty !== "object" || empty === null) return ctx === "effect" ? VOID : empty;
-            }
-            const call = keepPos([op, ...args], e);
-            return ctx === "effect" && effectFree(call) ? VOID : call;
         }
+        // the empty sequence, when it is no new object (as an empty list is not)
+        if (entry === intrinsics.pack && args.length === 0) {
+            const empty = entry.fn([], 0, 0);
+            if (typeof empty !== "object" || empty === null) return ctx === "effect" ? VOID : empty;
+        }
+        const call = keepPos([CORE_INTCALL, e[1], ...args], e);
+        return ctx === "effect" && effectFree(call) ? VOID : call;
+    };
+
+    const walkCall = (e: any[], ctx: Ctx, k: K): any => {
+        const op = e[1];
+        const nargs = e.length - 2;
         // a lambda applied, or a local bound to one: its body, its parameters bound to the arguments
         const head = aliasOf(op, k.env);
-        if (inlinable(head) && fits(head[1], e.length - 1)) {
+        if (inlinable(head) && fits(head[1], nargs)) {
             return inlined(lambdaName(head), head, e, ctx, k);
         }
         const info = typeof head === "symbol" ? k.env.get(head) : undefined;
-        if (info?.k === "lambda" && !k.own.has(head) && fits(info.lambda[1], e.length - 1)) {
+        if (info?.k === "lambda" && !k.own.has(head) && fits(info.lambda[1], nargs)) {
             const size = sizeOf(info.lambda, INLINE_SIZE);
             if (info.once || (size <= INLINE_SIZE && budget >= size)) {
                 if (!info.once) budget -= size;
@@ -443,15 +464,15 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         }
         // a known global's procedure, where it would pay: an argument it may call is a lambda or a known procedure
         const known = typeof head === "symbol" && !locals.has(head) && !k.own.has(head) ? intrinsics.known.get(head) : undefined;
-        if (known !== undefined && e.slice(1).some(x => knownProcedure(x, k.env))) {
+        if (known !== undefined && e.slice(2).some(x => knownProcedure(x, k.env))) {
             const size = sizeOf(known.lambda, KNOWN_SIZE);
-            const lambda = size <= KNOWN_SIZE && budget >= size && fits(known.lambda[1], e.length - 1) ? prepare(known.lambda) : null;
+            const lambda = size <= KNOWN_SIZE && budget >= size && fits(known.lambda[1], nargs) ? prepare(known.lambda) : null;
             if (lambda !== null && inlinable(lambda)) {
                 budget -= size;
                 return inlined(known.name, lambda, e, ctx, { ...k, own: new Set([...k.own, head]) });
             }
         }
-        return keepPos([walk(op, "value", notTail(k)), ...e.slice(1).map(x => walk(x, "value", notTail(k)))], e);
+        return keepPos([CORE_CALL, walk(op, "value", notTail(k)), ...e.slice(2).map(x => walk(x, "value", notTail(k)))], e);
     };
 
     // whether `x` is a procedure the optimizer knows the body of

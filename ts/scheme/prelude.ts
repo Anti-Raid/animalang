@@ -146,7 +146,7 @@ const knownIn = (core: any): [string, any][] => {
 export const loadPrelude = (cmp: Compiler, vm: AnimaVM, evaluator: MacroEvaluator, intrinsics: Intrinsics): Env => {
     if (PRELUDE_CODE === null) {
         const preludeAst = new ASP(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, true, "<prelude>").parse()
-        const core = toCore(evaluator.transform(preludeAst))
+        const core = toCore(evaluator.transform(preludeAst), evaluator.intrinsics)
         KNOWN = knownIn(core)
         const compiled = cmp.compile(core, false)
         PRELUDE_CODE = compiled.fresh(new Map(), schemeBase())

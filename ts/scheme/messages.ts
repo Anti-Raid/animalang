@@ -66,6 +66,8 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.UnreachableClause: return "%lambda: a clause after a padded one would never run";
         case Msg.BarrierReentry: return "cannot re-enter a continuation barrier";
         case Msg.NoClause: return `${a[0]}: no clause takes ${a[1]} args`;
+        case Msg.BareCall: return `bad syntax: ${name(a[0])} is not a core form (a call is (%call proc arg ...) or (%intcall %name arg ...))`;
+        case Msg.UnknownIntrinsic: return `${a[0]}: ${name(a[1])} is not an intrinsic`;
         case Msg.ApplyNonLeaf: return `%apply: ${a[0]} is not a leaf intrinsic, so it cannot be applied`;
         default: {
             const unworded: never = op;

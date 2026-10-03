@@ -5,7 +5,6 @@
 // The walk follows code generation's order: a %letrec's lambdas before its other inits, a %catch's thunk and pre-handler
 // before its handler, an %apply's forwarded rest list before the rest
 import { isSpreadOf } from "../analysis";
-import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { isLetrecLambda, unwrapBoxed } from "../lambda";
 import { malformed } from "./lang";
@@ -27,7 +26,6 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
             if (!f.captures.includes(sym)) f.captures.push(sym);
         }
     };
-    const isIntrinsic = (op: any) => typeof op === "symbol" && (isCoreForm(op) || intrinsics.get(op) !== undefined);
 
     // `used`: whether the value is used (a lambda whose value is not is not made); `blocks`: the same of each %block
     const body = (items: any[], fn: Fn, used: boolean, blocks: ReadonlyMap<symbol, boolean>) =>
@@ -103,14 +101,16 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
                 return walk(e[3], fn, used, blocks);
             case Symbol.for("%catch"):
                 return all(e.length >= 4 ? [e[1], e[3], e[2]] : [e[1], e[2]]);
-            case Symbol.for("%apply"): {
+            case Symbol.for("%apply"):
+            case Symbol.for("%intapply"): {
+                const from = op === Symbol.for("%apply") ? 1 : 2;
                 const last = e[e.length - 1];
-                if (e.length > 2 && isSpreadOf(last, intrinsics)) use(last[1], fn);
-                return all(isIntrinsic(e[1]) ? e.slice(2) : e.slice(1));
+                if (e.length > 2 && isSpreadOf(last, intrinsics)) use(last[2], fn);
+                return all(e.slice(from));
             }
         }
-        // a call: of an intrinsic, its arguments; else the procedure, then the arguments
-        all(isIntrinsic(op) ? e.slice(1) : e);
+        // a call: the procedure, then the arguments; an intrinsic's, its arguments
+        all(e.slice(op === Symbol.for("%intcall") ? 2 : 1));
     };
     walk(ast, { parent: null, captures: [] }, true, new Map());
     return out;

@@ -874,7 +874,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (typeof onsym !== "symbol") throw new Error(`anima-macro onsym must be a constant symbol right now`);
         let cmpexpr = list(OP_LAMBDA, list(Symbol.for("orig")), expr.cdr.car);
         let trCmpExpr = evaluator.transform(cmpexpr);
-        let cmpExprBc = evaluator.expandcmp.compile(toCore(trCmpExpr));
+        let cmpExprBc = evaluator.expandcmp.compile(toCore(trCmpExpr, evaluator.intrinsics));
         const res: Closure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
         evaluator.registerTransform(onsym, (evaluator, expr, orig) => {
             const resp = evaluator.expandvm.evaluateClosure(res, evaluator.scope, [orig]);

@@ -16,6 +16,9 @@ import {
   CORE_CATCH,
   OP_CURRENT_MARKS,
   OP_DEFINE_GLOBAL,
+  CORE_CALL,
+  CORE_INTCALL,
+  CORE_INTAPPLY,
 } from "../common";
 import { AnalysisScope, VariableMetadata } from "./scope";
 import { subExprs as subExprsOf } from "./passes/lang";
@@ -59,9 +62,9 @@ const lateValues = (bindings: [symbol, any][]): symbol[] => {
     return late;
 };
 
-// (spread x) of the table's spread intrinsic, x a variable
-export const isSpreadOf = (e: any, intrinsics: Intrinsics): e is [symbol, symbol] =>
-    intrinsics.spread !== undefined && Array.isArray(e) && e.length === 2 && e[0] === Symbol.for(intrinsics.spread.name) && typeof e[1] === "symbol";
+// (%intcall spread x) of the table's spread intrinsic, x a variable
+export const isSpreadOf = (e: any, intrinsics: Intrinsics): e is [symbol, symbol, symbol] =>
+    intrinsics.spread !== undefined && Array.isArray(e) && e.length === 3 && e[0] === CORE_INTCALL && e[1] === Symbol.for(intrinsics.spread.name) && typeof e[2] === "symbol";
 
 export class AstAnalysis {
     scopeMap = new WeakMap<object, AnalysisScope>();
@@ -168,15 +171,17 @@ export class AstAnalysis {
                 this.visit(ast[2], scope);
                 return;
             // (%apply proc arg ... (spread x)): x is only spread, so it may be a forwarded rest parameter
-            case OP_APPLY: {
+            case OP_APPLY:
+            case CORE_INTAPPLY: {
+                const from = op === OP_APPLY ? 1 : 2;
                 const last = ast[ast.length - 1];
-                for (const e of ast.slice(1, -1)) this.visit(e, scope);
-                if (ast.length > 2 && isSpreadOf(last, this.intrinsics)) scope.readApplyList(last[1]);
+                for (const e of ast.slice(from, -1)) this.visit(e, scope);
+                if (ast.length > 2 && isSpreadOf(last, this.intrinsics)) scope.readApplyList(last[2]);
                 else if (ast.length > 2) this.visit(last, scope);
                 return;
             }
         }
-        for (const e of ast) this.visit(e, scope);
+        for (const e of ast.slice(op === CORE_INTCALL ? 2 : 1)) this.visit(e, scope);
     }
 }
 
@@ -215,15 +220,11 @@ class CallLiveness {
         return live;
     }
 
-    // whether calling this operator never calls back into the VM, where a continuation of the current frame could be captured
-    #isLeaf(op: any): boolean {
-        if (typeof op !== "symbol") return false;
-        return (CORE_FORMS.get(op) ?? this.intrinsics.get(op))?.leaf ?? false;
-    }
-
-    // intrinsics' operands are expressions, but the operator is not evaluated
-    #isIntrinsic(op: any): boolean {
-        return typeof op === "symbol" && (CORE_FORMS.has(op) || this.intrinsics.get(op) !== undefined);
+    // whether the form never calls back into the VM, where a continuation of the current frame could be captured
+    #isLeaf(ast: any[]): boolean {
+        const op = ast[0];
+        if (op === CORE_INTCALL || op === CORE_INTAPPLY) return this.intrinsics.get(ast[1])?.leaf ?? false;
+        return CORE_FORMS.get(op)?.leaf ?? false;
     }
 
     // the variables bound by a %let / %let-values, as they are known in its own scope
@@ -344,10 +345,10 @@ class CallLiveness {
 
         // a call (or intrinsic): operands are evaluated first, then the call runs; anything live after a call that is not a
         // leaf could be read after re-entering a continuation captured during it
-        if (!this.#isLeaf(op)) {
+        if (!this.#isLeaf(ast)) {
             for (const meta of out) meta.liveAcrossCall = true;
         }
-        const operands = this.#isIntrinsic(op) ? ast.slice(1) : ast;
+        const operands = ast.slice(op === CORE_INTCALL || op === CORE_INTAPPLY ? 2 : 1);
         let live = out;
         for (let i = operands.length - 1; i >= 0; i--) live = this.expr(operands[i], scope, live, blocks);
         return live;

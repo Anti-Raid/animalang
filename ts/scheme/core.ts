@@ -1,6 +1,8 @@
 // The transformer's output (core forms as Scheme lists) as the compiler's input: core forms as arrays (see
 // bytecode-rvm/README.md). Quoted data stays Scheme data; a vector literal, being an array, is quoted
-import { CORE_BLOCK, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
+import { CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
+import { isCoreForm } from "../bytecode-rvm/core";
+import type { Intrinsics } from "../bytecode-rvm/intrinsics";
 import { Cons } from "./list";
 import { OP_CASE_LAMBDA } from "./symbols";
 import { ASTStringifier } from "./printer";
@@ -16,12 +18,16 @@ const formals = (f: any): [symbol[], symbol | null] => {
     return [params, p];
 };
 
-export const toCore = (e: any): any => {
+const OP_APPLY = Symbol.for("%apply");
+
+export const toCore = (e: any, intrinsics: Intrinsics): any => {
+    const toCore_ = (x: any) => toCore(x, intrinsics);
+    const isIntrinsic = (x: any) => typeof x === "symbol" && !isCoreForm(x) && intrinsics.get(x) !== undefined;
     if (Array.isArray(e)) return [CORE_QUOTE, e];
     if (!(e instanceof Cons)) return e;
     if (e.isImproper()) throw new Error(`bad syntax: illegal use of dotted pair in execution context (consider quoting e.g. '${new ASTStringifier().stringify(e)}')`);
     const items = e.toArray();
-    const body = (from: number) => items.slice(from).map(toCore);
+    const body = (from: number) => items.slice(from).map(toCore_);
     let out: any[];
     switch (items[0]) {
         case CORE_QUOTE:
@@ -38,7 +44,7 @@ export const toCore = (e: any): any => {
         case OP_CASE_LAMBDA: {
             const clauses = items.slice(1).map(c => {
                 if (!(c instanceof Cons) || c.car !== CORE_LAMBDA) throw new Error("%case-lambda clauses must be %lambda forms");
-                return toCore(c)[1];
+                return toCore_(c)[1];
             });
             if (clauses.length === 0) throw new Error("case-lambda needs a clause");
             out = [CORE_LAMBDA, ...clauses];
@@ -49,14 +55,14 @@ export const toCore = (e: any): any => {
         case CORE_LETREC:
             out = [items[0], toArr(items[1]).map(b => {
                 const s = SOURCE_POS.get(b);
-                const binding = [b.car, toCore(b.cdr.car)];
+                const binding = [b.car, toCore_(b.cdr.car)];
                 if (s !== undefined) SOURCE_POS.set(binding, s);
                 return binding;
             }), ...body(2)];
             break;
         case CORE_LET_VALUES:
         case CORE_LET_VALUES_STRICT:
-            out = [items[0], toArr(items[1]).map(c => [...formals(c.car), toCore(c.cdr.car)]), ...body(2)];
+            out = [items[0], toArr(items[1]).map(c => [...formals(c.car), toCore_(c.cdr.car)]), ...body(2)];
             break;
         case CORE_SET:
         case OP_DEFINE_GLOBAL:
@@ -64,8 +70,13 @@ export const toCore = (e: any): any => {
         case CORE_ESCAPE:
             out = [items[0], items[1], ...body(2)];
             break;
+        case OP_APPLY:
+            out = isIntrinsic(items[1]) ? [CORE_INTAPPLY, items[1], ...body(2)] : [OP_APPLY, ...body(1)];
+            break;
         default:
-            out = items.map(toCore);
+            if (typeof items[0] === "symbol" && isCoreForm(items[0])) out = [items[0], ...body(1)];
+            else if (isIntrinsic(items[0])) out = [CORE_INTCALL, items[0], ...body(1)];
+            else out = [CORE_CALL, ...body(0)];
     }
     const pos = SOURCE_POS.get(e);
     if (pos !== undefined) SOURCE_POS.set(out, pos);

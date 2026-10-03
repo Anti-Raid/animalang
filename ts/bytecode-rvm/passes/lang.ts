@@ -13,8 +13,9 @@ import { bodyOf, clausesOf, namesOf } from "../lambda";
 //  - let-values: [[params, rest, init] ...], body ...
 //  - assign: name, expr (%set!, %define-global)
 //  - label: name, expr ... (%block, %escape: the name is a label, not a variable)
-//  - exprs: every element is an expression, the head included (as in a call)
-export type Shape = "quote" | "lambda" | "let" | "letrec" | "let*" | "let-values" | "assign" | "label" | "exprs";
+//  - intrinsic: an intrinsic's name, expr ... (%intcall, %intapply)
+//  - exprs: every operand is an expression
+export type Shape = "quote" | "lambda" | "let" | "letrec" | "let*" | "let-values" | "assign" | "label" | "intrinsic" | "exprs";
 
 export type Language = { readonly name: string, readonly forms: ReadonlyMap<symbol, Shape> };
 
@@ -39,6 +40,9 @@ export const Lsrc = language("Lsrc", {
     "%let-values/strict": "let-values",
     "%set!": "assign",
     "%define-global": "assign",
+    "%call": "exprs",
+    "%intcall": "intrinsic",
+    "%intapply": "intrinsic",
     "%block": "label",
     "%escape": "label",
     "%if": "exprs",
@@ -64,7 +68,8 @@ export type Parts = { exprs: [any, symbol[]][], rebuild: (next: any[]) => any, s
 export const parts = (lang: Language, e: any[]): Parts => {
     const same = (exprs: [any, symbol[]][], rebuild: (next: any[]) => any): Parts => ({ exprs, rebuild: next => keepPos(rebuild(next), e) });
     const op = e[0];
-    switch (lang.forms.get(op) ?? "exprs") {
+    switch (lang.forms.get(op)) {
+        case undefined:
         case "quote":
             return { exprs: [], rebuild: () => e };
         case "lambda": {
@@ -105,9 +110,10 @@ export const parts = (lang: Language, e: any[]): Parts => {
         case "assign":
             return same([[e[2], []]], next => [op, e[1], next[0]]);
         case "label":
+        case "intrinsic":
             return same(e.slice(2).map(x => [x, []]), next => [op, e[1], ...next]);
         case "exprs":
-            return same(e.map(x => [x, []]), next => next);
+            return same(e.slice(1).map(x => [x, []]), next => [op, ...next]);
     }
 };
 
@@ -152,7 +158,7 @@ export const malformed = (lang: Language, e: any[]): string | null => {
             return Array.isArray(e[1]) && e[1].every((b: any) => Array.isArray(b) && b.length === 2 && typeof b[0] === "symbol") ? null : "malformed bindings";
         case "let-values":
             return Array.isArray(e[1]) && e[1].every((c: any) => Array.isArray(c) && c.length === 3 && isSyms(c[0]) && (c[1] === null || typeof c[1] === "symbol")) ? null : "malformed bindings";
-        case "assign": case "label":
+        case "assign": case "label": case "intrinsic":
             return typeof e[1] === "symbol" ? null : "a name that is not a symbol";
         default:
             return null;
@@ -165,7 +171,7 @@ export const check = (lang: Language, e: any): void => {
     if (!Array.isArray(e)) return;
     const fail = (why: string) => { throw new Error(`internal error: not ${lang.name}: ${why} in (${String(e[0]?.description ?? e[0])} ...)`); };
     const op = e[0];
-    if (!lang.forms.has(op) && typeof op === "symbol" && CORE_FORMS.has(op)) fail("a form the language does not have");
+    if (!lang.forms.has(op)) fail(typeof op === "symbol" && CORE_FORMS.has(op) ? "a form the language does not have" : "a call without %call");
     const why = malformed(lang, e);
     if (why !== null) fail(why);
     if (lang.forms.get(op) === "quote") return;

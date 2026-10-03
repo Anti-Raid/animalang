@@ -3,17 +3,18 @@
 // shadowing: a symbol is one variable. Globals, block labels and quoted data are left as they are.
 // A binder code generation rejects (not a symbol, a special form, a front end's reserved name, an intrinsic's, or a name
 // bound twice in one group) is left as it is, so the same error is reported, at the same place
-import { CORE_SET, SPECIAL_FORMS } from "../../common";
+import { CORE_SET, Msg, SOURCE_POS, SPECIAL_FORMS, VMError } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
-import { Lsrc, keepPos, malformed, mapExprs } from "./lang";
+import { keepPos, malformed, mapExprs } from "./lang";
+import { Lconv, SET_BOX } from "./assignments";
 import type { Pass } from "./pass";
 
 // what renaming can walk: a lambda code generation accepts (any other fails to compile), and binding lists of arrays, as
 // code generation reads them (a binding's extra elements are ignored there too)
 const traversable = (e: any[]): boolean => {
-    switch (Lsrc.forms.get(e[0])) {
-        case "lambda": return malformed(Lsrc, e) === null;
+    switch (Lconv.forms.get(e[0])) {
+        case "lambda": return malformed(Lconv, e) === null;
         case "let": case "letrec": case "let*": return Array.isArray(e[1]) && e[1].every(Array.isArray);
         case "let-values": return Array.isArray(e[1]) && e[1].every((c: any) => Array.isArray(c) && Array.isArray(c[0]));
         default: return true;
@@ -42,9 +43,15 @@ export const renamer = (intrinsics: Intrinsics) => {
 
     const expr = (e: any, env: Env): any => {
         if (typeof e === "symbol") return name(env, e);
-        if (!Array.isArray(e) || !traversable(e)) return e;
+        if (!Array.isArray(e) || e.length === 0) return e;
         const op = e[0];
-        switch (Lsrc.forms.get(op)) {
+        if (!Lconv.forms.has(op)) {
+            const err = new VMError(Msg.BareCall, [op]);
+            err.at = SOURCE_POS.get(e) ?? null;
+            throw err;
+        }
+        if (!traversable(e)) return e;
+        switch (Lconv.forms.get(op)) {
             case "quote":
                 return e;
             case "lambda":
@@ -77,9 +84,9 @@ export const renamer = (intrinsics: Intrinsics) => {
                 return keepPos([op, clauses.map(c => [c[0].map((p: any) => name(inner, p)), name(inner, c[1]), expr(c[2], env)]), ...e.slice(2).map(x => expr(x, inner))], e);
             }
             case "assign":
-                return keepPos([op, op === CORE_SET ? name(env, e[1]) : e[1], expr(e[2], env)], e);
+                return keepPos([op, op === CORE_SET || op === SET_BOX ? name(env, e[1]) : e[1], expr(e[2], env)], e);
             default:
-                return mapExprs(Lsrc, e, x => expr(x, env));
+                return mapExprs(Lconv, e, x => expr(x, env));
         }
     };
     return (ast: any) => expr(ast, new Map());

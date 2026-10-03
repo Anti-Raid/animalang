@@ -60,11 +60,10 @@ Block names are labels, not variables. An `%escape` cannot leave a `%lambda` (a 
 
 ### Procedure Calls
 
-- **Intrinsic Calls**:
-  - Form: `(<intrinsic> <arg> ...)`, where `<intrinsic>` is a compiler intrinsic or one registered on the instance (see host intrinsics).
-- **General Calls**:
-  - Form: `(<proc-expr> <arg> ...)`
-  - Evaluates `<proc-expr>` and all arguments, executing a procedure call (or tail call if in tail position).
+Every call is explicit, so passes tell a call from an intrinsic by its form, never by asking the table. Any other array whose head is not a core form is an error (`Msg.BareCall`).
+- **`(%call <proc-expr> <arg> ...)`**: evaluates `<proc-expr>` and the arguments, in order, and calls the procedure (a tail call in tail position).
+- **`(%intcall <%name> <arg> ...)`**: calls the intrinsic `<%name>`, a core operation or one registered on the instance (see host intrinsics); the name is not evaluated, and one the table does not have is an error (`Msg.UnknownIntrinsic`).
+- **`(%intapply <%name> <arg> ... <array>)`**: applies a leaf intrinsic (see `%apply`).
 
 ## Compiler Intrinsics (`%` Forms)
 
@@ -97,9 +96,9 @@ Besides the core forms, the compiler directly recognizes the following low-level
 - **Form**: `(%apply <proc> <arg> ... <array>)`
 - **Semantics**:
   - Calls `<proc>` with the `<arg>`s followed by the elements of `<array>`.
-  - `<proc>` may be a registered leaf intrinsic (`(%apply %name args)`), which compiles to `IntApply` (see below).
-  - Otherwise it is a call of the control operation `%apply-array` over `[proc, arg ..., array]` (a tail call in tail position), which returns a call request (`HostTail`) of `<proc>` with the spliced arguments. When `<array>` is the only one and comes from an intrinsic registered `fresh` (or the table's spread, or an `%apply` of one), it is `%apply-fresh`, which calls with the array itself instead of a copy.
-  - **Rest forwarding**: a front end with its own sequences (see sequences below) writes `(%apply proc arg ... (spread x))`. When `x` is a lambda's rest parameter that is never used any other way (not read as a value, assigned, or captured), the closure's rest arguments are bound as the plain array (`rest: "array"`) instead of being packed, and `(spread x)` compiles to `x`. So a wrapper like `(lambda args (%apply %+ (spread args)))` packs nothing, and applying an intrinsic this way passes the array itself as the argument window.
+  - `<proc>` is a procedure; applying a leaf intrinsic is `(%intapply %name arg ... <array>)`, which compiles to `IntApply` (see below).
+  - It is a call of the control operation `%apply-array` over `[proc, arg ..., array]` (a tail call in tail position), which returns a call request (`HostTail`) of `<proc>` with the spliced arguments. When `<array>` is the only one and comes from an intrinsic registered `fresh` (or the table's spread, or an `%apply` of one), it is `%apply-fresh`, which calls with the array itself instead of a copy.
+  - **Rest forwarding**: a front end with its own sequences (see sequences below) writes `(%apply proc arg ... (%intcall spread x))`. When `x` is a lambda's rest parameter that is never used any other way (not read as a value, assigned, or captured), the closure's rest arguments are bound as the plain array (`rest: "array"`) instead of being packed, and `(spread x)` compiles to `x`. So a wrapper like `(lambda args (%intapply %+ (%intcall spread args)))` packs nothing, and applying an intrinsic this way passes the array itself as the argument window.
 
 ### Sequences
 Rest parameters and `%apply` use arrays unless the table has its own sequences: an intrinsic registered with `sequence: "pack"` makes one of an argument window, and one with `sequence: "spread"` makes the array `%apply` takes of one. A rest parameter (and a `%let-values` rest variable) is then packed: the closure's `rest` is `"packed"`, and its code records the pack intrinsic's position (`Code.restPos`), which binding a call uses (`bindArgs`) and AOT code for a self tail call inlines.
@@ -206,7 +205,7 @@ What a non-leaf intrinsic may return instead of a value: a `ControlRequest` (`co
 
 ### How intrinsics are compiled
 - **Core operations** (see above) are intrinsics at fixed positions (below `CORE_COUNT`) in every table, so they compile as below.
-- **Applying a registered leaf intrinsic** (`(%apply %name arg ... array)`) compiles to `IntApply`: the last argument is spread as by `%apply`, and since the count is only known at run time, it is checked against the intrinsic's `args` there. Only leaves can be applied.
+- **Applying a registered leaf intrinsic** (`(%intapply %name arg ... array)`) compiles to `IntApply`: the last argument is spread as by `%apply`, and since the count is only known at run time, it is checked against the intrinsic's `args` there. Only leaves can be applied.
 - **Registered intrinsics** compile to `IntCall` (leaves) or `HostCall`, whose `pos` is the intrinsic's position in the table the code is compiled against. AOT code inlines the intrinsic's template when it has one; a call that is the fast path goes through a local the function is read into once (which V8 can inline), while a template's fallback goes through `RT[pos]`, so V8 does not inline the function into a cold path, which measurably slows the hot one.
 - **Control flow**: `Call` and `HostCall` say whether they are in tail position (`tail`; a non-tail one is followed by `MoveAcc`), and `Return` leaves the function. The control operations, `%call/ec` and `%catch` included, are `HostCall`s of core intrinsics (see above).
 
