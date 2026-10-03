@@ -662,8 +662,8 @@ describe('Anima', () => {
             // outside its binding the name is the builtin again, and still inlined
             expect(run(`(list (let ((map 1)) map) (map (lambda (x) (* x 2)) '(1 2)))`)).toBe("(1 (2 4))")
             // what the transformer emits still means the builtins, whatever the code around it binds
-            expect(run(`(let ((list 1) (cons 2) (vector 3) (car 4) (cdr 5) (null? 6) (reverse 7) (append 8) (eqv? 9) (call/cc 10) (call/ec 11) (with-exception-handler 12) (values 13))
-                          (@list \`(1 ,list ,@'(2 3)) (map (lambda (x) (+ x 1)) '(1 2)) (case 2 ((2) 'two) (else 'no)) (guard (e (#t e)) (raise 'boom)) \`#(,car)))`)).toBe("((1 1 2 3) (2 3) two boom #(4))")
+            expect(run(`(let ((mk list)) (let ((list 1) (cons 2) (vector 3) (car 4) (cdr 5) (null? 6) (reverse 7) (append 8) (eqv? 9) (call/cc 10) (call/ec 11) (with-exception-handler 12) (values 13))
+                          (mk \`(1 ,list ,@'(2 3)) (map (lambda (x) (+ x 1)) '(1 2)) (case 2 ((2) 'two) (else 'no)) (guard (e (#t e)) (raise 'boom)) \`#(,car))))`)).toBe("((1 1 2 3) (2 3) two boom #(4))")
 
             expect(run(`(guard (list (#t (+ list 1))) (raise 1))`)).toBe("2")
             expect(run(`(reset (+ 1 (shift car (car (car 10)))))`)).toBe("12")
@@ -674,9 +674,9 @@ describe('Anima', () => {
             expect(fresh(`(define (map f l) 'mine) (map car '((1)))`)).toBe("mine")
             expect(fresh(`(map (lambda (x) x) '(1))`)).toBe("mine")
             fresh(`(define (list . xs) 'mine) (define (append . xs) 'mine) (define (cons a b) 'mine)`)
-            expect(fresh(`(let ((x 1)) (@list \`(a ,x ,@'(b)) (list 1) (cons 1 (cons 2 '()))))`)).toBe("((a 1 b) mine mine)")
+            expect(fresh(`(let ((x 1)) (vector->list (vector \`(a ,x ,@'(b)) (list 1) (cons 1 (cons 2 '())))))`)).toBe("((a 1 b) mine mine)")
             expect(fresh(`(set! list 5) list`)).toBe("5")
-            expect(fresh(`(define-values (first second) (values 'a 'b)) (@list first second)`)).toBe("(a b)")
+            expect(fresh(`(define-values (first second) (values 'a 'b)) (vector->list (vector first second))`)).toBe("(a b)")
             // as in a Racket module, a redefined builtin cannot be read before its definition has run, nor seen by the host
             expect(() => fresh(`(define (early) (max 1 2)) (early) (define (max . xs) 'mine)`)).toThrow("Variable 'max' is not defined")
             expect(evaluator.scope.has(Symbol.for("max"))).toBe(false)
@@ -685,11 +685,13 @@ describe('Anima', () => {
             // a later program keeps it
             expect(fresh(`(max 2)`)).toBe("mine")
 
-            // syntax and the transformer's own names cannot be bound; a % name is an ordinary one
+            // syntax cannot be bound; a % or @ name is an ordinary one, so code never reaches what the transformer emits
             expect(() => run("(lambda (if) 1)")).toThrow("if: bad syntax")
             expect(() => run("(let ((guard 1)) guard)")).toThrow("guard: bad syntax")
             expect(run("((lambda (%car) %car) 1)")).toBe("1")
-            expect(() => run("(lambda (@car) 1)")).toThrow("cannot bind builtin @car")
+            expect(run("((lambda (@car) @car) 1)")).toBe("1")
+            expect(() => run("(@list 1 2)")).toThrow("Variable '@list' is not defined")
+            expect(evaluator.evaluateRaw(evaluator.compileRaw("'@list"))).toBe(Symbol.for("@list"))
             expect(run("(let ((@map (lambda (f l) 'plain))) (@map (lambda (x) x) '(1)))")).toBe("plain")
             expect(() => run("(set! = 1)")).toThrow("cannot bind builtin =")
         });

@@ -15,12 +15,14 @@ export const OP_QUOTE  = Symbol.for("quote");
 export const OP_AND      = Symbol.for("and");
 export const OP_OR       = Symbol.for("or");
 
-// A name starting with % means nothing special in Scheme source: the reader makes it a symbol of its own (the same one
-// for the same name), which is no core form or intrinsic, so code reaches neither. Quoted, it is the ordinary symbol
+// A name starting with % or @ means nothing special in Scheme source: the reader makes it a symbol of its own (the same
+// one for the same name), which is no core form, intrinsic or builtin twin, so code reaches none of them. Quoted, it is
+// the ordinary symbol
 const ESCAPED = new Map<string, symbol>();
 const ORDINARY = new Map<symbol, symbol>();
 export const sourceSymbol = (name: string): symbol => {
-    if (name.charCodeAt(0) !== 37) return Symbol.for(name);
+    const c = name.charCodeAt(0);
+    if (c !== 37 && c !== 64) return Symbol.for(name);
     let sym = ESCAPED.get(name);
     if (sym === undefined) {
         sym = Symbol(name);
