@@ -5,7 +5,6 @@ import { MAX_STRUCTURED_NESTING, STRUCTURE_MISMATCH } from "./types";
 import type { AotTerm } from "./types";
 import type { Arity } from "../arity";
 import { type Intrinsic, type Kind } from "../intrinsics";
-import { OP_SIZE } from "../ops";
 import { inlineDeps } from "./code-emitter";
 import { FunctionEmitter } from "./function";
 
@@ -177,13 +176,13 @@ export class DirectEmitter extends FunctionEmitter {
 
     // direct-entry code never resumes mid-function, so compiled `if`s (If c else ... Else end, else: ... EndIf, end:) can be emitted as nested js if/else
     #structuredBody(seed: Facts | null = null): string | null {
-        const body = new DirectEmitter(this.blocks, this.layout, this.liveness, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
+        const body = new DirectEmitter(this.blocks, this.structure, this.liveness, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
         body.#selfArity = this.#selfArity;
         body.#seed = seed;
         body.#specCheck = this.#specCheck;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {
-            body.#walk(index, 0, this.layout.size);
+            body.#walk(index, 0, this.structure.size);
         } catch (e) {
             if (e === STRUCTURE_MISMATCH) return null;
             throw e;
@@ -203,19 +202,8 @@ export class DirectEmitter extends FunctionEmitter {
     // whether the else branch of the if ending at endIp starts an elseif If of the same chain (whose then branch ends with
     // Else endIp; a nested if's chain has its own end)
     #hasElseIf(elseIp: number, endIp: number): boolean {
-        const { ops, at } = this.layout;
-        for (let i = ops.indexOf(at.get(elseIp)!); i >= 0 && i < ops.length && ops[i].ip < endIp - 1; i++) {
-            const op = ops[i];
-            if (op.k !== "If" || !op.elseif) continue;
-            if (this.#elseBefore(op.else) === endIp) return true;
-        }
-        return false;
-    }
-
-    // the end of the if whose then branch an Else right before `ip` closes
-    #elseBefore(ip: number): number | undefined {
-        const op = this.layout.at.get(ip - OP_SIZE.Else);
-        return op?.k === "Else" ? op.end : undefined;
+        const endIf = this.structure.endIfBefore.get(endIp)!;
+        return this.structure.elseIfs.some(e => e.ip >= elseIp && e.ip < endIf && this.structure.elseBefore.get(e.else) === endIp);
     }
 
     #walk(index: Map<number, number>, from: number, stop: number): void {
@@ -234,15 +222,15 @@ export class DirectEmitter extends FunctionEmitter {
         let i: number | undefined = first;
         while (i < blocks.length && blocks[i].start < stop) {
             const block = blocks[i];
-            const next = i + 1 < blocks.length ? blocks[i + 1].start : this.layout.size;
+            const next = i + 1 < blocks.length ? blocks[i + 1].start : this.structure.size;
             this.startBlock(this.entryFacts.get(block.start));
             for (const x of block.insts) this.emitInstWithFacts(x);
             const term = block.term;
             if (term.k === "Branch") {
                 const elseIp = term.else;
-                const endIp = this.#elseBefore(elseIp);
+                const endIp = this.structure.elseBefore.get(elseIp);
                 if (term.then !== next || endIp === undefined) throw STRUCTURE_MISMATCH;
-                if (this.layout.at.get(endIp - OP_SIZE.EndIf)?.k !== "EndIf") throw STRUCTURE_MISMATCH;
+                if (!this.structure.endIfBefore.has(endIp)) throw STRUCTURE_MISMATCH;
                 // a later clause of the chain being walked: a sibling of the first, leaving the chain's block when taken
                 if (term.elseif) {
                     const chain = this.#chains.get(endIp);
@@ -416,7 +404,7 @@ export class DirectEmitter extends FunctionEmitter {
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: this.layout.at.get(term.resume)?.k === "EndLoop" };
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume) };
                     return this.emit(`
                         ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}
                         ${control.direct(site, this.#callArray(term.isTail), (args, marks) => this.#callProc(args.join(", "), args.length, marks))}

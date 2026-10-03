@@ -5,19 +5,18 @@ import type { AotBlock, AotInst, AotTerm } from "./types";
 import type { Arity } from "../arity";
 import { CORE_COUNT } from "../coreops";
 import { Intrinsics } from "../intrinsics";
-import { UNPACK_REST, type Op } from "../ops";
+import { UNPACK_REST } from "../ops";
+import type { Structure } from "./structure";
 import { CodeEmitter, inlineDeps } from "./code-emitter";
 import { CONTROL_AOT, type ControlAot } from "./control";
 
-// where a function's instructions are, for the structured code of its direct entry: their positions and its size
-export type Layout = { readonly ops: readonly Op[], readonly at: ReadonlyMap<number, Op>, readonly size: number };
 
 // emits one entry point of a compiled function; subclasses decide how registers reach callees, how values come back and
 // how control leaves
 export abstract class FunctionEmitter extends CodeEmitter {
     constructor(
         protected readonly blocks: AotBlock[],
-        protected readonly layout: Layout,
+        protected readonly structure: Structure,
         // which registers are live where (see liveness.ts), computed once for both entries
         protected readonly liveness: Liveness,
         protected readonly numReg: number,
@@ -106,7 +105,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     protected emitSwitchBody(): void {
         for (let i = 0; i < this.blocks.length; i++) {
-            const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.layout.size;
+            const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.structure.size;
             this.emit(`case ${this.blocks[i].start}: {`);
             this.startBlock(undefined);
             for (const inst of this.blocks[i].insts) this.emitInstWithFacts(inst);
@@ -120,8 +119,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected jump(target: number, next: number): string {
-        if (target === next && target < this.layout.size) return "";
-        if (target >= this.layout.size) return this.endOfCode;
+        if (target === next && target < this.structure.size) return "";
+        if (target >= this.structure.size) return this.endOfCode;
         return `ip = ${target}; continue top;`;
     }
 

@@ -6,6 +6,7 @@ import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, m
 import { DirectEmitter } from "./direct";
 import { ResumeEmitter } from "./resume";
 import { Liveness } from "./liveness";
+import { structureOf } from "./structure";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
 import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS } from "../code";
@@ -169,14 +170,14 @@ export class AotCompiler {
         const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
         const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
         const usedDeps = new Set<string>();
-        const layout = { ops: code.ops, at: new Map(code.ops.map(op => [op.ip, op])), size: code.size };
+        const structure = structureOf(code.ops, code.size);
         const resume = this.#step("resume", () => {
-            const out = new ResumeEmitter(blocks, layout, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
+            const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
             out.emitFunction();
             return out.toString();
         });
         const direct = tmpl === undefined ? "null" : this.#step("direct", () => {
-            const out = new DirectEmitter(blocks, layout, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
+            const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
             out.emitFunction(tmpl.arity);
             return out.toString();
         });
