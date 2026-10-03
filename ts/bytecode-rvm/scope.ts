@@ -122,11 +122,22 @@ export class CompilerScope {
     regAlloc: RegAlloc = new RegAlloc();
 
     outer: CompilerScope | null;
-    upvars: UpVarLoc[] = [];
+    // the variables a lambda captures, in upvar order (see passes/closures.ts)
+    readonly captures: readonly symbol[];
 
-    constructor(outer: CompilerScope | null) {
+    constructor(outer: CompilerScope | null, captures: readonly symbol[] = []) {
         this.outer = outer;
-        this.upvars = []
+        this.captures = captures;
+    }
+
+    // where the closure finds each captured variable when it is made: a register of the function around it, or one of
+    // that function's own upvars
+    get upvars(): UpVarLoc[] {
+        return this.captures.map(sym => {
+            const at = this.outer!.resolve(sym);
+            if (at.type === "Global") throw new Error(`internal error: captured ${String(sym.description)} is not a variable around the lambda`);
+            return { local: at.type === "Local", index: at.index };
+        });
     }
 
     get numRegs() {
@@ -169,40 +180,13 @@ export class CompilerScope {
 
     // Returns the result of resolving
     resolve(sym: symbol): Resolve {
-        // Check if its a local
         const index = this.currBlock.resolve(sym)
         if (index !== null) return { type: 'Local', index }
-        // Check if its global
         if (!this.outer) return { type: "Global" }
-        
-        // Ask parent to try resolving it as a upvar
-        const parentResolved = this.outer.resolve(sym)
-        if (parentResolved.type === 'Local') {
-            return { 
-                type: 'Upvar', 
-                index: this.#recordUpvar({ local: true, index: parentResolved.index }) 
-            };
-        } 
-    
-        if (parentResolved.type === 'Upvar') {
-            return { 
-                type: 'Upvar', 
-                index: this.#recordUpvar({ local: false, index: parentResolved.index }) 
-            };
-        }
-
-        return parentResolved // global
-    }
-
-    // Records a upvar from parent scope
-    #recordUpvar(upvar: UpVarLoc) {
-        // Check if we already captured this exact upvalue to avoid duplicates
-        const existingIdx = this.upvars.findIndex(u => u.index === upvar.index && u.local === upvar.local);
-        if (existingIdx !== -1) {
-            //console.log("recorded upvar", upvar, "at index:", existingIdx);
-            return existingIdx;
-        }
-        return this.upvars.push(upvar) - 1;
+        const upvar = this.captures.indexOf(sym)
+        if (upvar !== -1) return { type: "Upvar", index: upvar }
+        if (this.outer.resolve(sym).type !== "Global") throw new Error(`internal error: ${String(sym.description)} is used but not captured`)
+        return { type: "Global" }
     }
 }
 

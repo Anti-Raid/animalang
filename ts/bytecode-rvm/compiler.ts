@@ -8,6 +8,7 @@ import { corePos, type Code } from "./exec";
 import { runPass, type Pass, type PassContext } from "./passes/pass";
 import { interruptsPass, type FunctionIR } from "./passes/interrupts";
 import { renamePass } from "./passes/rename";
+import { closureCaptures, type Captures } from "./passes/closures";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
@@ -17,6 +18,10 @@ const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length ==
 const OP_APPLY = Symbol.for("%apply");
 
 type Analyzed = { ast: any, analyzer: AstAnalysis, ascope: AnalysisScope }
+type Converted = Analyzed & { captures: Captures }
+
+// what each lambda captures (see passes/closures.ts)
+const closuresPass: Pass<Analyzed, Converted> = { name: "closures", run: (analyzed, ctx) => ({ ...analyzed, captures: closureCaptures(analyzed.ast, ctx.intrinsics) }) }
 
 // the core forms to core forms (see lift.ts)
 const escapesPass: Pass<any, any> = { name: "block-escapes", run: ast => blockEscapes(ast) }
@@ -66,9 +71,10 @@ interface CmpOpts {
     markRegions?: number[] // for each enclosing non-tail %with-mark, where it saved the marks (outermost first)
     name?: string // name for a lambda compiled directly as this value
 
-    // From pass 1
+    // from the analysis and closure passes
     ascope: AnalysisScope,
-    analyzer: AstAnalysis
+    analyzer: AstAnalysis,
+    captures: Captures
 }
 
 // Compiles core forms, as arrays (see README.md): `[op, operand ...]`, symbols as variable references, anything else
@@ -89,7 +95,8 @@ export class Compiler {
             const split = runPass(caseLambdasPass, escaped, ctx)
             const lifted = runPass(liftPass, split, ctx)
             const analyzed = runPass(callLivenessPass, runPass(resolvePass, lifted, ctx), ctx)
-            const ir = runPass(interruptsPass, runPass(this.#generatePass, analyzed, ctx), ctx)
+            const converted = runPass(closuresPass, analyzed, ctx)
+            const ir = runPass(interruptsPass, runPass(this.#generatePass, converted, ctx), ctx)
             return runPass(lowerPass, ir, ctx)
         } catch (err) {
             if (err instanceof VMError) err.format(this.intrinsics.format)
@@ -98,13 +105,13 @@ export class Compiler {
     }
 
     // the IR of a top-level expression, its variables analysed
-    readonly #generatePass: Pass<Analyzed, FunctionIR> = {
+    readonly #generatePass: Pass<Converted, FunctionIR> = {
         name: "generate",
-        run: ({ ast, analyzer, ascope }) => {
+        run: ({ ast, analyzer, ascope, captures }) => {
             const scope = new CompilerScope(null)
             const nodes: Node[] = []
             const retReg = scope.allocTemp()
-            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, ascope, analyzer })
+            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, ascope, analyzer, captures })
             if (!this.#nodesEndsInRet(nodes)) {
                 nodes.push({ t: "Return", reg: retReg })
             }
@@ -325,7 +332,7 @@ export class Compiler {
 
     // [options, params, rest, body ...]: params an array of symbols, rest a symbol or null
     #compileClause(clause: any[], opts: CmpOpts, name?: string) {
-        const lambdaScope = new CompilerScope(opts.scope)
+        const lambdaScope = new CompilerScope(opts.scope, opts.captures.get(clause) ?? [])
         const ascope = opts.analyzer.scopeMap.get(clause)
         if (!ascope) throw new Error(`internal error: could not find ascope for clause ${clause}`)
 
