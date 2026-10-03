@@ -68,6 +68,10 @@ export const schemeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.NoClause: return `${a[0]}: no clause takes ${a[1]} args`;
         case Msg.BareCall: return `bad syntax: ${name(a[0])} is not a core form (a call is (%call proc arg ...) or (%intcall %name arg ...))`;
         case Msg.UnknownIntrinsic: return `${a[0]}: ${name(a[1])} is not an intrinsic`;
+        case Msg.ReadUnclosed: return `read: unclosed ${a[0]}`;
+        case Msg.ReadUnexpected: return `read: unexpected ${a[0]}`;
+        case Msg.ReadBadEscape: return `read: bad escape ${a[0]} in a string`;
+        case Msg.ReadBadToken: return `read: bad token ${a[0]}`;
         case Msg.ApplyNonLeaf: return `%apply: ${a[0]} is not a leaf intrinsic, so it cannot be applied`;
         default: {
             const unworded: never = op;

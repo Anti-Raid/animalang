@@ -2,7 +2,7 @@ import { Cons } from "./list";
 import type { AnimaOptions } from "../bytecode-rvm/meta";
 import { Anima } from "../anima";
 import { ASP } from "./reader";
-import { toCore } from "./core";
+import { schemeDatum, toCore } from "./core";
 import { schemeBase } from "./base";
 import { loadPrelude } from "./prelude";
 import { OP_LAMBDA } from "./symbols";
@@ -24,6 +24,7 @@ export const createScheme = (options: AnimaOptions): Anima => {
         read: (source, file) => new ASP(source, true, file).parse(),
         transform: ast => toCore(evaluator.transformProgram(ast), intrinsics),
         lambda: (params, body) => Cons.list(OP_LAMBDA, params, body),
+        datum: schemeDatum,
     }, publicScope.chained());
     return anima;
 };

@@ -65,6 +65,20 @@ Every call is explicit, so passes tell a call from an intrinsic by its form, nev
 - **`(%intcall <%name> <arg> ...)`**: calls the intrinsic `<%name>`, a core operation or one registered on the instance (see host intrinsics); the name is not evaluated, and one the table does not have is an error (`Msg.UnknownIntrinsic`).
 - **`(%intapply <%name> <arg> ... <array>)`**: applies a leaf intrinsic (see `%apply`).
 
+### Core text
+The core forms can be written as text and read straight into the arrays the compiler takes (`corereader.ts`, which shares nothing with any front end's reader): `readCore(src, file, { datum })` reads, and `anima.compileCore(src, file, { datum })` reads and compiles, on any instance. The text names VM values only:
+
+| Text | Value |
+|---|---|
+| `( ... )` | an array (a form, or quoted data) |
+| a name | a symbol (`Symbol.for`) |
+| `12`, `-2.5`, `1e3`, `12n` | a number, a bigint |
+| `"..."` | a string (escapes `\n \t \r \0 \" \\ \u{41}`) |
+| `#t`, `#f`, `#null`, `#void` | `true`, `false`, `null`, `undefined` |
+| `; ...` | a comment, to the end of the line |
+
+A lambda clause is written as it is stored: `(%lambda (() (x y) #null body ...))`. Several forms are read as a `%begin` of them. Every list keeps where it was read, so errors and tracebacks point into the text. What a quoted `( ... )` means is the front end's: `datum` (by default the front end's `FrontEnd.datum`, else none) is called on what each `(%quote x)` quotes, and on nothing else (a front end may make it a list of its own, say). What cannot be read is a `VMError` (`ReadUnclosed`, `ReadUnexpected`, `ReadBadEscape`, `ReadBadToken`) with where it happened.
+
 ## Compiler Intrinsics (`%` Forms)
 
 Besides the core forms, the compiler directly recognizes the following low-level `%` intrinsics:

@@ -20,6 +20,9 @@ const formals = (f: any): [symbol[], symbol | null] => {
 
 const OP_APPLY = Symbol.for("%apply");
 
+// quoted data in core text as Scheme's: a list read there is a list
+export const schemeDatum = (x: any): any => Array.isArray(x) ? Cons.fromArray(x.map(schemeDatum)) : x;
+
 export const toCore = (e: any, intrinsics: Intrinsics): any => {
     const toCore_ = (x: any) => toCore(x, intrinsics);
     const isIntrinsic = (x: any) => typeof x === "symbol" && !isCoreForm(x) && intrinsics.get(x) !== undefined;

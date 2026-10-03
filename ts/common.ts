@@ -33,7 +33,7 @@ export enum Msg {
     EmptyForm, IfArgs, QuoteArgs, FormArgs, LambdaForm, SetTarget, EscapeNoBlock, EscapeFromLambda,
     BadSyntax, ParamNotSymbol, DuplicateParam, CannotBindBuiltin, CannotBindIntrinsic, IntrinsicAsValue, ApplyNonLeaf,
     NoClause, LambdaOption, UnreachableClause, BarrierReentry, NoPrompt, ErrorInHandler, CatchGuard,
-    BareCall, UnknownIntrinsic,
+    BareCall, UnknownIntrinsic, ReadUnclosed, ReadUnexpected, ReadBadEscape, ReadBadToken,
 }
 
 export type Formatter = (op: Msg, args: readonly any[], fmt: Formatter, at: SourcePos | null) => string;

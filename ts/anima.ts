@@ -1,4 +1,4 @@
-import { Env, CORE_LAMBDA } from "./common"
+import { Env, CORE_LAMBDA, VMError } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
 import type { CaseLambda } from "./bytecode-rvm/code"
 import { newIntrinsics } from "./bytecode-rvm/core"
@@ -6,6 +6,7 @@ import { Compiler } from "./bytecode-rvm/compiler"
 import { AnimaVM } from "./bytecode-rvm/vm"
 import type { Code, Closure } from "./bytecode-rvm/exec"
 import type { AnimaOptions } from "./bytecode-rvm/meta"
+import { readCore, type CoreReadOptions } from "./bytecode-rvm/corereader"
 
 // A language on top of the core: reads source into its syntax tree and lowers that to the core forms
 export interface FrontEnd {
@@ -13,6 +14,8 @@ export interface FrontEnd {
     transform(ast: any): any
     // a procedure of `params` whose body is `body`, in the front end's syntax
     lambda(params: any, body: any): any
+    // what quoted data in core text means to it (see readCore)
+    datum?(x: any): any
 }
 
 // A compiler and VM with their intrinsics. On its own it compiles core forms; a front end (see createScheme) adds a
@@ -130,6 +133,19 @@ export class Anima {
     // the front end's syntax tree, or core forms if there is no front end
     compileRawAst(ast: any) {
         return this.#comp.compile(this.#frontEnd !== null ? this.#frontEnd.transform(ast) : ast)
+    }
+
+    // core text (see corereader.ts), straight to the compiler; quoted data as the front end reads it unless `datum` says
+    compileCore(src: string, file?: string, options: CoreReadOptions = {}) {
+        const datum = options.datum ?? this.#frontEnd?.datum?.bind(this.#frontEnd)
+        let ast
+        try {
+            ast = readCore(src, file, { datum })
+        } catch (err) {
+            if (err instanceof VMError) err.format(this.#intrinsics.format)
+            throw err
+        }
+        return this.#comp.compile(ast)
     }
 
     #requireFrontEnd(): FrontEnd {
