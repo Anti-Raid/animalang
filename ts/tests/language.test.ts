@@ -82,8 +82,7 @@ describe('Anima', () => {
             // quoted, it is the ordinary symbol
             expect(evaluator.evaluateRaw(evaluator.compileRaw(`'%if`))).toBe(Symbol.for("%if"))
             expect(run(`(list '(%car x) (eq? '%car (car '(%car))))`)).toBe("((%car x) #t)")
-            // %at stays reader syntax
-            expect(() => run(`(%at "f.scm" 3 4 (car '()))`)).toThrow("car")
+            expect(() => run(`(%at "f.scm" 3 4 (car '(1)))`)).toThrow("Variable '%at' is not defined")
             // written in native-scheme, the core forms are the language
             expect(nrun(`(%if #f 1 (%begin 2 3))`)).toBe("3")
             expect(() => nrun(`(%if 1)`)).toThrow("%if requires at least a condition and a branch")

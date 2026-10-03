@@ -135,7 +135,7 @@ export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
 
-// source positions of forms, set by the reader and by (%at file line col expr), read by the compiler
+// source positions of forms (core-form arrays, or a front end's own data), set by readers and by front ends and transpilers that build forms, read by the compiler
 export const SOURCE_POS = new WeakMap<object, SourcePos>();
 
 export const formatPos = (pos: SourcePos | null | undefined) => pos ? `${pos.file}:${pos.line}:${pos.col}` : "?";

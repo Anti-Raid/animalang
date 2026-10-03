@@ -3,7 +3,7 @@ import { Cons } from "../list"
 import { Compiler } from "../../magicvm/compiler"
 import { AnimaVM } from "../../magicvm/vm"
 import type { AnimaOptions } from "../../magicvm/meta"
-import { OP_QUOTE, OP_AT, OP_BEGIN, OP_DEFINE } from "../symbols"
+import { OP_QUOTE, OP_BEGIN, OP_DEFINE } from "../symbols"
 import type { Intrinsics } from "../../magicvm/intrinsics";
 
 export enum TransformState {
@@ -98,11 +98,10 @@ export class MacroEvaluator {
                 redefine(f)
             }
         }
-        const stripped = this.#stripAt(ast)
-        scan(stripped)
-        if (fresh.length === 0) return this.transform(stripped)
+        scan(ast)
+        if (fresh.length === 0) return this.transform(ast)
         const declare = fresh.map(sym => Cons.list(OP_DEFINE_GLOBAL, sym, Cons.list(UNBOUND)))
-        return this.transform(new Cons(OP_BEGIN, Cons.fromArray([...declare, stripped])))
+        return this.transform(new Cons(OP_BEGIN, Cons.fromArray([...declare, ast])))
     }
 
     // the transformer for an operator: none for a redefined builtin's name; a builtin's `@name` twin uses its builtin's
@@ -129,7 +128,7 @@ export class MacroEvaluator {
         // called from inside a transformer (e.g. for a lambda body): keep counting toward the expansion limit
         if (this.#depth >= 0) return this.#transform(ast, this.#depth)
         try {
-            return this.#transform(this.#stripAt(ast), 0)
+            return this.#transform(ast, 0)
         } catch (e) {
             if (e instanceof RangeError && /call stack/i.test(e.message)) throw new Error(TOO_DEEP)
             throw e
@@ -137,34 +136,6 @@ export class MacroEvaluator {
     }
 
 
-    // (%at file line col expr) becomes expr with a source position attached, before any macro sees it
-    #stripAt(ast: any): any {
-        if (!(ast instanceof Cons) || ast.car === OP_QUOTE || ast.car === CORE_QUOTE) return ast
-        if (ast.car === OP_AT) {
-            const [file, line, col, expr] = ast.length === 5 ? ast.toArray().slice(1) : []
-            if (typeof file !== "string" || typeof line !== "number" || typeof col !== "number") {
-                throw new Error("%at must be in format (%at file line col expr)")
-            }
-            const inner = this.#stripAt(expr)
-            if (inner instanceof Cons) SOURCE_POS.set(inner, { file, line, col })
-            return inner
-        }
-        let changed = false
-        const items: any[] = []
-        let curr: any = ast
-        while (curr instanceof Cons) {
-            const item = this.#stripAt(curr.car)
-            if (item !== curr.car) changed = true
-            items.push(item)
-            curr = curr.cdr
-        }
-        if (!changed) return ast
-        let out: any = curr
-        for (let i = items.length - 1; i >= 0; i--) out = new Cons(items[i], out)
-        const pos = SOURCE_POS.get(ast)
-        if (pos !== undefined) SOURCE_POS.set(out, pos)
-        return out
-    }
 
     #transform(ast: any, depth: number): any {
         try {

@@ -11,7 +11,7 @@
 4. **Prelude.** `prelude.ts` defines the procedures behind the builtins' names and the rest of the standard library, written in native-scheme (`../native`), where calls into intrinsics are written out. It is compiled once for all instances, kept unbound, and each instance runs its own copy bound to its intrinsics by name.
 
 ### `%` names
-A name starting with `%` means nothing special in Scheme source: the reader makes it a symbol of its own (`sourceSymbol` in `symbols.ts`, the same one for the same name), which is no core form or intrinsic, so `(%car x)` calls a variable named `%car` and `(define (%if a b c) ...)` defines one. Neither code nor its macros can reach the core forms or the intrinsics; only what the transformer itself emits does. Quoted, such a name is the ordinary symbol (`'%if` is `Symbol.for("%if")`). `(%at file line col expr)` is the one exception: it stays reader syntax (see below).
+A name starting with `%` means nothing special in Scheme source: the reader makes it a symbol of its own (`sourceSymbol` in `symbols.ts`, the same one for the same name), which is no core form or intrinsic, so `(%car x)` calls a variable named `%car` and `(define (%if a b c) ...)` defines one. Neither code nor its macros can reach the core forms or the intrinsics; only what the transformer itself emits does. Quoted, such a name is the ordinary symbol (`'%if` is `Symbol.for("%if")`).
 
 The instance's intrinsics stay open, so a host can add its own; Scheme code reaches one through a procedure the host defines in native-scheme (`../native`), which can name intrinsics:
 
@@ -46,10 +46,6 @@ Each surface form lowers to a core form:
 Internal `define`s in a body become a `letrec`. `let`, `let*`, `letrec`, named `let`, `cond`, `and`, `or`, `guard`, `receive`, `let-values` and `let*-values` are pure surface syntax built from the core forms (for example `let` becomes `%let`, which binds variables in the current function instead of calling a lambda).
 
 A named `let` whose name is only called in tail position of its body, with the right number of arguments, becomes a loop instead of a procedure: `(%let ((c init) ...) (%block done (%loop (%block next (%let ((v c) ...) (%escape done body'))))))`, where each tail self call in `body'` assigns the hidden carriers `c` and escapes to `next`. The call's arguments are all computed first (into temporaries, but the last), then the carriers assigned, so none is assigned before a call and read after it: the boxing analysis keeps them in registers, and a continuation captured in an iteration keeps that iteration's values when re-entered. The parameters are bound fresh every iteration as calls would bind them. The check runs on the expanded body; any other use of the name (as a value, a non-tail call, a call from a nested lambda, `set!`, a wrong argument count) keeps the procedure instead of applying this optimization.
-
-### `%at`
-- **Form**: `(%at <file> <line> <col> <expr>)`
-- **Semantics**: Evaluates `<expr>`, recording `file:line:col` as its source position (the reader keeps `%at` itself, the one `%` name it does not make ordinary). For frontends that generate Anima code (e.g. a transpiler) so errors and tracebacks point at the original source. It is removed by the syntax transformer before macros run, so macros never see it. Positions only attach to forms (lists); a wrapped atom keeps the enclosing form's position.
 
 ## Builtins
 
@@ -86,7 +82,7 @@ Builtins, like every name the prelude exports, can be shadowed and redefined (se
 
 ### Printing and source positions
 - The VM has no wording of its own (see messages in `../magicvm/README.md`): Scheme's is `schemeFormat` (`messages.ts`), its table's formatter, which words every `Msg` and prints values as Scheme data (`printer.ts`, `ASTStringifier`), so messages and tracebacks show `#t`, `()` and `#(1 2)`. The transformer's own binding checks are worded by it too.
-- The reader records the position of every list form, and `%at` overrides it. The syntax transformer carries positions through macro expansion (an expansion inherits its macro call's position), and `toCore` onto the core forms.
+- The reader records the position of every list form. The syntax transformer carries positions through macro expansion (an expansion inherits its macro call's position), and `toCore` onto the core forms.
 
 ### `debug-frames` / `debug-traceback`
 - A direct call is rewritten by the syntax transformer, at compile time, so the prelude procedure is never called and the snapshot is taken in the calling function itself (its first frame):

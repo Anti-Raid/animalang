@@ -1,3 +1,4 @@
+import { SOURCE_POS } from '../common';
 import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
@@ -122,12 +123,14 @@ describe('Anima', () => {
             expect(runFile(`(define fresh-co (coroutine-create (lambda () 1))) (debug-traceback fresh-co)`)).toBe("stack traceback:");
         });
 
-        it("%at overrides positions for transpiled code", () => {
-            const err = errorOf(`(define (lua-fn t)
-  (%at "game.luau" 12 5 (car t)))
-(list (lua-fn '()))`);
+        it("takes positions from core forms a transpiler builds, and has no %at of its own", () => {
+            const S = Symbol.for;
+            const call = [S("%intcall"), S("%car"), S("t")];
+            SOURCE_POS.set(call, { file: "game.luau", line: 12, col: 5 });
+            evaluator.evaluateRaw(evaluator.compiler.compile([S("%define-global"), S("lua-fn"), [S("%lambda"), [[], [S("t")], null, call]]]));
+            const err = errorOf(`(list (lua-fn '()))`);
             expect(err.animaTraceback).toContain("game.luau:12:5 in lua-fn");
-            expect(() => runFile(`(%at "x" 1 (car '(1)))`)).toThrow("%at must be in format");
+            expect(() => runFile(`(%at "x" 1 2 (car '(1)))`)).toThrow("Variable '%at' is not defined");
         });
 
         it("continuations stay multi-shot after a traceback", () => {

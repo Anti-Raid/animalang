@@ -14,15 +14,13 @@ export const OP_ELSE   = Symbol.for("else"); // part of cond but not a special f
 export const OP_QUOTE  = Symbol.for("quote");
 export const OP_AND      = Symbol.for("and");
 export const OP_OR       = Symbol.for("or");
-export const OP_AT = Symbol.for("%at");
 
 // A name starting with % means nothing special in Scheme source: the reader makes it a symbol of its own (the same one
-// for the same name), which is no core form or intrinsic, so code reaches neither. Quoted, it is the ordinary symbol.
-// (%at file line col expr) stays reader syntax
+// for the same name), which is no core form or intrinsic, so code reaches neither. Quoted, it is the ordinary symbol
 const ESCAPED = new Map<string, symbol>();
 const ORDINARY = new Map<symbol, symbol>();
 export const sourceSymbol = (name: string): symbol => {
-    if (name.charCodeAt(0) !== 37 || name === "%at") return Symbol.for(name);
+    if (name.charCodeAt(0) !== 37) return Symbol.for(name);
     let sym = ESCAPED.get(name);
     if (sym === undefined) {
         sym = Symbol(name);
@@ -54,7 +52,6 @@ export const SCHEME_SPECIAL_FORMS: readonly symbol[] = [
     Symbol.for("receive"),
     Symbol.for("let-values"),
     Symbol.for("let*-values"),
-    OP_AT,
     OP_CASE_LAMBDA,
     ...["when", "unless", "case", "do", "=>", "define-values", "delay", "delay-force", "parameterize", "case-lambda", "reset", "shift", "quasiquote", "unquote", "unquote-splicing",
         "guard", "let/ec", "anima-macro", "with-continuation-mark"].map(name => Symbol.for(name)),
