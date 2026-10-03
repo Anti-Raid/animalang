@@ -420,6 +420,8 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%make-case-lambda", [1, Infinity], (regs, start, nargs) => new CaseLambda(regs.slice(start, start + nargs)));
     core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)), { effectFree: true });
     core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
+    // a new array of the arguments: a rest parameter's value where the table has no sequences of its own (see cp0)
+    core("%array", [0, Infinity], (regs, start, nargs) => regs.slice(start, start + nargs), { effectFree: true, fresh: true });
     core("%debug-frames", [3, 3], (regs, start, nargs, ctx) => {
         const { frames, args } = debugTarget(ctx, regs, start);
         const level = typeof args[0] === "number" ? args[0] : 0;

@@ -43,6 +43,10 @@ const PROGRAMS: string[] = [
     `(define ad-k2 #f) (define ad-c 0)
      (define (ad-re) (define (inner) (call/cc (lambda (k) (set! ad-k2 k))) (debug-traceback)) (list (inner)))
      (define ad-t (ad-re)) (set! ad-c (+ ad-c 1)) (if (< ad-c 2) (ad-k2 #f) ad-t)`,
+    `(define (ad-set) (define (g x) (set! x (* x 2)) (list x)) (list (g 1) (g 5))) (ad-set)`,
+    `(define (ad-rest) (define (g a . r) (cons a r)) (define (h . xs) (apply g xs)) (list (h 1) (h 1 2 3) (apply h '(4 5)))) (ad-rest)`,
+    `(define (ad-rest-err) (define (g . xs) (apply car xs)) (g 1 2)) (ad-rest-err)`,
+    `(define (ad-rest-k) (define k2 #f) (define n 0) (define (g . xs) (call/cc (lambda (k) (set! k2 k))) xs) (let ((r (g 1 2))) (set! n (+ n 1)) (if (< n 3) (k2 #f) (list r n)))) (ad-rest-k)`,
     // let*, let-values and shadowing through renaming
     `(let* ((a 1) (b (+ a 1)) (a (* b 10))) (list a b))`,
     `(let-values (((a b) (values 1 2)) ((c . d) (values 3 4 5))) (define (f) (list a b c d)) (f))`,

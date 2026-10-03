@@ -12,11 +12,11 @@
 // whose binders code generation rejects, and lambdas that escape to a %block outside them, are left as they are, so their
 // errors stay. Globals are never inlined or
 // propagated: they can be changed
-import { CORE_BEGIN, CORE_BLOCK, CORE_ESCAPE, CORE_IF, CORE_LAMBDA, CORE_LET, CORE_QUOTE, SOURCE_POS, SPECIAL_FORMS } from "../../common";
+import { CORE_BEGIN, CORE_BLOCK, CORE_ESCAPE, CORE_IF, CORE_LAMBDA, CORE_LET, CORE_LOOP, CORE_QUOTE, SOURCE_POS, SPECIAL_FORMS } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED, isLetrecLambda, isPadded, unwrapBoxed } from "../lambda";
-import { BOX, Lconv, SET_BOX, UNBOX } from "./assignments";
+import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX } from "./assignments";
 import { keepPos, malformed, mapExprs, subExprs } from "./lang";
 import { renamer } from "./rename";
 
@@ -24,7 +24,9 @@ import { renamer } from "./rename";
 const INLINE_SIZE = 16;
 const INLINE_BUDGET = 2000;
 
-type Info = { k: "const", e: any } | { k: "alias", sym: symbol } | { k: "lambda", lambda: any[], once: boolean, name: string };
+type Info = { k: "const", e: any } | { k: "alias", sym: symbol } | { k: "lambda", lambda: any[], once: boolean, name: string }
+    // a sequence made of locals and constants, used once outside any lambda or loop, so made where it is used
+    | { k: "seq", e: any[] };
 
 // (%inlined name body): `body` is the procedure `name`'s, inlined where this form is (tracebacks show its frame, see
 // Code.inlines); the name is a label, not a variable. %tail-inlined: the same, called in the tail position of the
@@ -32,6 +34,8 @@ type Info = { k: "const", e: any } | { k: "alias", sym: symbol } | { k: "lambda"
 export const INLINED = Symbol.for("%inlined");
 export const TAIL_INLINED = Symbol.for("%tail-inlined");
 const WITH_MARK = Symbol.for("%with-mark");
+const APPLY = Symbol.for("%apply");
+const ARRAY = Symbol.for("%array");
 type Env = ReadonlyMap<symbol, Info>;
 // what the walk knows where it is: the variables bound to what it can use, the lambdas not to inline there (their own
 // %letrec group, and those being inlined), whether it is in the tail position of the procedure it is in (a lambda's,
@@ -75,6 +79,28 @@ const usesIn = (es: readonly any[], sym: symbol): number => {
 const onlyCalledIn = (es: readonly any[], sym: symbol): boolean => {
     const walk = (x: any): boolean => x !== sym && children(x).every((y, i) => i === 0 && y === sym && x[0] === sym ? true : walk(y));
     return es.every(walk);
+};
+
+// whether `sym` is boxed in place in `es` ((%box! sym), see the assignments pass)
+const boxedInPlace = (es: readonly any[], sym: symbol): boolean => {
+    const walk = (x: any): boolean => Array.isArray(x) && x[0] !== CORE_QUOTE && ((x[0] === BOX_IN_PLACE && x[1] === sym) || children(x).some(walk));
+    return es.some(walk);
+};
+
+// whether `sym` is used once in `es`, and not inside a lambda or a loop there (which could run it more than once)
+const usedOnceStraight = (es: readonly any[], sym: symbol): boolean => {
+    let n = 0, nested = false;
+    const walk = (x: any, inside: boolean) => {
+        if (x === sym) {
+            n++;
+            nested ||= inside;
+        } else if (Array.isArray(x)) {
+            const deeper = inside || x[0] === CORE_LAMBDA || x[0] === CORE_LOOP;
+            for (const y of children(x)) walk(y, deeper);
+        }
+    };
+    es.forEach(x => walk(x, false));
+    return n === 1 && !nested;
 };
 
 // whether `e` escapes to a %block outside it (which is an error inside a lambda, and must stay one)
@@ -134,8 +160,11 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     // what binding `name` to `init` (simplified) tells the walk of `scope`: a constant or a copy takes its place (the
     // binding goes), a lambda may be inlined
     const learn = (env: Map<symbol, Info>, name: symbol, init: any, scope: readonly any[]): boolean => {
+        // boxed in place, it holds its box from then on: not the value it was bound to
+        if (boxedInPlace(scope, name)) return false;
         if (isConst(init)) env.set(name, { k: "const", e: init });
         else if (typeof init === "symbol" && locals.has(init)) env.set(name, { k: "alias", sym: init });
+        else if (sequenceOf(init) !== null && usedOnceStraight(scope, name)) env.set(name, { k: "seq", e: init });
         else {
             if (inlinable(init)) env.set(name, { k: "lambda", lambda: init, once: usesIn(scope, name) === 1 && onlyCalledIn(scope, name), name: String(name.description) });
             return false;
@@ -143,7 +172,22 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         return true;
     };
     const inlinable = (e: any): boolean => Array.isArray(e) && e[0] === CORE_LAMBDA && e.length === 2 && malformed(Lconv, e) === null
-        && e[1][2] === null && !isPadded(e[1]) && validBinders(e[1][1]) && !escapesOut([CORE_BEGIN, ...e[1].slice(3)]);
+        && validBinders(clauseNames(e[1])) && !escapesOut([CORE_BEGIN, ...e[1].slice(3)]);
+    // whether a call with `nargs` arguments binds the clause's parameters (else it is left to fail as a call)
+    const fits = (c: any[], nargs: number) => isPadded(c) || (c[2] === null ? nargs === c[1].length : nargs >= c[1].length);
+
+    // the elements of a sequence made of locals and constants (by the table's pack, or %array where it has none), or null
+    const sequenceOf = (e: any): any[] | null => {
+        if (!Array.isArray(e) || e[0] !== (intrinsics.pack !== undefined ? Symbol.for(intrinsics.pack.name) : ARRAY)) return null;
+        return e.slice(1).every(x => isConst(x) || (typeof x === "symbol" && locals.has(x))) ? e.slice(1) : null;
+    };
+    // what %apply takes last: an array, or of the table's own sequences, what its spread makes of one
+    const elementsOf = (last: any): any[] | null => {
+        if (intrinsics.pack === undefined) return Array.isArray(last) && last[0] === ARRAY ? last.slice(1) : null;
+        if (intrinsics.spread === undefined || !Array.isArray(last) || last[0] !== Symbol.for(intrinsics.spread.name) || last.length !== 2) return null;
+        const packed = last[1];
+        return Array.isArray(packed) && packed[0] === Symbol.for(intrinsics.pack.name) ? packed.slice(1) : null;
+    };
 
     // the bindings still needed: those with an init that may do something, and those the body or a needed binding's init
     // uses (so procedures that only call each other go when nothing else uses them)
@@ -162,6 +206,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
             const info = k.env.get(e);
             if (info?.k === "const") return ctx === "effect" ? VOID : info.e;
             if (info?.k === "alias") return walk(info.sym, ctx, k);
+            if (info?.k === "seq") return ctx === "effect" ? VOID : info.e;
             return ctx === "effect" && locals.has(e) ? VOID : e;
         }
         if (!Array.isArray(e)) return ctx === "effect" ? VOID : e;
@@ -253,6 +298,18 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 return e.length > 2 ? keepPos([op, e[1], walk(e[2], "value", { ...k, tail: k.blocks.get(e[1]) ?? false })], e) : e;
             case WITH_MARK:
                 return e.length === 4 ? keepPos([op, value(e[1]), value(e[2]), walk(e[3], ctx, k)], e) : e;
+            case APPLY: {
+                if (e.length < 3) break;
+                const next = keepPos([op, ...e.slice(1).map((x: any) => value(x))], e);
+                const elems = elementsOf(next[next.length - 1]);
+                if (elems === null) return next;
+                // (%apply f x ... ys) of a sequence made right there: a call of f with x ... and the elements
+                const call = keepPos([next[1], ...next.slice(2, -1), ...elems], e);
+                const entry = intrinsicOf(next[1]);
+                if (entry !== undefined && (!entry.leaf || call.length - 1 < entry.min || call.length - 1 > entry.max)) return next;
+                if (entry === undefined && typeof next[1] === "symbol" && isCoreForm(next[1])) return next;
+                return walkCall(call, ctx, k);
+            }
             // an inlined body's tail position is its procedure's
             case INLINED:
             case TAIL_INLINED: {
@@ -296,9 +353,17 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
 
     // (lambda arg ...) as a %let of its parameters around its body, marked as the procedure `name`'s, inlined at the
     // call (the arguments are evaluated outside it, as they are by the caller)
-    const inlined = (name: string, lambda: any[], call: any[], ctx: Ctx, k: K): any =>
-        walk(keepPos([CORE_LET, lambda[1][1].map((p: symbol, i: number) => [p, call[i + 1]]),
-            keepPos([k.tail ? TAIL_INLINED : INLINED, Symbol(name), ...lambda[1].slice(3)], call)], call), ctx, k);
+    // A missing parameter of a padded clause is <#void>; arguments past the parameters are evaluated, in order, into
+    // names of their own, and are the rest parameter's elements (a padded clause without one drops them)
+    const inlined = (name: string, lambda: any[], call: any[], ctx: Ctx, k: K): any => {
+        const [, params, rest] = lambda[1];
+        const args = call.slice(1);
+        const extra = args.slice(params.length).map((x: any) => [Symbol("arg"), x]);
+        const bindings = [...params.map((p: symbol, i: number) => [p, i < args.length ? args[i] : VOID]), ...extra];
+        const marked = keepPos([k.tail ? TAIL_INLINED : INLINED, Symbol(name), ...lambda[1].slice(3)], call);
+        const packed = rest === null ? marked : keepPos([CORE_LET, [[rest, [intrinsics.pack !== undefined ? Symbol.for(intrinsics.pack.name) : ARRAY, ...extra.map((b: any[]) => b[0])]]], marked], call);
+        return walk(keepPos([CORE_LET, bindings, packed], call), ctx, k);
+    };
 
     const walkCall = (e: any[], ctx: Ctx, k: K): any => {
         const op = e[0];
@@ -314,17 +379,22 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                     // left to throw when it runs
                 }
             }
+            // the empty sequence, when it is no new object (as an empty list is not)
+            if (entry === intrinsics.pack && args.length === 0) {
+                const empty = entry.fn([], 0, 0);
+                if (typeof empty !== "object" || empty === null) return ctx === "effect" ? VOID : empty;
+            }
             const call = keepPos([op, ...args], e);
             return ctx === "effect" && effectFree(call) ? VOID : call;
         }
         // a lambda applied, or a local bound to one: its body, its parameters bound to the arguments
         const head = aliasOf(op, k.env);
-        if (inlinable(head) && head[1][1].length === e.length - 1) {
+        if (inlinable(head) && fits(head[1], e.length - 1)) {
             const pos = SOURCE_POS.get(head);
             return inlined(pos !== undefined ? `lambda@${pos.file}:${pos.line}` : "lambda", head, e, ctx, k);
         }
         const info = typeof head === "symbol" ? k.env.get(head) : undefined;
-        if (info?.k === "lambda" && !k.own.has(head) && info.lambda[1][1].length === e.length - 1) {
+        if (info?.k === "lambda" && !k.own.has(head) && fits(info.lambda[1], e.length - 1)) {
             const size = sizeOf(info.lambda, INLINE_SIZE);
             if (info.once || (size <= INLINE_SIZE && budget >= size)) {
                 if (!info.once) budget -= size;

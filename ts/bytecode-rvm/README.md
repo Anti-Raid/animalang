@@ -176,6 +176,7 @@ The VM's own operations. They are intrinsics like any other (see host intrinsics
 | `%make-case-lambda` | 1 or more | yes | the procedure of a `%lambda` of several clauses, from their closures |
 | `%values-cons` | 2 | yes | prepend a value to multiple values |
 | `%values->array` | 1 | yes | an array of multiple values |
+| `%array` | any | yes | a new array of the arguments: what the optimizer makes an inlined procedure's rest parameter of where the table has no sequences of its own |
 | `%first-value` | 2 | yes | see above |
 | `%marks-first`, `%marks->array` | 3, 2 | yes | `continuation-mark-set-first` / the values of a key, innermost first |
 | `%debug-frames`, `%debug-traceback` | 3, 2 | yes | see above |

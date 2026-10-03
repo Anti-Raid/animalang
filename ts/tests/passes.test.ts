@@ -109,6 +109,24 @@ describe("The optimizer", () => {
         expect(run(`((lambda (n) (letrec ((ev? (lambda (n) (if (= n 0) #t (od? (- n 1))))) (od? (lambda (n) (if (= n 0) #f (ev? (- n 1)))))) (od? n))) 7)`)).toBe("#t");
     });
 
+    it("inlines procedures with rest and padded parameters, and applies to a list made there as a call", () => {
+        expect(opKinds(proc(`(lambda (f a b) (define (g . xs) (apply f xs)) (g a b))`)).filter(k => k === "Call" || k === "HostCall")).toEqual(["Call"]);
+        expect(run(`(define (rp) (define (g a . r) (list a r)) (list (g 1) (g 1 2 3))) (rp)`)).toBe("((1 ()) (1 (2 3)))");
+        expect(run(`(define (ra) (define (g . xs) (apply + xs)) (g 1 2 3)) (ra)`)).toBe("6");
+        // an applied intrinsic whose count does not fit still fails when it runs
+        expect(() => run(`(define (rb) (define (g . xs) (apply %car xs)) (g 1 2)) (rb)`)).toThrow("expected exactly 1 args, got 2");
+        // a padded clause (Lua): missing parameters <#void>, extra arguments evaluated and dropped
+        const S = Symbol.for;
+        const anima = make(true);
+        const padded = [S("%lambda"), [[S("pad")], [S("a"), S("b")], null, [S("%list"), S("a"), S("b")]]];
+        const program = [S("%let"), [[S("f"), padded]], [S("%list"), [S("f"), 1], [S("f"), 1, 2, [S("%list"), 3]]]];
+        expect(s.stringify(anima.evaluateRaw(anima.compiler.compile(program)))).toBe("((1 <#void>) (1 2))");
+    });
+
+    it("keeps a parameter of an inlined procedure that is assigned a variable of its own", () => {
+        expect(run(`(define (ap) (define (g x) (set! x (+ x 1)) x) (list (g 1) (g 10))) (ap)`)).toBe("(2 11)");
+    });
+
     it("keeps effects, and their order", () => {
         expect(run(`(define oe-log '()) (define (oe-note x) (set! oe-log (cons x oe-log)) x)
                     (define (oe-h) (let ((unused (oe-note 1))) (define (two a b) (list b a)) (two (oe-note 2) (oe-note 3))))

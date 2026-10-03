@@ -26,6 +26,8 @@ export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: In
         if (Lconv.forms.has(op) && Lconv.forms.get(op) !== "exprs" && malformed(Lconv, e) !== null) return e;
         if (op === UNBOX && unneeded(e[1])) return e[1];
         if (op === SET_BOX && unneeded(e[1])) return keepPos([CORE_SET, e[1], walk(e[2])], e);
+        // a box made in place (which may be anywhere once the optimizer has inlined a procedure) that is not needed: nothing
+        if (op === BOX_IN_PLACE && e.length === 2 && unneeded(e[1])) return undefined;
         const next = mapExprs(Lconv, e, walk);
         switch (Lconv.forms.get(op)) {
             case "lambda":
