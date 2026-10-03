@@ -1,6 +1,5 @@
-// What the compiler lowers a function to, for the AOT compiler: a list of instructions, each at a position (`ip`) in
-// the function. Positions are what frames resume at, the line table and caches are keyed by, and jumps target; an
-// instruction takes `OP_SIZE` of them
+// What the compiler lowers a function to, for the AOT compiler: a list of instructions, each at its index in the list
+// (`ip`). Positions are what frames resume at, the line table and caches are keyed by, and jumps target
 
 // Unpack flags
 export const UNPACK_REST = 1;
@@ -40,13 +39,6 @@ export type OpKind = Op["k"];
 
 export type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
-export const OP_SIZE: Readonly<Record<OpKind, number>> = Object.freeze({
-    LoadConst: 3, LoadInt: 3, LoadUpvar: 4, SetUpvar: 4, FixUpvar: 4, LoadGlobal: 3, SetGlobal: 3,
-    If: 3, Else: 2, EndIf: 1, Call: 5, Return: 2, NewClosure: 3, Move: 3, Box: 3, Unbox: 3, SetBox: 3, MoveAcc: 2,
-    Block: 2, Loop: 2, EndLoop: 2, Jump: 2, Unpack: 5, SetMark: 3, MarkSave: 2, MarkRestore: 2, CurMarks: 2,
-    HostCall: 5, IntCall: 5, IntApply: 5,
-});
-
 // whether the instruction after `op` starts a basic block
 const splits = (op: Op): boolean => {
     switch (op.k) {
@@ -71,7 +63,7 @@ export const blockStarts = (ops: readonly Op[]): number[] => {
     const starts = new Set<number>([0]);
     for (const op of ops) {
         for (const t of targets(op)) starts.add(t);
-        if (splits(op)) starts.add(op.ip + OP_SIZE[op.k]);
+        if (splits(op)) starts.add(op.ip + 1);
     }
     return Array.from(starts).sort((a, b) => a - b);
 };

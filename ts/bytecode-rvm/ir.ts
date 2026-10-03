@@ -2,7 +2,7 @@ import { ConstPool, type SourcePos } from "../common";
 import { Code, Closure, ClosureTemplate, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import type { RestKind } from "./arity";
-import { OP_SIZE, UNPACK_REST, UNPACK_STRICT, type DistributiveOmit, type Op } from "./ops";
+import { UNPACK_REST, UNPACK_STRICT, type DistributiveOmit, type Op } from "./ops";
 
 let nextLabelId = 0;
 
@@ -178,7 +178,7 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
         const full = op as Op
         full.ip = ip
         ops.push(full)
-        ip += OP_SIZE[op.k]
+        ip++
         return full
     }
     const lineTable: number[] = []
@@ -259,7 +259,7 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
         if (target === undefined) throw new Error(`unresolved label ${label.id}`)
         op[field] = target
     }
-    return { ops, size: ip, lineTable: new Uint32Array(lineTable), files, used, use }
+    return { ops, lineTable: new Uint32Array(lineTable), files, used, use }
 }
 
 export class IR {
@@ -269,9 +269,9 @@ export class IR {
         const cpool = new ConstPool()
         const lowerTemplate = (t: ClosureTemplateIR) =>
             new ClosureTemplate(t.params, t.remParams, this.lower(t.code, t.numRegs, t.rest === "packed"), t.upvarLocs, t.name, t.rest, t.pad)
-        const { ops, size, lineTable, files, used, use } = lowerOps(nodes, this.table, cpool, lowerTemplate)
+        const { ops, lineTable, files, used, use } = lowerOps(nodes, this.table, cpool, lowerTemplate)
         const restPos = packRest ? use(this.table.pack!.pos) : -1
-        const code = new Code(cpool.constants, ops, size, numRegs, lineTable, files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
+        const code = new Code(cpool.constants, ops, numRegs, lineTable, files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
         code.restPos = restPos
         code.interrupts = this.table.interrupts
         return code

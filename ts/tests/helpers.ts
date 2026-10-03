@@ -3,7 +3,7 @@ import { hostTailFrom } from '../bytecode-rvm/exec';
 import { IProcedure } from '../common';
 import { Code, type UsedIntrinsic } from '../bytecode-rvm/code';
 import { CORE_INTRINSICS } from '../bytecode-rvm/coreops';
-import { OP_SIZE, type DistributiveOmit, type Op } from '../bytecode-rvm/ops';
+import type { DistributiveOmit, Op } from '../bytecode-rvm/ops';
 import { hostError } from '../errors';
 
 // intrinsics belong to an instance, so every instance that uses these registers them
@@ -22,7 +22,6 @@ export const opKinds = (code: Code): string[] => code.ops.map(op => op.k === "If
 
 // code made from instructions written out (positions filled in), as the compiler would lower them
 export const codeOf = (constants: any[], body: DistributiveOmit<Op, "ip">[], numReg: number, used: UsedIntrinsic[] = []): Code => {
-    let ip = 0;
-    const ops = body.map(op => { const full = { ...op, ip } as Op; ip += OP_SIZE[op.k]; return full; });
-    return new Code(constants, ops, ip, numReg, undefined, undefined, false, used.length > 0 ? CORE_INTRINSICS : null, used);
+    const ops = body.map((op, ip) => ({ ...op, ip }) as Op);
+    return new Code(constants, ops, numReg, undefined, undefined, false, used.length > 0 ? CORE_INTRINSICS : null, used);
 };

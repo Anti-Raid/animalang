@@ -2,7 +2,7 @@
 // coroutines, Suspend) <- coreops.ts (the core intrinsics and control requests) <- aot/ (the AOT compiler) <- executor.ts
 // (VMExecutor). This module re-exports them for the rest of the VM
 
-export { OP_SIZE, UNPACK_REST, UNPACK_STRICT } from "./ops";
+export { UNPACK_REST, UNPACK_STRICT } from "./ops";
 export type { Op, OpKind } from "./ops";
 export { AotCompiler } from "./aot/compiler";
 export { CodeEmitter } from "./aot/code-emitter";

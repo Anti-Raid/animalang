@@ -8,7 +8,7 @@ import { bindArgs, checkArity } from "./arity";
 import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
 import type { VMHost } from "./code";
 import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, tracebackMessage } from "./coreops";
-import { OP_SIZE, type DistributiveOmit, type Op } from "./ops";
+import type { DistributiveOmit, Op } from "./ops";
 import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
@@ -59,12 +59,11 @@ const escapeTarget = (tok: EscapeContinuation, from: Frame | null): Frame | null
     return null;
 };
 export const helperClosure = (numReg: number, constants: any[], body: DistributiveOmit<Op, "ip">[], name: string = "raise", params: number = 0): Closure => {
-    let ip = 0;
-    const ops = body.map(op => { const full = { ...op, ip } as Op; ip += OP_SIZE[op.k]; return full; });
+    const ops = body.map((op, ip) => ({ ...op, ip }) as Op);
     const positions = new Set<number>();
     for (const op of ops) if (op.k === "HostCall" || op.k === "IntCall" || op.k === "IntApply") positions.add(op.pos);
     const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
-    const code = new Code(constants, ops, ip, numReg, undefined, undefined, false, CORE_INTRINSICS, used);
+    const code = new Code(constants, ops, numReg, undefined, undefined, false, CORE_INTRINSICS, used);
     code.internal = true;
     return new Closure(new ClosureTemplate(Array.from({ length: params }, () => Symbol()), null, code, [], name), [], name);
 };

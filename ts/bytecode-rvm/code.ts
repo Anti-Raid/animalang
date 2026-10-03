@@ -48,12 +48,10 @@ export class Code {
     // compiled with interrupt checks (see Intrinsics.setInterruptHandler)
     public interrupts: boolean = false;
 
-    // `size`: the position after the last instruction. lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each
-    // covers the code up to the next entry
+    // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
         public constants: any[],
         public ops: readonly Op[],
-        public size: number,
         public numReg: number,
         public lineTable: Uint32Array = new Uint32Array(0),
         public files: string[] = [],
@@ -134,7 +132,7 @@ export class Code {
     fresh(copies: Map<Code, Code> = new Map(), table: Intrinsics | null = this.table): Code {
         const known = copies.get(this);
         if (known !== undefined) return known;
-        const copy = new Code([], this.ops, this.size, this.numReg, this.lineTable, this.files, this.debug, this.table, this.intrinsics);
+        const copy = new Code([], this.ops, this.numReg, this.lineTable, this.files, this.debug, this.table, this.intrinsics);
         copies.set(this, copy);
         copy.restPos = this.restPos;
         copy.interrupts = this.interrupts;

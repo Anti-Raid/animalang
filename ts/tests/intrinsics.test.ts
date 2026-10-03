@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
 import { Code, AotCompiler } from '../bytecode-rvm/vm';
-import { Closure, CORE_COUNT, CORE_INTRINSICS, OP_SIZE, corePos, listing } from '../bytecode-rvm/exec';
+import { Closure, CORE_COUNT, CORE_INTRINSICS, corePos, listing } from '../bytecode-rvm/exec';
 import { Compiler } from '../bytecode-rvm/compiler';
 import { Intrinsics } from '../bytecode-rvm/intrinsics';
 import { Anima } from '../anima';
@@ -253,8 +253,8 @@ describe("Instructions", () => {
         // a spread list is a new array, called with as it is
         const l = listing(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-l").tmpl.code)
         expect(l.some(line => /HostCall +pos=%apply-fresh, start=r\d+, nargs=2, tail=true$/.test(line))).toBe(true)
-        // positions advance by each instruction's size
-        for (let i = 1; i < bc.ops.length; i++) expect(bc.ops[i].ip - bc.ops[i - 1].ip).toBe(OP_SIZE[bc.ops[i - 1].k])
+        // an instruction's position is its index
+        bc.ops.forEach((op, i) => expect(op.ip).toBe(i))
     })
 
 })

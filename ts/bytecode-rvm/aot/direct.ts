@@ -203,7 +203,7 @@ export class DirectEmitter extends FunctionEmitter {
     // Else endIp; a nested if's chain has its own end)
     #hasElseIf(elseIp: number, endIp: number): boolean {
         const endIf = this.structure.endIfBefore.get(endIp)!;
-        return this.structure.elseIfs.some(e => e.ip >= elseIp && e.ip < endIf && this.structure.elseBefore.get(e.else) === endIp);
+        return this.structure.elseIfs.some(e => e.ip >= elseIp && e.ip < endIf && this.structure.elseBefore.get(e.else)?.end === endIp);
     }
 
     #walk(index: Map<number, number>, from: number, stop: number): void {
@@ -228,15 +228,17 @@ export class DirectEmitter extends FunctionEmitter {
             const term = block.term;
             if (term.k === "Branch") {
                 const elseIp = term.else;
-                const endIp = this.structure.elseBefore.get(elseIp);
-                if (term.then !== next || endIp === undefined) throw STRUCTURE_MISMATCH;
-                if (!this.structure.endIfBefore.has(endIp)) throw STRUCTURE_MISMATCH;
+                const thenEnd = this.structure.elseBefore.get(elseIp);
+                if (term.then !== next || thenEnd === undefined) throw STRUCTURE_MISMATCH;
+                const endIp = thenEnd.end, thenStop = thenEnd.at;
+                const elseStop = this.structure.endIfBefore.get(endIp);
+                if (elseStop === undefined) throw STRUCTURE_MISMATCH;
                 // a later clause of the chain being walked: a sibling of the first, leaving the chain's block when taken
                 if (term.elseif) {
                     const chain = this.#chains.get(endIp);
                     if (chain === undefined) throw STRUCTURE_MISMATCH;
                     this.emit(`if (${this.truthy(term.cond)}) {`);
-                    this.#walk(index, term.then, elseIp - 2);
+                    this.#walk(index, term.then, thenStop);
                     this.emit(`break ${chain}; }`);
                     i = index.get(elseIp);
                     if (i === undefined) throw STRUCTURE_MISMATCH;
@@ -248,16 +250,16 @@ export class DirectEmitter extends FunctionEmitter {
                     this.#chains.set(endIp, chain);
                     this.emit(`${chain}: {`);
                     this.emit(`if (${this.truthy(term.cond)}) {`);
-                    this.#walk(index, term.then, elseIp - 2);
+                    this.#walk(index, term.then, thenStop);
                     this.emit(`break ${chain}; }`);
-                    this.#walk(index, elseIp, endIp - 1);
+                    this.#walk(index, elseIp, elseStop);
                     this.emit(`}`);
                     this.#chains.delete(endIp);
                 } else {
                     this.emit(`if (${this.truthy(term.cond)}) {`);
-                    this.#walk(index, term.then, elseIp - 2);
+                    this.#walk(index, term.then, thenStop);
                     this.emit(`} else {`);
-                    this.#walk(index, elseIp, endIp - 1);
+                    this.#walk(index, elseIp, elseStop);
                     this.emit(`}`);
                 }
                 if (endIp >= stop) return;

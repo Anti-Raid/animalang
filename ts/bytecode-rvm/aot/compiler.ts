@@ -13,7 +13,7 @@ import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS } from "../code";
 import type { Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
-import { OP_SIZE, blockStarts, type Op } from "../ops";
+import { blockStarts, type Op } from "../ops";
 import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
@@ -170,7 +170,7 @@ export class AotCompiler {
         const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
         const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
         const usedDeps = new Set<string>();
-        const structure = structureOf(code.ops, code.size);
+        const structure = structureOf(code.ops);
         const resume = this.#step("resume", () => {
             const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
             out.emitFunction();
@@ -203,7 +203,7 @@ export class AotCompiler {
         const blocks: AotBlock[] = [];
         let o = 0;
         for (let b = 0; b < starts.length; b++) {
-            const end = b + 1 < starts.length ? starts[b + 1] : code.size;
+            const end = b + 1 < starts.length ? starts[b + 1] : code.ops.length;
             const insts: AotInst[] = [];
             let term: AotTerm | null = null;
             let ip = starts[b];
@@ -211,7 +211,7 @@ export class AotCompiler {
             while (ip < end && term === null) {
                 const op = code.ops[o++];
                 const at = op.ip;
-                ip = at + OP_SIZE[op.k];
+                ip = at + 1;
                 switch (op.k) {
                     case "LoadConst": insts.push({ k: "LoadConst", dst: op.dst, idx: op.idx, at }); break;
                     case "LoadInt": insts.push({ k: "LoadInt", dst: op.dst, value: op.value, at }); break;
