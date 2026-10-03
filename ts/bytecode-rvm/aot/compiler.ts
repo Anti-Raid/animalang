@@ -1,9 +1,11 @@
-// The AOT compiler: splits a function's instructions into basic blocks, generates a function's JS source (see emit.ts) and builds it,
+// The AOT compiler: splits a function's instructions into basic blocks, generates a function's JS source (resume.ts, direct.ts) and builds it,
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
 import { Intrinsics, type TypeSystem } from "../intrinsics";
 import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, packValues } from "../../common";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
-import { DirectEmitter, ResumeEmitter } from "./emit";
+import { DirectEmitter } from "./direct";
+import { ResumeEmitter } from "./resume";
+import { Liveness } from "./liveness";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
 import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS } from "../code";
@@ -153,26 +155,38 @@ export class AotCompiler {
         return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 
+    // called with each step's output when generating source: the blocks, their liveness, the resume and direct entries
+    static trace?: (step: string, output: unknown) => void;
+
+    static #step<T>(name: string, run: () => T): T {
+        const output = run();
+        this.trace?.(name, output);
+        return output;
+    }
+
     public static generateSource(code: Code, tmpl?: ClosureTemplate): string {
         if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
-        const blocks = this.buildAot(code, tmpl);
+        const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
+        const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
         const usedDeps = new Set<string>();
         const layout = { ops: code.ops, at: new Map(code.ops.map(op => [op.ip, op])), size: code.size };
-        const resume = new ResumeEmitter(blocks, layout, code.numReg, code.debug, code.table, usedDeps, code.constants);
-        resume.emitFunction();
-        let direct = "null";
-        if (tmpl !== undefined) {
-            const out = new DirectEmitter(blocks, layout, code.numReg, code.debug, code.table, usedDeps, code.constants);
+        const resume = this.#step("resume", () => {
+            const out = new ResumeEmitter(blocks, layout, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
+            out.emitFunction();
+            return out.toString();
+        });
+        const direct = tmpl === undefined ? "null" : this.#step("direct", () => {
+            const out = new DirectEmitter(blocks, layout, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
             out.emitFunction(tmpl.arity);
-            direct = out.toString();
-        }
+            return out.toString();
+        });
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
         const callCaches = this.#callSites(code).map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("");
         // positions never change once registered, so each intrinsic's function and deps are read once, into locals
         const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
         const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
         const deps = [...usedDeps].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
-        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${resume.toString()},\ndirect: ${direct}\n};`;
+        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${resume},\ndirect: ${direct}\n};`;
     }
 
     static #globalLoads(code: Code): number[] {

@@ -393,7 +393,7 @@ export class EscapedError {
 }
 
 // About how many interrupt checks pass between calls of the handler (see Intrinsics.setInterruptHandler): the VM's own
-// choice, which it may change. AOT code counts only some checks (see %interrupt in aot/emit.ts)
+// choice, which it may change. AOT code counts only some checks (see %interrupt in aot/control.ts)
 export const INTERRUPT_INTERVAL = 65536;
 
 // An interrupt handler's stop (hostInterruptError): it leaves every evaluation it is in for the host, past exception
