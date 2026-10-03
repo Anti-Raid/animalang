@@ -86,7 +86,7 @@ describe('Anima', () => {
             // written in native-scheme, the core forms are the language
             expect(nrun(`(%if #f 1 (%begin 2 3))`)).toBe("3")
             expect(() => nrun(`(%if 1)`)).toThrow("%if requires at least a condition and a branch")
-            expect(() => nrun(`(define %if 1)`)).toThrow()
+            expect(() => nrun(`(define-global %if 1)`)).toThrow()
             expect(() => nrun(`(lambda (%lambda) 1)`)).toThrow()
         })
         it('inlined predicates agree with the builtins', () => {
@@ -396,10 +396,10 @@ describe('Anima', () => {
             expose(evaluator, "%test-current")
             expect(evaluator.currentCoroutine()).toBe(null)
             expect(nrun(`(%call list (%call current-coroutine) (%call null? (%intcall %test-current)) (%call (%call car (%call list current-coroutine))) (%intcall %current-coroutine 'none))`)).toBe("(#f #t #f none)")
-            expect(nrun(`(define co (%call coroutine-create (lambda () (%call list (%call eq? (%call current-coroutine) co) (%call eq? (%intcall %test-current) co))))) (%call coroutine-resume co)`)).toBe("(#t #t)")
+            expect(nrun(`(define-global co (%call coroutine-create (lambda () (%call list (%call eq? (%call current-coroutine) co) (%call eq? (%intcall %test-current) co))))) (%call coroutine-resume co)`)).toBe("(#t #t)")
             // nested: back in the outer one after the inner yields, returns or is closed
-            expect(nrun(`(define inner (%call coroutine-create (lambda () (%call coroutine-yield (%call eq? (%intcall %test-current) inner)) 'done))) (define outer (%call coroutine-create (lambda () (let* ((a (%call coroutine-resume inner)) (b (%call eq? (%intcall %test-current) outer)) (c (%call coroutine-resume inner)) (d (%call eq? (%call current-coroutine) outer))) (%call list a b c d))))) (%call list (%call coroutine-resume outer) (%call null? (%intcall %test-current)))`)).toBe("((#t #t done #t) #t)")
-            expect(nrun(`(define dies (%call coroutine-create (lambda () (%call raise 'x)))) (define outer2 (%call coroutine-create (lambda () (%catch (lambda () (%call coroutine-resume dies)) (lambda (e) (%call eq? (%intcall %test-current) outer2)))))) (%call coroutine-resume outer2)`)).toBe("#t")
+            expect(nrun(`(define-global inner (%call coroutine-create (lambda () (%call coroutine-yield (%call eq? (%intcall %test-current) inner)) 'done))) (define-global outer (%call coroutine-create (lambda () (let* ((a (%call coroutine-resume inner)) (b (%call eq? (%intcall %test-current) outer)) (c (%call coroutine-resume inner)) (d (%call eq? (%call current-coroutine) outer))) (%call list a b c d))))) (%call list (%call coroutine-resume outer) (%call null? (%intcall %test-current)))`)).toBe("((#t #t done #t) #t)")
+            expect(nrun(`(define-global dies (%call coroutine-create (lambda () (%call raise 'x)))) (define-global outer2 (%call coroutine-create (lambda () (%catch (lambda () (%call coroutine-resume dies)) (lambda (e) (%call eq? (%intcall %test-current) outer2)))))) (%call coroutine-resume outer2)`)).toBe("#t")
             const co = evaluator.evaluateRaw(evaluator.compileRaw(`(coroutine-create (lambda () (coroutine-yield (eq? (test-current) (current-coroutine))) (current-coroutine)))`))
             expect(evaluator.coroutineResume(co).value).toBe(true)
             expect(evaluator.currentCoroutine()).toBe(null)
@@ -431,15 +431,15 @@ describe('Anima', () => {
         it('yields from a host intrinsic with hostYield', () => {
             evaluator.registerIntrinsic("%test-yield", (regs, s, n) => hostYield(...regs.slice(s, s + n)), { args: [0, Infinity] })
             // the values it is resumed with are the call's value
-            expect(nrun(`(define co (%call coroutine-create (lambda () (%call list (%intcall %test-yield 1) (%intcall %test-yield 2))))) (%call list (%call coroutine-resume co) (%call coroutine-resume co 'a) (%call coroutine-resume co 'b) (%call coroutine-status co))`)).toBe("(1 2 (a b) dead)")
+            expect(nrun(`(define-global co (%call coroutine-create (lambda () (%call list (%intcall %test-yield 1) (%intcall %test-yield 2))))) (%call list (%call coroutine-resume co) (%call coroutine-resume co 'a) (%call coroutine-resume co 'b) (%call coroutine-status co))`)).toBe("(1 2 (a b) dead)")
             // in tail position: the caller's value, or with no caller left, the coroutine's
-            expect(nrun(`(define (y v) (%intcall %test-yield v)) (define co2 (%call coroutine-create (lambda () (%call list (%call y 1) 'after)))) (%call list (%call coroutine-resume co2) (%call coroutine-resume co2 'r))`)).toBe("(1 (r after))")
-            expect(nrun(`(define co3 (%call coroutine-create (lambda () (%intcall %test-yield 1)))) (%call list (%call coroutine-resume co3) (%call coroutine-resume co3 'x) (%call coroutine-status co3))`)).toBe("(1 x dead)")
+            expect(nrun(`(define-global (y v) (%intcall %test-yield v)) (define-global co2 (%call coroutine-create (lambda () (%call list (%call y 1) 'after)))) (%call list (%call coroutine-resume co2) (%call coroutine-resume co2 'r))`)).toBe("(1 (r after))")
+            expect(nrun(`(define-global co3 (%call coroutine-create (lambda () (%intcall %test-yield 1)))) (%call list (%call coroutine-resume co3) (%call coroutine-resume co3 'x) (%call coroutine-status co3))`)).toBe("(1 x dead)")
             // several values and none, in a loop hot enough for direct code
-            expect(nrun(`(define co4 (%call coroutine-create (lambda () (named-let loop ((i 0) (acc 0)) (%if (%call = i 200) acc (%call loop (%call + i 1) (%call + acc (%intcall %test-yield i i)))))))) (named-let loop ((n 1) (seen (%call call-with-values (lambda () (%call coroutine-resume co4)) list))) (%if (%call = n 200) (%call list seen (%call coroutine-resume co4 1)) (%call loop (%call + n 1) (%call call-with-values (lambda () (%call coroutine-resume co4 1)) list))))`)).toBe("((199 199) 200)")
-            expect(nrun(`(define co5 (%call coroutine-create (lambda () (%intcall %test-yield) 'done))) (%call call-with-values (lambda () (%call coroutine-resume co5)) list)`)).toBe("()")
+            expect(nrun(`(define-global co4 (%call coroutine-create (lambda () (let loop ((i 0) (acc 0)) (%if (%call = i 200) acc (%call loop (%call + i 1) (%call + acc (%intcall %test-yield i i)))))))) (let loop ((n 1) (seen (%call call-with-values (lambda () (%call coroutine-resume co4)) list))) (%if (%call = n 200) (%call list seen (%call coroutine-resume co4 1)) (%call loop (%call + n 1) (%call call-with-values (lambda () (%call coroutine-resume co4 1)) list))))`)).toBe("((199 199) 200)")
+            expect(nrun(`(define-global co5 (%call coroutine-create (lambda () (%intcall %test-yield) 'done))) (%call call-with-values (lambda () (%call coroutine-resume co5)) list)`)).toBe("()")
             // raised into at the yield, under the coroutine's handlers
-            expect(nrun(`(define co6 (%call coroutine-create (lambda () (%catch (lambda () (%intcall %test-yield 1)) (lambda (e) (%call list 'caught e)))))) (%call list (%call coroutine-resume co6) (%call coroutine-raise co6 'boom))`)).toBe("(1 (caught boom))")
+            expect(nrun(`(define-global co6 (%call coroutine-create (lambda () (%catch (lambda () (%intcall %test-yield 1)) (lambda (e) (%call list 'caught e)))))) (%call list (%call coroutine-resume co6) (%call coroutine-raise co6 'boom))`)).toBe("(1 (caught boom))")
             expect(() => nrun(`(%intcall %test-yield 1)`)).toThrow("coroutine-yield: not inside a coroutine")
         })
 
@@ -485,7 +485,7 @@ describe('Anima', () => {
             expect(evaluator.coroutineYieldable()).toBe(false)
             expect(run(`(list (coroutine-yieldable?) (coroutine-resume (coroutine-create (lambda () (coroutine-yieldable?)))))`)).toBe("(#f #t)")
             expect(nrun(`(%call list (%intcall %test-yieldable) (%call coroutine-resume (%call coroutine-create (lambda () (%intcall %test-yieldable)))))`)).toBe("(#f #t)")
-            expect(nrun(`(define seen '()) (define co (%call coroutine-create (lambda () (%call dynamic-wind (lambda () #f) (lambda () (%call coroutine-yield 1)) (lambda () (%set! seen (%call list (%call coroutine-yieldable?) (%intcall %test-yieldable)))))))) (%call coroutine-resume co) (%call coroutine-close co) seen`)).toBe("(#f #f)")
+            expect(nrun(`(define-global seen '()) (define-global co (%call coroutine-create (lambda () (%call dynamic-wind (lambda () #f) (lambda () (%call coroutine-yield 1)) (lambda () (%set! seen (%call list (%call coroutine-yieldable?) (%intcall %test-yieldable)))))))) (%call coroutine-resume co) (%call coroutine-close co) seen`)).toBe("(#f #f)")
         })
 
         it('takes any procedure where the VM calls one itself', () => {
@@ -501,7 +501,7 @@ describe('Anima', () => {
                 try { evaluator.coroutineRaise(regs[s], "boom") } catch { }
                 return evaluator.currentCoroutine()
             }, { args: [1, 1], leaf: true })
-            expect(nrun(`(define fresh (%call coroutine-create (lambda () 1))) (define outer (%call coroutine-create (lambda () (%call eq? (%intcall %test-raise-into fresh) outer)))) (%call list (%call coroutine-resume outer) (%call coroutine-status fresh))`)).toBe("(#t dead)")
+            expect(nrun(`(define-global fresh (%call coroutine-create (lambda () 1))) (define-global outer (%call coroutine-create (lambda () (%call eq? (%intcall %test-raise-into fresh) outer)))) (%call list (%call coroutine-resume outer) (%call coroutine-status fresh))`)).toBe("(#t dead)")
         })
 
         it('kills a coroutine whose first call fails, and raises the error in its resumer', () => {
@@ -1704,14 +1704,14 @@ describe('Anima', () => {
 
         it('binds in parallel, captures correctly and works across yields and continuations', () => {
             expect(nrun(`(let ((a 10)) (%let-values (((a) #null (%call values 1)) ((b) #null (%call values a))) (%call list a b)))`)).toBe("(1 10)")
-            expect(nrun(`(define (pair-fns) (%let-values (((x y) #null (%call values 1 2))) (%call list (lambda () x) (lambda () y)))) (%call map (lambda (f) (%call f)) (%call pair-fns))`)).toBe("(1 2)")
-            expect(nrun(`(define lv-co (%call coroutine-create (lambda () (%let-values (((a b) #null (%call coroutine-yield 'ready))) (%call list b a))))) (%call list (%call coroutine-resume lv-co) (%call coroutine-resume lv-co 1 2))`)).toBe("(ready (2 1))")
-            expect(nrun(`(define lv-k #f) (define lv-n 0) (define lv-r (%let-values (((a b) #null (%call call/cc (lambda (k) (%set! lv-k k) (%call values 1 2))))) (%call list a b))) (%set! lv-n (%call + lv-n 1)) (%if (%call = lv-n 1) (%call lv-k 5) (%call list lv-r lv-n))`)).toBe("((5 <#void>) 2)")
+            expect(nrun(`(define-global (pair-fns) (%let-values (((x y) #null (%call values 1 2))) (%call list (lambda () x) (lambda () y)))) (%call map (lambda (f) (%call f)) (%call pair-fns))`)).toBe("(1 2)")
+            expect(nrun(`(define-global lv-co (%call coroutine-create (lambda () (%let-values (((a b) #null (%call coroutine-yield 'ready))) (%call list b a))))) (%call list (%call coroutine-resume lv-co) (%call coroutine-resume lv-co 1 2))`)).toBe("(ready (2 1))")
+            expect(nrun(`(define-global lv-k #f) (define-global lv-n 0) (define-global lv-r (%let-values (((a b) #null (%call call/cc (lambda (k) (%set! lv-k k) (%call values 1 2))))) (%call list a b))) (%set! lv-n (%call + lv-n 1)) (%if (%call = lv-n 1) (%call lv-k 5) (%call list lv-r lv-n))`)).toBe("((5 <#void>) 2)")
         })
 
         it('%first-value truncates multiple values to the first (Lua)', () => {
             expect(nrun(`(%call list (%intcall %first-value (%call values 1 2 3) 'none) (%intcall %first-value 5 'none) (%intcall %first-value (%call values) 'none) (%intcall %first-value (%call values) #void))`)).toBe("(1 5 none <#void>)")
-            expect(nrun(`(define (two) (%call values 10 20)) (define (fv-sum) (%call + (%intcall %first-value (%call two) #void) 1)) (%call fv-sum)`)).toBe("11")
+            expect(nrun(`(define-global (two) (%call values 10 20)) (define-global (fv-sum) (%call + (%intcall %first-value (%call two) #void) 1)) (%call fv-sum)`)).toBe("11")
             expect(() => nrun(`(%intcall %first-value 1)`)).toThrow("%first-value: expected exactly 2 args, got 1")
         })
 
@@ -1853,7 +1853,7 @@ describe('Anima', () => {
             expect(run(`(define (body k) (coroutine-yield 1) (k 'escaped) 'not)
                         (define co (coroutine-create (lambda () (coroutine-yield (call/ec body)) 'end)))
                         (list (coroutine-resume co) (coroutine-resume co) (coroutine-resume co))`)).toBe("(1 escaped end)")
-            expect(nrun(`(define co2 (%call coroutine-create (lambda () (%catch (lambda () (%call coroutine-yield 1) (%call raise 'late)) (lambda (e) (%call list 'caught e)))))) (%call list (%call coroutine-resume co2) (%call coroutine-resume co2))`)).toBe("(1 (caught late))")
+            expect(nrun(`(define-global co2 (%call coroutine-create (lambda () (%catch (lambda () (%call coroutine-yield 1) (%call raise 'late)) (lambda (e) (%call list 'caught e)))))) (%call list (%call coroutine-resume co2) (%call coroutine-resume co2))`)).toBe("(1 (caught late))")
             // re-entering the extent through a continuation makes k live again
             expect(run(`(define again #f) (define n 0)
                         (define (body k) (call/cc (lambda (c) (set! again c))) (set! n (+ n 1)) (k n))

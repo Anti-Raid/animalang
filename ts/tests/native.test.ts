@@ -86,16 +86,18 @@ describe("native-scheme", () => {
         expect(() => a.compileRaw(`(f 1)`)).toThrow("f is not a core form");
     });
 
-    it("has lambda, define and Scheme's let, let* and letrec as sugar", () => {
+    it("has lambda, define-global and Scheme's let, let* and letrec as sugar", () => {
         const a = make();
-        expect(run(a, `(define (add . xs) (%intapply %+ xs)) (define one 1) (%call add one 2 3)`)).toBe("6");
+        expect(run(a, `(define-global (add . xs) (%intapply %+ xs)) (define-global one 1) (%call add one 2 3)`)).toBe("6");
         expect(run(a, `(%call (lambda (a b . r) (%intcall %push r (%intcall %+ a b))) 1 2 3)`)).toBe("(3 3)");
         expect(run(a, `(%call (lambda xs xs) 1 2)`)).toBe("(1 2)");
         expect(run(a, `(let ((x 1) (y 2)) (let* ((x 10) (z (%intcall %+ x y))) z))`)).toBe("12");
         expect(run(a, `(letrec ((ev? (lambda (n) (%if (%intcall %= n 0) #t (%call od? (%intcall %- n 1)))))
                                 (od? (lambda (n) (%if (%intcall %= n 0) #f (%call ev? (%intcall %- n 1))))))
                          (%call ev? 10))`)).toBe("#t");
-        expect(() => a.compileRaw(`(let ((x 1)) (define y 2) y)`)).toThrow("define: only at the top level");
+        // a global, wherever it is defined; native-scheme has no define of locals (let and letrec bind them)
+        expect(run(a, `(let ((x 1)) (define-global y (%intcall %+ x 1)) y)`)).toBe("2");
+        expect(() => a.compileRaw(`(define z 1)`)).toThrow("define is not a core form");
         expect(() => a.compileRaw(`(lambda (a . b c) a)`)).toThrow("one name must follow .");
     });
 
@@ -107,48 +109,48 @@ describe("native-scheme", () => {
         expect(run(a, `(%intcall %array (and 0 #null) (or #null 1))`)).toBe("(#null #null)");
     });
 
-    it("makes a named-let a loop when its name is only called in tail position", () => {
+    it("makes a named let a loop when its name is only called in tail position", () => {
         const a = make();
-        const sum = `(named-let loop ((i 0) (acc 0)) (%if (%intcall %= i 100000) acc (%call loop (%intcall %+ i 1) (%intcall %+ acc i))))`;
+        const sum = `(let loop ((i 0) (acc 0)) (%if (%intcall %= i 100000) acc (%call loop (%intcall %+ i 1) (%intcall %+ acc i))))`;
         expect(run(a, sum)).toBe("4999950000");
         expect(JSON.stringify(transformNative(readNative(sum)), (_, v) => typeof v === "symbol" ? v.description : v)).toContain('"%loop"');
         // nested, and the inner one going round the outer
-        expect(run(a, `(named-let outer ((i 0) (out '()))
+        expect(run(a, `(let outer ((i 0) (out '()))
                          (%if (%intcall %= i 3) out
-                           (named-let inner ((j 0) (out out))
+                           (let inner ((j 0) (out out))
                              (%if (%intcall %= j i) (%call outer (%intcall %+ i 1) out) (%call inner (%intcall %+ j 1) (%intcall %push out j))))))`)).toBe("(0 0 1)");
         // used as a value, or not in tail position: a procedure
-        const proc = `(named-let count ((n 3)) (%if (%intcall %= n 0) 0 (%intcall %+ 1 (%call count (%intcall %- n 1)))))`;
+        const proc = `(let count ((n 3)) (%if (%intcall %= n 0) 0 (%intcall %+ 1 (%call count (%intcall %- n 1)))))`;
         expect(run(a, proc)).toBe("3");
         expect(JSON.stringify(transformNative(readNative(proc)), (_, v) => typeof v === "symbol" ? v.description : v)).toContain('"%letrec"');
-        expect(run(a, `(named-let f ((n 1)) (%if (%intcall %= n 1) f n))`).startsWith("#<procedure")).toBe(true);
+        expect(run(a, `(let f ((n 1)) (%if (%intcall %= n 1) f n))`).startsWith("#<procedure")).toBe(true);
         // a parameter of the loop's name hides it
-        expect(run(a, `(named-let f ((f 5)) f)`)).toBe("5");
+        expect(run(a, `(let f ((f 5)) f)`)).toBe("5");
         // an escape to a block that is not in tail position is not a tail call, even if an outer block of the same name
         // is: (outer 1) here is an argument of +, so this is recursion (result 2), not a loop (result 1)
-        const shadowed = `(named-let outer ((i 0)) (%if (%intcall %= i 1) i (%block b (%intcall %+ 1 (%block b (%escape b (%call outer 1)))))))`;
+        const shadowed = `(let outer ((i 0)) (%if (%intcall %= i 1) i (%block b (%intcall %+ 1 (%block b (%escape b (%call outer 1)))))))`;
         expect(run(a, shadowed)).toBe("2");
         expect(JSON.stringify(transformNative(readNative(shadowed)), (_, v) => typeof v === "symbol" ? v.description : v)).toContain('"%letrec"');
         // defining a global of the loop's name leaves the loop alone
-        expect(run(a, `(%intcall %array (named-let loop ((i 0)) (%define-global loop 42) (%if (%intcall %= i 3) i (%call loop (%intcall %+ i 1)))) loop)`)).toBe("(3 42)");
+        expect(run(a, `(%intcall %array (let loop ((i 0)) (%define-global loop 42) (%if (%intcall %= i 3) i (%call loop (%intcall %+ i 1)))) loop)`)).toBe("(3 42)");
     });
 
-    it("gives each round of a named-let loop its own bindings, as calls would", () => {
+    it("gives each round of a named let loop its own bindings, as calls would", () => {
         const a = make();
-        expect(run(a, `(define k #f) (define n 0)
-            (define r (named-let loop ((i 0) (acc '()))
+        expect(run(a, `(define-global k #f) (define-global n 0)
+            (define-global r (let loop ((i 0) (acc '()))
                 (%if (%intcall %= i 3) acc
                     (%call loop (%intcall %+ i 1) (%intcall %push acc (%intcall %call/cc (lambda (c) (%if (%intcall %= i 1) (%set! k c)) i)))))))
             (%set! n (%intcall %+ n 1))
             (%if (%intcall %< n 3) (%call k (%intcall %+ 10 n)) (%intcall %array r n))`)).toBe("((0 12 2) 3)");
         // closures made in a round keep that round's value
-        expect(run(a, `(named-let loop ((i 0) (fs '()))
+        expect(run(a, `(let loop ((i 0) (fs '()))
             (%if (%intcall %= i 3) (%intcall %array (%call (%intcall %at fs 0)) (%call (%intcall %at fs 2))) (%call loop (%intcall %+ i 1) (%intcall %push fs (lambda () i)))))`)).toBe("(0 2)");
     });
 
     it("compiles on another front end's instance, with its quoted data and table", () => {
         const scheme = createScheme(impl);
-        expect(s.stringify(scheme.evaluateRaw(compileNative(scheme, `(named-let loop ((l '(1 2 3)) (acc 0)) (%if (%intcall %null? l) acc (%call loop (%intcall %cdr l) (%intcall %+ acc (%intcall %car l)))))`)))).toBe("6");
+        expect(s.stringify(scheme.evaluateRaw(compileNative(scheme, `(let loop ((l '(1 2 3)) (acc 0)) (%if (%intcall %null? l) acc (%call loop (%intcall %cdr l) (%intcall %+ acc (%intcall %car l)))))`)))).toBe("6");
     });
 
     it("words messages in its own terms", () => {

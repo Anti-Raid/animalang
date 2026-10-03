@@ -114,7 +114,7 @@ describe("The optimizer", () => {
         expect(run(`(define (rp) (define (g a . r) (list a r)) (list (g 1) (g 1 2 3))) (rp)`)).toBe("((1 ()) (1 (2 3)))");
         expect(run(`(define (ra) (define (g . xs) (apply + xs)) (g 1 2 3)) (ra)`)).toBe("6");
         // an applied intrinsic whose count does not fit still fails when it runs
-        expect(() => runNative(make(true), `(define (rb) (letrec ((g (lambda xs (%intapply %car (%intcall %spread xs))))) (%call g 1 2))) (%call rb)`)).toThrow("expected exactly 1 args, got 2");
+        expect(() => runNative(make(true), `(define-global (rb) (letrec ((g (lambda xs (%intapply %car (%intcall %spread xs))))) (%call g 1 2))) (%call rb)`)).toThrow("expected exactly 1 args, got 2");
         // a padded clause (Lua): missing parameters <#void>, extra arguments evaluated and dropped
         const S = Symbol.for;
         const anima = make(true);

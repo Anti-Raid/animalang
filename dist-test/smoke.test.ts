@@ -17,8 +17,8 @@ describe.each([["release", implRvm], ["debug", implRvmDebug]] as const)("dist %s
         anima.registerIntrinsic("%smoke-call", (regs: any[], start: number, nargs: number) => hostTailFrom(regs[start], regs, start + 1, nargs - 1), { args: [1, Infinity] });
         // Scheme code reaches intrinsics only through procedures the host defines, in native-scheme
         anima.evaluateRaw(compileNative(anima, `
-            (define (smoke-add a b) (%intcall %smoke-add a b))
-            (define smoke-call (%lambda (() (f) #null (%intcall %smoke-call f)) (() (f a b) #null (%intcall %smoke-call f a b))))`, "host.ns"));
+            (define-global (smoke-add a b) (%intcall %smoke-add a b))
+            (define-global smoke-call (%lambda (() (f) #null (%intcall %smoke-call f)) (() (f a b) #null (%intcall %smoke-call f a b))))`, "host.ns"));
         return anima;
     };
     const run = (anima: ReturnType<typeof createScheme>, src: string) => s.stringify(anima.evaluateRaw(anima.compileRaw(src)));
@@ -54,6 +54,6 @@ describe.each([["release", implRvm], ["debug", implRvmDebug]] as const)("dist %s
         const ns = createNativeScheme(options);
         ns.registerIntrinsic("%add", (regs: any[], start: number) => regs[start] + regs[start + 1], { args: [2, 2], leaf: true });
         ns.registerIntrinsic("%less", (regs: any[], start: number) => regs[start] < regs[start + 1], { args: [2, 2], leaf: true });
-        expect(ns.evaluateRaw(ns.compileRaw(`(define (sum n) (named-let loop ((i 0) (acc 0)) (%if (%intcall %less i n) (%call loop (%intcall %add i 1) (%intcall %add acc i)) acc))) (%call sum 10)`))).toBe(45);
+        expect(ns.evaluateRaw(ns.compileRaw(`(define-global (sum n) (let loop ((i 0) (acc 0)) (%if (%intcall %less i n) (%call loop (%intcall %add i 1) (%intcall %add acc i)) acc))) (%call sum 10)`))).toBe(45);
     });
 });

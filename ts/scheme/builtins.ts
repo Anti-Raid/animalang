@@ -656,10 +656,10 @@ export const SCHEME_ALIASES: ReadonlyMap<symbol, SchemeAlias> = new Map([
 export const ALIAS_WRAPPERS = [
     ...[...SCHEME_ALIASES].filter(([, { wrapper }]) => wrapper).map(([sym, { target, min, max }]) => {
         const name = Symbol.keyFor(sym)!, op = Symbol.keyFor(target)!;
-        if (min !== max) return `(define ($${name} . args) (%intapply ${op} (%intcall %spread args)))`;
+        if (min !== max) return `(define-global ($${name} . args) (%intapply ${op} (%intcall %spread args)))`;
         const params = Array.from({ length: min }, (_, i) => ` a${i}`).join("");
-        return `(define ($${name}${params}) (%intcall ${op}${params}))`;
+        return `(define-global ($${name}${params}) (%intcall ${op}${params}))`;
     }),
-    "(define ($list . args) args)",
-    "(define ($values . args) (%intapply %values (%intcall %spread args)))",
+    "(define-global ($list . args) args)",
+    "(define-global ($values . args) (%intapply %values (%intcall %spread args)))",
 ].join("\n");

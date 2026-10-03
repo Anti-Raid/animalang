@@ -1,9 +1,9 @@
 // native-scheme's sugar, lowered to the core forms; everything else is core already (calls are explicit: %call, %intcall)
 //  - (lambda formals body ...): formals a name (all arguments), (a b), or (a b . rest)
-//  - (define name expr), (define (name . formals) body ...): a global, at the top level only
+//  - (define-global name expr), (define-global (name . formals) body ...): a global
 //  - (let ((x init) ...) body ...), let*, letrec: the core forms of the same shape
-//  - (named-let name ((x init) ...) body ...): a loop when name is only called in tail position with every argument,
-//    else a %letrec of a procedure
+//  - (let name ((x init) ...) body ...): a loop when name is only called in tail position with every argument, else a
+//    %letrec of a procedure
 //  - (when c body ...), (unless c body ...), (and x ...), (or x ...)
 import {
     CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_STAR,
@@ -20,10 +20,10 @@ export class NativeSyntaxError extends Error {
 }
 
 const S = Symbol.for;
-export const LAMBDA = S("lambda"); const DEFINE = S("define"), LET = S("let"), LET_STAR = S("let*"), LETREC = S("letrec");
-const NAMED_LET = S("named-let"), WHEN = S("when"), UNLESS = S("unless"), AND = S("and"), OR = S("or"), DOT = S(".");
+export const LAMBDA = S("lambda"); const DEFINE_GLOBAL = S("define-global"), LET = S("let"), LET_STAR = S("let*"), LETREC = S("letrec");
+const WHEN = S("when"), UNLESS = S("unless"), AND = S("and"), OR = S("or"), DOT = S(".");
 
-export const SUGAR: ReadonlySet<symbol> = new Set([LAMBDA, DEFINE, LET, LET_STAR, LETREC, NAMED_LET, WHEN, UNLESS, AND, OR]);
+export const SUGAR: ReadonlySet<symbol> = new Set([LAMBDA, DEFINE_GLOBAL, LET, LET_STAR, LETREC, WHEN, UNLESS, AND, OR]);
 
 const fail = (what: string, e: any): never => {
     throw new NativeSyntaxError(what, SOURCE_POS.get(e) ?? null);
@@ -48,20 +48,19 @@ const bindingsOf = (who: string, b: any, e: any): [symbol, any][] => {
     return b;
 };
 
-export const transformNative = (ast: any): any => walk(ast, true);
+export const transformNative = (ast: any): any => walk(ast);
 
-const walk = (e: any, top: boolean): any => {
+const walk = (e: any): any => {
     if (!Array.isArray(e) || e.length === 0) return e;
     const op = e[0];
-    if (typeof op === "symbol" && SUGAR.has(op)) return keepPos(lower(e, top), e);
-    if (op === CORE_BEGIN && top) return keepPos([op, ...e.slice(1).map(x => walk(x, true))], e);
+    if (typeof op === "symbol" && SUGAR.has(op)) return keepPos(lower(e), e);
     if (!Lsrc.forms.has(op) || malformed(Lsrc, e) !== null) return e;
-    return mapExprs(Lsrc, e, x => walk(x, false));
+    return mapExprs(Lsrc, e, walk);
 };
 
-const body = (items: any[]): any[] => items.map(x => walk(x, false));
+const body = (items: any[]): any[] => items.map(walk);
 
-const lower = (e: any[], top: boolean): any => {
+const lower = (e: any[]): any => {
     const op = e[0];
     switch (op) {
         case LAMBDA: {
@@ -69,31 +68,30 @@ const lower = (e: any[], top: boolean): any => {
             const [params, rest] = formalsOf(e[1], e);
             return [CORE_LAMBDA, [[], params, rest, ...body(e.slice(2))]];
         }
-        case DEFINE: {
-            if (!top) fail("define: only at the top level (bind locals with let or letrec)", e);
+        case DEFINE_GLOBAL: {
             if (Array.isArray(e[1])) {
-                if (e.length < 3 || typeof e[1][0] !== "symbol") fail("define: (define (name . formals) body ...)", e);
+                if (e.length < 3 || typeof e[1][0] !== "symbol") fail("define-global: (define-global (name . formals) body ...)", e);
                 const lambda = keepPos([LAMBDA, e[1].length === 3 && e[1][1] === DOT ? e[1][2] : e[1].slice(1), ...e.slice(2)], e);
-                return [OP_DEFINE_GLOBAL, e[1][0], walk(lambda, false)];
+                return [OP_DEFINE_GLOBAL, e[1][0], walk(lambda)];
             }
-            if (e.length !== 3 || typeof e[1] !== "symbol") fail("define: (define name expr)", e);
-            return [OP_DEFINE_GLOBAL, e[1], walk(e[2], false)];
+            if (e.length !== 3 || typeof e[1] !== "symbol") fail("define-global: (define-global name expr)", e);
+            return [OP_DEFINE_GLOBAL, e[1], walk(e[2])];
         }
         case LET: case LET_STAR: case LETREC: {
+            if (op === LET && typeof e[1] === "symbol") {
+                if (e.length < 4) fail("let: (let name ((name init) ...) body ...)", e);
+                const bindings = bindingsOf("let", e[2], e);
+                return namedLet(e[1], bindings.map(b => b[0]), bindings.map(b => walk(b[1])), body(e.slice(3)), e);
+            }
             if (e.length < 3) fail(`${op.description}: needs bindings and a body`, e);
             const core = op === LET ? CORE_LET : op === LET_STAR ? CORE_LET_STAR : CORE_LETREC;
-            const bindings = bindingsOf(op.description!, e[1], e).map(b => keepPos([b[0], walk(b[1], false)], b));
+            const bindings = bindingsOf(op.description!, e[1], e).map(b => keepPos([b[0], walk(b[1])], b));
             return [core, bindings, ...body(e.slice(2))];
-        }
-        case NAMED_LET: {
-            if (e.length < 4 || typeof e[1] !== "symbol") fail("named-let: (named-let name ((name init) ...) body ...)", e);
-            const bindings = bindingsOf("named-let", e[2], e);
-            return namedLet(e[1], bindings.map(b => b[0]), bindings.map(b => walk(b[1], false)), body(e.slice(3)), e);
         }
         case WHEN: case UNLESS: {
             if (e.length < 3) fail(`${op.description}: needs a condition and a body`, e);
             const then = keepPos([CORE_BEGIN, ...body(e.slice(2))], e);
-            return op === WHEN ? [CORE_IF, walk(e[1], false), then] : [CORE_IF, walk(e[1], false), undefined, then];
+            return op === WHEN ? [CORE_IF, walk(e[1]), then] : [CORE_IF, walk(e[1]), undefined, then];
         }
         case AND: {
             const xs = body(e.slice(1));

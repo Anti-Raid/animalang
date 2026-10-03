@@ -91,7 +91,7 @@ describe('Anima', () => {
         })
 
         it('evaluates the %catch handler only when an error is caught', () => {
-            expect(nrun(`(define ce-n 0) (%call list (%catch (lambda () 1) (%begin (%set! ce-n (%call + ce-n 1)) (lambda (e) e))) ce-n)`)).toBe("(1 0)")
+            expect(nrun(`(define-global ce-n 0) (%call list (%catch (lambda () 1) (%begin (%set! ce-n (%call + ce-n 1)) (lambda (e) e))) ce-n)`)).toBe("(1 0)")
             expect(nrun(`(%call list (%catch (lambda () (%call raise 5)) (%begin (%set! ce-n (%call + ce-n 1)) (lambda (e) (%call * e 2)))) ce-n)`)).toBe("(10 1)")
             expect(nrun(`(let ((h (lambda (e) (%call list 'h e)))) (%call list (%catch (lambda () (%call raise 1)) h)))`)).toBe("((h 1))")
         })
@@ -105,7 +105,7 @@ describe('Anima', () => {
         })
 
         it('calls the %catch handler in tail position', () => {
-            expect(nrun(`(define (ce-loop n) (%if (%call = n 0) 'ok (%catch (lambda () (%call raise n)) (lambda (e) (%call ce-loop (%call - e 1)))))) (%call ce-loop 100000)`)).toBe("ok")
+            expect(nrun(`(define-global (ce-loop n) (%if (%call = n 0) 'ok (%catch (lambda () (%call raise n)) (lambda (e) (%call ce-loop (%call - e 1)))))) (%call ce-loop 100000)`)).toBe("ok")
         })
 
         it('catches repeatedly, from coroutines, and lets escapes through', () => {
@@ -129,7 +129,7 @@ describe('Anima', () => {
             // pre's own handlers still come first
             expect(nrun(xp(`(lambda () (%call raise 'x))`, `(lambda (e) (%call try (lambda () (%call raise 'y)) (lambda (e2) 'recovered)))`))).toBe("(handled recovered)")
             // in any mode, from inside calls and in tail position
-            expect(nrun(`(define (deep n) (%if (%call = n 0) (%call raise 'bottom) (%call + 1 (%call deep (%call - n 1))))) ${xp(`(lambda () (%call deep 50))`, `(lambda (e) (%call raise 'bad))`)}`)).toMatch(/^\(handled <error: error in error handling: bad>\)$/)
+            expect(nrun(`(define-global (deep n) (%if (%call = n 0) (%call raise 'bottom) (%call + 1 (%call deep (%call - n 1))))) ${xp(`(lambda () (%call deep 50))`, `(lambda (e) (%call raise 'bad))`)}`)).toMatch(/^\(handled <error: error in error handling: bad>\)$/)
             expect(() => compileNative(evaluator, `(%catch (lambda () 1) (lambda (r) r) (lambda (e) e) 5)`)).toThrow("%catch: guarded must be #t or #f")
         })
 
@@ -148,10 +148,10 @@ describe('Anima', () => {
         })
 
         it('runs %catch pre-handlers before unwinding, with the outer handlers', () => {
-            expect(nrun(`(define em-log '()) (%catch (lambda () (%call dynamic-wind (lambda () #f) (lambda () (%intcall %raise 'x)) (lambda () (%set! em-log (%call cons 'after em-log))))) (lambda (v) (%call list v (%call reverse em-log))) (lambda (e) (%set! em-log (%call cons 'pre em-log)) (%call list 'pre-saw e)))`)).toBe("((pre-saw x) (pre after))")
+            expect(nrun(`(define-global em-log '()) (%catch (lambda () (%call dynamic-wind (lambda () #f) (lambda () (%intcall %raise 'x)) (lambda () (%set! em-log (%call cons 'after em-log))))) (lambda (v) (%call list v (%call reverse em-log))) (lambda (e) (%set! em-log (%call cons 'pre em-log)) (%call list 'pre-saw e)))`)).toBe("((pre-saw x) (pre after))")
             expect(nrun(`(%catch (lambda () (%catch (lambda () (%intcall %raise 1)) (lambda (v) (%call list 'inner v)) (lambda (e) (%intcall %raise (%call + e 1))))) (lambda (v) (%call list 'outer v)))`)).toBe("(outer 2)")
             expect(nrun(`(%catch (lambda () (%call car '())) (lambda (v) v) (lambda (e) (%call error-message e)))`)).toBe('"car: list is too short"')
-            expect(nrun(`(define em-many (named-let loop ((i 0) (n 0)) (%if (%call = i 30) n (%call loop (%call + i 1) (%call + n (%catch (lambda () (%intcall %raise i)) (lambda (v) v) (lambda (e) 1))))))) em-many`)).toBe("30")
+            expect(nrun(`(define-global em-many (let loop ((i 0) (n 0)) (%if (%call = i 30) n (%call loop (%call + i 1) (%call + n (%catch (lambda () (%intcall %raise i)) (lambda (v) v) (lambda (e) 1))))))) em-many`)).toBe("30")
         })
 
         it('mixes handler procedures and catches in one list', () => {
@@ -161,7 +161,7 @@ describe('Anima', () => {
         })
 
         it('reports unhandled raises with a traceback', () => {
-            expect(() => nrun(`(define (em-bad) (%intcall %raise 'nope)) (%call list (%call em-bad))`)).toThrow("nope")
+            expect(() => nrun(`(define-global (em-bad) (%intcall %raise 'nope)) (%call list (%call em-bad))`)).toThrow("nope")
         })
     });
 
@@ -180,7 +180,7 @@ describe('Anima', () => {
         it('runs %dynamic-wind as a core operation: its count checked, any values kept, in tail position too', () => {
             expect(() => compileNative(evaluator, `(%intcall %dynamic-wind (lambda () 1) (lambda () 2))`)).toThrow("%dynamic-wind: expected exactly 3 args, got 2");
             expect(nrun(`(%call call-with-values (lambda () (%intcall %dynamic-wind (lambda () #f) (lambda () (%call values 1 2)) (lambda () #f))) list)`)).toBe("(1 2)");
-            expect(nrun(`(define (dw-tail n) (%if (%call = n 0) 'done (%intcall %dynamic-wind (lambda () #f) (lambda () (%call dw-tail (%call - n 1))) (lambda () #f)))) (%call dw-tail 3000)`)).toBe("done");
+            expect(nrun(`(define-global (dw-tail n) (%if (%call = n 0) 'done (%intcall %dynamic-wind (lambda () #f) (lambda () (%call dw-tail (%call - n 1))) (lambda () #f)))) (%call dw-tail 3000)`)).toBe("done");
             expect(() => nrun(`(%intcall %dynamic-wind 5 (lambda () 1) (lambda () 2))`)).toThrow();
         });
 
@@ -523,21 +523,21 @@ describe('Anima', () => {
         })
 
         it('loops run until an escape, with break and continue as blocks', () => {
-            expect(nrun(`(define (count-to n) (let ((i 0)) (%block done (%loop (%if (%call = i n) (%escape done i) (%begin)) (%set! i (%call + i 1)))))) (%call count-to 100000)`)).toBe("100000")
+            expect(nrun(`(define-global (count-to n) (let ((i 0)) (%block done (%loop (%if (%call = i n) (%escape done i) (%begin)) (%set! i (%call + i 1)))))) (%call count-to 100000)`)).toBe("100000")
             // continue = escape to a block around the body, so the step still runs
-            expect(nrun(`(define (sum-odds n) (let ((i 0) (sum 0)) (%block break (%loop (%if (%call > i n) (%escape break sum) (%begin)) (%block continue (%if (%call even? i) (%escape continue) (%begin)) (%set! sum (%call + sum i))) (%set! i (%call + i 1)))))) (%call sum-odds 10)`)).toBe("25")
+            expect(nrun(`(define-global (sum-odds n) (let ((i 0) (sum 0)) (%block break (%loop (%if (%call > i n) (%escape break sum) (%begin)) (%block continue (%if (%call even? i) (%escape continue) (%begin)) (%set! sum (%call + sum i))) (%set! i (%call + i 1)))))) (%call sum-odds 10)`)).toBe("25")
             // nested loops: escaping the inner one only
-            expect(nrun(`(define (pairs n) (let ((i 0) (acc '())) (%block outer (%loop (%if (%call = i n) (%escape outer (%call reverse acc)) (%begin)) (let ((j 0)) (%block inner (%loop (%if (%call = j i) (%escape inner) (%begin)) (%set! acc (%call cons (%call list i j) acc)) (%set! j (%call + j 1))))) (%set! i (%call + i 1)))))) (%call pairs 3)`)).toBe("((1 0) (2 0) (2 1))")
+            expect(nrun(`(define-global (pairs n) (let ((i 0) (acc '())) (%block outer (%loop (%if (%call = i n) (%escape outer (%call reverse acc)) (%begin)) (let ((j 0)) (%block inner (%loop (%if (%call = j i) (%escape inner) (%begin)) (%set! acc (%call cons (%call list i j) acc)) (%set! j (%call + j 1))))) (%set! i (%call + i 1)))))) (%call pairs 3)`)).toBe("((1 0) (2 0) (2 1))")
         })
 
         it('early return from a function is an escape in tail position', () => {
-            expect(nrun(`(define (find-first pred xs) (let ((l xs)) (%block return (%loop (%if (%call null? l) (%escape return #f) (%begin)) (%if (%call pred (%call car l)) (%escape return (%call car l)) (%begin)) (%set! l (%call cdr l)))))) (%call find-first even? '(1 3 4 5 6))`)).toBe("4")
+            expect(nrun(`(define-global (find-first pred xs) (let ((l xs)) (%block return (%loop (%if (%call null? l) (%escape return #f) (%begin)) (%if (%call pred (%call car l)) (%escape return (%call car l)) (%begin)) (%set! l (%call cdr l)))))) (%call find-first even? '(1 3 4 5 6))`)).toBe("4")
             // a named let used only as a loop compiles to a %loop, so escaping out of it is fine
-            expect(nrun(`(%block return (named-let loop ((l '(1 2))) (%if (%call null? l) 'none (%escape return (%call car l)))))`)).toBe("1")
+            expect(nrun(`(%block return (let loop ((l '(1 2))) (%if (%call null? l) 'none (%escape return (%call car l)))))`)).toBe("1")
             // one whose name is used as a value stays a procedure, so escaping out of it is rejected
-            expect(() => nrun(`(%block return (named-let loop ((l '(1))) (%call list loop) (%escape return l)))`)).toThrow("from inside a lambda")
+            expect(() => nrun(`(%block return (let loop ((l '(1))) (%call list loop) (%escape return l)))`)).toThrow("from inside a lambda")
             // the escaped value is computed in tail position, so this does not grow the stack
-            expect(nrun(`(define (down n) (%block k (%if (%call = n 0) (%escape k 'done) (%escape k (%call down (%call - n 1)))))) (%call down 100000)`)).toBe("done")
+            expect(nrun(`(define-global (down n) (%block k (%if (%call = n 0) (%escape k 'done) (%escape k (%call down (%call - n 1)))))) (%call down 100000)`)).toBe("done")
         })
 
         it('each iteration can capture its own variable', () => {
@@ -547,8 +547,8 @@ describe('Anima', () => {
         it('works across call/cc re-entry and coroutine yields', () => {
             // i is a variable (a location), so a re-entry continues from its current value rather than from 1;
             // entries bounds the re-entries, since the continuation includes the rest of the program
-            expect(nrun(`(define saved #f) (define hits 0) (define entries 0) (define (loop-with-k) (let ((i 0)) (%block done (%loop (%if (%call >= i 3) (%escape done i) (%begin)) (%if (%call = i 1) (%call call/cc (lambda (k) (%set! saved k))) (%begin)) (%set! hits (%call + hits 1)) (%set! i (%call + i 1)))))) (define r (%call loop-with-k)) (%set! entries (%call + entries 1)) (%if (%call < entries 3) (%call saved #f) (%call list r hits entries))`)).toBe("(5 5 3)")
-            expect(nrun(`(define gen (%call coroutine-create (lambda () (let ((i 0)) (%block d (%loop (%if (%call = i 3) (%escape d 'end) (%begin)) (%call coroutine-yield i) (%set! i (%call + i 1)))))))) (%call list (%call coroutine-resume gen) (%call coroutine-resume gen) (%call coroutine-resume gen) (%call coroutine-resume gen))`)).toBe("(0 1 2 end)")
+            expect(nrun(`(define-global saved #f) (define-global hits 0) (define-global entries 0) (define-global (loop-with-k) (let ((i 0)) (%block done (%loop (%if (%call >= i 3) (%escape done i) (%begin)) (%if (%call = i 1) (%call call/cc (lambda (k) (%set! saved k))) (%begin)) (%set! hits (%call + hits 1)) (%set! i (%call + i 1)))))) (define-global r (%call loop-with-k)) (%set! entries (%call + entries 1)) (%if (%call < entries 3) (%call saved #f) (%call list r hits entries))`)).toBe("(5 5 3)")
+            expect(nrun(`(define-global gen (%call coroutine-create (lambda () (let ((i 0)) (%block d (%loop (%if (%call = i 3) (%escape d 'end) (%begin)) (%call coroutine-yield i) (%set! i (%call + i 1)))))))) (%call list (%call coroutine-resume gen) (%call coroutine-resume gen) (%call coroutine-resume gen) (%call coroutine-resume gen))`)).toBe("(0 1 2 end)")
         })
 
         it('rejects escapes that leave a lambda or name no block', () => {

@@ -38,11 +38,11 @@ export const expose = (anima: Anima, ...names: string[]) => {
         if (entry === undefined) throw new Error(`no intrinsic ${name}`);
         if (entry.min === entry.max) {
             const params = Array.from({ length: entry.min }, (_, i) => `a${i}`).join(" ");
-            return `(define (${name.slice(1)} ${params}) (%intcall ${name} ${params}))`;
+            return `(define-global (${name.slice(1)} ${params}) (%intcall ${name} ${params}))`;
         }
         if (!entry.leaf) throw new Error(`${name} takes ${entry.min} to ${entry.max} args and is not a leaf`);
         const spread = anima.intrinsics.spread;
-        return `(define (${name.slice(1)} . args) (%intapply ${name} ${spread !== undefined ? `(%intcall ${spread.name} args)` : "args"}))`;
+        return `(define-global (${name.slice(1)} . args) (%intapply ${name} ${spread !== undefined ? `(%intcall ${spread.name} args)` : "args"}))`;
     });
     runNative(anima, wrappers.join("\n"), "<exposed>");
 };

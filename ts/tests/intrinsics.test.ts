@@ -46,7 +46,7 @@ describe('Anima', () => {
         it('calls leaf intrinsics, inline and not', () => {
             expect(nrun(`(%intcall %test-add 1 2)`)).toBe("3")
             expect(nrun(`(%intcall %test-add "a" "b")`)).toBe('"ab"')
-            expect(nrun(`(define (ht-sum n acc) (%if (%call = n 0) acc (%call ht-sum (%call - n 1) (%intcall %test-add acc n)))) (%call ht-sum 100 0)`)).toBe("5050")
+            expect(nrun(`(define-global (ht-sum n acc) (%if (%call = n 0) acc (%call ht-sum (%call - n 1) (%intcall %test-add acc n)))) (%call ht-sum 100 0)`)).toBe("5050")
             expect(() => nrun(`(%intcall %test-add 1)`)).toThrow()
         })
 
@@ -55,12 +55,12 @@ describe('Anima', () => {
             expect(nrun(`(%intcall %test-call-or (lambda (x) (%call * x 2)) 21)`)).toBe("42")
             expect(nrun(`(%intcall %test-call-or + 1 2)`)).toBe("3")
             expect(nrun(`(%call + 1 (%intcall %test-call-or (lambda () 41)))`)).toBe("42")
-            expect(nrun(`(define (ht-loop n) (%if (%call = n 0) 'ok (%intcall %test-call-or ht-loop (%call - n 1)))) (%call ht-loop 100000)`)).toBe("ok")
+            expect(nrun(`(define-global (ht-loop n) (%if (%call = n 0) 'ok (%intcall %test-call-or ht-loop (%call - n 1)))) (%call ht-loop 100000)`)).toBe("ok")
         })
 
         it('lets tail requests yield, re-enter and raise', () => {
-            expect(nrun(`(define ht-co (%call coroutine-create (lambda () (%call + 1 (%intcall %test-call-or (lambda () (%call coroutine-yield 'y) 10)))))) (%call list (%call coroutine-resume ht-co) (%call coroutine-resume ht-co))`)).toBe("(y 11)")
-            expect(nrun(`(define ht-k #f) (define ht-n 0) (define ht-r (%call + 100 (%intcall %test-call-or (lambda () (%call call/cc (lambda (k) (%set! ht-k k) 1)))))) (%set! ht-n (%call + ht-n 1)) (%if (%call < ht-n 3) (%call ht-k ht-n) (%call list ht-r ht-n))`)).toBe("(102 3)")
+            expect(nrun(`(define-global ht-co (%call coroutine-create (lambda () (%call + 1 (%intcall %test-call-or (lambda () (%call coroutine-yield 'y) 10)))))) (%call list (%call coroutine-resume ht-co) (%call coroutine-resume ht-co))`)).toBe("(y 11)")
+            expect(nrun(`(define-global ht-k #f) (define-global ht-n 0) (define-global ht-r (%call + 100 (%intcall %test-call-or (lambda () (%call call/cc (lambda (k) (%set! ht-k k) 1)))))) (%set! ht-n (%call + ht-n 1)) (%if (%call < ht-n 3) (%call ht-k ht-n) (%call list ht-r ht-n))`)).toBe("(102 3)")
             expect(nrun(`(%call try (lambda () (%intcall %test-fail "boom")) (lambda (e) (%call error-message e)))`)).toBe('"boom"')
             expect(nrun(`(%call try (lambda () (%intcall %test-call-or (lambda () (%call raise 'inner)))) (lambda (e) e))`)).toBe("inner")
         })
@@ -97,10 +97,10 @@ describe('Anima', () => {
         it('runs %if chains (c1 e1 c2 e2 ... [else]) as one flat IF ... ELSEIF ... ENDIF', () => {
             expect(nrun(`(%call list (%if #f 1 #t 2 3) (%if #f 1 #f 2 3) (%call void? (%if #f 1 #f 2)) (%if 'a 1 #t 2))`)).toBe("(2 3 #t 1)")
             // conditions run in order, and stop at the first true one
-            expect(nrun(`(define ch-log '()) (define (ch-t x) (%set! ch-log (%call cons x ch-log)) (%call = x 2)) (%call list (%if (%call ch-t 1) 'a (%call ch-t 2) 'b (%call ch-t 3) 'c 'd) ch-log)`)).toBe("(b (2 1))")
+            expect(nrun(`(define-global ch-log '()) (define-global (ch-t x) (%set! ch-log (%call cons x ch-log)) (%call = x 2)) (%call list (%if (%call ch-t 1) 'a (%call ch-t 2) 'b (%call ch-t 3) 'c 'd) ch-log)`)).toBe("(b (2 1))")
             // branches keep tail position, and a variable assigned in them is seen after
             expect(run(`(define (ch-count n) (cond ((= n 0) 'done) ((< n 0) 'neg) (else (ch-count (- n 1))))) (ch-count 100000)`)).toBe("done")
-            expect(nrun(`(define (ch-set x) (let ((r 0)) (%if (%call = x 1) (%set! r 'one) (%call = x 2) (%set! r 'two) (%set! r 'many)) r)) (%call list (%call ch-set 1) (%call ch-set 2) (%call ch-set 7))`)).toBe("(one two many)")
+            expect(nrun(`(define-global (ch-set x) (let ((r 0)) (%if (%call = x 1) (%set! r 'one) (%call = x 2) (%set! r 'two) (%set! r 'many)) r)) (%call list (%call ch-set 1) (%call ch-set 2) (%call ch-set 7))`)).toBe("(one two many)")
             const bc = evaluator.compileRaw(`(define (ch-f x) (cond ((= x 1) 'a) ((= x 2) 'b) (else 'c)))`) as Code
             const fn: Code = bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code
             expect(opKinds(fn).filter(k => k === "If" || k === "ElseIf" || k === "EndIf")).toEqual(["If", "ElseIf", "EndIf"])
@@ -222,7 +222,7 @@ describe('Anima', () => {
                 inline: ([p], slow, _tmp, d) => `(${p} instanceof ${d.Point} ? ${p}.x : ${slow})`,
             })
             other.scope.set(Symbol.for("pt"), new Point(5))
-            expect(s.stringify(runNative(other, `(define (px p) (%intcall %test-px p)) (%call px pt)`))).toBe("5")
+            expect(s.stringify(runNative(other, `(define-global (px p) (%intcall %test-px p)) (%call px pt)`))).toBe("5")
             other.registerIntrinsic("%test-bad-dep", (regs, s) => regs[s], {
                 args: [1, 1], leaf: true, inline: ([a], _slow, _tmp, d) => `(${d.Missing}, ${a})`,
             })
@@ -322,10 +322,10 @@ describe("Control operations", () => {
             const nrun = (src: string) => new ASTStringifier().stringify(runNative(anima, src))
             expect(nrun("(%intcall %+ 1 (%intcall %call/cc (lambda (k) (%call k 41))))")).toBe("42")
             // a tail %call/cc is a tail call: a loop through it runs in constant space
-            expect(nrun("(define (cc-loop n) (%if (%intcall %= n 0) 'done (%intcall %call/cc (lambda (k) (%call cc-loop (%intcall %- n 1)))))) (%call cc-loop 100000)")).toBe("done")
+            expect(nrun("(define-global (cc-loop n) (%if (%intcall %= n 0) 'done (%intcall %call/cc (lambda (k) (%call cc-loop (%intcall %- n 1)))))) (%call cc-loop 100000)")).toBe("done")
             expect(nrun("(%catch (lambda () (%intcall %raise 'boom)) (lambda (e) (%intcall %list 'caught e)))")).toBe("(caught boom)")
             expect(() => nrun("(%intcall %raise 'boom 5)")).toThrow("%raise: continuable must be #t or #f")
-            expect(nrun("(define (cs-f skip) (%intcall %vector-ref (%intcall %vector-ref (%intcall %debug-frames (%intcall %current-stack skip) (%intcall %vector) #f) 0) 0)) (%call cs-f 0)")).toBe('"cs-f"')
+            expect(nrun("(define-global (cs-f skip) (%intcall %vector-ref (%intcall %vector-ref (%intcall %debug-frames (%intcall %current-stack skip) (%intcall %vector) #f) 0) 0)) (%call cs-f 0)")).toBe('"cs-f"')
             expect(() => nrun("(%intcall %current-stack -1)")).toThrow("%current-stack: expected a count of frames to skip")
             expect(() => nrun("(%intcall %apply-array list '(1))")).toThrow("%apply: expected an array but got (1)")
             expect(nrun("(let ((co (%intcall %coroutine-create (lambda (a) (%intcall %+ a (%intcall %coroutine-yield (%intcall %* a 2))))))) (%intcall %list (%intcall %coroutine-resume co 5) (%intcall %coroutine-resume co 1)))")).toBe("(10 6)")
@@ -336,13 +336,13 @@ describe("Control operations", () => {
             expect(run("(let ((call/cc (lambda (f) 'mine))) (call/cc 1))")).toBe("mine")
         }
         // AOT code carries control operations out at the call, with no request object
-        const co = compileNative(createScheme(impl), "(define (co-f v) (%intcall %+ 1 (%intcall %coroutine-yield v)))") as Code
+        const co = compileNative(createScheme(impl), "(define-global (co-f v) (%intcall %+ 1 (%intcall %coroutine-yield v)))") as Code
         const coTmpl = co.constants.find((c: any) => c instanceof Closure)!.tmpl
         const src = AotCompiler.generateSource(coTmpl.code, coTmpl)
         expect(src).toContain("executor.coYield(ctx, frame, r")
         expect(src).toContain("throw Suspend.yield(r")
         expect(src).not.toContain("res.run(")
-        const bc = compileNative(createScheme(impl), "(define (cc-f g) (%intcall %call/cc g))") as Code
+        const bc = compileNative(createScheme(impl), "(define-global (cc-f g) (%intcall %call/cc g))") as Code
         const lines = listing(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code)
         expect(lines.some(line => /HostCall +pos=%call\/cc, start=r\d+, nargs=1, tail=true$/.test(line))).toBe(true)
     })
