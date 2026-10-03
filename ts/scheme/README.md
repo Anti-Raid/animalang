@@ -6,16 +6,20 @@
 2. **Reserved names and shadowing.** The surface keywords (`symbols.ts`: special forms like `if`, `lambda`, `cond`, `guard`, and `else`/`=>`) go into the instance's `Intrinsics.reserved` as syntax, which code cannot bind (`if: bad syntax`), and so do `%` intrinsics. Builtin procedures (the builtins' names and the prelude's exports) can be shadowed, while the compiler still never sees one bound:
    - **Locally**: each core binder's rule (`%lambda`, `%let`, `%let*`, `%letrec`, `%let-values`, which every surface binding form lowers to before its body is expanded) renames a bound builtin to a fresh symbol of the same name wherever it is in scope, before its body is expanded (`renameIn`: not in quoted data, the literal parts of a quasiquote, `case` datums or a macro's keyword). So `(let ((map f)) (map g l))` calls the local `map`, and no builtin rewrite (`map` inlining, direct calls of aliases) sees its name.
    - **At the top level**: a `define` of a builtin makes its name an ordinary global of the instance from then on (`MacroEvaluator.redefine`): it leaves `reserved`, and the transformer stops rewriting it. A program's top-level definitions (in top-level `begin`s too) are found before it is transformed, so they apply to all of it; one a macro makes applies from where it is expanded. As in a Racket module, the name cannot be read before its definition has run (`Variable 'map' is not defined`): a program that redefines a builtin for the first time starts by binding the name to `Env.UNDEFINED` (`%unbound`), which lookups treat as missing without looking further out, and which the host sees as absent. A later program in the instance reads the definition an earlier one made. Code compiled before the redefinition keeps the builtin, as code compiled at Racket's top level does.
-   - **What the transformer emits** (quasiquote's `list`/`append`, `guard`'s `call/ec`, the `map` loop's `car`/`cdr`, ...) refers to builtins by `@name` twins (`TWINNED` in `transformer/syntax.ts`), which the prelude binds too and code cannot bind or redefine (they are reserved), and which the builtin's own rewrites apply to. So neither kind of shadowing can capture an expansion.
+   - **What the transformer emits** (quasiquote's `list`/`append`, `guard`'s `call/ec`, ...) refers to builtins by `@name` twins (`TWINNED` in `transformer/syntax.ts`), which the prelude binds too and code cannot bind or redefine (they are reserved), and which the builtin's own rewrites apply to. So neither kind of shadowing can capture an expansion.
 3. **Reader and transformer.** `reader.ts` parses source; `transformer/` expands macros and lowers the surface syntax to core forms, still as Scheme lists; `core.ts` (`toCore`) then turns them into the compiler's array representation (see `../bytecode-rvm/README.md`), leaving quoted data as Scheme data and quoting vector literals.
 4. **Prelude.** `prelude.ts` defines the procedures behind the builtins' names and the rest of the standard library, written in native-scheme (`../native`), where calls into intrinsics are written out. It is compiled once for all instances, kept unbound, and each instance runs its own copy bound to its intrinsics by name.
 
-The instance's intrinsics stay open, so a host can add its own before compiling code that uses them:
+### `%` names
+A name starting with `%` means nothing special in Scheme source: the reader makes it a symbol of its own (`sourceSymbol` in `symbols.ts`, the same one for the same name), which is no core form or intrinsic, so `(%car x)` calls a variable named `%car` and `(define (%if a b c) ...)` defines one. Neither code nor its macros can reach the core forms or the intrinsics; only what the transformer itself emits does. Quoted, such a name is the ordinary symbol (`'%if` is `Symbol.for("%if")`). `(%at file line col expr)` is the one exception: it stays reader syntax (see below).
+
+The instance's intrinsics stay open, so a host can add its own; Scheme code reaches one through a procedure the host defines in native-scheme (`../native`), which can name intrinsics:
 
 ```ts
 const anima = createScheme(impl)
 anima.registerIntrinsic("%lua-index", fn, { args: [2, 2], leaf: true, inline, deps: { Table } })
-anima.compileRaw("(%lua-index t 1)")
+anima.evaluateRaw(compileNative(anima, "(define (lua-index t k) (%intcall %lua-index t k))", "host.ns"))
+anima.compileRaw("(lua-index t 1)")
 anima.freeze() // optional: no more registrations
 ```
 
@@ -45,7 +49,7 @@ A named `let` whose name is only called in tail position of its body, with the r
 
 ### `%at`
 - **Form**: `(%at <file> <line> <col> <expr>)`
-- **Semantics**: Evaluates `<expr>`, recording `file:line:col` as its source position. For frontends that generate Anima code (e.g. a transpiler) so errors and tracebacks point at the original source. It is removed by the syntax transformer before macros run, so macros never see it. Positions only attach to forms (lists); a wrapped atom keeps the enclosing form's position.
+- **Semantics**: Evaluates `<expr>`, recording `file:line:col` as its source position (the reader keeps `%at` itself, the one `%` name it does not make ordinary). For frontends that generate Anima code (e.g. a transpiler) so errors and tracebacks point at the original source. It is removed by the syntax transformer before macros run, so macros never see it. Positions only attach to forms (lists); a wrapped atom keeps the enclosing form's position.
 
 ## Builtins
 
@@ -54,11 +58,11 @@ A builtin is one entry of `SCHEME_BUILTINS` (`builtins.ts`): its name, argument 
 - **Direct calls.** The transformer rewrites `(name arg ...)` to `(%name arg ...)` (`SCHEME_ALIASES`) when the argument count is in range, so the call compiles to `CALLINT`, and to inline JS in AOT code when the builtin has a template (whose `deps` give it `Cons`, `Table` and so on). The same table maps other procedures to the VM's own operations and forms, each with its own range: `list` to `%list`, `values` to `%values`; `call/cc`, `call/ec` (and their long names), `dynamic-wind`, `raise` and `apply` to `%call/cc`, `%call/ec`, `%dynamic-wind`, `%raise` and `%apply`; and the `coroutine-*` procedures to their `%` operations. A call with a count out of range is left as an ordinary call, so it still compiles, and fails only if it runs.
 - **As values.** `(map car xs)` uses the prelude's procedure of that name, a wrapper generated from the alias table (`ALIAS_WRAPPERS`, in native-scheme like the rest of the prelude): `(define ($car a0) (%intcall %car a0))` for a fixed count (the control aliases too, e.g. `(define ($call/cc a0) (%intcall %call/cc a0))`), `(define ($+ . args) (%intapply %+ (%intcall %spread args)))` otherwise (`APPLYINT`, which checks the count at run time). A wrong count is reported by the procedure: `cons: expected exactly 2 args, got 1`, or `%-: expected at least 1 args, got 0` (one message format for closures and intrinsics). `list` is `(define ($list . args) args)`, since a rest parameter is already a fresh list, and `values` is `(define ($values . args) (%intapply %values (%intcall %spread args)))`. A rest parameter only spread into `%apply` is never made a list.
 
-Builtins, like every name the prelude exports, can be shadowed and redefined (see reserved names and shadowing above); their `@name` twins and the `%` intrinsics cannot be rebound.
+Builtins, like every name the prelude exports, can be shadowed and redefined (see reserved names and shadowing above); their `@name` twins cannot be rebound.
 
 ## Standard library
 
-- `apply`: a direct call `(apply proc arg ... lst)` becomes `(%apply proc arg ... (%spread lst))`; as a value, it is the prelude procedure `(define $apply (lambda (proc . lst) (%apply proc (%apply %apply-args (%spread lst)))))`, whose rest arguments are never made a list.
+- `apply`: a direct call `(apply proc arg ... lst)` becomes `(%apply proc arg ... (%spread lst))` (`%intapply` of the intrinsic when `proc` is a builtin that aliases a leaf, so `(apply + xs)` applies `%+` itself); as a value, it is the prelude procedure `(define $apply (lambda (proc . lst) (%apply proc (%apply %apply-args (%spread lst)))))`, whose rest arguments are never made a list.
 - `call/cc`, `call/ec` or `let/ec` whose continuation is only called in the body itself (the "early return" use) compile to a block and jumps, with no continuation made (see the lifting step in `../bytecode-rvm/README.md`); any other use of it keeps a real one.
 - `call/cc` and `call-with-current-continuation` are aliases of `%call/cc`; `call/ec` and `call-with-escape-continuation` of `%call/ec`, which `(let/ec k body ...)` also uses. `guard` uses `%call/ec`; `try` and `pcall` use `%catch`.
 - `coroutine-create coroutine-resume coroutine-yield coroutine-status coroutine-close coroutine-raise`: aliases of the matching `%` operations; as values, generated wrappers (and for resume and yield, prelude procedures that pass on their rest arguments).

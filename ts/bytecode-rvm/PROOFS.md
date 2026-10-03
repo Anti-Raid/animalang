@@ -42,19 +42,19 @@ They mean what a store-based machine gives them:
 
 - *Within*: `within(L)` is the list of inits and body forms of a `%letrec` `L`, the only places its names are in scope.
 - *Free locals*: `FV(e)` is the set of free local names of `e`, as `freeIn` computes it over expression positions. `%set!` targets and block labels are not expression positions.
-- *Call site*: a node `(f a1 … am)` with `f` in operator position.
+- *Call site*: a node `(%call f a1 … am)`, `f` its operator. (Calls are explicit; an intrinsic's is `(%intcall %name …)`, which is no call site.)
 
 ---
 
 ## 1. `blockEscapes`
 
-**Rewrite.** For `E = (C (%lambda (k) B1 … Bn))` with `C ∈ {%call/ec, %call/cc}`:
+**Rewrite.** For `E = (%intcall C (%lambda (k) B1 … Bn))` with `C ∈ {%call/ec, %call/cc}`:
 
 ```
 E  ⟶  (%block L B1' … Bn')
 ```
 
-Here `L` is fresh, and each call `(k a…)` in the `Bi` becomes `(%escape L v)`, where `v` is `a` if there is one argument and `(%values a…)` otherwise.
+Here `L` is fresh, and each call `(%call k a…)` in the `Bi` becomes `(%escape L v)`, where `v` is `a` if there is one argument and `(%intcall %values a…)` otherwise.
 
 **Conditions checked.**
 
@@ -70,7 +70,7 @@ Here `L` is fresh, and each call `(k a…)` in the `Bi` becomes `(%escape L v)`,
 
 **Theorem 1.** `E ≡ (%block L B1' … Bn')`.
 
-*Proof.* We match the two programs step by step. They agree until a call site `s = (k a…)` in `A` runs.
+*Proof.* We match the two programs step by step. They agree until a call site `s = (%call k a…)` in `A` runs.
 
 - **Original:** `k` is `κ` (by C1 it stays bound to `κ`), so the values `v̄` are delivered to `κ`.
 - **Rewritten:** `(%escape L v)` delivers `v̄` to the continuation of the block, which is `κ` because the block is evaluated in `E`'s place. `%escape` also restores the marks to the block's depth (`MarkRestore`).
@@ -532,7 +532,7 @@ A call of an intrinsic declared `foldable` whose arguments are all constants is 
 An expression whose value is not used is dropped when it has no effect and cannot fail: constants, local reads, lambdas (making a closure runs nothing; a lambda whose binders code generation rejects is kept, so its error stays), `%box`/`%unbox` of such, and calls of `effectFree` intrinsics (which promise no effect and no failure) on such arguments, with the right number of arguments. A binding nothing uses any more is dropped under the same condition on its init. Nothing else is dropped, so every effect and every error stays, in order.
 
 ### 9.4 Inlining
-A call `(f a1 … an)`, where `f` is a lambda or a local bound to one with `n` parameters (no rest, not padded), becomes `(%let ((x1 a1) … (xn an)) body)`:
+A call `(%call f a1 … an)`, where `f` is a lambda or a local bound to one with `n` parameters (no rest, not padded), becomes `(%let ((x1 a1) … (xn an)) body)`:
 
 - **Order.** The call evaluates the operator (a variable read or a lambda: no effect) and then the arguments, left to right, then runs the body with the parameters bound; the `%let` evaluates the arguments left to right and then runs the body with the parameters bound.
 - **Environment.** The body's free variables are bound around the lambda, so (by A7, uniquely named) they are in scope at the call, and are never assigned, so they hold what the closure would have captured; a box is the same box. The copy inlined has fresh names for its binders (the rename pass), so A7 still holds.
