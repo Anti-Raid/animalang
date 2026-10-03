@@ -1,7 +1,7 @@
 // native-scheme: the core forms as text (reader.ts) with a little sugar (transformer.ts), a front end of its own,
 // separate from Scheme
 import { Anima } from "../anima";
-import { Env, Positions } from "../common";
+import { Env, SyntaxPositions } from "../common";
 import type { AnimaOptions } from "../magicvm/meta";
 import { nativeFormat } from "./messages";
 import { readNative, type NativeReadOptions } from "./reader";
@@ -16,10 +16,12 @@ export { nativeFormat, showValue } from "./messages";
 export const createNativeScheme = (options: AnimaOptions): Anima => {
     const anima = new Anima(options);
     anima.intrinsics.setFormatter(nativeFormat);
+    // where the reader read each list, for the transformer (weakly held: a tree read and compiled leaves nothing behind)
+    const where = new SyntaxPositions();
     for (const sym of SUGAR) anima.intrinsics.reserved.set(sym, "special form");
     anima.attachFrontEnd({
-        read: (source, file, positions) => readNative(source, file, { positions }),
-        transform: (ast, positions) => transformNative(ast, anima.intrinsics, positions),
+        read: (source, file) => readNative(source, file, { positions: where }),
+        transform: ast => transformNative(ast, anima.intrinsics, where),
         lambda: (params, body) => [LAMBDA, params, body],
     }, new Env());
     return anima;
@@ -30,6 +32,6 @@ export const createNativeScheme = (options: AnimaOptions): Anima => {
 export const compileNative = (anima: Anima, src: string, file?: string, options: NativeReadOptions = {}) => {
     const frontEnd = anima.frontEnd;
     const datum = options.datum ?? frontEnd?.datum?.bind(frontEnd);
-    const positions = new Positions();
-    return anima.compiler.compile(transformNative(readNative(src, file, { datum, positions }), anima.intrinsics, positions), positions);
+    const where = new SyntaxPositions();
+    return anima.compiler.compile(transformNative(readNative(src, file, { datum, positions: where }), anima.intrinsics, where));
 };

@@ -6,14 +6,12 @@ import { CORE_SET } from "../../common";
 import { AstAnalysis, markLiveAcrossCalls } from "../analysis";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED } from "../lambda";
-import type { Positions } from "../../common";
 import { malformed, mapExprs } from "./lang";
 import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX } from "./assignments";
 
 export type Unboxed = { ast: any, forwards: ReadonlySet<symbol> };
 
-export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: Intrinsics, positions: Positions): Unboxed => {
-    const keepPos = positions.keep;
+export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: Intrinsics): Unboxed => {
     const analysis = new AstAnalysis(intrinsics);
     const scope = analysis.analyze(ast);
     markLiveAcrossCalls(ast, analysis, scope, intrinsics);
@@ -23,26 +21,26 @@ export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: In
 
     const walk = (e: any): any => {
         if (!Array.isArray(e) || e.length === 0) return e;
-        const op = e[0];
+        const op = e[0], pos = e[1];
         if (Lconv.forms.get(op) === "quote") return e;
-        if (Lconv.forms.has(op) && Lconv.forms.get(op) !== "exprs" && malformed(Lconv, e) !== null) return e;
-        if (op === UNBOX && unneeded(e[1])) return e[1];
-        if (op === SET_BOX && unneeded(e[1])) return keepPos([CORE_SET, e[1], walk(e[2])], e);
+        if (Lconv.forms.has(op) && malformed(Lconv, e) !== null) return e;
+        if (op === UNBOX && unneeded(e[2])) return e[2];
+        if (op === SET_BOX && unneeded(e[2])) return [CORE_SET, pos, e[2], walk(e[3])];
         // a box made in place (which may be anywhere once the optimizer has inlined a procedure) that is not needed: nothing
-        if (op === BOX_IN_PLACE && e.length === 2 && unneeded(e[1])) return undefined;
-        const next = mapExprs(Lconv, e, walk, positions);
+        if (op === BOX_IN_PLACE && e.length === 3 && unneeded(e[2])) return undefined;
+        const next = mapExprs(Lconv, e, walk);
         switch (Lconv.forms.get(op)) {
             case "lambda":
-                return keepPos([op, ...next.slice(1).map((c: any[]) => [c[0], c[1], c[2], ...c.slice(3).filter(x => !isUnneededBox(x))])], e);
+                return [op, pos, ...next.slice(2).map((c: any[]) => [c[0], c[1], c[2], ...c.slice(3).filter(x => !isUnneededBox(x))])];
             case "let": case "let*": case "letrec":
-                return keepPos([op, next[1].map((b: any[]) => keepPos([b[0], unwrapIf(b[0], b[1])], b)), ...next.slice(2)], e);
+                return [op, pos, next[2].map((b: any[]) => [b[0], unwrapIf(b[0], b[1])]), ...next.slice(3)];
             case "let-values":
-                return keepPos([op, next[1], ...next.slice(2).filter((x: any) => !isUnneededBox(x))], e);
+                return [op, pos, next[2], ...next.slice(3).filter((x: any) => !isUnneededBox(x))];
             default:
                 return next;
         }
     };
-    const isUnneededBox = (x: any) => Array.isArray(x) && x[0] === BOX_IN_PLACE && x.length === 2 && unneeded(x[1]);
-    const unwrapIf = (name: any, init: any) => unneeded(name) && Array.isArray(init) && (init[0] === BOX || init[0] === BOXED) && init.length === 2 ? init[1] : init;
+    const isUnneededBox = (x: any) => Array.isArray(x) && x[0] === BOX_IN_PLACE && x.length === 3 && unneeded(x[2]);
+    const unwrapIf = (name: any, init: any) => unneeded(name) && Array.isArray(init) && (init[0] === BOX || init[0] === BOXED) && init.length === 3 ? init[2] : init;
     return { ast: walk(ast), forwards };
 };

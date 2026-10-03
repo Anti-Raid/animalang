@@ -1,8 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { Positions } from '../common';
 import { createScheme } from '../scheme';
 import { ASTStringifier } from '../scheme/printer';
-import { opKinds, runNative } from './helpers';
+import { form, opKinds, runNative } from './helpers';
 import { impl } from '../magicvm/meta';
 import { Lsrc, check, extend, mapExprs, parts, withBounds } from '../magicvm/passes/lang';
 import { Lconv } from '../magicvm/passes/assignments';
@@ -15,23 +14,25 @@ describe("Languages", () => {
         expect(L1.forms.has(S("%let*"))).toBe(false);
         expect(L1.forms.get(S("%my-let"))).toBe("let");
         expect(Lsrc.forms.has(S("%let*"))).toBe(true);
-        const letStar = [S("%let*"), [[S("a"), 1]], S("a")];
+        const letStar = form("%let*", [[S("a"), 1]], S("a"));
         expect(() => check(Lsrc, letStar)).not.toThrow();
-        expect(() => check(L1, [S("%begin"), letStar])).toThrow("not L1: a form the language does not have in (%let* ...)");
+        expect(() => check(L1, form("%begin", letStar))).toThrow("not L1: a form the language does not have in (%let* ...)");
     });
 
-    it("check each form's layout", () => {
-        expect(() => check(Lsrc, [S("%let"), [[1, 2]], 3])).toThrow("malformed bindings");
-        expect(() => check(Lsrc, [S("%lambda"), [[], [S("x")], 5, S("x")]])).toThrow("a malformed clause");
-        expect(() => check(Lsrc, [S("%set!"), "x", 1])).toThrow("a name that is not a symbol");
+    it("check each form's layout, its position slot included", () => {
+        expect(() => check(Lsrc, form("%let", [[1, 2]], 3))).toThrow("malformed bindings");
+        expect(() => check(Lsrc, form("%lambda", [[], [S("x")], 5, S("x")]))).toThrow("a malformed clause");
+        expect(() => check(Lsrc, form("%set!", "x", 1))).toThrow("a name that is not a symbol");
+        expect(() => check(Lsrc, [S("%if"), S("c"), 1, 2])).toThrow("no position slot");
+        expect(() => check(Lsrc, [S("%if"), { file: "t", line: 1, col: 1 }, S("c"), 1, 2])).not.toThrow();
         // quoted data is not checked
-        expect(() => check(Lsrc, [S("%quote"), [S("%let*"), 1]])).not.toThrow();
+        expect(() => check(Lsrc, form("%quote", [S("%let*"), 1]))).not.toThrow();
     });
 
     it("give each expression the names bound around it", () => {
-        const lam = [S("%lambda"), [[], [S("x")], S("r"), S("x"), S("y")]];
+        const lam = form("%lambda", [[], [S("x")], S("r"), S("x"), S("y")]);
         expect(parts(Lsrc, lam).exprs).toEqual([[S("x"), [S("x"), S("r")]], [S("y"), [S("x"), S("r")]]]);
-        const letStar = [S("%let*"), [[S("a"), 1], [S("b"), S("a")]], S("b")];
+        const letStar = form("%let*", [[S("a"), 1], [S("b"), S("a")]], S("b"));
         // one growing set, so it is read as each position comes
         const seen: [any, symbol[]][] = [];
         for (const [x, bound] of withBounds(parts(Lsrc, letStar), new Set())) seen.push([x, [...bound]]);
@@ -39,13 +40,12 @@ describe("Languages", () => {
     });
 
     it("rebuild a form only when an expression in it changed, keeping its position", () => {
-        const e = [S("%if"), S("c"), 1, 2];
-        const positions = new Positions();
-        positions.set(e, { file: "t", line: 1, col: 2 });
-        expect(mapExprs(Lsrc, e, x => x, positions)).toBe(e);
-        const next = mapExprs(Lsrc, e, x => x === 1 ? 10 : x, positions);
-        expect(next).toEqual([S("%if"), S("c"), 10, 2]);
-        expect(positions.get(next)).toEqual({ file: "t", line: 1, col: 2 });
+        const pos = { file: "t", line: 1, col: 2 };
+        const e = [S("%if"), pos, S("c"), 1, 2];
+        expect(mapExprs(Lsrc, e, x => x)).toBe(e);
+        const next = mapExprs(Lsrc, e, x => x === 1 ? 10 : x);
+        expect(next).toEqual([S("%if"), pos, S("c"), 10, 2]);
+        expect(next[1]).toBe(pos);
     });
 });
 
@@ -119,9 +119,9 @@ describe("The optimizer", () => {
         // a padded clause (Lua): missing parameters <#void>, extra arguments evaluated and dropped
         const S = Symbol.for;
         const anima = make(true);
-        const list = (...xs: any[]) => [S("%intcall"), S("%list"), ...xs];
-        const padded = [S("%lambda"), [[S("pad")], [S("a"), S("b")], null, list(S("a"), S("b"))]];
-        const program = [S("%let"), [[S("f"), padded]], list([S("%call"), S("f"), 1], [S("%call"), S("f"), 1, 2, list(3)])];
+        const list = (...xs: any[]) => form("%intcall", S("%list"), ...xs);
+        const padded = form("%lambda", [[S("pad")], [S("a"), S("b")], null, list(S("a"), S("b"))]);
+        const program = form("%let", [[S("f"), padded]], list(form("%call", S("f"), 1), form("%call", S("f"), 1, 2, list(3))));
         expect(s.stringify(anima.evaluateRaw(anima.compiler.compile(program)))).toBe("((1 <#void>) (1 2))");
     });
 

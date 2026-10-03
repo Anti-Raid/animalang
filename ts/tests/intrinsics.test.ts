@@ -13,7 +13,7 @@ import { impl } from '../magicvm/meta';
 import { bindArgs, closureArity } from '../magicvm/arity';
 import { CORE_FORMS, hasCore, newIntrinsics } from '../magicvm/core';
 import { readdirSync, readFileSync } from 'fs';
-import { opKinds, registerTestIntrinsics, runNative } from './helpers';
+import { form, opKinds, registerTestIntrinsics, runNative } from './helpers';
 import { compileNative } from '../native';
 
 describe("vm", () => {
@@ -154,32 +154,32 @@ describe('Anima', () => {
 
         it('pads the arguments of a padded clause (Lua)', () => {
             const S = Symbol.for
-            const L = (options: string[], params: string[], rest: string | null, ...body: any[]) => [S("%lambda"), [options.map(S), params.map(S), rest === null ? null : S(rest), ...body]]
-            const list = (...xs: any[]) => [S("%intcall"), S("%list"), ...xs]
-            const call = (f: string, ...xs: any[]) => [S("%call"), S(f), ...xs]
-            const q = (x: any) => [S("%quote"), x]
+            const L = (options: string[], params: string[], rest: string | null, ...body: any[]) => form("%lambda", [options.map(S), params.map(S), rest === null ? null : S(rest), ...body])
+            const list = (...xs: any[]) => form("%intcall", S("%list"), ...xs)
+            const call = (f: string, ...xs: any[]) => form("%call", S(f), ...xs)
+            const q = (x: any) => form("%quote", x)
             // core forms, straight to the compiler (compileRawAst would read them as Scheme data)
             const compile = (ast: any) => evaluator.compiler.compile(ast)
             const run = (ast: any) => s.stringify(evaluator.evaluateRaw(compile(ast)))
             const f = L(["pad"], ["a", "b"], null, list(S("a"), S("b")))
             // missing ones are <#void>, extra ones dropped: bound locally, globally, and applied
-            expect(run([S("%let"), [[S("f"), f]], list(call("f", 1), call("f", 1, 2), call("f", 1, 2, 3), call("f"))])).toBe("((1 <#void>) (1 2) (1 2) (<#void> <#void>))")
-            expect(run([S("%begin"), [S("%define-global"), S("pf"), f], list(call("pf", 1), call("pf", 1, 2, 3), [S("%apply"), S("pf"), [S("%quote"), [7]]])])).toBe("((1 <#void>) (1 2) (7 <#void>))")
+            expect(run(form("%let", [[S("f"), f]], list(call("f", 1), call("f", 1, 2), call("f", 1, 2, 3), call("f"))))).toBe("((1 <#void>) (1 2) (1 2) (<#void> <#void>))")
+            expect(run(form("%begin", form("%define-global", S("pf"), f), list(call("pf", 1), call("pf", 1, 2, 3), form("%apply", S("pf"), form("%quote", [7])))))).toBe("((1 <#void>) (1 2) (7 <#void>))")
             // with a rest parameter, extra ones go to it
             const r = L(["pad"], ["a"], "r", list(S("a"), S("r")))
-            expect(run([S("%let"), [[S("r"), r]], list(call("r"), call("r", 1, 2, 3))])).toBe("((<#void> ()) (1 (2 3)))")
+            expect(run(form("%let", [[S("r"), r]], list(call("r"), call("r", 1, 2, 3))))).toBe("((<#void> ()) (1 (2 3)))")
             // a self tail call with fewer arguments pads them too
-            const loop = L(["pad"], ["n", "acc"], null, [S("%if"), call("=", S("n"), 0), S("acc"), call("g", call("-", S("n"), 1))])
-            expect(run([S("%letrec"), [[S("g"), loop]], call("g", 3, q(S("x")))])).toBe("<#void>")
+            const loop = L(["pad"], ["n", "acc"], null, form("%if", call("=", S("n"), 0), S("acc"), call("g", call("-", S("n"), 1))))
+            expect(run(form("%letrec", [[S("g"), loop]], call("g", 3, q(S("x")))))).toBe("<#void>")
             // deep, past direct code's depth, with an extra argument each time
-            const deep = L(["pad"], ["n"], null, [S("%if"), call("=", S("n"), 0), 0, call("+", 1, call("h", call("-", S("n"), 1), q(S("extra"))))])
-            expect(run([S("%begin"), [S("%define-global"), S("h"), deep], call("h", 3000)])).toBe("3000")
+            const deep = L(["pad"], ["n"], null, form("%if", call("=", S("n"), 0), 0, call("+", 1, call("h", call("-", S("n"), 1), q(S("extra"))))))
+            expect(run(form("%begin", form("%define-global", S("h"), deep), call("h", 3000)))).toBe("3000")
             // a padded last clause takes the counts no clause before it does
-            const two = [S("%lambda"), [[], [S("a")], null, q(S("one"))], [[S("pad")], [S("a"), S("b")], null, list(S("a"), S("b"))]]
-            expect(run([S("%begin"), [S("%define-global"), S("t2"), two], list(call("t2", 1), call("t2"), call("t2", 1, 2, 3))])).toBe("(one (<#void> <#void>) (1 2))")
-            expect(run([S("%let"), [[S("t3"), two]], list(call("t3", 1), call("t3"), call("t3", 1, 2, 3))])).toBe("(one (<#void> <#void>) (1 2))")
-            expect(() => compile([S("%lambda"), [[S("pad")], [], null, 1], [[], [], null, 2]])).toThrow("a clause after a padded one would never run")
-            expect(() => compile([S("%lambda"), [[S("nope")], [], null, 1]])).toThrow("unknown clause option nope")
+            const two = form("%lambda", [[], [S("a")], null, q(S("one"))], [[S("pad")], [S("a"), S("b")], null, list(S("a"), S("b"))])
+            expect(run(form("%begin", form("%define-global", S("t2"), two), list(call("t2", 1), call("t2"), call("t2", 1, 2, 3))))).toBe("(one (<#void> <#void>) (1 2))")
+            expect(run(form("%let", [[S("t3"), two]], list(call("t3", 1), call("t3"), call("t3", 1, 2, 3))))).toBe("(one (<#void> <#void>) (1 2))")
+            expect(() => compile(form("%lambda", [[S("pad")], [], null, 1], [[], [], null, 2]))).toThrow("a clause after a padded one would never run")
+            expect(() => compile(form("%lambda", [[S("nope")], [], null, 1]))).toThrow("unknown clause option nope")
             // the host can call it
             const made = evaluator.evaluateRaw(compile(f))
             expect(s.stringify(evaluator.evaluateClosure(made, [5]))).toBe("(5 <#void>)")
@@ -189,26 +189,26 @@ describe('Anima', () => {
             const bare = new Anima(vmImpl)
             expect(bare.intrinsics.byName("%car")).toBeUndefined()
             expect(() => bare.compileRaw(`(+ 1 2)`)).toThrow("no front end")
-            const ifForm = [Symbol.for("%if"), false, 1, [Symbol.for("%intcall"), Symbol.for("%values"), 2, 3]]
+            const ifForm = form("%if", false, 1, form("%intcall", Symbol.for("%values"), 2, 3))
             expect(s.stringify(bare.evaluateRaw(bare.compileRawAst(ifForm)))).toBe("(values 2 3)")
             // its sequences are arrays: rest parameters, and what %apply spreads
-            const restForm = [Symbol.for("%call"), [Symbol.for("%lambda"), [[], [], Symbol.for("r"), Symbol.for("r")]], 1, 2]
+            const restForm = form("%call", form("%lambda", [[], [], Symbol.for("r"), Symbol.for("r")]), 1, 2)
             expect(bare.evaluateRaw(bare.compileRawAst(restForm))).toEqual([1, 2])
-            const applyForm = [Symbol.for("%apply"), [Symbol.for("%lambda"), [[], [Symbol.for("a")], Symbol.for("r"), Symbol.for("r")]], 1, [Symbol.for("%quote"), [2, 3]]]
+            const applyForm = form("%apply", form("%lambda", [[], [Symbol.for("a")], Symbol.for("r"), Symbol.for("r")]), 1, form("%quote", [2, 3]))
             expect(bare.evaluateRaw(bare.compileRawAst(applyForm))).toEqual([2, 3])
             // values print neutrally, unless the front end has its own printer
             // nor wording: without a formatter, a message is its op's name, and the host reads the op and its arguments
             expect(evaluator.intrinsics.print([true, null, Symbol.for("a"), "s"])).toBe('#(#t () a "s")')
             expect(bare.intrinsics.print([true])).toBe("Value")
             let thrown: any
-            try { bare.evaluateRaw(bare.compileRawAst([Symbol.for("%intcall"), Symbol.for("%values"), [Symbol.for("%call"), 5, 1]])) } catch (err) { thrown = err }
+            try { bare.evaluateRaw(bare.compileRawAst(form("%intcall", Symbol.for("%values"), form("%call", 5, 1)))) } catch (err) { thrown = err }
             expect(thrown).toBeInstanceOf(VMError)
             expect([thrown.message, thrown.op, thrown.args]).toEqual(["NonProcedure", Msg.NonProcedure, [5]])
             expect(() => bare.compileRawAst([])).toThrow("EmptyForm")
             // every call is explicit: a bare (f ...) is no core form, and %intcall names an intrinsic the table has
             expect(() => bare.compileRawAst([Symbol.for("f"), 1])).toThrow("BareCall")
-            expect(() => bare.compileRawAst([Symbol.for("%intcall"), Symbol.for("%nope"), 1])).toThrow("UnknownIntrinsic")
-            expect(() => evaluator.compiler.compile([Symbol.for("%car"), 1])).toThrow("%car is not a core form")
+            expect(() => bare.compileRawAst(form("%intcall", Symbol.for("%nope"), 1))).toThrow("UnknownIntrinsic")
+            expect(() => evaluator.compiler.compile(form("%car", 1))).toThrow("%car is not a core form")
             // a front end has one pack and one spread
             expect(() => evaluator.registerIntrinsic("%my-pack", () => null, { leaf: true, sequence: "pack" })).toThrow("already has a sequence pack")
             expect(() => bare.registerIntrinsic("%my-spread", () => null, { sequence: "spread" })).toThrow("must be a leaf")

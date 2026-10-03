@@ -20,7 +20,7 @@ import {
     OP_RAISE,
     OP_CURRENT_MARKS,
     OP_CURRENT_STACK,
-    Positions,
+    SyntaxPositions,
 } from "../../common";
 import { Cons } from "../list";
 import { toCore } from "../core";
@@ -70,7 +70,7 @@ const OP_CASE = Symbol.for("case"), OP_ANIMA_MACRO = Symbol.for("anima-macro");
 
 // `e` with the symbols in `map` replaced where they are code: not in quoted data, the literal parts of a quasiquote, a
 // case's datums or a macro's keyword. `level` is the quasiquote nesting (0 in code)
-const renameIn = (e: any, map: ReadonlyMap<symbol, symbol>, positions: Positions, level: number = 0): any => {
+const renameIn = (e: any, map: ReadonlyMap<symbol, symbol>, positions: SyntaxPositions, level: number = 0): any => {
     if (typeof e === "symbol") return level === 0 ? map.get(e) ?? e : e;
     if (Array.isArray(e)) {
         if (level === 0) return e;
@@ -886,7 +886,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (typeof onsym !== "symbol") throw new Error(`anima-macro onsym must be a constant symbol right now`);
         let cmpexpr = list(OP_LAMBDA, list(Symbol.for("orig")), expr.cdr.car);
         let trCmpExpr = evaluator.transform(cmpexpr);
-        let cmpExprBc = evaluator.expandcmp.compile(toCore(trCmpExpr, evaluator.intrinsics, evaluator.positions), evaluator.positions);
+        let cmpExprBc = evaluator.expandcmp.compile(toCore(trCmpExpr, evaluator.intrinsics, evaluator.positions));
         const res: Closure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
         evaluator.registerTransform(onsym, (evaluator, expr, orig) => {
             const resp = evaluator.expandvm.evaluateClosure(res, evaluator.scope, [orig]);

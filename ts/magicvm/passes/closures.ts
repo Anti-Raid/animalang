@@ -36,13 +36,13 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
         if (!Array.isArray(e) || e.length === 0) return;
         const op = e[0];
         const shape = Lconv.forms.get(op);
-        if (shape !== undefined && shape !== "exprs" && malformed(Lconv, e) !== null) return;
+        if (shape !== undefined && malformed(Lconv, e) !== null) return;
         const all = (xs: any[]) => xs.forEach(x => walk(x, fn, true, blocks));
         switch (shape) {
             case "quote":
                 return;
             case "lambda":
-                for (const c of e.slice(1)) {
+                for (const c of e.slice(2)) {
                     if (!used) continue;
                     const inner: Fn = { parent: fn, captures: [] };
                     bind(inner, c[2] === null ? c[1] : [...c[1], c[2]]);
@@ -51,41 +51,41 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
                 }
                 return;
             case "let":
-                all(e[1].map((b: any[]) => b[1]));
-                bind(fn, e[1].map((b: any[]) => b[0]));
-                return body(e.slice(2), fn, used, blocks);
+                all(e[2].map((b: any[]) => b[1]));
+                bind(fn, e[2].map((b: any[]) => b[0]));
+                return body(e.slice(3), fn, used, blocks);
             case "let*":
-                for (const b of e[1]) {
+                for (const b of e[2]) {
                     walk(b[1], fn, true, blocks);
                     bind(fn, [b[0]]);
                 }
-                return body(e.slice(2), fn, used, blocks);
+                return body(e.slice(3), fn, used, blocks);
             case "letrec": {
-                const bindings: any[][] = e[1];
+                const bindings: any[][] = e[2];
                 bind(fn, bindings.map(b => b[0]));
                 all(bindings.filter(b => isLetrecLambda(b[1])).map(b => unwrapBoxed(b[1])));
                 all(bindings.filter(b => !isLetrecLambda(b[1])).map(b => unwrapBoxed(b[1])));
-                return body(e.slice(2), fn, used, blocks);
+                return body(e.slice(3), fn, used, blocks);
             }
             case "let-values":
-                all(e[1].map((c: any[]) => c[2]));
-                bind(fn, e[1].flatMap((c: any[]) => c[1] === null ? c[0] : [...c[0], c[1]]));
-                return body(e.slice(2), fn, used, blocks);
+                all(e[2].map((c: any[]) => c[2]));
+                bind(fn, e[2].flatMap((c: any[]) => c[1] === null ? c[0] : [...c[0], c[1]]));
+                return body(e.slice(3), fn, used, blocks);
             case "assign":
-                walk(e[2], fn, true, blocks);
-                if ((op === Symbol.for("%set!") || op === Symbol.for("%set-box!")) && typeof e[1] === "symbol") use(e[1], fn);
+                walk(e[3], fn, true, blocks);
+                if ((op === Symbol.for("%set!") || op === Symbol.for("%set-box!")) && typeof e[2] === "symbol") use(e[2], fn);
                 return;
             case "label":
-                if (op === Symbol.for("%block")) return body(e.slice(2), fn, used, new Map(blocks).set(e[1], used));
-                if (op === Symbol.for("%inlined") || op === Symbol.for("%tail-inlined")) return body(e.slice(2), fn, used, blocks);
-                if (e.length > 2) walk(e[2], fn, blocks.get(e[1]) ?? false, blocks);
+                if (op === Symbol.for("%block")) return body(e.slice(3), fn, used, new Map(blocks).set(e[2], used));
+                if (op === Symbol.for("%inlined") || op === Symbol.for("%tail-inlined")) return body(e.slice(3), fn, used, blocks);
+                if (e.length > 3) walk(e[3], fn, blocks.get(e[2]) ?? false, blocks);
                 return;
         }
         switch (op) {
             case Symbol.for("%begin"):
-                return body(e.slice(1), fn, used, blocks);
+                return body(e.slice(2), fn, used, blocks);
             case Symbol.for("%if"): {
-                const args = e.slice(1);
+                const args = e.slice(2);
                 for (let i = 0; i + 1 < args.length; i += 2) {
                     walk(args[i], fn, true, blocks);
                     walk(args[i + 1], fn, used, blocks);
@@ -94,23 +94,23 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
                 return;
             }
             case Symbol.for("%loop"):
-                return e.slice(1).forEach((x: any) => walk(x, fn, false, blocks));
+                return e.slice(2).forEach((x: any) => walk(x, fn, false, blocks));
             case Symbol.for("%with-mark"):
-                walk(e[1], fn, true, blocks);
                 walk(e[2], fn, true, blocks);
-                return walk(e[3], fn, used, blocks);
+                walk(e[3], fn, true, blocks);
+                return walk(e[4], fn, used, blocks);
             case Symbol.for("%catch"):
-                return all(e.length >= 4 ? [e[1], e[3], e[2]] : [e[1], e[2]]);
+                return all(e.length >= 5 ? [e[2], e[4], e[3]] : [e[2], e[3]]);
             case Symbol.for("%apply"):
             case Symbol.for("%intapply"): {
-                const from = op === Symbol.for("%apply") ? 1 : 2;
+                const from = op === Symbol.for("%apply") ? 2 : 3;
                 const last = e[e.length - 1];
-                if (e.length > 2 && isSpreadOf(last, intrinsics)) use(last[2], fn);
+                if (e.length > 3 && isSpreadOf(last, intrinsics)) use(last[3], fn);
                 return all(e.slice(from));
             }
         }
         // a call: the procedure, then the arguments; an intrinsic's, its arguments
-        all(e.slice(op === Symbol.for("%intcall") ? 2 : 1));
+        all(e.slice(op === Symbol.for("%intcall") ? 3 : 2));
     };
     walk(ast, { parent: null, captures: [] }, true, new Map());
     return out;

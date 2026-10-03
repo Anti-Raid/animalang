@@ -1,4 +1,4 @@
-import { IProcedure, Env, Positions } from "../common";
+import { IProcedure, Env, SyntaxPositions } from "../common";
 import { TWINNED } from "./transformer/syntax";
 import type { Compiler } from "../magicvm/compiler";
 import type { AnimaVM } from "../magicvm/vm";
@@ -131,31 +131,30 @@ let PRELUDE_CODE: Code | null = null
 // the prelude's procedures, as core forms, the optimizer may inline (see Intrinsics.defineKnown): the public name of each,
 // and its %lambda
 let KNOWN: [string, any][] = []
-let PRELUDE_POSITIONS = new Positions()
 
 const CORE_BEGIN = Symbol.for("%begin"), CORE_LAMBDA = Symbol.for("%lambda"), DEFINE_GLOBAL = Symbol.for("%define-global")
 const knownIn = (core: any): [string, any][] => {
     if (!Array.isArray(core)) return []
-    if (core[0] === CORE_BEGIN) return core.slice(1).flatMap(knownIn)
-    const name: string | undefined = core[0] === DEFINE_GLOBAL && typeof core[1] === "symbol" ? core[1].description : undefined
-    const value = core[2]
-    return name?.startsWith("$") && Array.isArray(value) && value[0] === CORE_LAMBDA && value.length === 2 ? [[name.slice(1), value]] : []
+    if (core[0] === CORE_BEGIN) return core.slice(2).flatMap(knownIn)
+    const name: string | undefined = core[0] === DEFINE_GLOBAL && typeof core[2] === "symbol" ? core[2].description : undefined
+    const value = core[3]
+    return name?.startsWith("$") && Array.isArray(value) && value[0] === CORE_LAMBDA && value.length === 3 ? [[name.slice(1), value]] : []
 }
 
 // Runs the prelude with `vm` and returns the scope of its $ exports (under their public names), which the instance's
 // code cannot rebind
 export const loadPrelude = (cmp: Compiler, vm: AnimaVM, intrinsics: Intrinsics): Env => {
     if (PRELUDE_CODE === null) {
-        const positions = PRELUDE_POSITIONS = new Positions()
-        const core = transformNative(readNative(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, "<prelude>", { datum: schemeDatum, positions }), intrinsics, positions)
+        const where = new SyntaxPositions()
+        const core = transformNative(readNative(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, "<prelude>", { datum: schemeDatum, positions: where }), intrinsics, where)
         KNOWN = knownIn(core)
-        const compiled = cmp.compile(core, positions, false)
+        const compiled = cmp.compile(core, false)
         PRELUDE_CODE = compiled.fresh(new Map(), schemeBase())
     }
 
     for (const [name, lambda] of KNOWN) {
-        intrinsics.defineKnown(Symbol.for(name), lambda, name, PRELUDE_POSITIONS)
-        if (TWINNED.has(name)) intrinsics.defineKnown(Symbol.for(`@${name}`), lambda, name, PRELUDE_POSITIONS)
+        intrinsics.defineKnown(Symbol.for(name), lambda, name)
+        if (TWINNED.has(name)) intrinsics.defineKnown(Symbol.for(`@${name}`), lambda, name)
     }
 
     const privScope = stdPreludeScope()

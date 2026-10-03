@@ -1,4 +1,4 @@
-import { Env, CORE_LAMBDA, Positions } from "./common"
+import { Env, CORE_LAMBDA } from "./common"
 import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./magicvm/intrinsics"
 import type { CaseLambda } from "./magicvm/code"
 import { newIntrinsics } from "./magicvm/core"
@@ -7,11 +7,11 @@ import { AnimaVM } from "./magicvm/vm"
 import type { Code, Closure } from "./magicvm/exec"
 import type { AnimaOptions } from "./magicvm/meta"
 
-// A language on top of the core: reads source into its syntax tree and lowers that to the core forms, recording where
-// each form comes from in `positions` (which the compiler then reads)
+// A language on top of the core: reads source into its syntax tree and lowers that to the core forms (each carrying
+// where it comes from, see magicvm/forms.ts)
 export interface FrontEnd {
-    read(source: string, file: string | undefined, positions: Positions): any
-    transform(ast: any, positions: Positions): any
+    read(source: string, file?: string): any
+    transform(ast: any): any
     // a procedure of `params` whose body is `body`, in the front end's syntax
     lambda(params: any, body: any): any
     // what quoted data in native-scheme text means to it (see native/reader.ts)
@@ -120,25 +120,23 @@ export class Anima {
     }
 
     compileToClosure(s: string, args: any, globals: Env) {
-        const positions = new Positions()
-        return this.compileAstToClosure(this.#requireFrontEnd().read(s, undefined, positions), args, globals, positions)
+        return this.compileAstToClosure(this.#requireFrontEnd().read(s), args, globals)
     }
 
     // without a front end, `args` is the lambda's parameters (an array of symbols) and `bast` its body, a core form
-    compileAstToClosure(bast: any, args: any, globals: Env, positions: Positions = new Positions()): Closure {
-        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : [CORE_LAMBDA, [[], args, null, bast]]
-        const bc = this.compileRawAst(ast, positions)
+    compileAstToClosure(bast: any, args: any, globals: Env): Closure {
+        const ast = this.#frontEnd !== null ? this.#frontEnd.lambda(args, bast) : [CORE_LAMBDA, null, [[], args, null, bast]]
+        const bc = this.compileRawAst(ast)
         return this.#vm.evaluateRaw(bc, globals) // Use the VM to create the closure
     }
 
     compileRaw(s: string, file?: string) {
-        const positions = new Positions()
-        return this.compileRawAst(this.#requireFrontEnd().read(s, file, positions), positions)
+        return this.compileRawAst(this.#requireFrontEnd().read(s, file))
     }
 
-    // the front end's syntax tree, or core forms if there is no front end; `positions`, where its forms come from
-    compileRawAst(ast: any, positions: Positions = new Positions()) {
-        return this.#comp.compile(this.#frontEnd !== null ? this.#frontEnd.transform(ast, positions) : ast, positions)
+    // the front end's syntax tree, or core forms if there is no front end
+    compileRawAst(ast: any) {
+        return this.#comp.compile(this.#frontEnd !== null ? this.#frontEnd.transform(ast) : ast)
     }
 
     #requireFrontEnd(): FrontEnd {

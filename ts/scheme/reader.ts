@@ -1,4 +1,4 @@
-import { Positions, type SourcePos } from "../common";
+import { SyntaxPositions, type SourcePos } from "../common";
 import { OP_BEGIN, OP_QUOTE, sourceSymbol } from "./symbols";
 import { Cons } from "./list";
 
@@ -71,8 +71,8 @@ export class ASP {
     #file: string
     #tokenOffsets: number[] = []
     // `positions`: where each list read is recorded
-    readonly #positions: Positions
-    constructor(str: string, supportsDottedPairs: boolean = false, file: string = "<input>", positions: Positions = new Positions()) {
+    readonly #positions: SyntaxPositions
+    constructor(str: string, supportsDottedPairs: boolean = false, file: string = "<input>", positions: SyntaxPositions = new SyntaxPositions()) {
         this.#positions = positions
         this.#str = str
         this.#currPos = 0

@@ -1,6 +1,6 @@
 import { ASTStringifier } from '../scheme/printer';
 import { Anima } from '../anima';
-import { runNative } from './helpers';
+import { form, runNative } from './helpers';
 import { describe, it, expect } from 'vitest';
 import { createScheme } from '../scheme';
 import { Code, AnimaVM, AotCompiler } from '../magicvm/vm';
@@ -134,7 +134,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
             return anima;
         };
         // (lambda (a b) (%v2+ (%v2+ a b) b)): the inner result is known, and the parameters in a version for vec2s
-        const fnAst = [S("%lambda"), [[], [S("a"), S("b")], null, [S("%intcall"), S("%v2+"), [S("%intcall"), S("%v2+"), S("a"), S("b")], S("b")]]];
+        const fnAst = form("%lambda", [[], [S("a"), S("b")], null, form("%intcall", S("%v2+"), form("%intcall", S("%v2+"), S("a"), S("b")), S("b"))]);
         const aot = build(impl);
         const bc = aot.compiler.compile(fnAst);
         const tmpl = (bc.constants.find((c: any) => c instanceof Closure) as any).tmpl;
@@ -151,7 +151,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const bare = new Anima(impl);
         const plus = bare.registerIntrinsic("%p+", (regs, st) => regs[st] + regs[st + 1], { args: [2, 2], leaf: true, inline: ([a, b], slow, _t, _d, known) => known.every(k => k === "number") ? `${a} + ${b}` : `(typeof ${a} === "number" && typeof ${b} === "number" ? ${a} + ${b} : ${slow})` });
         expect(plus.name).toBe("%p+");
-        const bc2 = bare.compiler.compile([S("%lambda"), [[], [S("n")], null, [S("%intcall"), S("%p+"), 1, [S("%intcall"), S("%p+"), 2, S("n")]]]]);
+        const bc2 = bare.compiler.compile(form("%lambda", [[], [S("n")], null, form("%intcall", S("%p+"), 1, form("%intcall", S("%p+"), 2, S("n")))]));
         const t2 = (bc2.constants.find((c: any) => c instanceof Closure) as any).tmpl;
         expect(AotCompiler.generateSource(t2.code, t2)).toContain('typeof ');
     });

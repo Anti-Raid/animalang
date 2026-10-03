@@ -1,12 +1,12 @@
 // native-scheme's reader: s-expressions read straight into arrays. It names VM values only: `( ... )` (or `[ ... ]`) an
 // array, a name a symbol, numbers (and `123n` bigints), strings, `#t` / `#f`, `#null` and `#void` (undefined); `'x` is
 // (%quote x), `%[f x ...]` a call, (%call f x ...), or of an intrinsic, (%intcall %name x ...). `;` comments out the rest
-// of a line, `#| ... |#` what it encloses (nested too), and `#;` the next form. Where each list was read goes in `positions`. A front end's meaning for quoted data comes from
+// of a line, `#| ... |#` what it encloses (nested too), and `#;` the next form. Where each list was read goes in `positions`, for transformNative to put in the core forms' position slots. A front end's meaning for quoted data comes from
 // `datum`, called on what each (%quote x) quotes
-import { CORE_BEGIN, CORE_CALL, CORE_INTCALL, CORE_QUOTE, Positions, formatPos, type SourcePos } from "../common";
+import { CORE_BEGIN, CORE_CALL, CORE_INTCALL, CORE_QUOTE, SyntaxPositions, formatPos, type SourcePos } from "../common";
 import { isCoreForm } from "../magicvm/core";
 
-export type NativeReadOptions = { datum?: (x: any) => any, positions?: Positions };
+export type NativeReadOptions = { datum?: (x: any) => any, positions?: SyntaxPositions };
 
 export class NativeReadError extends Error {
     constructor(readonly what: string, readonly at: SourcePos) {
@@ -26,7 +26,7 @@ const LITERALS: Record<string, any> = { "#t": true, "#f": false, "#null": null, 
 // the forms in `src`: one is itself, several a %begin of them
 export const readNative = (src: string, file: string = "<native>", options: NativeReadOptions = {}): any => {
     const datum = options.datum;
-    const positions = options.positions ?? new Positions();
+    const positions = options.positions ?? new SyntaxPositions();
     let i = 0, line = 1, lineStart = 0;
     const here = (): SourcePos => ({ file, line, col: i - lineStart + 1 });
     const fail = (what: string, at: SourcePos): never => {

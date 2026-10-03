@@ -1,4 +1,4 @@
-import { Env, CORE_QUOTE, OP_DEFINE_GLOBAL, Positions } from "../../common"
+import { Env, CORE_QUOTE, OP_DEFINE_GLOBAL, SyntaxPositions } from "../../common"
 import { Cons } from "../list"
 import { Compiler } from "../../magicvm/compiler"
 import { AnimaVM } from "../../magicvm/vm"
@@ -85,8 +85,7 @@ export class MacroEvaluator {
     // are ordinary globals everywhere in it. As in a Racket module, such a name cannot be read before its definition has
     // run: the program first binds it to Env.UNDEFINED (only where it is redefined for the first time, so a later program
     // does not undo an earlier one's definition)
-    transformProgram(ast: any, positions: Positions): any {
-        this.positions = positions
+    transformProgram(ast: any): any {
         const fresh: symbol[] = []
         const scan = (e: any) => {
             if (!(e instanceof Cons)) return
@@ -125,15 +124,20 @@ export class MacroEvaluator {
     #depth = -1
     #nesting = 0
 
-    // where the forms of the program being transformed come from (see Positions): what the reader recorded, and kept on
-    // what the transformers make of them
-    positions: Positions = new Positions()
+    // where the forms of the program being read and transformed come from (see SyntaxPositions): what the reader recorded,
+    // kept on what the transformers make of them, for toCore to put in the core forms' position slots. A new one for each
+    // program (see readProgram), as transformers may hand out the same pairs to more than one
+    positions: SyntaxPositions = new SyntaxPositions()
 
-    // `positions`: those of a new program's forms (not given when a transformer transforms part of its own)
-    transform(ast: any, positions?: Positions): any {
+    // a new program's syntax tree, read by `read` with a new record of positions
+    readProgram<T>(read: (positions: SyntaxPositions) => T): T {
+        this.positions = new SyntaxPositions()
+        return read(this.positions)
+    }
+
+    transform(ast: any): any {
         // called from inside a transformer (e.g. for a lambda body): keep counting toward the expansion limit
         if (this.#depth >= 0) return this.#transform(ast, this.#depth)
-        if (positions !== undefined) this.positions = positions
         try {
             return this.#transform(ast, 0)
         } catch (e) {

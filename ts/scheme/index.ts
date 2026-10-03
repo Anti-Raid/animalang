@@ -21,8 +21,8 @@ export const createScheme = (options: AnimaOptions): Anima => {
 
     const publicScope = loadPrelude(anima.compiler, anima.vm, intrinsics);
     anima.attachFrontEnd({
-        read: (source, file, positions) => new ASP(source, true, file, positions).parse(),
-        transform: (ast, positions) => toCore(evaluator.transformProgram(ast, positions), intrinsics, positions),
+        read: (source, file) => evaluator.readProgram(positions => new ASP(source, true, file, positions).parse()),
+        transform: ast => toCore(evaluator.transformProgram(ast), intrinsics, evaluator.positions),
         lambda: (params, body) => Cons.list(OP_LAMBDA, params, body),
         datum: schemeDatum,
     }, publicScope.chained());

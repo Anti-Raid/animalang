@@ -135,9 +135,13 @@ export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
 
-// Where forms come from: the positions of a program's forms (core-form arrays, or a front end's own data), which the
-// reader or transpiler that makes the forms fills in and hands to the compiler with them. One map per program
-export class Positions {
+
+export const formatPos = (pos: SourcePos | null | undefined) => pos ? `${pos.file}:${pos.line}:${pos.col}` : "?";
+
+// A front end's record of where it read the parts of its own syntax tree (lists that are not core forms yet, or a
+// front end's own data like Scheme's pairs), which it puts in the position slots of the core forms it makes of them.
+// The compiler never sees it: core forms carry their own positions (see magicvm/forms.ts)
+export class SyntaxPositions {
     readonly #of = new WeakMap<object, SourcePos>();
 
     get(form: any): SourcePos | undefined {
@@ -152,14 +156,6 @@ export class Positions {
         this.#of.set(form, pos);
     }
 
-    // the positions `from` has of `form` and the forms inside it, as this map's too
-    adopt(form: any, from: Positions): void {
-        if (!Array.isArray(form) || from === this) return;
-        const pos = from.get(form);
-        if (pos !== undefined) this.#of.set(form, pos);
-        for (const x of form) this.adopt(x, from);
-    }
-
     // `to`, at `from`'s position if it has one
     readonly keep = <T>(to: T, from: any): T => {
         const pos = this.get(from);
@@ -167,8 +163,6 @@ export class Positions {
         return to;
     };
 }
-
-export const formatPos = (pos: SourcePos | null | undefined) => pos ? `${pos.file}:${pos.line}:${pos.col}` : "?";
 
 // the core forms: they cannot be bound (a front end reserves its own keywords through its intrinsics table)
 export const SPECIAL_FORMS = new Set([

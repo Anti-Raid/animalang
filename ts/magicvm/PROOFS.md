@@ -46,6 +46,8 @@ They mean what a store-based machine gives them:
 
 ---
 
+Forms are written without their position slot (`[op, pos, operand ...]`, see README): a rewrite gives each form it makes the slot of the form it replaces, or `null`, which affects only where errors and tracebacks point.
+
 ## 1. `blockEscapes`
 
 **Rewrite.** For `E = (%intcall C (%lambda (k) B1 … Bn))` with `C ∈ {%call/ec, %call/cc}`:

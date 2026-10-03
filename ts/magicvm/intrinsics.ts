@@ -1,4 +1,4 @@
-import { Msg, Positions, opName, type Formatter } from "../common";
+import { Msg, opName, type Formatter } from "../common";
 // AOT inlining: given the js expressions of the arguments and of a call to the operation itself (the fallback, which
 // reports errors), returns a js expression computing the result, or null to always make the call. `tmp` names a scratch
 // variable the expression may assign; `d` maps each declared dep to the local variable holding it
@@ -109,7 +109,7 @@ export class Intrinsics {
     // and the procedures it provides ("builtin")
     readonly reserved = new Map<symbol, "special form" | "builtin">()
     // globals whose definitions the optimizer may inline where they are called (see defineKnown)
-    readonly known = new Map<symbol, { readonly lambda: any, readonly name: string, readonly positions: Positions }>()
+    readonly known = new Map<symbol, { readonly lambda: any, readonly name: string }>()
     #pack: Intrinsic | undefined
     #spread: Intrinsic | undefined
     // how the VM's and the compiler's messages are worded (see Msg): the front end's formatter, if it sets one
@@ -252,11 +252,11 @@ export class Intrinsics {
     }
 
     // The global `sym` is the procedure `lambda` (a one-clause %lambda core form that refers to nothing but intrinsics and
-    // its own variables), shown in tracebacks as `name`, with where its forms come from in `positions`: code compiled while
-    // this holds may run its body where it calls `sym` (see passes/cp0.ts). A front end forgets it (forgetKnown) when a
-    // program may change the global
-    defineKnown(sym: symbol, lambda: any, name: string, positions: Positions = new Positions()): void {
-        this.known.set(sym, Object.freeze({ lambda, name, positions }))
+    // its own variables, its forms carrying their positions), shown in tracebacks as `name`: code compiled while this
+    // holds may run its body where it calls `sym` (see passes/cp0.ts). A front end forgets it (forgetKnown) when a program
+    // may change the global
+    defineKnown(sym: symbol, lambda: any, name: string): void {
+        this.known.set(sym, Object.freeze({ lambda, name }))
     }
 
     forgetKnown(sym: symbol): void {

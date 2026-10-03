@@ -6,18 +6,18 @@ The compiler only understands `%` forms: a language's front end (its reader and 
 
 ### Representation
 
-The compiler's input is JS data, not a language's syntax tree: a form is an array `[op, operand ...]` whose first element is a core form's or intrinsic's symbol (or, for a call, the procedure expression); a symbol is a variable reference; anything else that is not an array is a literal. The forms with binders or labels have fixed shapes:
+The compiler's input is JS data, not a language's syntax tree: a form is an array `[op, pos, operand ...]` whose first element is a core form's symbol and whose second is where it comes from: a `SourcePos` (`{ file, line, col }`) or `null` to take the enclosing form's position; a symbol is a variable reference; anything else that is not an array is a literal. The forms with binders or labels have fixed shapes:
 
 | Form | Shape |
 |---|---|
-| `%quote` | `[%quote, datum]` (the datum is data, any value, arrays included) |
-| `%lambda` | `[%lambda, clause ...]`, each clause `[options, [param ...], rest, body ...]`: `options` a list of symbols (`[]`, or `[pad]`), `rest` a symbol or `null` (helpers in `lambda.ts`) |
-| `%let`, `%let*`, `%letrec` | `[op, [[name, init] ...], body ...]` |
-| `%let-values`, `%let-values/strict` | `[op, [[[param ...], rest, init] ...], body ...]` |
-| `%set!`, `%define-global` | `[op, name, expr]` |
-| `%block`, `%escape` | `[op, label, expr ...]` |
+| `%quote` | `[%quote, pos, datum]` (the datum is data, any value, arrays included) |
+| `%lambda` | `[%lambda, pos, clause ...]`, each clause `[options, [param ...], rest, body ...]`: `options` a list of symbols (`[]`, or `[pad]`), `rest` a symbol or `null` (helpers in `lambda.ts`) |
+| `%let`, `%let*`, `%letrec` | `[op, pos, [[name, init] ...], body ...]` |
+| `%let-values`, `%let-values/strict` | `[op, pos, [[[param ...], rest, init] ...], body ...]` |
+| `%set!`, `%define-global` | `[op, pos, name, expr]` |
+| `%block`, `%escape` | `[op, pos, label, expr ...]` |
 
-An array value (e.g. a vector literal) must be quoted, since an array is a form. Where forms come from is not in the forms: it is a `Positions` map (form to `file:line:col`, `common.ts`) the reader or transpiler fills in as it makes them, and hands to the compiler with them: `compiler.compile(ast, positions)`, or `anima.compileRawAst(ast, positions)`. One map per program; a form missing from it takes its enclosing form's position. A front end converts its expanded code to this, leaving the data it quotes in its own representation.
+An array value (e.g. a vector literal) must be quoted, since an array is a form. Every form has the position slot (lambda clauses, binding pairs and quoted data are not forms and have none), so the forms carry where they come from and the compiler needs nothing else: whoever builds them fills it in — a front end from where it read its own syntax (each keeps its own record of that, `SyntaxPositions`, which the compiler never sees), a transpiler from its source, and a pass that makes a form from the form it replaces, or `null`. `posOf` and `isPosSlot` (`forms.ts`) read and check it. The tables and examples below leave the slot out where it does not matter.
 
 ## Core Language
 
@@ -289,7 +289,7 @@ A non-tail resume from direct code instead runs the coroutine in a nested driver
 ## Debugging
 
 - **Names**: a lambda is named after what it is bound to (`%define-global`, `%set!`, a binding form), else `lambda@file:line`. A front end can rename the procedures it exports.
-- **Source positions**: a front end, or a transpiler building core forms, records the positions of the forms it produces in the program's `Positions` (there is no position form in the core language). The passes keep them on the forms they rebuild (`Positions.keep`; `parts`/`mapExprs` take the map), and a known definition (`defineKnown`) carries the map it was read with, which the optimizer adopts where it inlines it. The compiler emits `Pos` IR nodes, which lower into `Code.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
+- **Source positions**: each form's position slot (see the representation above); a form whose slot is `null` takes its enclosing form's position. The compiler emits `Pos` IR nodes, which lower into `Code.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
 - **Tracebacks**: `%debug-frames` / `%debug-traceback` describe a snapshot `(%current-stack)` takes in the function that calls it, so written in the caller itself, that function is the first frame. A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. Given a coroutine, they trace it instead: a suspended one from where it yielded, a normal one (waiting on a coroutine it resumed) from where it resumed it, and an unstarted or dead one as empty. The host can get a coroutine's traceback with `Anima.traceback(co)`.
 - **Unhandled errors**: the VM builds a traceback from the raising frame before giving up, and it is attached to the JS error as `animaTraceback`. For an error that escaped a coroutine, the coroutine's traceback is kept.
 - **Debug mode** (`implDebug`, i.e. `new Compiler(true)`): the compiled `Code` is flagged `debug`, and the AOT code for it

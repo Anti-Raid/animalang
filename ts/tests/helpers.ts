@@ -33,3 +33,6 @@ export const runNative = (anima: Anima, src: string, file?: string): any => anim
 // a procedure for each intrinsic, named without its %, as an embedder would define one
 export const expose = (anima: Anima, ...names: string[]) =>
     runNative(anima, names.map(name => `(define-intrinsic ${name.slice(1)} ${name})`).join("\n"), "<exposed>");
+
+// a core form with no position of its own (it takes its enclosing form's): [op, null, ...operands]
+export const form = (op: string, ...operands: any[]): any[] => [Symbol.for(op), null, ...operands];
