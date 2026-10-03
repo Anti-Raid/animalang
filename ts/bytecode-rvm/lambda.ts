@@ -30,3 +30,10 @@ export const clause = (options: symbol[], params: symbol[], rest: symbol | null,
 
 // a %lambda of one clause
 export const lambda = (params: symbol[], rest: symbol | null, body: any[], options: symbol[] = []): any[] => [CORE_LAMBDA, clause(options, params, rest, body)];
+
+// a %letrec init whose name the assignments pass boxed: (%boxed init) (see passes/assignments.ts)
+export const BOXED = Symbol.for("%boxed");
+export const unwrapBoxed = (init: any): any => Array.isArray(init) && init[0] === BOXED && init.length === 2 ? init[1] : init;
+export const isBoxedInit = (init: any): boolean => unwrapBoxed(init) !== init;
+// whether a %letrec init is a lambda (made before the other inits run), boxed or not
+export const isLetrecLambda = (init: any): boolean => isSingleLambda(unwrapBoxed(init));

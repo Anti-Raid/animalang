@@ -59,6 +59,6 @@ describe("The compiler's passes", () => {
             (define (f . xs) (let* ((a 1) (b (+ a 1))) (set! a (lambda () b)) (call/cc (lambda (k) (if (null? xs) (k b) a)))))
             (define (g n) (define h (case-lambda ((x) x) ((x y) (+ x y)))) (letrec ((loop (lambda (i) (if (= i n) (h i) (loop (+ i 1)))))) (loop 0)))
             (let-values (((a . b) (values 1 2))) (g 3))`);
-        expect(seen).toEqual(["rename", "block-escapes", "split-case-lambdas", "lift-lambdas", "resolve", "call-liveness", "assignments", "closures", "generate", "interrupts", "lower"]);
+        expect(seen).toEqual(["rename", "block-escapes", "split-case-lambdas", "lift-lambdas", "resolve", "assignments", "unbox", "closures", "generate", "interrupts", "lower"]);
     });
 });

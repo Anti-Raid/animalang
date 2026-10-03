@@ -1,15 +1,16 @@
 import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
-import { AstAnalysis, isSpreadOf, markLiveAcrossCalls } from "./analysis";
+import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
 import { blockEscapes, liftLambdas, splitCaseLambdas } from "./lift";
-import { PAD, bodyOf, clausesOf, isPadded, isSingleLambda, optionsOf, paramsOf, restOf } from "./lambda";
+import { PAD, bodyOf, clausesOf, isBoxedInit, isLetrecLambda, isPadded, optionsOf, paramsOf, restOf, unwrapBoxed } from "./lambda";
 import { corePos, type Code } from "./exec";
 import { runPass, type Pass, type PassContext } from "./passes/pass";
 import { interruptsPass, type FunctionIR } from "./passes/interrupts";
 import { renamePass } from "./passes/rename";
 import { closureCaptures, type Captures } from "./passes/closures";
-import { convertAssignments, type Converted } from "./passes/assignments";
+import { BOX, BOX_IN_PLACE, SET_BOX, UNBOX, convertAssignments, type Converted } from "./passes/assignments";
+import { removeBoxes, type Unboxed } from "./passes/unbox";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
@@ -17,19 +18,18 @@ import { Intrinsics, type Intrinsic } from "./intrinsics";
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, ...body]
 
 const OP_APPLY = Symbol.for("%apply");
-const BOX = Symbol.for("%box");
-const UNBOX = Symbol.for("%unbox");
-const BOX_IN_PLACE = Symbol.for("%box!");
-const SET_BOX = Symbol.for("%set-box!");
 
 type Analyzed = { ast: any, analyzer: AstAnalysis, ascope: AnalysisScope }
-type Closed = Converted & { captures: Captures }
+type Closed = Unboxed & { captures: Captures }
 
-// boxes made explicit (see passes/assignments.ts)
+// every assigned local a box (see passes/assignments.ts)
 const assignmentsPass: Pass<Analyzed, Converted> = { name: "assignments", run: ({ ast, ascope }) => convertAssignments(ast, ascope.variables) }
 
+// only the boxes that are needed (see passes/unbox.ts)
+const unboxPass: Pass<Converted, Unboxed> = { name: "unbox", run: ({ ast, boxes }, ctx) => removeBoxes(ast, boxes, ctx.intrinsics) }
+
 // what each lambda captures (see passes/closures.ts)
-const closuresPass: Pass<Converted, Closed> = { name: "closures", run: (converted, ctx) => ({ ...converted, captures: closureCaptures(converted.ast, ctx.intrinsics) }) }
+const closuresPass: Pass<Unboxed, Closed> = { name: "closures", run: (unboxed, ctx) => ({ ...unboxed, captures: closureCaptures(unboxed.ast, ctx.intrinsics) }) }
 
 // the core forms to core forms (see lift.ts)
 const escapesPass: Pass<any, any> = { name: "block-escapes", run: ast => blockEscapes(ast) }
@@ -42,15 +42,6 @@ const resolvePass: Pass<any, Analyzed> = {
     run: (ast, ctx) => {
         const analyzer = new AstAnalysis(ctx.intrinsics)
         return { ast, analyzer, ascope: analyzer.analyze(ast) }
-    },
-}
-
-// which assigned variables are read after a call, and so are boxed with the captured ones (see VariableMetadata.isBoxed)
-const callLivenessPass: Pass<Analyzed, Analyzed> = {
-    name: "call-liveness",
-    run: (analyzed, ctx) => {
-        markLiveAcrossCalls(analyzed.ast, analyzed.analyzer, analyzed.ascope, ctx.intrinsics)
-        return analyzed
     },
 }
 
@@ -101,8 +92,9 @@ export class Compiler {
             const escaped = runPass(escapesPass, renamed, ctx)
             const split = runPass(caseLambdasPass, escaped, ctx)
             const lifted = runPass(liftPass, split, ctx)
-            const analyzed = runPass(callLivenessPass, runPass(resolvePass, lifted, ctx), ctx)
-            const closed = runPass(closuresPass, runPass(assignmentsPass, analyzed, ctx), ctx)
+            const converted = runPass(assignmentsPass, runPass(resolvePass, lifted, ctx), ctx)
+            const unboxed = runPass(unboxPass, converted, ctx)
+            const closed = runPass(closuresPass, unboxed, ctx)
             const ir = runPass(interruptsPass, runPass(this.#generatePass, closed, ctx), ctx)
             return runPass(lowerPass, ir, ctx)
         } catch (err) {
@@ -700,7 +692,9 @@ export class Compiler {
     // one a closure may copy before its init has run, see lateValues) is a box
     #compileLetrec(expr: any[], opts: CmpOpts) {
         const bindings: [symbol, any][] = expr[1]
-        const isLambda = bindings.map(([, init]) => isSingleLambda(init))
+        const isLambda = bindings.map(([, init]) => isLetrecLambda(init))
+        // a name the assignments pass boxed holds its box from the start, which its init sets
+        const boxed = bindings.map(([, init]) => isBoxedInit(init))
 
         opts.scope.enterBlock()
         const seen = new Set<symbol>()
@@ -711,11 +705,13 @@ export class Compiler {
             this.#ensureNotIntrinsic(sym, "letrec")
             const reg = opts.scope.addLocal(sym)
             regs.push(reg)
-            if (!isLambda[i]) opts.nodes.push({ t: "LoadValue", constant: undefined, destReg: reg })
+            if (boxed[i] || !isLambda[i]) opts.nodes.push({ t: "LoadValue", constant: undefined, destReg: reg })
+            if (boxed[i]) opts.nodes.push({ t: "Box", srcReg: reg, destReg: reg })
         }
 
         // every closure made here, with what it captured, so a name can be filled into them once its value exists
         const made: { reg: number, captures: readonly { index: number, local: boolean }[] }[] = []
+        const temps: number[] = []
         const fillIn = (reg: number) => {
             for (const closure of made) {
                 closure.captures.forEach((c, j) => {
@@ -724,9 +720,12 @@ export class Compiler {
             }
         }
         const compileInit = (i: number) => {
+            const dest = boxed[i] ? opts.scope.allocTemp() : regs[i]
+            if (boxed[i]) temps.push(dest)
             const before = opts.nodes.length
-            this.#compile(bindings[i][1], { ...opts, destReg: regs[i], isTail: false, name: bindings[i][0].description })
-            return { dest: regs[i], closure: opts.nodes.slice(before).reverse().find(n => n.t === "NewClosure") }
+            this.#compile(unwrapBoxed(bindings[i][1]), { ...opts, destReg: dest, isTail: false, name: bindings[i][0].description })
+            if (boxed[i]) opts.nodes.push({ t: "SetBox", destReg: regs[i], srcReg: dest })
+            return { dest, closure: opts.nodes.slice(before).reverse().find(n => n.t === "NewClosure") }
         }
 
         for (let i = 0; i < bindings.length; i++) {
@@ -734,12 +733,13 @@ export class Compiler {
             const { dest, closure } = compileInit(i)
             made.push({ reg: dest, captures: closure?.t === "NewClosure" ? closure.template.upvarLocs : [] })
         }
-        for (let i = 0; i < bindings.length; i++) if (isLambda[i]) fillIn(regs[i])
+        for (let i = 0; i < bindings.length; i++) if (isLambda[i] && !boxed[i]) fillIn(regs[i])
         for (let i = 0; i < bindings.length; i++) {
             if (isLambda[i]) continue
             compileInit(i)
-            fillIn(regs[i])
+            if (!boxed[i]) fillIn(regs[i])
         }
+        for (const reg of temps) opts.scope.freeTemp(reg)
 
         this.#compileBody(expr.slice(2), opts)
         opts.scope.exitBlock()

@@ -18,17 +18,18 @@ import {
   OP_DEFINE_GLOBAL,
 } from "../common";
 import { AnalysisScope, VariableMetadata } from "./scope";
-import { Lsrc, subExprs as subExprsOf } from "./passes/lang";
+import { subExprs as subExprsOf } from "./passes/lang";
+import { Lconv, SET_BOX } from "./passes/assignments";
 
 const OP_APPLY = Symbol.for("%apply");
 import { CORE_FORMS } from "./core";
-import { bodyOf, clausesOf, isSingleLambda, paramsOf, restOf } from "./lambda";
+import { bodyOf, clausesOf, isLetrecLambda, paramsOf, restOf, unwrapBoxed } from "./lambda";
 import type { Intrinsics } from "./intrinsics";
 
 // Analyzes the core forms (arrays, see compiler.ts) to handle scoping prior to actual compilation. This lets us avoid
 // boxing of primitives
 
-const subExprs = (e: any[]): any[] => subExprsOf(Lsrc, e);
+const subExprs = (e: any[]): any[] => subExprsOf(Lconv, e);
 
 const mentions = (e: any, names: ReadonlySet<symbol>): boolean =>
     typeof e === "symbol" ? names.has(e) : Array.isArray(e) && subExprs(e).some(x => mentions(x, names));
@@ -42,7 +43,7 @@ const lambdaMentions = (e: any, names: ReadonlySet<symbol>): boolean =>
 // (or its own) init mentions it, or earlier inits may have run the %letrec's lambdas, whose nested closures could then
 // have copied it. Inits that mention a lambda's name, or a value whose init did, may run them
 const lateValues = (bindings: [symbol, any][]): symbol[] => {
-    const isLambda = isSingleLambda;
+    const isLambda = isLetrecLambda;
     const runsGroup = new Set<symbol>(bindings.filter(([, init]) => isLambda(init)).map(([name]) => name));
     const values = bindings.filter(([, init]) => !isLambda(init));
     const late: symbol[] = [];
@@ -102,7 +103,8 @@ export class AstAnalysis {
                 }
                 return;
             }
-            case CORE_SET: {
+            case CORE_SET:
+            case SET_BOX: {
                 scope.markMutable(ast[1]);
                 this.visit(ast[2], scope);
                 return;
@@ -259,7 +261,8 @@ class CallLiveness {
             }
             case CORE_BEGIN:
                 return this.#seq(ast.slice(1), scope, out, blocks);
-            case CORE_SET: {
+            case CORE_SET:
+            case SET_BOX: {
                 const meta = this.#candidate(scope, ast[1]);
                 let after = out;
                 if (meta !== null && out.has(meta)) {
@@ -286,9 +289,9 @@ class CallLiveness {
                 const clauses: [symbol, any][] = ast[1];
                 let live = new Set(this.#seq(ast.slice(2), letScope, out, blocks));
                 for (let i = clauses.length - 1; i >= 0; i--) {
-                    if (isSingleLambda(clauses[i][1])) continue;
+                    if (isLetrecLambda(clauses[i][1])) continue;
                     for (const meta of this.#bound(letScope, [clauses[i][0]])) live.delete(meta);
-                    live = this.expr(clauses[i][1], letScope, live, blocks);
+                    live = this.expr(unwrapBoxed(clauses[i][1]), letScope, live, blocks);
                 }
                 for (const meta of this.#bound(letScope, clauses.map(c => c[0]))) live.delete(meta);
                 return live;

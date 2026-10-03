@@ -203,7 +203,7 @@ The VM keeps a variable either in a **register** of its function's frame, or in 
 
 Only three things can make a register and the location it stands for disagree:
 
-- **(D1) Closure copies.** A captured variable that is assigned needs a box. That is `isCaptured`, part of `VariableMetadata.isBoxed`, which the `assignments` pass turns into explicit boxes (4.3a).
+- **(D1) Closure copies.** A captured variable that is assigned needs a box. That is `isCaptured`, part of `VariableMetadata.isBoxed`, which decides which of the boxes the `assignments` pass makes are kept (4.3a).
 - **(D2) Continuation re-entry.** A frame captured by `%call/cc` or `%call/comp` is shared. Re-entering it runs a copy (`Frame.thaw`, `#compose`) whose registers are those at the capture point. A later assignment to an unboxed variable is lost in that copy.
 - **(D3) Nothing else.**
   - Escapes, `%catch` and returns resume the frame object itself, at its pending call.
@@ -259,16 +259,13 @@ This program re-enters an init with the second init's value already assigned:
 
 The program invokes an init's continuation again, which A5 forbids. That is why §4 does not assume A5: boxing must be right even then.
 
-### 4.3a Assignment conversion (boxes made explicit)
+### 4.3a Assignment conversion and box removal
 
-The `assignments` pass (`passes/assignments.ts`) runs after `CallLiveness` and writes every variable with `isBoxed` set as an explicit box; code generation then compiles the box forms as it used to compile those variables.
+The `assignments` pass (`passes/assignments.ts`) makes every assigned local (`mutable`) a box; the `unbox` pass (`passes/unbox.ts`) then runs the analysis on the converted program and writes back as plain variables the boxes that are not needed (`isBoxed` false). Code generation compiles the box forms as it compiles a boxed variable.
 
-- **Binding.** The box is made before any code that could read the variable runs, holding the value the variable would have:
-  - a parameter or `%let-values` variable: `(%box! x)` first in the body, so before any body code (`Box r r`, as before);
-  - a `%let` or `%let*` variable: bound to `(%box init)`, compiled as the init then `Box` into the variable's register (as before);
-  - a `%letrec` name: bound around the `%letrec` to `(%box <void>)`, which is what the variable held before its init ran (`LoadValue undefined`, `Box`). A value's init becomes `(%set-box! x init)` at its own position among the value inits. A lambda init stays a lambda binding under a fresh name `x'` (made in the lambda phase, filled in like any lambda name), and `(%set-box! x x')` becomes the first value init. Between the old place of that `SetBox` (right after the lambda was made) and the new one, only closures are made and filled in (A3): they read no box's contents, so no read can tell.
-- **Uses.** A reference is `(%unbox x)` and `(%set! x v)` is `(%set-box! x v)`: exactly the `Unbox`, `LoadUpvar … unbox` and `SetBox` code generation emitted for a boxed variable before.
-- **What `CallLiveness` saw stays true.** The analysis ran on the program before conversion. The conversion adds no call and moves no read or assignment of an unboxed variable: the only code it moves is a `%letrec` lambda's `SetBox`, which reads only `x'`, a lambda name that is never assigned and so never tracked. So Lemma 4.1 and Theorem 4 hold of the converted program too, and every variable left unboxed is one Theorem 4 covers.
+- **Conversion keeps the meaning.** The box is made before any code that could read the variable runs, holding the value the variable would have: a parameter or `%let-values` variable is boxed in place by `(%box! x)`, first in its body; a `%let`/`%let*` variable is bound to `(%box init)`; a `%letrec` name's init is `(%boxed init)`: the name holds a box (of `<#void>`) from the start, set when the init runs. A reference is `(%unbox x)` and `(%set! x v)` is `(%set-box! x v)`. Each is the same store operation on the box that the original performs on the location.
+- **The analysis sees the same program.** On the converted program `%unbox x` is a read of `x`, `%set-box! x v` an assignment, `%box!` a read at the start of the body (where nothing has been called), and `%boxed` is transparent. The conversion adds no call and moves no read or assignment, so `mutable`, `isCaptured` and `liveAcrossCall` come out as on the original (Lemma 4.1 applies form by form).
+- **Removing a box keeps the meaning.** `unbox` removes exactly the boxes of variables with `isBoxed` false, restoring the original forms; by Theorem 4 such a variable behaves as a location without a box. A box is kept for every variable with `isBoxed`, as code generation did before.
 
 ### 4.4 `Liveness` (what resume code loads and spills)
 

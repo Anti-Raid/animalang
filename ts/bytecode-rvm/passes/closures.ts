@@ -7,7 +7,7 @@
 import { isSpreadOf } from "../analysis";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
-import { isSingleLambda } from "../lambda";
+import { isLetrecLambda, unwrapBoxed } from "../lambda";
 import { malformed } from "./lang";
 import { Lconv } from "./assignments";
 
@@ -65,8 +65,8 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
             case "letrec": {
                 const bindings: any[][] = e[1];
                 bind(fn, bindings.map(b => b[0]));
-                all(bindings.filter(b => isSingleLambda(b[1])).map(b => b[1]));
-                all(bindings.filter(b => !isSingleLambda(b[1])).map(b => b[1]));
+                all(bindings.filter(b => isLetrecLambda(b[1])).map(b => unwrapBoxed(b[1])));
+                all(bindings.filter(b => !isLetrecLambda(b[1])).map(b => unwrapBoxed(b[1])));
                 return body(e.slice(2), fn, used, blocks);
             }
             case "let-values":
