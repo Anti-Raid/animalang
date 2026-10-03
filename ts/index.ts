@@ -1,5 +1,5 @@
 export * from './anima';
-export { compileNative, readNative, NativeReadError, type NativeReadOptions } from './native';
+export { createNativeScheme, compileNative, readNative, transformNative, NativeReadError, NativeSyntaxError, type NativeReadOptions } from './native';
 export { createScheme } from './scheme';
 export { impl as implRvm, implDebug as implRvmDebug } from './bytecode-rvm/meta'
 export { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions, type InlineFn } from './bytecode-rvm/intrinsics'
