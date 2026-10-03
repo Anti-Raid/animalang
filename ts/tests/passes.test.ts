@@ -102,6 +102,13 @@ describe("The optimizer", () => {
         expect(run(`(define (oe-ev? n) (letrec ((ev? (lambda (n) (if (= n 0) #t (od? (- n 1))))) (od? (lambda (n) (if (= n 0) #f (ev? (- n 1)))))) (ev? n))) (oe-ev? 1001)`)).toBe("#f");
     });
 
+    it("drops procedures nothing uses, even ones that call each other", () => {
+        const kinds = opKinds(proc(`(lambda (n) (letrec ((ev? (lambda (n) (if (= n 0) #t (od? (- n 1))))) (od? (lambda (n) (if (= n 0) #f (ev? (- n 1)))))) n))`));
+        expect(kinds).not.toContain("NewClosure");
+        expect(kinds.filter(k => k === "LoadConst")).toHaveLength(0);
+        expect(run(`((lambda (n) (letrec ((ev? (lambda (n) (if (= n 0) #t (od? (- n 1))))) (od? (lambda (n) (if (= n 0) #f (ev? (- n 1)))))) (od? n))) 7)`)).toBe("#t");
+    });
+
     it("keeps effects, and their order", () => {
         expect(run(`(define oe-log '()) (define (oe-note x) (set! oe-log (cons x oe-log)) x)
                     (define (oe-h) (let ((unused (oe-note 1))) (define (two a b) (list b a)) (two (oe-note 2) (oe-note 3))))

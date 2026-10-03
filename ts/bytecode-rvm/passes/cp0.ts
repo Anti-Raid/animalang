@@ -145,15 +145,16 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     const inlinable = (e: any): boolean => Array.isArray(e) && e[0] === CORE_LAMBDA && e.length === 2 && malformed(Lconv, e) === null
         && e[1][2] === null && !isPadded(e[1]) && validBinders(e[1][1]) && !escapesOut([CORE_BEGIN, ...e[1].slice(3)]);
 
-    // the bindings still needed: used, or with an init that may do something
+    // the bindings still needed: those with an init that may do something, and those the body or a needed binding's init
+    // uses (so procedures that only call each other go when nothing else uses them)
     const needed = (bindings: any[][], items: readonly any[]): any[][] => {
-        let kept = bindings;
-        for (let changed = true; changed;) {
-            const next = kept.filter(([name, init]) => !effectFree(unwrapBoxed(init)) || usesIn([...items, ...kept.filter(b => b[0] !== name).map(b => b[1])], name) > 0);
-            changed = next.length !== kept.length;
-            kept = next;
+        const kept = new Set(bindings.filter(([, init]) => !effectFree(unwrapBoxed(init))).map(b => b[0]));
+        for (let reach = [...items, ...bindings.filter(b => kept.has(b[0])).map(b => b[1])]; reach.length > 0;) {
+            const found = bindings.filter(b => !kept.has(b[0]) && usesIn(reach, b[0]) > 0);
+            for (const b of found) kept.add(b[0]);
+            reach = found.map(b => b[1]);
         }
-        return kept;
+        return bindings.filter(b => kept.has(b[0]));
     };
 
     const walk = (e: any, ctx: Ctx, k: K): any => {
