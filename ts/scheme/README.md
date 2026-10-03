@@ -18,7 +18,7 @@ The instance's intrinsics stay open, so a host can add its own; Scheme code reac
 ```ts
 const anima = createScheme(impl)
 anima.registerIntrinsic("%lua-index", fn, { args: [2, 2], leaf: true, inline, deps: { Table } })
-anima.evaluateRaw(compileNative(anima, "(define (lua-index t k) (%intcall %lua-index t k))", "host.ns"))
+anima.evaluateRaw(compileNative(anima, "(define-intrinsic lua-index %lua-index)", "host.ns"))
 anima.compileRaw("(lua-index t 1)")
 anima.freeze() // optional: no more registrations
 ```
@@ -52,7 +52,7 @@ A named `let` whose name is only called in tail position of its body, with the r
 A builtin is one entry of `SCHEME_BUILTINS` (`builtins.ts`): its name, argument count range, JS function over a register window (`fn(regs, start, nargs)`) and optionally an AOT template. The function never checks the count: the compiler checks direct calls, and `APPLYINT` applied ones. Each is reachable two ways:
 
 - **Direct calls.** The transformer rewrites `(name arg ...)` to `(%name arg ...)` (`SCHEME_ALIASES`) when the argument count is in range, so the call compiles to `CALLINT`, and to inline JS in AOT code when the builtin has a template (whose `deps` give it `Cons`, `Table` and so on). The same table maps other procedures to the VM's own operations and forms, each with its own range: `list` to `%list`, `values` to `%values`; `call/cc`, `call/ec` (and their long names), `dynamic-wind`, `raise` and `apply` to `%call/cc`, `%call/ec`, `%dynamic-wind`, `%raise` and `%apply`; and the `coroutine-*` procedures to their `%` operations. A call with a count out of range is left as an ordinary call, so it still compiles, and fails only if it runs.
-- **As values.** `(map car xs)` uses the prelude's procedure of that name, a wrapper generated from the alias table (`ALIAS_WRAPPERS`, in native-scheme like the rest of the prelude): `(define ($car a0) (%intcall %car a0))` for a fixed count (the control aliases too, e.g. `(define ($call/cc a0) (%intcall %call/cc a0))`), `(define ($+ . args) (%intapply %+ (%intcall %spread args)))` otherwise (`APPLYINT`, which checks the count at run time). A wrong count is reported by the procedure: `cons: expected exactly 2 args, got 1`, or `%-: expected at least 1 args, got 0` (one message format for closures and intrinsics). `list` is `(define ($list . args) args)`, since a rest parameter is already a fresh list, and `values` is `(define ($values . args) (%intapply %values (%intcall %spread args)))`. A rest parameter only spread into `%apply` is never made a list.
+- **As values.** `(map car xs)` uses the prelude's procedure of that name, a wrapper generated from the alias table (`ALIAS_WRAPPERS`, in native-scheme like the rest of the prelude): `(define-global ($car a0) %[%car a0])` for a fixed count (the control aliases too, e.g. `(define-global ($call/cc a0) %[%call/cc a0])`), `(define-global ($+ . args) (apply %+ args))` otherwise (`APPLYINT`, which checks the count at run time). A wrong count is reported by the procedure: `cons: expected exactly 2 args, got 1`, or `%-: expected at least 1 args, got 0` (one message format for closures and intrinsics). `list` is `(define-global ($list . args) args)`, since a rest parameter is already a fresh list, and `values` is `(define-global ($values . args) (apply %values args))`. A rest parameter only spread into `%apply` is never made a list.
 
 Builtins, like every name the prelude exports, can be shadowed and redefined (see reserved names and shadowing above); their `@name` twins cannot be rebound.
 

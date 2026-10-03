@@ -12,7 +12,7 @@ The host API changed. Host functions now go through intrinsics only: there are n
 - **Options**: `{ args: [min, max], leaf, inline, deps }`. The argument count is checked when code compiles. Set `leaf: true` for a function that only computes a value; it is cheaper to call and can have an inline template for AOT code.
 - **Calling back into Anima**: an intrinsic that is not a leaf calls an Anima procedure by returning `hostTail(proc, ...args)` (or `hostTailFrom(proc, regs, from, count)`) instead of calling it itself. The call then runs in the VM, so the procedure can yield, capture continuations and raise.
 - **Yielding from the host**: an intrinsic that is not a leaf yields the coroutine running it by returning `hostYield(...values)`; the values the coroutine is resumed with are the value of the call.
-- **Calling host functions from Scheme**: Scheme code cannot name intrinsics: a `%` name in Scheme source is an ordinary identifier, so `(%clamp x 0 10)` no longer calls the intrinsic. Define a procedure for each in native-scheme (`compileNative`), which writes intrinsic calls out as `(%intcall %name arg ...)`, and call that from Scheme. Such a procedure is also how an intrinsic becomes a value.
+- **Calling host functions from Scheme**: Scheme code cannot name intrinsics: a `%` name in Scheme source is an ordinary identifier, so `(%clamp x 0 10)` no longer calls the intrinsic. Define a procedure for each in native-scheme (`compileNative`): `(define-intrinsic clamp %clamp)`, or one written out with intrinsic calls like `%[%clamp x lo hi]`, and call that from Scheme. Such a procedure is also how an intrinsic becomes a value.
 - **Calling back into Anima, and continuing**: `hostCall(proc, args, then)` calls `proc` and goes on with `then(value)`, as often as an intrinsic needs (a sort with a comparator, say); the callback can yield, raise and capture continuations.
 - **Serialized code is gone**: `dumpFull` / `readFull` no longer exist. Compile from source in each instance.
 
@@ -26,10 +26,10 @@ anima.registerIntrinsic("%clamp", (regs, start) => Math.min(Math.max(regs[start]
 // not a leaf: calls an Anima procedure by returning a tail request
 anima.registerIntrinsic("%with-double", (regs, start) => hostTail(regs[start], regs[start + 1] * 2), { args: [2, 2] });
 
-// Scheme reaches them through procedures defined in native-scheme, where intrinsic calls are written out
+// Scheme reaches them through procedures defined in native-scheme
 anima.evaluateRaw(compileNative(anima, `
-  (define (clamp x lo hi) (%intcall %clamp x lo hi))
-  (define (with-double f x) (%intcall %with-double f x))`));
+  (define-intrinsic clamp %clamp)
+  (define-intrinsic with-double %with-double)`));
 
 anima.evaluateRaw(anima.compileRaw(`
   (list (map (lambda (x) (clamp x 0 10)) '(-5 5 50)) (with-double (lambda (y) (+ y 1)) 5))`)); // ((0 5 10) 11)
