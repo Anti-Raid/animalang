@@ -183,15 +183,16 @@ export type Node = {
 export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, lowerTemplate: (t: ClosureTemplateIR) => ClosureTemplate) => {
     const ops: Op[] = []
     let ip = 0
+    // the position the instructions pushed now come from (the last Pos node)
+    let where: SourcePos | null = null
     const push = (op: DistributiveOmit<Op, "ip">): Op => {
         const full = op as Op
         full.ip = ip
+        full.where = where
         ops.push(full)
         ip++
         return full
     }
-    const lineTable: number[] = []
-    const files: string[] = []
     const used = new Map<number, UsedIntrinsic>()
     const use = (pos: number): number => {
         if (!used.has(pos)) {
@@ -271,16 +272,7 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
                 break
             }
             case "Box": case "SetBox": case "Unbox": case "Move": push({ k: node.t, dst: node.destReg, src: node.srcReg }); break
-            case "Pos": {
-                let fileIdx = files.indexOf(node.pos.file)
-                if (fileIdx === -1) fileIdx = files.push(node.pos.file) - 1
-                const n = lineTable.length
-                if (n > 0 && lineTable[n - 4] === ip) lineTable.length = n - 4
-                const m = lineTable.length
-                if (m > 0 && lineTable[m - 3] === fileIdx && lineTable[m - 2] === node.pos.line && lineTable[m - 1] === node.pos.col) break
-                lineTable.push(ip, fileIdx, node.pos.line, node.pos.col)
-                break
-            }
+            case "Pos": where = node.pos; break
             default: { const _: never = node }
         }
     }
@@ -289,7 +281,7 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
         if (target === undefined) throw new Error(`unresolved label ${label.id}`)
         op[field] = target
     }
-    return { ops, lineTable: new Uint32Array(lineTable), files, used, use, inlines }
+    return { ops, used, use, inlines }
 }
 
 export class IR {
@@ -299,10 +291,10 @@ export class IR {
         const cpool = new ConstPool()
         const lowerTemplate = (t: ClosureTemplateIR) =>
             new ClosureTemplate(t.params, t.remParams, this.lower(t.code, t.numRegs, t.rest === "packed"), t.upvarLocs, t.name, t.rest, t.pad)
-        const { ops, lineTable, files, used, use, inlines } = lowerOps(nodes, this.table, cpool, lowerTemplate)
+        const { ops, used, use, inlines } = lowerOps(nodes, this.table, cpool, lowerTemplate)
         for (const pos of this.assumed) use(pos)
         const restPos = packRest ? use(this.table.pack!.pos) : -1
-        const code = new Code(cpool.constants, ops, numRegs, lineTable, files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
+        const code = new Code(cpool.constants, ops, numRegs, this.debug, used.size > 0 ? this.table : null, [...used.values()])
         code.restPos = restPos
         code.interrupts = this.table.interrupts
         code.inlines = inlines

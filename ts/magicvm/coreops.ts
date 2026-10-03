@@ -96,7 +96,7 @@ export const helperClosure = (numReg: number, constants: any[], body: Distributi
     const positions = new Set<number>();
     for (const op of ops) if (op.k === "HostCall" || op.k === "IntCall" || op.k === "IntApply") positions.add(op.pos);
     const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
-    const code = new Code(constants, ops, numReg, undefined, undefined, false, CORE_INTRINSICS, used);
+    const code = new Code(constants, ops, numReg, false, CORE_INTRINSICS, used);
     code.internal = true;
     return new Closure(new ClosureTemplate(Array.from({ length: params }, () => Symbol()), null, code, [], name), [], name);
 };

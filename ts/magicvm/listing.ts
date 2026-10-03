@@ -32,7 +32,7 @@ const fieldToString = (code: Code, op: Op, name: string, value: any): string => 
 export const listing = (code: Code): string[] => {
     const lines: string[] = [];
     for (const op of code.ops) {
-        const fields = Object.entries(op).filter(([name]) => name !== "k" && name !== "ip").map(([name, value]) => `${name}=${fieldToString(code, op, name, value)}`);
+        const fields = Object.entries(op).filter(([name]) => name !== "k" && name !== "ip" && name !== "where").map(([name, value]) => `${name}=${fieldToString(code, op, name, value)}`);
         lines.push(`${op.ip.toString().padStart(4, "0")}: ${op.k.padEnd(12, " ")}${fields.join(", ")}`.trimEnd());
         if (op.k === "NewClosure") for (const line of listing((code.constants[op.tmpl] as ClosureTemplate).code)) lines.push(`\t${line}`);
     }

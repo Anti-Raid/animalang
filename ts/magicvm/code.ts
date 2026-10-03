@@ -54,13 +54,10 @@ export class Code {
     // the procedures inlined into this code, for tracebacks (see inlinedAt)
     public inlines: readonly InlineSite[] = [];
 
-    // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
         public constants: any[],
         public ops: readonly Op[],
         public numReg: number,
-        public lineTable: Uint32Array = new Uint32Array(0),
-        public files: string[] = [],
         // compiled in debug mode: records tail calls and exact error positions (never mixed with non-debug code)
         public debug: boolean = false,
         // the intrinsics the instructions' `pos` are positions in; null when `intrinsics` is empty
@@ -138,7 +135,7 @@ export class Code {
     fresh(copies: Map<Code, Code> = new Map(), table: Intrinsics | null = this.table): Code {
         const known = copies.get(this);
         if (known !== undefined) return known;
-        const copy = new Code([], this.ops, this.numReg, this.lineTable, this.files, this.debug, this.table, this.intrinsics);
+        const copy = new Code([], this.ops, this.numReg, this.debug, this.table, this.intrinsics);
         copies.set(this, copy);
         copy.restPos = this.restPos;
         copy.interrupts = this.interrupts;
@@ -182,20 +179,9 @@ export class Code {
         return inner === -1 ? this.positionAt(ip) : this.inlines[inner].at;
     }
 
+    // where the instruction at `ip` comes from (the last one's, past the end)
     positionAt(ip: number): SourcePos | null {
-        const table = this.lineTable;
-        let lo = 0, hi = table.length / 4 - 1, found = -1;
-        while (lo <= hi) {
-            const mid = (lo + hi) >> 1;
-            if (table[mid * 4] <= ip) {
-                found = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        if (found === -1) return null;
-        return { file: this.files[table[found * 4 + 1]], line: table[found * 4 + 2], col: table[found * 4 + 3] };
+        return this.ops[Math.min(ip, this.ops.length - 1)]?.where ?? null;
     }
 }
 

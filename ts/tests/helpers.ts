@@ -24,7 +24,7 @@ export const opKinds = (code: Code): string[] => code.ops.map(op => op.k === "If
 // code made from instructions written out (positions filled in), as the compiler would lower them
 export const codeOf = (constants: any[], body: DistributiveOmit<Op, "ip">[], numReg: number, used: UsedIntrinsic[] = []): Code => {
     const ops = body.map((op, ip) => ({ ...op, ip }) as Op);
-    return new Code(constants, ops, numReg, undefined, undefined, false, used.length > 0 ? CORE_INTRINSICS : null, used);
+    return new Code(constants, ops, numReg, false, used.length > 0 ? CORE_INTRINSICS : null, used);
 };
 
 // native-scheme text run on an instance (a Scheme one, say, with its table and its lists for quoted data)

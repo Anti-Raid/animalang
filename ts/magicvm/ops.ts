@@ -1,11 +1,14 @@
+import type { SourcePos } from "../common";
+
 // What the compiler lowers a function to, for the AOT compiler: a list of instructions, each at its index in the list
-// (`ip`). Positions are what frames resume at, the line table and caches are keyed by, and jumps target
+// (`ip`). Indexes are what frames resume at, caches are keyed by, and jumps target. Each instruction carries `where`: the
+// source position of the form it was compiled from (null if none), so finding where code is is reading a field
 
 // Unpack flags
 export const UNPACK_REST = 1;
 export const UNPACK_STRICT = 2;
 
-export type Op = { ip: number } & (
+export type Op = { ip: number, where?: SourcePos | null } & (
     | { k: "LoadConst"; dst: number; idx: number }
     | { k: "LoadInt"; dst: number; value: number }
     | { k: "LoadUpvar"; dst: number; idx: number; unbox: boolean }
