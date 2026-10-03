@@ -7,8 +7,7 @@ import { AotCompiler } from "./aot/compiler";
 import { bindArgs, checkArity } from "./arity";
 import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
 import type { VMHost } from "./code";
-import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, tracebackMessage } from "./coreops";
-import type { DistributiveOmit, Op } from "./ops";
+import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, helperClosure, tracebackMessage } from "./coreops";
 import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
@@ -57,15 +56,6 @@ const escapeTarget = (tok: EscapeContinuation, from: Frame | null): Frame | null
     const owner = tok.owner;
     for (let f = from; f !== null; f = f.parent) if (f.escape === owner) return f;
     return null;
-};
-export const helperClosure = (numReg: number, constants: any[], body: DistributiveOmit<Op, "ip">[], name: string = "raise", params: number = 0): Closure => {
-    const ops = body.map((op, ip) => ({ ...op, ip }) as Op);
-    const positions = new Set<number>();
-    for (const op of ops) if (op.k === "HostCall" || op.k === "IntCall" || op.k === "IntApply") positions.add(op.pos);
-    const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
-    const code = new Code(constants, ops, numReg, undefined, undefined, false, CORE_INTRINSICS, used);
-    code.internal = true;
-    return new Closure(new ClosureTemplate(Array.from({ length: params }, () => Symbol()), null, code, [], name), [], name);
 };
 
 export class VMExecutor {

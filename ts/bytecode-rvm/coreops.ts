@@ -3,7 +3,8 @@
 import { ErrorObject, Msg, MultipleValues, packValues, unpackValues, vmError } from "../common";
 import { BARRIER, Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markValues } from "../marks";
 import type { Marks } from "../marks";
-import { CaseLambda, type Closure } from "./code";
+import { CaseLambda, Closure, ClosureTemplate, Code } from "./code";
+import type { DistributiveOmit, Op } from "./ops";
 import type { VMExecutor } from "./executor";
 import { Intrinsics } from "./intrinsics";
 import type { InlineFn, IntrinsicFn, IntrinsicOptions } from "./intrinsics";
@@ -76,6 +77,30 @@ export class HostTail extends ControlRequest {
 }
 
 export const hostTail = (proc: any, ...args: any[]): HostTail => new HostTail(proc, args);
+
+// A host intrinsic that is not a leaf may return this to call (proc args ...) and go on with then(value): what `then`
+// returns, a value or another request, is the intrinsic's. The call is an ordinary one, under a frame that holds `then`, so
+// it can yield, be interrupted, raise, and capture continuations, which may resume `then` more than once: whatever it
+// goes on with must be passed along (in what it returns or the closures it makes), not changed in place
+export const hostCall = (proc: any, args: any[], then: (value: any) => any): HostTail => new HostTail(hostThen(), [then, proc, args]);
+
+let thenHelper: Closure | null = null;
+const hostThen = (): Closure => thenHelper ??= helperClosure(3, [], [
+    { k: "HostCall", pos: corePos("%apply-fresh"), start: 1, nargs: 2, tail: false },
+    { k: "MoveAcc", dst: 1 },
+    { k: "HostCall", pos: corePos("%host-then"), start: 0, nargs: 2, tail: true },
+], "host-call", 3);
+
+export const helperClosure = (numReg: number, constants: any[], body: DistributiveOmit<Op, "ip">[], name: string = "raise", params: number = 0): Closure => {
+    const ops = body.map((op, ip) => ({ ...op, ip }) as Op);
+    const positions = new Set<number>();
+    for (const op of ops) if (op.k === "HostCall" || op.k === "IntCall" || op.k === "IntApply") positions.add(op.pos);
+    const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
+    const code = new Code(constants, ops, numReg, undefined, undefined, false, CORE_INTRINSICS, used);
+    code.internal = true;
+    return new Closure(new ClosureTemplate(Array.from({ length: params }, () => Symbol()), null, code, [], name), [], name);
+};
+
 
 // (proc regs[from] ... regs[from+count-1]): a call of `proc` with part of an intrinsic's argument window, copied with a
 // loop, which on windows this small costs about half of regs.slice plus a spread
@@ -475,6 +500,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     // (%apply proc arg ... array) compiles to these: %apply-fresh when the array is a new one nothing else holds
     control("%apply-array", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], applyArgs(regs, start + 1, nargs - 1)));
     control("%apply-fresh", [2, 2], (regs, start) => new HostTail(regs[start], arrayArg("%apply", regs[start + 1])));
+    control("%host-then", [2, 2], (regs, start) => regs[start](regs[start + 1]));
     return table.freeze();
 })();
 
