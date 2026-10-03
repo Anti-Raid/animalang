@@ -8,7 +8,7 @@
 import { CORE_BLOCK, CORE_ESCAPE, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LETREC, CORE_SET } from "../common";
 import { Lsrc, keepPos, parts as partsOf, withBounds, type Parts } from "./passes/lang";
 
-import { accepts, bodyOf, clause, clausesOf, isLambda, isSingleLambda, namesOf, optionsOf, paramsOf, restOf, type Clause } from "./lambda";
+import { accepts, bodyOf, clause, clausesOf, isLambda, isSingleLambda, optionsOf, paramsOf, restOf, type Clause } from "./lambda";
 
 // the clause of a %lambda of one (see lambda.ts)
 const only = (lambda: any[]): Clause => lambda[1];
@@ -26,50 +26,45 @@ const assignedNames = (e: any, out: Set<symbol> = new Set()): Set<symbol> => {
 // the forms that are not laid out as a call
 const FORMS = new Set([...Lsrc.forms].filter(([, shape]) => shape !== "exprs").map(([head]) => head));
 
-// The unshadowed uses of `name` in `e`: calls (with the names bound between `e` and each call, unless the call is inside
-// one of `skip`, the lifted lambdas, which rename what they need), and whether it is used any other way
-type Uses = { calls: { node: any[], bound: ReadonlySet<symbol> }[], other: boolean };
-const usesOf = (e: any, name: symbol, skip: ReadonlySet<any>, bound: ReadonlySet<symbol> = new Set(), out: Uses = { calls: [], other: false }, inSkip = false): Uses => {
+// Locals have names of their own (the rename pass), so a name is never shadowed: a use of it anywhere is a use of the
+// one variable
+
+// The uses of `name` in `e`: its calls, and whether it is used any other way
+type Uses = { calls: any[][], other: boolean };
+const usesOf = (e: any, name: symbol, out: Uses = { calls: [], other: false }): Uses => {
     if (e === name) {
         out.other = true;
         return out;
     }
     if (!Array.isArray(e)) return out;
     if (e[0] === CORE_SET && e[1] === name) out.other = true;
-    const inner = inSkip || skip.has(e);
-    let i = 0;
-    for (const [x, around] of withBounds(parts(e), bound)) {
-        if (!around.has(name)) {
-            // the operator of a call
-            if (i === 0 && x === name && e[0] === name && !FORMS.has(e[0])) out.calls.push({ node: e, bound: inner ? new Set() : new Set(bound) });
-            else usesOf(x, name, skip, around, out, inner);
-        }
-        i++;
-    }
+    parts(e).exprs.forEach(([x], i) => {
+        // the operator of a call
+        if (i === 0 && x === name && e[0] === name && !FORMS.has(e[0])) out.calls.push(e);
+        else usesOf(x, name, out);
+    });
     return out;
 };
 
-// the names of `scope` used (unshadowed) in `e`
-const freeIn = (e: any, scope: ReadonlySet<symbol>, bound: ReadonlySet<symbol>, out: Set<symbol>): Set<symbol> => {
+// the names of `scope` used in `e`
+const freeIn = (e: any, scope: ReadonlySet<symbol>, out: Set<symbol>): Set<symbol> => {
     if (typeof e === "symbol") {
-        if (scope.has(e) && !bound.has(e)) out.add(e);
+        if (scope.has(e)) out.add(e);
         return out;
     }
     if (!Array.isArray(e)) return out;
-    for (const [x, around] of withBounds(parts(e), bound)) freeIn(x, scope, around, out);
+    for (const [x] of parts(e).exprs) freeIn(x, scope, out);
     return out;
 };
 
-// `e` with the unshadowed free uses of the names in `map` replaced, and the calls in `extra` given their extra arguments
-const rewrite = (e: any, map: ReadonlyMap<symbol, symbol>, extra: ReadonlyMap<any[], symbol[]>, bound: ReadonlySet<symbol> = new Set()): any => {
-    if (typeof e === "symbol") return !bound.has(e) && map.get(e) || e;
+// `e` with the uses of the names in `map` replaced, and the calls in `extra` given their extra arguments
+const rewrite = (e: any, map: ReadonlyMap<symbol, symbol>, extra: ReadonlyMap<any[], symbol[]>): any => {
+    if (typeof e === "symbol") return map.get(e) ?? e;
     if (!Array.isArray(e)) return e;
     const p = parts(e);
-    const next: any[] = [];
-    for (const [x, around] of withBounds(p, bound)) next.push(rewrite(x, map, extra, around));
+    const next = p.exprs.map(([x]) => rewrite(x, map, extra));
     const added = extra.get(e);
     if (added === undefined) return p.rebuild(next);
-    // inside a lifted lambda these are its fresh parameters, which nothing shadows
     return keepPos([next[0], ...added.map(a => map.get(a) ?? a), ...next.slice(1)], e);
 };
 
@@ -96,10 +91,10 @@ export const splitCaseLambdas = (ast: any): any => {
     const split = (name: symbol, caseLambda: any[], within: any[]) => {
         const clauses = clausesOf(caseLambda);
         const names = clauses.map(() => Symbol(name.description));
-        const uses = within.reduce((u, x) => usesOf(x, name, new Set(), new Set(), u), { calls: [], other: false } as Uses);
+        const uses = within.reduce((u, x) => usesOf(x, name, u), { calls: [], other: false } as Uses);
         const map = new Map<any[], symbol>();
         let needed = uses.other;
-        for (const { node } of uses.calls) {
+        for (const node of uses.calls) {
             const i = clauses.findIndex(c => accepts(c, node.length - 1));
             if (i === -1) needed = true;
             else map.set(node, names[i]);
@@ -116,11 +111,9 @@ export const splitCaseLambdas = (ast: any): any => {
         if (at === -1) return e;
         const [name, caseLambda] = bindings[at];
         const body = e.slice(2);
-        // where the name is in scope: every init of a %letrec, the later ones of a %let* (up to one binding it again, whose
-        // init still sees it), and the body
-        const again = op === CORE_LET_STAR ? bindings.findIndex((b, i) => i > at && b[0] === name) : -1;
+        // where the name is in scope: every init of a %letrec, the later ones of a %let*, and the body
         const within = op === CORE_LETREC ? [...bindings.map(b => b[1]), ...body]
-            : op === CORE_LET_STAR ? (again === -1 ? [...bindings.slice(at + 1).map(b => b[1]), ...body] : bindings.slice(at + 1, again + 1).map(b => b[1]))
+            : op === CORE_LET_STAR ? [...bindings.slice(at + 1).map(b => b[1]), ...body]
             : body;
         const { bindings: clauses, procedure, map } = split(name, caseLambda, within);
         const fix = (x: any) => replaceCalls(x, map);
@@ -157,25 +150,18 @@ const VALUES = Symbol.for("%values");
 // frame the block is in, so an escape there still lands where k would return to
 export const blockEscapes = (ast: any): any => {
     const assigned = assignedNames(ast);
-    // whether every unshadowed use of k in e is a call outside any lambda
-    const onlyCalled = (e: any, k: symbol, bound: ReadonlySet<symbol>, inLambda: boolean): boolean => {
+    // whether every use of k in e is a call outside any lambda
+    const onlyCalled = (e: any, k: symbol, inLambda: boolean): boolean => {
         if (e === k) return false;
         if (!Array.isArray(e)) return true;
         const nested = inLambda || e[0] === CORE_LAMBDA;
-        let i = 0;
-        for (const [x, around] of withBounds(parts(e), bound)) {
-            const operator = i++ === 0 && x === k && e[0] === k && !FORMS.has(e[0]);
-            if (around.has(k)) continue;
-            if (operator ? nested : !onlyCalled(x, k, around, nested)) return false;
-        }
-        return true;
+        return parts(e).exprs.every(([x], i) => i === 0 && x === k && e[0] === k && !FORMS.has(e[0]) ? !nested : onlyCalled(x, k, nested));
     };
-    const toEscapes = (e: any, k: symbol, label: symbol, bound: ReadonlySet<symbol>): any => {
+    const toEscapes = (e: any, k: symbol, label: symbol): any => {
         if (!Array.isArray(e)) return e;
         const p = parts(e);
-        const next: any[] = [];
-        for (const [x, around] of withBounds(p, bound)) next.push(around.has(k) ? x : toEscapes(x, k, label, around));
-        if (e[0] !== k || FORMS.has(e[0]) || bound.has(k)) return p.rebuild(next);
+        const next = p.exprs.map(([x]) => toEscapes(x, k, label));
+        if (e[0] !== k || FORMS.has(e[0])) return p.rebuild(next);
         const args = next.slice(1);
         return keepPos([CORE_ESCAPE, label, args.length === 1 ? args[0] : [VALUES, ...args]], e);
     };
@@ -188,9 +174,9 @@ export const blockEscapes = (ast: any): any => {
         if (!isSingleLambda(proc) || paramsOf(only(proc)).length !== 1 || restOf(only(proc)) !== null) return done;
         const k: symbol = paramsOf(only(proc))[0];
         const body = bodyOf(only(proc));
-        if (assigned.has(k) || !body.every((x: any) => onlyCalled(x, k, new Set(), false))) return done;
+        if (assigned.has(k) || !body.every((x: any) => onlyCalled(x, k, false))) return done;
         const label = Symbol(k.description);
-        return keepPos([CORE_BLOCK, label, ...body.map((x: any) => toEscapes(x, k, label, new Set()))], done);
+        return keepPos([CORE_BLOCK, label, ...body.map((x: any) => toEscapes(x, k, label))], done);
     };
     return walk(ast);
 };
@@ -209,7 +195,7 @@ export const liftLambdas = (ast: any): any => {
             const lambdas = new Set(names.filter((_, i) => isSingleLambda(bindings[i][1])));
             const values = names.filter(n => !lambdas.has(n));
             // the values' inits run before some values have theirs; if they may run the lambdas, so may everything else
-            const runsEarly = bindings.some(b => !isSingleLambda(b[1]) && freeIn(b[1], lambdas, new Set(), new Set()).size > 0);
+            const runsEarly = bindings.some(b => !isSingleLambda(b[1]) && freeIn(b[1], lambdas, new Set()).size > 0);
             const inner = new Set([...scope, ...names]);
             const inInits = new Set([...unsafe, ...values]);
             const afterInits = runsEarly ? inInits : unsafe;
@@ -235,12 +221,11 @@ export const liftLambdas = (ast: any): any => {
         let fv = new Map<symbol, symbol[]>();
         let calls = new Map<symbol, Uses["calls"]>();
         for (;;) {
-            const skip = new Set([...lifted].map(n => inits.get(n)));
             calls = new Map();
             const next = new Set<symbol>();
             for (const name of lifted) {
-                const uses = within.reduce((u, x) => usesOf(x, name, skip, new Set(), u), { calls: [], other: false } as Uses);
-                if (uses.other || uses.calls.some((c: Uses["calls"][number]) => !accepts(only(inits.get(name)), c.node.length - 1))) continue;
+                const uses = within.reduce((u, x) => usesOf(x, name, u), { calls: [], other: false } as Uses);
+                if (uses.other || uses.calls.some((c: any[]) => !accepts(only(inits.get(name)), c.length - 1))) continue;
                 next.add(name);
                 calls.set(name, uses.calls);
             }
@@ -248,7 +233,7 @@ export const liftLambdas = (ast: any): any => {
             fv = new Map([...next].map(name => {
                 const c = only(inits.get(name));
                 const free = new Set<symbol>();
-                for (const x of bodyOf(c)) freeIn(x, scope, new Set(namesOf(c)), free);
+                for (const x of bodyOf(c)) freeIn(x, scope, free);
                 return [name, [...free]];
             }));
             for (let changed = true; changed;) {
@@ -267,7 +252,7 @@ export const liftLambdas = (ast: any): any => {
             // an assigned or not yet known variable cannot be passed, and a call must see the variables it passes as they are here
             for (const name of [...next]) {
                 const vars = fv.get(name)!;
-                if (vars.some(v => assigned.has(v) || unsafe.has(v)) || calls.get(name)!.some(c => vars.some(v => c.bound.has(v)))) next.delete(name);
+                if (vars.some(v => assigned.has(v) || unsafe.has(v))) next.delete(name);
             }
             if (next.size === lifted.size) break;
             lifted = next;
@@ -275,13 +260,13 @@ export const liftLambdas = (ast: any): any => {
         if (lifted.size === 0) return letrec;
 
         const extra = new Map<any[], symbol[]>();
-        for (const name of lifted) for (const c of calls.get(name)!) extra.set(c.node, fv.get(name)!);
+        for (const name of lifted) for (const c of calls.get(name)!) extra.set(c, fv.get(name)!);
         const liftedInit = (name: symbol): any[] => {
             const lambda = inits.get(name);
             const c = only(lambda);
             const vars = fv.get(name)!;
             const renamed = new Map(vars.map(v => [v, Symbol(v.description)]));
-            const newBody = bodyOf(c).map((x: any) => rewrite(x, renamed, extra, new Set(namesOf(c))));
+            const newBody = bodyOf(c).map((x: any) => rewrite(x, renamed, extra));
             return keepPos([CORE_LAMBDA, clause(optionsOf(c), [...vars.map(v => renamed.get(v)!), ...paramsOf(c)], restOf(c), newBody)], lambda);
         };
         const newBindings = bindings.map(b => keepPos([b[0], lifted.has(b[0]) ? liftedInit(b[0]) : rewrite(b[1], new Map(), extra)], b));

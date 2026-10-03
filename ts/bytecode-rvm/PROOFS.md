@@ -35,8 +35,8 @@ They mean what a store-based machine gives them:
   3. the other ("value") inits run in order, and each name is set after its init.
 - **A4: `%escape` stays in one function.** An `%escape` only targets a `%block` of the same function. `#compileEscape` rejects anything else (`Msg.EscapeFromLambda`).
 - **A5: a value init's continuation runs once.** The continuation of a `%letrec` value init is not invoked again after that init has returned. R6RS requires this (11.4.6), and without it a value's binding is effectively assigned. Only §3 relies on A5. §4 does not: it holds without A5, see 4.3.
-- **A7: locals have names of their own.** The `rename` pass runs first and gives each binder a fresh symbol, its references and `%set!`s the binder's, so in what the passes below see, a local symbol is bound by exactly one binder and never shadowed. It leaves a binder as it was only where code generation rejects the program (a duplicate name in one group, a special form's, a reserved or intrinsic name, or not a symbol), so A7 holds for every program that compiles. Renaming changes no meaning: it is a consistent change of bound names.
 - **A6: interrupt checks are not calls.** The `(%interrupt)` checks (see Interrupts in the README) are added by the `interrupts` pass, to the IR, after lifting and the core forms' liveness analysis, which never see one; AOT liveness, which works on the instructions, sees each as the host call it is. A check calls no procedure and captures no continuation: its handler can only continue, pause the running coroutine (which then resumes once, where it was) or stop the evaluation for good. So adding them changes nothing proved here.
+- **A7: locals have names of their own.** The `rename` pass runs first and gives each binder a fresh symbol, its references and `%set!`s the binder's, so in what the passes below see, a local symbol is bound by exactly one binder and never shadowed. It leaves a binder as it was only where code generation rejects the program (a duplicate name in one group, a special form's, a reserved or intrinsic name, or not a symbol), so A7 holds for every program that compiles. Renaming changes no meaning: it is a consistent change of bound names.
 
 **Notation.**
 
@@ -113,7 +113,7 @@ Zero or several arguments become `(%values …)`, which is exactly what `κ` rec
    - the fresh names cannot capture anything;
    - for a `%let`, the inits were evaluated outside its scope, and the new `%letrec` binds only fresh names;
    - for a `%let*`, the clauses sit after exactly the bindings before `x`.
-3. **Calls.** A rewritten call site refers to this binding of `x` (`usesOf` skips positions where `x` is shadowed). Since `x ∉ assigned`, its value there is the procedure `P` made from `c1 … cn`. Calling `P` with `m` arguments runs `select(m)`, which by Lemma 2.1 is clause `i`, the same closure `xi` names. The argument count is static because the site is a plain call; `%apply` goes through the kept procedure.
+3. **Calls.** A rewritten call site refers to this binding of `x` (by A7, the only one of its name). Since `x ∉ assigned`, its value there is the procedure `P` made from `c1 … cn`. Calling `P` with `m` arguments runs `select(m)`, which by Lemma 2.1 is clause `i`, the same closure `xi` names. The argument count is static because the site is a plain call; `%apply` goes through the kept procedure.
 4. **The rest.** Uses that are not calls, or calls no clause accepts, still use `x`, which is still `P`. Calls with no fitting clause therefore still raise `Msg.NoClause`. □
 
 ---
@@ -122,7 +122,7 @@ Zero or several arguments become `(%values …)`, which is exactly what `κ` rec
 
 **Rewrite.** For a `%letrec` `L` with bindings `fj = λj`, `liftIn` computes a set `Lifted` of names and, for each `f ∈ Lifted`, a list `V(f)` of free locals. Then:
 
-- `f`'s lambda gets fresh parameters `v'` for each `v ∈ V(f)`, placed before its own parameters. Every unshadowed free `v` in its body becomes `v'`.
+- `f`'s lambda gets fresh parameters `v'` for each `v ∈ V(f)`, placed before its own parameters. Every free `v` in its body becomes `v'`.
 - Every call site of `f` gets `V(f)` as extra leading arguments:
   - inside a lifted lambda `h`, those arguments are `h`'s own fresh parameters;
   - elsewhere, they are the names themselves.
@@ -133,18 +133,18 @@ Zero or several arguments become `(%values …)`, which is exactly what `κ` rec
 - **(L2)** Every free occurrence of `f` in `within(L)` is the operator of a call whose argument count the clause accepts (`uses.other` is false and `accepts` holds).
 - **(L3)** `V(f) = FV(body of f) ∩ scope`, closed under `g ∈ V(f) ∧ g ∈ Lifted ⇒ V(g) ⊆ V(f)`. Here `scope` holds the locals bound around `L` plus `L`'s names.
 - **(L4)** No `v ∈ V(f)` is in `assigned` or in `unsafe`.
-- **(L5)** For every call site `s` of `f` not inside a lifted lambda, no `v ∈ V(f)` is bound between `L` and `s` (`c.bound ∩ V(f) = ∅`).
+- **(L5)** For every call site `s` of `f` not inside a lifted lambda, no `v ∈ V(f)` is bound between `L` and `s`. The code no longer checks this: by A7, each `v` has one binder, around `L`, so nothing between `L` and `s` binds it.
 
 `unsafe` is built in `walk`. It holds the value names of enclosing `%letrec`s whose inits may not have run when code at this point runs:
 
 - a value init and everything inside it sees the values of its own `%letrec` as unsafe;
 - if any value init of a `%letrec` mentions one of its lambdas (`runsEarly`), its lambdas and body see them as unsafe too.
 
-The loop only ever removes names, so it terminates. Its result satisfies L1–L5 simultaneously: the loop exits only when a pass removes nothing, and `calls` and `fv` are computed in that last pass with `skip = Lifted`.
+The loop only ever removes names, so it terminates. Its result satisfies L1–L4 simultaneously (and L5 always holds, by A7): the loop exits only when a pass removes nothing, and `calls` and `fv` are computed in that last pass.
 
 **Lemma 3.1 (every use is a call).** In the original program, every reference to the binding `f` evaluates `f` as the operator of a call with an accepted count.
 
-*Proof.* The scope of `L`'s names is exactly `within(L)`, and L2 covers every unshadowed occurrence there. □
+*Proof.* The scope of `L`'s names is exactly `within(L)`, and by A7 every occurrence of the name there is this binding, which L2 covers. □
 
 **Lemma 3.2 (the extra arguments name the right bindings).** Let `s` be a call site of `f` and `v ∈ V(f)`. The expression passed for `v` at `s` evaluates to the location that `v` denotes in the environment where `f`'s closure was made, in the same activation.
 
@@ -154,7 +154,7 @@ The loop only ever removes names, so it terminates. Its result satisfies L1–L5
   - `s` refers to the binding `f` of `L`, so its environment extends the activation `A` of `L` in which that `f` closure was made. The closure's own environment is `A` as well.
   - `v ∈ scope` is visible in `A`, and by L5 nothing between `L` and `s` rebinds it. So `v` at `s` is `v` in `A`.
 - **`s` is in a lifted lambda `h`.**
-  - Since `s` uses `f` unshadowed, `f ∈ FV(h) ∩ scope ⊆ V(h)`, and by L3, `V(f) ⊆ V(h)`. So the renaming map `rewrite` uses inside `h` contains `v`, and the argument is `h`'s fresh parameter `v'`.
+  - Since `s` uses `f` (by A7, this binding of it), `f ∈ FV(h) ∩ scope ⊆ V(h)`, and by L3, `V(f) ⊆ V(h)`. So the renaming map `rewrite` uses inside `h` contains `v`, and the argument is `h`'s fresh parameter `v'`.
   - The fresh parameter cannot be shadowed. By induction on the call chain (each call to `h` meets this lemma), `v'` holds the location, or under L4 the value, of `v` in `A`. □
 
 **Lemma 3.3 (the value is ready and fixed).** Whenever a call site of `f` runs, every `v ∈ V(f)` holds its one and only value.
@@ -185,7 +185,7 @@ We check that every step preserves `≈`:
   - then the lifted one evaluates the extra arguments, which are variable references with no effects that cannot fail (Lemma 3.3);
   - bind the same parameters, because the extra ones come first and the count is accepted (L2). For a padded clause or a rest parameter, the prepended parameters leave the original arguments aligned.
 
-  In the body, each rewritten `v'` reads the value the original's `v` would read (Lemmas 3.2 and 3.3). Nothing else in the body is renamed: `rewrite` skips names that are bound inside it.
+  In the body, each rewritten `v'` reads the value the original's `v` would read (Lemmas 3.2 and 3.3). Nothing else in the body is renamed: by A7, a name bound inside it is none of the `v`.
 - **Calls from `f'` to another lifted `g`.** The operator `g` has become `g'`, a parameter holding the value of `g`, and `g ∈ V(f)` by L3. The extra arguments are mapped through `f'`'s renaming, since `V(g) ⊆ V(f)`. That is the same situation as a call of `g`, so Lemmas 3.2 and 3.3 apply.
 - **Identity.** A lifted lambda is only ever passed on as an extra argument and called. So using one closure where the original made one per activation is not observable.
 
