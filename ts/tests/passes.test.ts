@@ -127,6 +127,17 @@ describe("The optimizer", () => {
         expect(run(`(define (ap) (define (g x) (set! x (+ x 1)) x) (list (g 1) (g 10))) (ap)`)).toBe("(2 11)");
     });
 
+    it("inlines map, for-each and filter given a procedure it knows, unless they are redefined", () => {
+        const calls = (src: string, a = make(true)) => opKinds(a.evaluateRaw(a.compileRaw(src)).tmpl.code).filter(k => k === "Call" || k === "TailCall" || k === "HostCall");
+        expect(calls(`(lambda (l) (map (lambda (x) (* x 2)) l))`)).toEqual([]);
+        expect(calls(`(lambda (l) (for-each (lambda (x) (display x)) l) (filter (lambda (x) (odd? x)) l))`)).toEqual([]);
+        expect(calls(`(lambda (f l) (map f l))`)).toHaveLength(1);
+        const redefined = make(true);
+        redefined.evaluateRaw(redefined.compileRaw(`(define (map f l) 'mine)`));
+        expect(calls(`(lambda (l) (map (lambda (x) x) l))`, redefined)).toHaveLength(1);
+        expect(run(`(list (map (lambda (x y) (+ x y)) '(1 2) '(10 20)) (map car '((1) (2))))`)).toBe("((11 22) (1 2))");
+    });
+
     it("keeps effects, and their order", () => {
         expect(run(`(define oe-log '()) (define (oe-note x) (set! oe-log (cons x oe-log)) x)
                     (define (oe-h) (let ((unused (oe-note 1))) (define (two a b) (list b a)) (two (oe-note 2) (oe-note 3))))

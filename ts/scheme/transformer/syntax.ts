@@ -672,27 +672,6 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         return { expanded: list(Symbol.for("%call/comp"), capture, defaultTag()), state: TransformState.Recurse };
     });
 
-    // (map (lambda (x) body ...) lst), and the same with for-each and filter: a loop with the body inline, as the prelude's
-    // procedures run it (the result built reversed, then copied in order), with no closure made or called
-    const inlineOver = (name: string, loop: (l: symbol, acc: symbol, elem: symbol, body: any, next: symbol) => any) =>
-        evaluator.registerTransform(Symbol.for(name), (evaluator, expr, orig) => {
-            const f = car(expr);
-            const oneParam = f instanceof Cons && f.car === OP_LAMBDA && f.cdr instanceof Cons && f.cdr.car instanceof Cons
-                && typeof f.cdr.car.car === "symbol" && f.cdr.car.cdr === null && f.cdr.cdr instanceof Cons;
-            if (!(orig instanceof Cons) || orig.length !== 3 || !oneParam) return { expanded: orig, state: TransformState.DoChildren };
-            const l = Symbol("list"), acc = Symbol("acc"), next = Symbol("loop");
-            const body = cons(OP_LET, cons(null, f.cdr.cdr));
-            return { expanded: list(OP_LET, next, list(list(l, cadr(expr)), list(acc, null)), loop(l, acc, f.cdr.car.car, body, next)), state: TransformState.Recurse };
-        });
-    const step = (l: symbol, elem: symbol, then: any) => list(OP_LET, list(list(elem, list(B("car"), l))), then);
-    const rest = (l: symbol) => list(B("cdr"), l);
-    inlineOver("map", (l, acc, x, body, next) =>
-        list(CORE_IF, list(B("null?"), l), list(B("reverse"), acc), step(l, x, list(next, rest(l), list(B("cons"), body, acc)))));
-    inlineOver("for-each", (l, acc, x, body, next) =>
-        list(CORE_IF, list(B("null?"), l), undefined, step(l, x, list(OP_BEGIN, body, list(next, rest(l), acc)))));
-    inlineOver("filter", (l, acc, x, body, next) =>
-        list(CORE_IF, list(B("null?"), l), list(B("reverse"), acc), step(l, x, list(next, rest(l), list(CORE_IF, body, list(B("cons"), x, acc), acc)))));
-
     // `x (R7RS quasiquote, nested levels too): lists and vectors are built with list, cons*, append and list->vector from
     // their parts, and any part with nothing unquoted in it stays a quoted constant
     const isForm = (x: any, sym: symbol) => x instanceof Cons && x.car === sym && x.length === 2;

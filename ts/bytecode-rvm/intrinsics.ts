@@ -108,6 +108,8 @@ export class Intrinsics {
     // names code compiled with this table cannot bind, besides the intrinsics: a front end's keywords ("special form")
     // and the procedures it provides ("builtin")
     readonly reserved = new Map<symbol, "special form" | "builtin">()
+    // globals whose definitions the optimizer may inline where they are called (see defineKnown)
+    readonly known = new Map<symbol, { readonly lambda: any, readonly name: string }>()
     #pack: Intrinsic | undefined
     #spread: Intrinsic | undefined
     // how the VM's and the compiler's messages are worded (see Msg): the front end's formatter, if it sets one
@@ -130,6 +132,7 @@ export class Intrinsics {
         this.deps.push(...base.deps)
         for (const [sym, pos] of base.#bySym) this.#bySym.set(sym, pos)
         for (const [sym, kind] of base.reserved) this.reserved.set(sym, kind)
+        for (const [sym, def] of base.known) this.known.set(sym, def)
         this.#pack = base.#pack
         this.#spread = base.#spread
         this.#format = base.#format
@@ -246,6 +249,17 @@ export class Intrinsics {
         const returns = entry.returns
         if (typeof returns !== "function") return returns
         return kinds === null ? undefined : returns(kinds)
+    }
+
+    // The global `sym` is the procedure `lambda` (a one-clause %lambda core form that refers to nothing but intrinsics and
+    // its own variables), shown in tracebacks as `name`: code compiled while this holds may run its body where it calls
+    // `sym` (see passes/cp0.ts). A front end forgets it (forgetKnown) when a program may change the global
+    defineKnown(sym: symbol, lambda: any, name: string): void {
+        this.known.set(sym, Object.freeze({ lambda, name }))
+    }
+
+    forgetKnown(sym: symbol): void {
+        this.known.delete(sym)
     }
 
     get pack(): Intrinsic | undefined {

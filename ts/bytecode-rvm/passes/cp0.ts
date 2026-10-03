@@ -16,12 +16,16 @@ import { CORE_BEGIN, CORE_BLOCK, CORE_ESCAPE, CORE_IF, CORE_LAMBDA, CORE_LET, CO
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED, isLetrecLambda, isPadded, unwrapBoxed } from "../lambda";
-import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX } from "./assignments";
-import { keepPos, malformed, mapExprs, subExprs } from "./lang";
+import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX, convertAssignments } from "./assignments";
+import { AstAnalysis } from "../analysis";
+import { keepPos, malformed, mapExprs, parts, subExprs, withBounds } from "./lang";
 import { renamer } from "./rename";
 
-// a lambda of at most this many forms may be inlined at every call, within the budget; one called once always may
+// a lambda of at most this many forms may be inlined at every call, within the budget; one called once always may. A
+// known global's procedure (Intrinsics.defineKnown) of at most KNOWN_SIZE is inlined where an argument is a lambda
+// or a known procedure, so the call of it inside can be inlined too
 const INLINE_SIZE = 16;
+const KNOWN_SIZE = 160;
 const INLINE_BUDGET = 2000;
 
 type Info = { k: "const", e: any } | { k: "alias", sym: symbol } | { k: "lambda", lambda: any[], once: boolean, name: string }
@@ -62,6 +66,11 @@ const sizeOf = (e: any, limit: number): number => {
     };
     walk(e);
     return n;
+};
+
+const lambdaName = (lambda: any): string => {
+    const pos = SOURCE_POS.get(lambda);
+    return pos !== undefined ? `lambda@${pos.file}:${pos.line}` : "lambda";
 };
 
 // how often `sym` is used in the expressions `es`
@@ -111,7 +120,18 @@ const escapesOut = (e: any, inside: ReadonlySet<symbol> = new Set()): boolean =>
     return children(e).some(x => escapesOut(x, within));
 };
 
-export type Optimized = { ast: any, assumed: ReadonlySet<number> };
+// the free variables of `e` (in expression positions), given the names bound around it
+const freeIn = (e: any, bound: ReadonlySet<symbol>, out: Set<symbol>): Set<symbol> => {
+    if (typeof e === "symbol") {
+        if (!bound.has(e)) out.add(e);
+    } else if (Array.isArray(e) && e[0] !== CORE_QUOTE) {
+        for (const [x, around] of withBounds(parts(Lconv, e), bound)) freeIn(x, around, out);
+    }
+    return out;
+};
+
+// `boxes`: the variables boxes were made of in what was inlined (for the unbox pass)
+export type Optimized = { ast: any, assumed: ReadonlySet<number>, boxes: ReadonlySet<symbol> };
 
 export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     // the intrinsics whose calls were folded or dropped: the code still depends on what they are (see Code.bind)
@@ -119,6 +139,23 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     const locals = new Set<symbol>();
     const copy = renamer(intrinsics);
     let budget = INLINE_BUDGET;
+    const boxes = new Set<symbol>();
+
+    // a known global's procedure as this pass takes its input: names of its own, its assigned locals boxes (null if it
+    // refers to anything but intrinsics and its own variables, which may mean something else where it is inlined)
+    const prepared = new Map<any, boolean>();
+    const prepare = (lambda: any): any[] | null => {
+        let closed = prepared.get(lambda);
+        if (closed === undefined) {
+            closed = [...freeIn(lambda, new Set(), new Set())].every(sym => isCoreForm(sym) || intrinsics.get(sym) !== undefined);
+            prepared.set(lambda, closed);
+        }
+        if (!closed) return null;
+        const own = copy(lambda);
+        const converted = convertAssignments(own, new AstAnalysis(intrinsics).analyze(own).variables);
+        for (const sym of converted.boxes) boxes.add(sym);
+        return converted.ast;
+    };
 
     const intrinsicOf = (op: any) => typeof op === "symbol" && !isCoreForm(op) ? intrinsics.get(op) : undefined;
     const canBind = (n: any) => typeof n === "symbol" && !SPECIAL_FORMS.has(n) && intrinsics.reserved.get(n) === undefined && !isCoreForm(n) && intrinsics.get(n) === undefined;
@@ -357,12 +394,16 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     // names of their own, and are the rest parameter's elements (a padded clause without one drops them)
     const inlined = (name: string, lambda: any[], call: any[], ctx: Ctx, k: K): any => {
         const [, params, rest] = lambda[1];
-        const args = call.slice(1);
+        // a lambda passed keeps its own name (the compiler names a lambda after the variable it is bound to)
+        const own = call.slice(1).map((x: any) => Array.isArray(x) && x[0] === CORE_LAMBDA ? [Symbol(lambdaName(x)), x] : null);
+        const args = call.slice(1).map((x: any, i: number) => own[i]?.[0] ?? x);
         const extra = args.slice(params.length).map((x: any) => [Symbol("arg"), x]);
         const bindings = [...params.map((p: symbol, i: number) => [p, i < args.length ? args[i] : VOID]), ...extra];
         const marked = keepPos([k.tail ? TAIL_INLINED : INLINED, Symbol(name), ...lambda[1].slice(3)], call);
         const packed = rest === null ? marked : keepPos([CORE_LET, [[rest, [intrinsics.pack !== undefined ? Symbol.for(intrinsics.pack.name) : ARRAY, ...extra.map((b: any[]) => b[0])]]], marked], call);
-        return walk(keepPos([CORE_LET, bindings, packed], call), ctx, k);
+        const bound = keepPos([CORE_LET, bindings, packed], call);
+        const lambdas = own.filter(b => b !== null);
+        return walk(lambdas.length === 0 ? bound : keepPos([CORE_LET, lambdas, bound], call), ctx, k);
     };
 
     const walkCall = (e: any[], ctx: Ctx, k: K): any => {
@@ -390,8 +431,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         // a lambda applied, or a local bound to one: its body, its parameters bound to the arguments
         const head = aliasOf(op, k.env);
         if (inlinable(head) && fits(head[1], e.length - 1)) {
-            const pos = SOURCE_POS.get(head);
-            return inlined(pos !== undefined ? `lambda@${pos.file}:${pos.line}` : "lambda", head, e, ctx, k);
+            return inlined(lambdaName(head), head, e, ctx, k);
         }
         const info = typeof head === "symbol" ? k.env.get(head) : undefined;
         if (info?.k === "lambda" && !k.own.has(head) && fits(info.lambda[1], e.length - 1)) {
@@ -401,8 +441,26 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 return inlined(info.name, copy(info.lambda), e, ctx, { ...k, own: new Set([...k.own, head]) });
             }
         }
+        // a known global's procedure, where it would pay: an argument it may call is a lambda or a known procedure
+        const known = typeof head === "symbol" && !locals.has(head) && !k.own.has(head) ? intrinsics.known.get(head) : undefined;
+        if (known !== undefined && e.slice(1).some(x => knownProcedure(x, k.env))) {
+            const size = sizeOf(known.lambda, KNOWN_SIZE);
+            const lambda = size <= KNOWN_SIZE && budget >= size && fits(known.lambda[1], e.length - 1) ? prepare(known.lambda) : null;
+            if (lambda !== null && inlinable(lambda)) {
+                budget -= size;
+                return inlined(known.name, lambda, e, ctx, { ...k, own: new Set([...k.own, head]) });
+            }
+        }
         return keepPos([walk(op, "value", notTail(k)), ...e.slice(1).map(x => walk(x, "value", notTail(k)))], e);
     };
 
-    return { ast: walk(ast, "value", { env: new Map(), own: new Set(), tail: true, blocks: new Map() }), assumed };
+    // whether `x` is a procedure the optimizer knows the body of
+    const knownProcedure = (x: any, env: Env): boolean => {
+        if (Array.isArray(x)) return x[0] === CORE_LAMBDA;
+        if (typeof x !== "symbol") return false;
+        const info = env.get(aliasOf(x, env));
+        return info?.k === "lambda" || (!locals.has(x) && intrinsics.known.has(x));
+    };
+
+    return { ast: walk(ast, "value", { env: new Map(), own: new Set(), tail: true, blocks: new Map() }), assumed, boxes };
 };

@@ -47,6 +47,19 @@ const PROGRAMS: string[] = [
     `(define (ad-rest) (define (g a . r) (cons a r)) (define (h . xs) (apply g xs)) (list (h 1) (h 1 2 3) (apply h '(4 5)))) (ad-rest)`,
     `(define (ad-rest-err) (define (g . xs) (apply car xs)) (g 1 2)) (ad-rest-err)`,
     `(define (ad-rest-k) (define k2 #f) (define n 0) (define (g . xs) (call/cc (lambda (k) (set! k2 k))) xs) (let ((r (g 1 2))) (set! n (+ n 1)) (if (< n 3) (k2 #f) (list r n)))) (ad-rest-k)`,
+    // the prelude's map, for-each and filter inlined: errors and tracebacks in the procedure, continuations re-entering
+    // it, several lists, a procedure that is a global, a redefined map, a map that is a local
+    `(define (ad-m l) (map (lambda (x) (car x)) l)) (ad-m '((1) 2))`,
+    `(define (ad-fe l) (for-each (lambda (x) (vector-ref x 1)) l)) (list (ad-fe (list (vector 1))))`,
+    `(define (ad-fl l) (filter (lambda (x) (debug-traceback)) l)) (ad-fl '(1))`,
+    `(define (ad-g x) (* x 2)) (list (map ad-g '(1 2 3)) (map + '(1 2) '(10 20)) (map (lambda (a b) (list a b)) '(1 2) '(3 4 5)))`,
+    `(define ad-mk #f) (define ad-mn 0)
+     (define ad-mr (map (lambda (x) (call/cc (lambda (k) (if (= x 2) (set! ad-mk k)) x))) '(1 2 3)))
+     (set! ad-mn (+ ad-mn 1)) (if (< ad-mn 3) (ad-mk (* 10 ad-mn)) (list ad-mr ad-mn))`,
+    `(define (ad-acc) (let ((s 0)) (for-each (lambda (x) (set! s (+ s x))) '(1 2 3)) s)) (ad-acc)`,
+    `(define (ad-loc l) (let ((map (lambda (f l) 'mine))) (map (lambda (x) x) l))) (ad-loc '(1))`,
+    `(define (map f l) 'redefined) (map (lambda (x) x) '(1))`,
+    `(define (ad-bad) (map (lambda (x) x))) (ad-bad)`,
     // let*, let-values and shadowing through renaming
     `(let* ((a 1) (b (+ a 1)) (a (* b 10))) (list a b))`,
     `(let-values (((a b) (values 1 2)) ((c . d) (values 3 4 5))) (define (f) (list a b c d)) (f))`,

@@ -77,6 +77,7 @@ export class MacroEvaluator {
         if (typeof sym !== "symbol" || this.#internal(sym) || this.intrinsics.reserved.get(sym) !== "builtin") return false
         this.#redefined.add(sym)
         this.intrinsics.reserved.delete(sym)
+        this.intrinsics.forgetKnown(sym)
         return true
     }
 

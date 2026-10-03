@@ -53,9 +53,9 @@ const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numReg
 const cp0Pass: Pass<Converted, Converted> = {
     name: "cp0",
     run: (converted, ctx) => {
-        const { ast, assumed } = optimize(converted.ast, ctx.intrinsics)
+        const { ast, assumed, boxes } = optimize(converted.ast, ctx.intrinsics)
         for (const pos of assumed) ctx.assumed.add(pos)
-        return { ...converted, ast }
+        return { ast, boxes: new Set([...converted.boxes, ...boxes]) }
     },
 }
 

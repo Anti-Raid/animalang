@@ -543,6 +543,8 @@ A call `(f a1 … an)`, where `f` is a lambda or a local bound to one with `n` p
 - **Termination.** A `%letrec`'s lambdas are not inlined in their own group, and a procedure is not inlined in its own inlined body, so inlining ends; small procedures are inlined within a total budget.
 - **Interrupts.** A check at a function's entry goes with the call it no longer makes; the code that remains still has its loops' checks, and the inlined code has none of its own unbounded loops without them, so interrupts still come (A6).
 
+- **Known globals.** A call of a global with a known definition (`Intrinsics.known`) is the call of that definition while the global holds it: the front end gives the definition the global is bound to and forgets it when code may redefine the global (Scheme: `define` at top level of a builtin's name, which `MacroEvaluator.redefine` handles; the builtins' globals cannot otherwise be assigned). The definition refers to nothing but intrinsics and its own variables, checked before it is inlined, so it means the same wherever it is inlined; it is copied with fresh names (A7), and its assigned locals are boxed as the assignments pass would (the boxes are added to those the unbox pass may remove). It is never inlined in its own inlined body.
+
 ### 9.5 What is recorded
 The intrinsics a fold or a drop relied on are recorded as used by every function compiled, so `Code.bind` and `Code.runsWith` still check them when the code moves to another table.
 

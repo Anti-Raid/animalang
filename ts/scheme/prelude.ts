@@ -18,29 +18,22 @@ export const STD_PRELUDE = `
 (define $call-with-values (lambda (producer consumer) (%apply consumer (%values->array (producer)))))
 
 
-(let ((apply-proc #f)
-      (map-proc #f))
-    (set! apply-proc
-        (lambda (proc . lst)
-            (%apply proc (%apply %apply-args (%spread lst)))))
+(define ($apply proc . lst)
+    (%apply proc (%apply %apply-args (%spread lst))))
 
-    ;; iterative, so long lists need no deep recursion; the result is built reversed, then copied in order (reversing it
-    ;; in place would change a list a continuation captured inside f still holds)
-    (set! map-proc
-        (lambda (f list1 . more)
-            (if (null? more)
-                (let loop ((lst list1) (acc '()))
-                    (if (null? lst)
-                        (reverse acc)
-                        (loop (cdr lst) (cons (f (car lst)) acc))))
-                (let loop ((lists (cons list1 more)) (acc '()))
-                    (let ((cars (%map-cars lists)))
-                        (if cars
-                            (loop (%map-cdrs lists) (cons (%apply f cars) acc))
-                            (reverse acc)))))))
-
-    (%define-global $apply apply-proc)
-    (%define-global $map map-proc))
+;; iterative, so long lists need no deep recursion; the result is built reversed, then copied in order (reversing it in
+;; place would change a list a continuation captured inside f still holds)
+(define ($map f list1 . more)
+    (if (null? more)
+        (let loop ((lst list1) (acc '()))
+            (if (null? lst)
+                (reverse acc)
+                (loop (cdr lst) (cons (f (car lst)) acc))))
+        (let loop ((lists (cons list1 more)) (acc '()))
+            (let ((cars (%map-cars lists)))
+                (if cars
+                    (loop (%map-cdrs lists) (cons (%apply f cars) acc))
+                    (reverse acc))))))
 
 (define ($for-each f list1 . more)
     (if (null? more)
@@ -135,14 +128,33 @@ export const STD_PRELUDE = `
 // compiled once, for every instance (the prelude is never debug code, and its JS is generated later, per VM), and bound to the frozen Scheme base table, so the cache holds no instance's intrinsics; each instance runs its own
 // copy, bound by name, sharing the closures that call the same intrinsics through its table (every builtin's wrapper)
 let PRELUDE_CODE: Code | null = null
+// the prelude's procedures, as core forms, the optimizer may inline (see Intrinsics.defineKnown): the public name of each,
+// and its %lambda
+let KNOWN: [string, any][] = []
+
+const CORE_BEGIN = Symbol.for("%begin"), CORE_LAMBDA = Symbol.for("%lambda"), DEFINE_GLOBAL = Symbol.for("%define-global")
+const knownIn = (core: any): [string, any][] => {
+    if (!Array.isArray(core)) return []
+    if (core[0] === CORE_BEGIN) return core.slice(1).flatMap(knownIn)
+    const name: string | undefined = core[0] === DEFINE_GLOBAL && typeof core[1] === "symbol" ? core[1].description : undefined
+    const value = core[2]
+    return name?.startsWith("$") && Array.isArray(value) && value[0] === CORE_LAMBDA && value.length === 2 ? [[name.slice(1), value]] : []
+}
 
 // Runs the prelude with `vm` and returns the scope of its $ exports (under their public names), which the instance's
 // code cannot rebind
 export const loadPrelude = (cmp: Compiler, vm: AnimaVM, evaluator: MacroEvaluator, intrinsics: Intrinsics): Env => {
     if (PRELUDE_CODE === null) {
         const preludeAst = new ASP(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, true, "<prelude>").parse()
-        const compiled = cmp.compile(toCore(evaluator.transform(preludeAst)), false)
+        const core = toCore(evaluator.transform(preludeAst))
+        KNOWN = knownIn(core)
+        const compiled = cmp.compile(core, false)
         PRELUDE_CODE = compiled.fresh(new Map(), schemeBase())
+    }
+
+    for (const [name, lambda] of KNOWN) {
+        intrinsics.defineKnown(Symbol.for(name), lambda, name)
+        if (TWINNED.has(name)) intrinsics.defineKnown(Symbol.for(`@${name}`), lambda, name)
     }
 
     const privScope = stdPreludeScope()
