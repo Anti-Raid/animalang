@@ -3,6 +3,7 @@ import { SOURCE_POS } from '../common';
 import { createScheme } from '../scheme';
 import { impl } from '../bytecode-rvm/meta';
 import { Lsrc, check, extend, mapExprs, parts, withBounds } from '../bytecode-rvm/passes/lang';
+import { Lconv } from '../bytecode-rvm/passes/assignments';
 
 const S = Symbol.for;
 
@@ -52,11 +53,12 @@ describe("The compiler's passes", () => {
         anima.compiler.trace = (name, output) => {
             seen.push(name);
             if (name === "rename" || name === "block-escapes" || name === "split-case-lambdas" || name === "lift-lambdas") check(Lsrc, output);
+            if (name === "assignments") check(Lconv, (output as any).ast);
         };
         anima.compileRaw(`
-            (define (f . xs) (let* ((a 1) (b (+ a 1))) (call/cc (lambda (k) (if (null? xs) (k b) a)))))
+            (define (f . xs) (let* ((a 1) (b (+ a 1))) (set! a (lambda () b)) (call/cc (lambda (k) (if (null? xs) (k b) a)))))
             (define (g n) (define h (case-lambda ((x) x) ((x y) (+ x y)))) (letrec ((loop (lambda (i) (if (= i n) (h i) (loop (+ i 1)))))) (loop 0)))
             (let-values (((a . b) (values 1 2))) (g 3))`);
-        expect(seen).toEqual(["rename", "block-escapes", "split-case-lambdas", "lift-lambdas", "resolve", "call-liveness", "closures", "generate", "interrupts", "lower"]);
+        expect(seen).toEqual(["rename", "block-escapes", "split-case-lambdas", "lift-lambdas", "resolve", "call-liveness", "assignments", "closures", "generate", "interrupts", "lower"]);
     });
 });

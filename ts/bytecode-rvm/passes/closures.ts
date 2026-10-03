@@ -8,7 +8,8 @@ import { isSpreadOf } from "../analysis";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { isSingleLambda } from "../lambda";
-import { Lsrc, malformed } from "./lang";
+import { malformed } from "./lang";
+import { Lconv } from "./assignments";
 
 // each clause's captured variables, by clause
 export type Captures = WeakMap<object, readonly symbol[]>;
@@ -36,8 +37,8 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
         if (typeof e === "symbol") return use(e, fn);
         if (!Array.isArray(e) || e.length === 0) return;
         const op = e[0];
-        const shape = Lsrc.forms.get(op);
-        if (shape !== undefined && shape !== "exprs" && malformed(Lsrc, e) !== null) return;
+        const shape = Lconv.forms.get(op);
+        if (shape !== undefined && shape !== "exprs" && malformed(Lconv, e) !== null) return;
         const all = (xs: any[]) => xs.forEach(x => walk(x, fn, true, blocks));
         switch (shape) {
             case "quote":
@@ -74,7 +75,7 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
                 return body(e.slice(2), fn, used, blocks);
             case "assign":
                 walk(e[2], fn, true, blocks);
-                if (op === Symbol.for("%set!") && typeof e[1] === "symbol") use(e[1], fn);
+                if ((op === Symbol.for("%set!") || op === Symbol.for("%set-box!")) && typeof e[1] === "symbol") use(e[1], fn);
                 return;
             case "label":
                 if (op === Symbol.for("%block")) return body(e.slice(2), fn, used, new Map(blocks).set(e[1], used));

@@ -26,9 +26,13 @@ export class VariableMetadata {
 export class AnalysisScope {
     #vals = new Map<symbol, VariableMetadata>()
     outer: AnalysisScope | null;
+    // every variable defined in this scope and the scopes inside it, by name (locals have names of their own, see
+    // passes/rename.ts)
+    readonly variables: Map<symbol, VariableMetadata>;
 
     constructor(outer: AnalysisScope | null, readonly isFunction: boolean = true) {
         this.outer = outer;
+        this.variables = outer?.variables ?? new Map();
     }
 
     dbgPrint() {
@@ -38,7 +42,9 @@ export class AnalysisScope {
     }
 
     define(sym: symbol) {
-        this.#vals.set(sym, new VariableMetadata());
+        const meta = new VariableMetadata();
+        this.#vals.set(sym, meta);
+        this.variables.set(sym, meta);
     }
 
     getVarinfo(sym: symbol): VariableMetadata | null {

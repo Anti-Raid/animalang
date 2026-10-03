@@ -9,6 +9,7 @@ import { runPass, type Pass, type PassContext } from "./passes/pass";
 import { interruptsPass, type FunctionIR } from "./passes/interrupts";
 import { renamePass } from "./passes/rename";
 import { closureCaptures, type Captures } from "./passes/closures";
+import { convertAssignments, type Converted } from "./passes/assignments";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
@@ -16,12 +17,19 @@ import { Intrinsics, type Intrinsic } from "./intrinsics";
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, ...body]
 
 const OP_APPLY = Symbol.for("%apply");
+const BOX = Symbol.for("%box");
+const UNBOX = Symbol.for("%unbox");
+const BOX_IN_PLACE = Symbol.for("%box!");
+const SET_BOX = Symbol.for("%set-box!");
 
 type Analyzed = { ast: any, analyzer: AstAnalysis, ascope: AnalysisScope }
-type Converted = Analyzed & { captures: Captures }
+type Closed = Converted & { captures: Captures }
+
+// boxes made explicit (see passes/assignments.ts)
+const assignmentsPass: Pass<Analyzed, Converted> = { name: "assignments", run: ({ ast, ascope }) => convertAssignments(ast, ascope.variables) }
 
 // what each lambda captures (see passes/closures.ts)
-const closuresPass: Pass<Analyzed, Converted> = { name: "closures", run: (analyzed, ctx) => ({ ...analyzed, captures: closureCaptures(analyzed.ast, ctx.intrinsics) }) }
+const closuresPass: Pass<Converted, Closed> = { name: "closures", run: (converted, ctx) => ({ ...converted, captures: closureCaptures(converted.ast, ctx.intrinsics) }) }
 
 // the core forms to core forms (see lift.ts)
 const escapesPass: Pass<any, any> = { name: "block-escapes", run: ast => blockEscapes(ast) }
@@ -71,9 +79,8 @@ interface CmpOpts {
     markRegions?: number[] // for each enclosing non-tail %with-mark, where it saved the marks (outermost first)
     name?: string // name for a lambda compiled directly as this value
 
-    // from the analysis and closure passes
-    ascope: AnalysisScope,
-    analyzer: AstAnalysis,
+    // from the assignment conversion and closures passes
+    forwards: ReadonlySet<symbol>,
     captures: Captures
 }
 
@@ -95,8 +102,8 @@ export class Compiler {
             const split = runPass(caseLambdasPass, escaped, ctx)
             const lifted = runPass(liftPass, split, ctx)
             const analyzed = runPass(callLivenessPass, runPass(resolvePass, lifted, ctx), ctx)
-            const converted = runPass(closuresPass, analyzed, ctx)
-            const ir = runPass(interruptsPass, runPass(this.#generatePass, converted, ctx), ctx)
+            const closed = runPass(closuresPass, runPass(assignmentsPass, analyzed, ctx), ctx)
+            const ir = runPass(interruptsPass, runPass(this.#generatePass, closed, ctx), ctx)
             return runPass(lowerPass, ir, ctx)
         } catch (err) {
             if (err instanceof VMError) err.format(this.intrinsics.format)
@@ -105,13 +112,13 @@ export class Compiler {
     }
 
     // the IR of a top-level expression, its variables analysed
-    readonly #generatePass: Pass<Converted, FunctionIR> = {
+    readonly #generatePass: Pass<Closed, FunctionIR> = {
         name: "generate",
-        run: ({ ast, analyzer, ascope, captures }) => {
+        run: ({ ast, forwards, captures }) => {
             const scope = new CompilerScope(null)
             const nodes: Node[] = []
             const retReg = scope.allocTemp()
-            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, ascope, analyzer, captures })
+            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, forwards, captures })
             if (!this.#nodesEndsInRet(nodes)) {
                 nodes.push({ t: "Return", reg: retReg })
             }
@@ -206,6 +213,18 @@ export class Compiler {
                     return
                 case OP_DEFINE_GLOBAL:
                     this.#compileDefine(expr, opts)
+                    return
+                case BOX:
+                    this.#compileBox(expr, opts)
+                    return
+                case UNBOX:
+                    this.#compileUnbox(expr, opts)
+                    return
+                case BOX_IN_PLACE:
+                    this.#compileBoxInPlace(expr, opts)
+                    return
+                case SET_BOX:
+                    this.#compileSetBox(expr, opts)
                     return
                 case OP_APPLY:
                     this.#compileApply(expr, opts)
@@ -333,8 +352,6 @@ export class Compiler {
     // [options, params, rest, body ...]: params an array of symbols, rest a symbol or null
     #compileClause(clause: any[], opts: CmpOpts, name?: string) {
         const lambdaScope = new CompilerScope(opts.scope, opts.captures.get(clause) ?? [])
-        const ascope = opts.analyzer.scopeMap.get(clause)
-        if (!ascope) throw new Error(`internal error: could not find ascope for clause ${clause}`)
 
         const params: symbol[] = paramsOf(clause)
         const remParams: symbol | null = restOf(clause)
@@ -346,20 +363,8 @@ export class Compiler {
         const lambdaNodes: Node[] = []
         if (opts.pos !== undefined) lambdaNodes.push({ t: "Pos", pos: opts.pos })
 
-        for(let i = 0; i < params.length; i++) {
-            const reg = lambdaScope.addLocal(params[i])
-
-            const inf = ascope.getVarinfo(params[i])
-            if(!inf) throw new Error("Could not fetch varinfo")
-            if(inf.isBoxed) lambdaNodes.push({t: "Box", destReg: reg, srcReg: reg})
-        }
-        if (remParams) {
-            const reg = lambdaScope.addLocal(remParams)
-
-            const inf = ascope.getVarinfo(remParams)
-            if(!inf) throw new Error("Could not fetch varinfo")
-            if(inf.isBoxed) lambdaNodes.push({t: "Box", destReg: reg, srcReg: reg})
-        }
+        for (const p of params) lambdaScope.addLocal(p)
+        if (remParams !== null) lambdaScope.addLocal(remParams)
 
         // Once we've verified the syntax, we can then drop the entire lambda if its not actually needed
         if (opts.destReg === undefined) return
@@ -367,12 +372,12 @@ export class Compiler {
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
         lambdaNodes.push({ t: "FunctionEntry" })
-        this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
+        this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, fnDepth: (opts.fnDepth ?? 0) + 1 })
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
-        const rest = remParams === null || ascope.getVarinfo(remParams)!.forwardsRest || this.intrinsics.pack === undefined ? "array" : "packed"
+        const rest = remParams === null || opts.forwards.has(remParams) || this.intrinsics.pack === undefined ? "array" : "packed"
         const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, rest, isPadded(clause));
         opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
     }
@@ -381,8 +386,6 @@ export class Compiler {
     // all the variables are bound in a block, as in %let
     // clauses are [params, rest, init]
     #compileLetValues(expr: any[], opts: CmpOpts, strict: boolean) {
-        const ascope = opts.analyzer.scopeMap.get(expr)
-        if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
         const clauses: [symbol[], symbol | null, any][] = expr[1]
 
         const bound: { sym: symbol, reg: number }[] = []
@@ -409,12 +412,10 @@ export class Compiler {
         for (const { sym, reg } of bound) {
             ensureCanBind(sym, seen, "let-values")
             this.#ensureNotIntrinsic(sym, "let-values")
-            const inf = ascope.getVarinfo(sym)
-            if (!inf) throw new Error("Could not fetch varinfo")
             const destReg = opts.scope.addLocal(sym)
-            opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: reg, destReg })
+            opts.nodes.push({ t: "Move", srcReg: reg, destReg })
         }
-        this.#compileBody(expr.slice(2), { ...opts, ascope })
+        this.#compileBody(expr.slice(2), opts)
         opts.scope.exitBlock()
         for (const { start, size } of blocks) opts.scope.regAlloc.freeBlock(start, size)
     }
@@ -625,7 +626,7 @@ export class Compiler {
     #forwarded(expr: any, opts: CmpOpts): any {
         if (!isSpreadOf(expr, this.intrinsics)) return expr
         const sym = expr[1]
-        return opts.scope.resolve(sym).type === "Local" && opts.ascope.getVarinfo(sym)?.forwardsRest === true ? sym : expr
+        return opts.scope.resolve(sym).type === "Local" && opts.forwards.has(sym) ? sym : expr
     }
 
     // a normal call
@@ -654,33 +655,28 @@ export class Compiler {
     #compileLetStar(expr: any[], opts: CmpOpts) {
         const bindings: [symbol, any][] = expr[1]
         opts.scope.enterBlock()
-        let ascope = opts.ascope
         for (const binding of bindings) {
             const [sym, init] = binding
             ensureCanBind(sym, undefined, "let*")
             this.#ensureNotIntrinsic(sym, "let*")
             const reg = opts.scope.allocTemp()
-            this.#compile(init, { ...opts, ascope, destReg: reg, isTail: false, name: sym.description })
-            ascope = opts.analyzer.scopeMap.get(binding)!
-            const inf = ascope.getVarinfo(sym)
-            if (!inf) throw new Error("Could not fetch varinfo")
+            const boxed = this.#compileInit(init, { ...opts, destReg: reg, isTail: false, name: sym.description })
             const destReg = opts.scope.addLocal(sym)
-            opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: reg, destReg })
+            opts.nodes.push({ t: boxed ? "Box" : "Move", srcReg: reg, destReg })
             opts.scope.freeTemp(reg)
         }
-        this.#compileBody(expr.slice(2), { ...opts, ascope: opts.analyzer.scopeMap.get(expr)! })
+        this.#compileBody(expr.slice(2), opts)
         opts.scope.exitBlock()
     }
 
     #compileLet(expr: any[], opts: CmpOpts) {
-        const ascope = opts.analyzer.scopeMap.get(expr)
-        if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
         const bindings: [symbol, any][] = expr[1]
 
         const initRegs: number[] = []
+        const boxed: boolean[] = []
         for (const [sym, init] of bindings) {
             const reg = opts.scope.allocTemp()
-            this.#compile(init, { ...opts, destReg: reg, isTail: false, name: sym.description })
+            boxed.push(this.#compileInit(init, { ...opts, destReg: reg, isTail: false, name: sym.description }))
             initRegs.push(reg)
         }
 
@@ -690,12 +686,10 @@ export class Compiler {
             const sym = bindings[i][0]
             ensureCanBind(sym, seen, "let")
             this.#ensureNotIntrinsic(sym, "let")
-            const inf = ascope.getVarinfo(sym)
-            if (!inf) throw new Error("Could not fetch varinfo")
             const destReg = opts.scope.addLocal(sym)
-            opts.nodes.push({ t: inf.isBoxed ? "Box" : "Move", srcReg: initRegs[i], destReg })
+            opts.nodes.push({ t: boxed[i] ? "Box" : "Move", srcReg: initRegs[i], destReg })
         }
-        this.#compileBody(expr.slice(2), { ...opts, ascope })
+        this.#compileBody(expr.slice(2), opts)
         opts.scope.exitBlock()
         for (const reg of initRegs) opts.scope.freeTemp(reg)
     }
@@ -705,31 +699,23 @@ export class Compiler {
     // directly, and the upvars captured before it existed are filled in once it does (FixUpvar); an assigned name (or
     // one a closure may copy before its init has run, see lateValues) is a box
     #compileLetrec(expr: any[], opts: CmpOpts) {
-        const ascope = opts.analyzer.scopeMap.get(expr)
-        if (!ascope) throw new Error(`internal error: could not find ascope for expr ${expr}`)
         const bindings: [symbol, any][] = expr[1]
         const isLambda = bindings.map(([, init]) => isSingleLambda(init))
 
         opts.scope.enterBlock()
         const seen = new Set<symbol>()
         const regs: number[] = []
-        const boxed: boolean[] = []
         for (let i = 0; i < bindings.length; i++) {
             const sym = bindings[i][0]
             ensureCanBind(sym, seen, "letrec")
             this.#ensureNotIntrinsic(sym, "letrec")
-            const inf = ascope.getVarinfo(sym)
-            if (!inf) throw new Error("Could not fetch varinfo")
             const reg = opts.scope.addLocal(sym)
             regs.push(reg)
-            boxed.push(inf.isBoxed)
-            if (inf.isBoxed || !isLambda[i]) opts.nodes.push({ t: "LoadValue", constant: undefined, destReg: reg })
-            if (inf.isBoxed) opts.nodes.push({ t: "Box", srcReg: reg, destReg: reg })
+            if (!isLambda[i]) opts.nodes.push({ t: "LoadValue", constant: undefined, destReg: reg })
         }
 
         // every closure made here, with what it captured, so a name can be filled into them once its value exists
         const made: { reg: number, captures: readonly { index: number, local: boolean }[] }[] = []
-        const temps: number[] = []
         const fillIn = (reg: number) => {
             for (const closure of made) {
                 closure.captures.forEach((c, j) => {
@@ -738,12 +724,9 @@ export class Compiler {
             }
         }
         const compileInit = (i: number) => {
-            const dest = boxed[i] ? opts.scope.allocTemp() : regs[i]
-            if (boxed[i]) temps.push(dest)
             const before = opts.nodes.length
-            this.#compile(bindings[i][1], { ...opts, ascope, destReg: dest, isTail: false, name: bindings[i][0].description })
-            if (boxed[i]) opts.nodes.push({ t: "SetBox", destReg: regs[i], srcReg: dest })
-            return { dest, closure: opts.nodes.slice(before).reverse().find(n => n.t === "NewClosure") }
+            this.#compile(bindings[i][1], { ...opts, destReg: regs[i], isTail: false, name: bindings[i][0].description })
+            return { dest: regs[i], closure: opts.nodes.slice(before).reverse().find(n => n.t === "NewClosure") }
         }
 
         for (let i = 0; i < bindings.length; i++) {
@@ -751,89 +734,79 @@ export class Compiler {
             const { dest, closure } = compileInit(i)
             made.push({ reg: dest, captures: closure?.t === "NewClosure" ? closure.template.upvarLocs : [] })
         }
-        for (let i = 0; i < bindings.length; i++) if (isLambda[i] && !boxed[i]) fillIn(regs[i])
+        for (let i = 0; i < bindings.length; i++) if (isLambda[i]) fillIn(regs[i])
         for (let i = 0; i < bindings.length; i++) {
             if (isLambda[i]) continue
             compileInit(i)
-            if (!boxed[i]) fillIn(regs[i])
+            fillIn(regs[i])
         }
-        for (const reg of temps) opts.scope.freeTemp(reg)
 
-        this.#compileBody(expr.slice(2), { ...opts, ascope })
+        this.#compileBody(expr.slice(2), opts)
         opts.scope.exitBlock()
     }
 
     #getVar(varname: symbol, opts: CmpOpts, destReg?: number): Node[] {
-        // Check if we can resolve it to a local/upvar
         const resolved = opts.scope.resolve(varname)
-        //console.log(resolved)
-
-        if (resolved.type === 'Local') {
-            const aresolved = opts.ascope.getVarinfo(varname)
-            if (!aresolved) throw new Error(`internal error: ${String(varname)} has no analysis info present`)
-            if (aresolved.isBoxed) {
-                if (destReg !== undefined) {
-                    // Unbox
-                    return [{t: "Unbox", srcReg: resolved.index, destReg }]
-                }
-            } else {
-                // Move
-                if (destReg !== undefined && resolved.index !== destReg) {
-                    return [{t: "Move", srcReg: resolved.index, destReg }]
-                }
-            }
-            return []
-        } 
-        
-        if (resolved.type === 'Upvar') {
-            const aresolved = opts.ascope.getVarinfo(varname)
-            if (!aresolved) throw new Error(`internal error: ${String(varname)} has no analysis info present`)
-
-            if (destReg !== undefined) {
-                // right now, we need to load the upvalue in and unbox it (if boxed)
-                return [{t: "LoadUpvar", upvarIdx: resolved.index, destReg, andUnbox: aresolved.isBoxed }]
-            }
-            return []
-        }
-
-        // Assume global
-        if (destReg !== undefined) return [{t: "LoadGlobal", sym: varname, destReg}]
+        if (resolved.type === "Local") return destReg !== undefined && resolved.index !== destReg ? [{ t: "Move", srcReg: resolved.index, destReg }] : []
+        if (resolved.type === "Upvar") return destReg !== undefined ? [{ t: "LoadUpvar", upvarIdx: resolved.index, destReg, andUnbox: false }] : []
+        if (destReg !== undefined) return [{ t: "LoadGlobal", sym: varname, destReg }]
         const tmpReg = opts.scope.allocTemp()
         opts.scope.freeTemp(tmpReg)
-        return [{t: "LoadGlobal", sym: varname, destReg: tmpReg}]
+        return [{ t: "LoadGlobal", sym: varname, destReg: tmpReg }]
     }
 
     #setVar(varname: symbol, opts: CmpOpts, srcReg: number): Node[] {
-        // Check if we can resolve it to a local/upvar
         const resolved = opts.scope.resolve(varname)
+        if (resolved.type === "Local") return srcReg !== resolved.index ? [{ t: "Move", srcReg, destReg: resolved.index }] : []
+        if (resolved.type === "Upvar") return [{ t: "SetUpvar", srcReg, upvarIdx: resolved.index, andBox: false }]
+        return [{ t: "SetGlobal", sym: varname, srcReg }]
+    }
 
-        if (resolved.type === 'Local') {
-            const aresolved = opts.ascope.getVarinfo(varname)
-            if (!aresolved) throw new Error(`internal error: ${String(varname)} has no analysis info present`)
-            if (aresolved.isBoxed) {
-                return [{ t: "SetBox", srcReg, destReg: resolved.index }]
-            } else {
-                if (srcReg !== resolved.index) {
-                    return [{ t: "Move", srcReg, destReg: resolved.index }];
-                }
-            }
-        } 
-        
-        if (resolved.type === 'Upvar') {
-            const aresolved = opts.ascope.getVarinfo(varname)
-            if (!aresolved) throw new Error(`internal error: ${String(varname)} has no analysis info present`)
+    // a %let or %let* init: (%box e) is e, which the binding boxes (whether it did is the result)
+    #compileInit(init: any, opts: CmpOpts): boolean {
+        const boxed = Array.isArray(init) && init[0] === BOX && init.length === 2
+        this.#compile(boxed ? init[1] : init, opts)
+        return boxed
+    }
 
-            if (aresolved.isBoxed) {
-                const tmpReg = opts.scope.allocTemp()
-                const nodes: Node[] = [{t: "LoadUpvar", andUnbox: false, destReg: tmpReg, upvarIdx: resolved.index}, { t: "SetBox", destReg: tmpReg, srcReg }]
-                opts.scope.freeTemp(tmpReg)
-                return nodes
-            } else {
-                return [{ t: "SetUpvar", srcReg, upvarIdx: resolved.index, andBox: false }];
-            }
+    // (%box e): a new box holding e's value
+    #compileBox(expr: any[], opts: CmpOpts) {
+        this.#compile(expr[1], { ...opts, isTail: false })
+        if (opts.destReg !== undefined) opts.nodes.push({ t: "Box", srcReg: opts.destReg, destReg: opts.destReg })
+    }
+
+    // (%unbox x): the value in the box x holds
+    #compileUnbox(expr: any[], opts: CmpOpts) {
+        const resolved = opts.scope.resolve(expr[1])
+        if (opts.destReg === undefined) return
+        if (resolved.type === "Local") opts.nodes.push({ t: "Unbox", srcReg: resolved.index, destReg: opts.destReg })
+        else if (resolved.type === "Upvar") opts.nodes.push({ t: "LoadUpvar", upvarIdx: resolved.index, destReg: opts.destReg, andUnbox: true })
+        else throw new Error(`internal error: unboxing ${String(expr[1]?.description)}, which is not a local variable`)
+    }
+
+    // (%box! x): x, a local, now holds a box of its value
+    #compileBoxInPlace(expr: any[], opts: CmpOpts) {
+        const resolved = opts.scope.resolve(expr[1])
+        if (resolved.type !== "Local") throw new Error(`internal error: boxing ${String(expr[1]?.description)} in place, which is not a local of this function`)
+        opts.nodes.push({ t: "Box", srcReg: resolved.index, destReg: resolved.index })
+    }
+
+    // (%set-box! x v): the box x holds now holds v; the value is <#void>
+    #compileSetBox(expr: any[], opts: CmpOpts) {
+        const [, sym, val] = expr
+        const valReg = opts.scope.allocTemp()
+        this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description })
+        const resolved = opts.scope.resolve(sym)
+        if (resolved.type === "Local") {
+            opts.nodes.push({ t: "SetBox", srcReg: valReg, destReg: resolved.index })
+        } else if (resolved.type === "Upvar") {
+            const tmpReg = opts.scope.allocTemp()
+            opts.nodes.push({ t: "LoadUpvar", andUnbox: false, destReg: tmpReg, upvarIdx: resolved.index }, { t: "SetBox", destReg: tmpReg, srcReg: valReg })
+            opts.scope.freeTemp(tmpReg)
+        } else {
+            throw new Error(`internal error: setting the box of ${String(sym?.description)}, which is not a local variable`)
         }
-
-        // Assume global
-        return [{t: "SetGlobal", sym: varname, srcReg}]
+        opts.scope.freeTemp(valReg)
+        if (opts.destReg !== undefined) opts.nodes.push({ t: "LoadValue", destReg: opts.destReg, constant: undefined })
     }
 }
