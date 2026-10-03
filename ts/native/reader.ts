@@ -1,6 +1,7 @@
 // native-scheme's reader: s-expressions read straight into arrays. It names VM values only: `( ... )` (or `[ ... ]`) an
 // array, a name a symbol, numbers (and `123n` bigints), strings, `#t` / `#f`, `#null` and `#void` (undefined); `'x` is
-// (%quote x), `%[f x ...]` a call, (%call f x ...), or of an intrinsic, (%intcall %name x ...), and `;` starts a comment. Every list keeps where it was read (SOURCE_POS). A front end's meaning for quoted data comes from
+// (%quote x), `%[f x ...]` a call, (%call f x ...), or of an intrinsic, (%intcall %name x ...). `;` comments out the rest
+// of a line, `#| ... |#` what it encloses (nested too), and `#;` the next form. Every list keeps where it was read (SOURCE_POS). A front end's meaning for quoted data comes from
 // `datum`, called on what each (%quote x) quotes
 import { CORE_BEGIN, CORE_CALL, CORE_INTCALL, CORE_QUOTE, SOURCE_POS, formatPos, type SourcePos } from "../common";
 import { isCoreForm } from "../magicvm/core";
@@ -14,7 +15,7 @@ export class NativeReadError extends Error {
     }
 }
 
-const OPEN = 40, CLOSE = 41, OPEN_BRACKET = 91, CLOSE_BRACKET = 93, QUOTE = 34, SEMI = 59, NL = 10, BACKSLASH = 92, APOSTROPHE = 39, PERCENT = 37;
+const OPEN = 40, CLOSE = 41, OPEN_BRACKET = 91, CLOSE_BRACKET = 93, QUOTE = 34, SEMI = 59, NL = 10, BACKSLASH = 92, APOSTROPHE = 39, PERCENT = 37, HASH = 35, BAR = 124;
 const isSpace = (c: number) => c === 32 || c === 9 || c === NL || c === 13 || c === 12;
 const isDelimiter = (c: number) => isSpace(c) || c === OPEN || c === CLOSE || c === OPEN_BRACKET || c === CLOSE_BRACKET || c === QUOTE || c === SEMI;
 const NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i;
@@ -36,6 +37,32 @@ export const readNative = (src: string, file: string = "<native>", options: Nati
             const c = src.charCodeAt(i);
             if (c === SEMI) {
                 while (i < src.length && src.charCodeAt(i) !== NL) i++;
+            } else if (c === HASH && src.charCodeAt(i + 1) === BAR) {
+                const at = here();
+                i += 2;
+                for (let depth = 1; depth > 0;) {
+                    if (i >= src.length) fail("unclosed #| comment", at);
+                    const d = src.charCodeAt(i);
+                    if (d === HASH && src.charCodeAt(i + 1) === BAR) {
+                        depth++;
+                        i += 2;
+                    } else if (d === BAR && src.charCodeAt(i + 1) === HASH) {
+                        depth--;
+                        i += 2;
+                    } else {
+                        if (d === NL) {
+                            line++;
+                            lineStart = i + 1;
+                        }
+                        i++;
+                    }
+                }
+            } else if (c === HASH && src.charCodeAt(i + 1) === SEMI) {
+                const at = here();
+                i += 2;
+                skip();
+                if (i >= src.length) fail("nothing after #;", at);
+                form();
             } else if (isSpace(c)) {
                 if (c === NL) {
                     line++;

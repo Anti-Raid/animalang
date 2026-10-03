@@ -30,19 +30,6 @@ export const codeOf = (constants: any[], body: DistributiveOmit<Op, "ip">[], num
 // native-scheme text run on an instance (a Scheme one, say, with its table and its lists for quoted data)
 export const runNative = (anima: Anima, src: string, file?: string): any => anima.evaluateRaw(compileNative(anima, src, file));
 
-// defines a procedure for each intrinsic, named without its %, as an embedder would: fixed counts call it, a leaf of
-// any count applies it
-export const expose = (anima: Anima, ...names: string[]) => {
-    const wrappers = names.map(name => {
-        const entry = anima.intrinsics.byName(name);
-        if (entry === undefined) throw new Error(`no intrinsic ${name}`);
-        if (entry.min === entry.max) {
-            const params = Array.from({ length: entry.min }, (_, i) => `a${i}`).join(" ");
-            return `(define-global (${name.slice(1)} ${params}) (%intcall ${name} ${params}))`;
-        }
-        if (!entry.leaf) throw new Error(`${name} takes ${entry.min} to ${entry.max} args and is not a leaf`);
-        const spread = anima.intrinsics.spread;
-        return `(define-global (${name.slice(1)} . args) (%intapply ${name} ${spread !== undefined ? `(%intcall ${spread.name} args)` : "args"}))`;
-    });
-    runNative(anima, wrappers.join("\n"), "<exposed>");
-};
+// a procedure for each intrinsic, named without its %, as an embedder would define one
+export const expose = (anima: Anima, ...names: string[]) =>
+    runNative(anima, names.map(name => `(define-intrinsic ${name.slice(1)} ${name})`).join("\n"), "<exposed>");

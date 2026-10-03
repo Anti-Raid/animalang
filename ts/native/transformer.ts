@@ -1,16 +1,24 @@
-// native-scheme's sugar, lowered to the core forms; everything else is core already (calls are explicit: %call, %intcall)
-//  - (lambda formals body ...): formals a name (all arguments), (a b), or (a b . rest)
+// native-scheme's sugar, lowered to the core forms; everything else is core already (calls are explicit: %call and
+// %intcall, or %[f x] as the reader reads it)
+//  - (lambda formals body ...): formals a name (all arguments), (a b), or (a b . rest); (case-lambda (formals body ...) ...)
 //  - (define-global name expr), (define-global (name . formals) body ...): a global
+//  - (define-intrinsic name %intrinsic): a global procedure calling the intrinsic, its parameters from the table (a
+//    fixed count, or any count of a leaf, which it applies)
 //  - (let ((x init) ...) body ...), let*, letrec: the core forms of the same shape
 //  - (let name ((x init) ...) body ...): a loop when name is only called in tail position with every argument, else a
 //    %letrec of a procedure
-//  - (when c body ...), (unless c body ...), (and x ...), (or x ...)
+//  - (let-values ((formals expr) ...) body ...), (receive formals expr body ...): %let-values/strict
+//  - if, set!, begin, (cond (test body ...) ... [(else body ...)]), not, when, unless, and, or
+//  - (apply f x ... seq): %apply, or %intapply of an intrinsic, with the table's spread of seq if it has one
 import {
     CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_STAR,
     CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LOOP, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS,
     formatPos, type SourcePos,
 } from "../common";
+import type { Intrinsics } from "../magicvm/intrinsics";
 import { Lsrc, keepPos, malformed, mapExprs } from "../magicvm/passes/lang";
+
+const CORE_APPLY = Symbol.for("%apply");
 
 export class NativeSyntaxError extends Error {
     constructor(readonly what: string, readonly at: SourcePos | null) {
@@ -20,24 +28,28 @@ export class NativeSyntaxError extends Error {
 }
 
 const S = Symbol.for;
-export const LAMBDA = S("lambda"); const DEFINE_GLOBAL = S("define-global"), LET = S("let"), LET_STAR = S("let*"), LETREC = S("letrec");
-const WHEN = S("when"), UNLESS = S("unless"), AND = S("and"), OR = S("or"), DOT = S(".");
+export const LAMBDA = S("lambda");
+const CASE_LAMBDA = S("case-lambda"), DEFINE_GLOBAL = S("define-global"), DEFINE_INTRINSIC = S("define-intrinsic");
+const LET = S("let"), LET_STAR = S("let*"), LETREC = S("letrec"), LET_VALUES = S("let-values"), RECEIVE = S("receive");
+const IF = S("if"), SET = S("set!"), BEGIN = S("begin"), COND = S("cond"), ELSE = S("else"), NOT = S("not");
+const WHEN = S("when"), UNLESS = S("unless"), AND = S("and"), OR = S("or"), APPLY = S("apply"), DOT = S(".");
 
-export const SUGAR: ReadonlySet<symbol> = new Set([LAMBDA, DEFINE_GLOBAL, LET, LET_STAR, LETREC, WHEN, UNLESS, AND, OR]);
+export const SUGAR: ReadonlySet<symbol> = new Set([LAMBDA, CASE_LAMBDA, DEFINE_GLOBAL, DEFINE_INTRINSIC, LET, LET_STAR, LETREC,
+    LET_VALUES, RECEIVE, IF, SET, BEGIN, COND, ELSE, NOT, WHEN, UNLESS, AND, OR, APPLY]);
 
 const fail = (what: string, e: any): never => {
     throw new NativeSyntaxError(what, SOURCE_POS.get(e) ?? null);
 };
 
 // [params, rest] of a formals list
-const formalsOf = (f: any, e: any): [symbol[], symbol | null] => {
+const formalsOf = (who: string, f: any, e: any): [symbol[], symbol | null] => {
     if (typeof f === "symbol") return [[], f];
-    if (!Array.isArray(f)) fail("lambda: formals must be a name or a list of names", e);
+    if (!Array.isArray(f)) fail(`${who}: formals must be a name or a list of names`, e);
     const dot = f.indexOf(DOT);
     const params = dot === -1 ? f : f.slice(0, dot);
     const rest = dot === -1 ? null : f[dot + 1];
-    if (dot !== -1 && (dot !== f.length - 2 || typeof rest !== "symbol")) fail("lambda: one name must follow .", e);
-    if (!params.every((p: any) => typeof p === "symbol")) fail("lambda: parameters must be names", e);
+    if (dot !== -1 && (dot !== f.length - 2 || typeof rest !== "symbol")) fail(`${who}: one name must follow .`, e);
+    if (!params.every((p: any) => typeof p === "symbol")) fail(`${who}: parameters must be names`, e);
     return [params, rest];
 };
 
@@ -48,65 +60,130 @@ const bindingsOf = (who: string, b: any, e: any): [symbol, any][] => {
     return b;
 };
 
-export const transformNative = (ast: any): any => walk(ast);
+const isIntrinsicName = (x: any): x is symbol => typeof x === "symbol" && x.description!.charCodeAt(0) === 37;
 
-const walk = (e: any): any => {
-    if (!Array.isArray(e) || e.length === 0) return e;
-    const op = e[0];
-    if (typeof op === "symbol" && SUGAR.has(op)) return keepPos(lower(e), e);
-    if (!Lsrc.forms.has(op) || malformed(Lsrc, e) !== null) return e;
-    return mapExprs(Lsrc, e, walk);
-};
+// `intrinsics`: the table of the instance the code is for, which apply and define-intrinsic consult
+export const transformNative = (ast: any, intrinsics?: Intrinsics): any => {
+    const walk = (e: any): any => {
+        if (!Array.isArray(e) || e.length === 0) return e;
+        const op = e[0];
+        if (typeof op === "symbol" && SUGAR.has(op)) return keepPos(lower(e), e);
+        if (!Lsrc.forms.has(op) || malformed(Lsrc, e) !== null) return e;
+        return mapExprs(Lsrc, e, walk);
+    };
+    const body = (items: any[]): any[] => items.map(walk);
+    const seq = (items: any[], e: any): any => items.length === 1 ? walk(items[0]) : keepPos([CORE_BEGIN, ...body(items)], e);
+    const spread = (x: any) => intrinsics?.spread !== undefined ? [CORE_INTCALL, S(intrinsics.spread.name), x] : x;
+    const clause = (who: string, formals: any, items: any[], e: any) => {
+        if (items.length === 0) fail(`${who}: needs a body`, e);
+        const [params, rest] = formalsOf(who, formals, e);
+        return [[], params, rest, ...body(items)];
+    };
 
-const body = (items: any[]): any[] => items.map(walk);
-
-const lower = (e: any[]): any => {
-    const op = e[0];
-    switch (op) {
-        case LAMBDA: {
-            if (e.length < 3) fail("lambda: needs formals and a body", e);
-            const [params, rest] = formalsOf(e[1], e);
-            return [CORE_LAMBDA, [[], params, rest, ...body(e.slice(2))]];
-        }
-        case DEFINE_GLOBAL: {
-            if (Array.isArray(e[1])) {
-                if (e.length < 3 || typeof e[1][0] !== "symbol") fail("define-global: (define-global (name . formals) body ...)", e);
-                const lambda = keepPos([LAMBDA, e[1].length === 3 && e[1][1] === DOT ? e[1][2] : e[1].slice(1), ...e.slice(2)], e);
-                return [OP_DEFINE_GLOBAL, e[1][0], walk(lambda)];
+    const lower = (e: any[]): any => {
+        const op = e[0];
+        switch (op) {
+            case LAMBDA:
+                if (e.length < 3) fail("lambda: needs formals and a body", e);
+                return [CORE_LAMBDA, clause("lambda", e[1], e.slice(2), e)];
+            case CASE_LAMBDA:
+                if (e.length < 2 || !e.slice(1).every(Array.isArray)) fail("case-lambda: (case-lambda (formals body ...) ...)", e);
+                return [CORE_LAMBDA, ...e.slice(1).map((c: any[]) => clause("case-lambda", c[0], c.slice(1), c))];
+            case DEFINE_GLOBAL: {
+                if (Array.isArray(e[1])) {
+                    if (e.length < 3 || typeof e[1][0] !== "symbol") fail("define-global: (define-global (name . formals) body ...)", e);
+                    const formals = e[1].length === 3 && e[1][1] === DOT ? e[1][2] : e[1].slice(1);
+                    return [OP_DEFINE_GLOBAL, e[1][0], keepPos([CORE_LAMBDA, clause("define-global", formals, e.slice(2), e)], e)];
+                }
+                if (e.length !== 3 || typeof e[1] !== "symbol") fail("define-global: (define-global name expr)", e);
+                return [OP_DEFINE_GLOBAL, e[1], walk(e[2])];
             }
-            if (e.length !== 3 || typeof e[1] !== "symbol") fail("define-global: (define-global name expr)", e);
-            return [OP_DEFINE_GLOBAL, e[1], walk(e[2])];
-        }
-        case LET: case LET_STAR: case LETREC: {
-            if (op === LET && typeof e[1] === "symbol") {
-                if (e.length < 4) fail("let: (let name ((name init) ...) body ...)", e);
-                const bindings = bindingsOf("let", e[2], e);
-                return namedLet(e[1], bindings.map(b => b[0]), bindings.map(b => walk(b[1])), body(e.slice(3)), e);
+            case DEFINE_INTRINSIC: {
+                if (e.length !== 3 || typeof e[1] !== "symbol" || !isIntrinsicName(e[2])) fail("define-intrinsic: (define-intrinsic name %intrinsic)", e);
+                if (intrinsics === undefined) fail("define-intrinsic: needs the instance's table (compile with compileNative)", e);
+                const entry = intrinsics!.get(e[2]);
+                if (entry === undefined) fail(`define-intrinsic: ${e[2].description} is not an intrinsic`, e);
+                if (entry!.min === entry!.max) {
+                    const params = Array.from({ length: entry!.min }, (_, i) => S(`a${i}`));
+                    return [OP_DEFINE_GLOBAL, e[1], keepPos([CORE_LAMBDA, [[], params, null, [CORE_INTCALL, e[2], ...params]]], e)];
+                }
+                if (!entry!.leaf) fail(`define-intrinsic: ${e[2].description} takes ${entry!.min} or more args and is not a leaf, so it cannot be applied (write a case-lambda)`, e);
+                const args = S("args");
+                return [OP_DEFINE_GLOBAL, e[1], keepPos([CORE_LAMBDA, [[], [], args, [CORE_INTAPPLY, e[2], spread(args)]]], e)];
             }
-            if (e.length < 3) fail(`${op.description}: needs bindings and a body`, e);
-            const core = op === LET ? CORE_LET : op === LET_STAR ? CORE_LET_STAR : CORE_LETREC;
-            const bindings = bindingsOf(op.description!, e[1], e).map(b => keepPos([b[0], walk(b[1])], b));
-            return [core, bindings, ...body(e.slice(2))];
+            case LET: case LET_STAR: case LETREC: {
+                if (op === LET && typeof e[1] === "symbol") {
+                    if (e.length < 4) fail("let: (let name ((name init) ...) body ...)", e);
+                    const bindings = bindingsOf("let", e[2], e);
+                    return namedLet(e[1], bindings.map(b => b[0]), bindings.map(b => walk(b[1])), body(e.slice(3)), e);
+                }
+                if (e.length < 3) fail(`${op.description}: needs bindings and a body`, e);
+                const core = op === LET ? CORE_LET : op === LET_STAR ? CORE_LET_STAR : CORE_LETREC;
+                const bindings = bindingsOf(op.description!, e[1], e).map(b => keepPos([b[0], walk(b[1])], b));
+                return [core, bindings, ...body(e.slice(2))];
+            }
+            case LET_VALUES: case RECEIVE: {
+                const clauses = op === RECEIVE ? [[e[1], e[2]]] : e[1];
+                const items = e.slice(op === RECEIVE ? 3 : 2);
+                if ((op === RECEIVE && e.length < 3) || !Array.isArray(clauses) || !clauses.every((c: any) => Array.isArray(c) && c.length === 2) || items.length === 0) {
+                    fail(op === RECEIVE ? "receive: (receive formals expr body ...)" : "let-values: (let-values ((formals expr) ...) body ...)", e);
+                }
+                return [CORE_LET_VALUES_STRICT, clauses.map((c: any[]) => [...formalsOf(op.description!, c[0], e), walk(c[1])]), ...body(items)];
+            }
+            case IF:
+                if (e.length !== 3 && e.length !== 4) fail("if: (if test then [else])", e);
+                return [CORE_IF, ...body(e.slice(1))];
+            case SET:
+                if (e.length !== 3 || typeof e[1] !== "symbol") fail("set!: (set! name expr)", e);
+                return [CORE_SET, e[1], walk(e[2])];
+            case BEGIN:
+                return [CORE_BEGIN, ...body(e.slice(1))];
+            case COND: {
+                const clauses = e.slice(1);
+                if (!clauses.every((c: any) => Array.isArray(c) && c.length >= 1)) fail("cond: (cond (test body ...) ... [(else body ...)])", e);
+                const out: any[] = [CORE_IF];
+                for (const [i, c] of clauses.entries()) {
+                    if (c[0] === ELSE) {
+                        if (i !== clauses.length - 1 || c.length < 2) fail("cond: else must be last, with a body", e);
+                        out.push(seq(c.slice(1), c));
+                    } else {
+                        if (c.length < 2) fail("cond: each clause needs a body (use or for a test's own value)", c);
+                        out.push(walk(c[0]), seq(c.slice(1), c));
+                    }
+                }
+                return out.length === 1 ? undefined : out.length === 2 ? out[1] : out;
+            }
+            case ELSE:
+                return fail("else: only in cond", e);
+            case NOT:
+                if (e.length !== 2) fail("not: (not x)", e);
+                return [CORE_IF, walk(e[1]), false, true];
+            case WHEN: case UNLESS: {
+                if (e.length < 3) fail(`${op.description}: needs a condition and a body`, e);
+                const then = keepPos([CORE_BEGIN, ...body(e.slice(2))], e);
+                return op === WHEN ? [CORE_IF, walk(e[1]), then] : [CORE_IF, walk(e[1]), undefined, then];
+            }
+            case AND: {
+                const xs = body(e.slice(1));
+                if (xs.length === 0) return true;
+                return xs.reduceRight((rest, x) => [CORE_IF, x, rest, false]);
+            }
+            case OR: {
+                const xs = body(e.slice(1));
+                if (xs.length === 0) return false;
+                return xs.reduceRight((rest, x) => {
+                    const t = Symbol("or");
+                    return [CORE_LET, [[t, x]], [CORE_IF, t, t, rest]];
+                });
+            }
+            case APPLY: {
+                if (e.length < 3) fail("apply: (apply f x ... seq)", e);
+                const args = [...body(e.slice(2, -1)), spread(walk(e[e.length - 1]))];
+                return isIntrinsicName(e[1]) ? [CORE_INTAPPLY, e[1], ...args] : [CORE_APPLY, walk(e[1]), ...args];
+            }
         }
-        case WHEN: case UNLESS: {
-            if (e.length < 3) fail(`${op.description}: needs a condition and a body`, e);
-            const then = keepPos([CORE_BEGIN, ...body(e.slice(2))], e);
-            return op === WHEN ? [CORE_IF, walk(e[1]), then] : [CORE_IF, walk(e[1]), undefined, then];
-        }
-        case AND: {
-            const xs = body(e.slice(1));
-            if (xs.length === 0) return true;
-            return xs.reduceRight((rest, x) => [CORE_IF, x, rest, false]);
-        }
-        case OR: {
-            const xs = body(e.slice(1));
-            if (xs.length === 0) return false;
-            return xs.reduceRight((rest, x) => {
-                const t = Symbol("or");
-                return [CORE_LET, [[t, x]], [CORE_IF, t, t, rest]];
-            });
-        }
-    }
+    };
+    return walk(ast);
 };
 
 const NOT_A_LOOP = Symbol("not a loop");

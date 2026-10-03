@@ -19,7 +19,7 @@ export const createNativeScheme = (options: AnimaOptions): Anima => {
     for (const sym of SUGAR) anima.intrinsics.reserved.set(sym, "special form");
     anima.attachFrontEnd({
         read: (source, file) => readNative(source, file),
-        transform: transformNative,
+        transform: ast => transformNative(ast, anima.intrinsics),
         lambda: (params, body) => [LAMBDA, params, body],
     }, new Env());
     return anima;
@@ -30,5 +30,5 @@ export const createNativeScheme = (options: AnimaOptions): Anima => {
 export const compileNative = (anima: Anima, src: string, file?: string, options: NativeReadOptions = {}) => {
     const frontEnd = anima.frontEnd;
     const datum = options.datum ?? frontEnd?.datum?.bind(frontEnd);
-    return anima.compiler.compile(transformNative(readNative(src, file, { datum })));
+    return anima.compiler.compile(transformNative(readNative(src, file, { datum }), anima.intrinsics));
 };

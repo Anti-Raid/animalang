@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { compileNative, createNativeScheme, readNative, showValue, transformNative, NativeReadError } from '../native';
 import { Anima } from '../anima';
 import { createScheme } from '../scheme';
+import { hostTailFrom } from '../magicvm/exec';
 import { ASTStringifier } from '../scheme/printer';
 import { impl } from '../magicvm/meta';
 import { SOURCE_POS } from '../common';
@@ -111,6 +112,47 @@ describe("native-scheme", () => {
         expect(run(a, `(let ((x 1)) (define-global y (%intcall %+ x 1)) y)`)).toBe("2");
         expect(() => a.compileRaw(`(define z 1)`)).toThrow("define is not a core form");
         expect(() => a.compileRaw(`(lambda (a . b c) a)`)).toThrow("one name must follow .");
+    });
+
+    it("has if, set!, begin, cond and not", () => {
+        const a = make();
+        expect(run(a, `(%intcall %array (if #t 1 2) (if #f 1) (begin 1 2) (not #f) (not 0))`)).toBe("(1 #void 2 #t #f)");
+        expect(run(a, `(define-global n 1) (set! n (%intcall %+ n 1)) n`)).toBe("2");
+        const sign = `(lambda (x) (cond (%[%< x 0] 'neg) (%[%= x 0] 'zero) (else 'pos)))`;
+        expect(run(a, `(let ((f ${sign})) (%intcall %array %[f -1] %[f 0] %[f 5]))`)).toBe("(neg zero pos)");
+        expect(run(a, `(%intcall %array (cond (#f 1)) (cond (else 2)))`)).toBe("(#void 2)");
+        expect(() => a.compileRaw(`(cond (else 1) (#t 2))`)).toThrow("cond: else must be last");
+        expect(() => a.compileRaw(`(cond (#t))`)).toThrow("cond: each clause needs a body");
+        expect(() => a.compileRaw(`else`)).not.toThrow();
+        expect(() => a.compileRaw(`(else 1)`)).toThrow("else: only in cond");
+    });
+
+    it("applies and binds multiple values with Scheme's formals", () => {
+        const a = make();
+        expect(run(a, `(%intcall %array (apply %+ 1 '(2 3)) (apply (lambda xs xs) 1 '(2)))`)).toBe("(6 (1 2))");
+        expect(run(a, `(let-values (((a b . r) %[%values 1 2 3 4]) (all %[%values])) (%intcall %array a b r all))`)).toBe("(1 2 (3 4) ())");
+        expect(run(a, `(receive (x y) %[%values 1 2] %[%+ x y])`)).toBe("3");
+        expect(() => run(a, `(receive (x y) %[%values 1] x)`)).toThrow("expected 2 values but got 1");
+        // on an instance with sequences of its own, apply spreads the last argument with them
+        const scheme = createScheme(impl);
+        expect(s.stringify(scheme.evaluateRaw(compileNative(scheme, `(apply %+ 1 '(2 3))`)))).toBe("6");
+    });
+
+    it("defines a procedure for an intrinsic, from the table", () => {
+        const a = make();
+        expect(run(a, `(define-intrinsic sub %-) (define-intrinsic add %+) (%intcall %array %[sub 5 3] %[add] %[add 1 2 3] %[%at '(7 8) 1])`)).toBe("(2 0 6 8)");
+        expect(() => a.compileRaw(`(define-intrinsic f %nope)`)).toThrow("%nope is not an intrinsic");
+        expect(() => a.compileRaw(`(define-intrinsic f car)`)).toThrow("(define-intrinsic name %intrinsic)");
+        a.registerIntrinsic("%any-call", (regs, st, n) => hostTailFrom(regs[st], regs, st + 1, n - 1), { args: [1, Infinity] });
+        expect(() => a.compileRaw(`(define-intrinsic any-call %any-call)`)).toThrow("is not a leaf, so it cannot be applied");
+        expect(() => transformNative(readNative(`(define-intrinsic sub %-)`))).toThrow("needs the instance's table");
+    });
+
+    it("has case-lambda, and comments that skip a block or a form", () => {
+        const a = make();
+        expect(run(a, `(define-global f (case-lambda ((x) 'one) ((x y) 'two) ((x . r) r))) (%intcall %array %[f 1] %[f 1 2] %[f 1 2 3])`)).toBe("(one two (2 3))");
+        expect(run(a, `#| a #| nested |# comment |# (%intcall %array 1 #;(ignored 2) 3)`)).toBe("(1 3)");
+        expect(() => readNative(`#| open`)).toThrow("unclosed #| comment");
     });
 
     it("has when, unless, and and or", () => {
