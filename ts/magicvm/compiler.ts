@@ -1,4 +1,4 @@
-import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_CALL, CORE_INTCALL, CORE_INTAPPLY, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
+import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_CALL, CORE_INTCALL, CORE_INTAPPLY, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, Positions, type SourcePos } from "../common";
 import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
@@ -25,18 +25,18 @@ type Analyzed = { ast: any, analyzer: AstAnalysis, ascope: AnalysisScope }
 type Closed = Unboxed & { captures: Captures }
 
 // every assigned local a box (see passes/assignments.ts)
-const assignmentsPass: Pass<Analyzed, Converted> = { name: "assignments", run: ({ ast, ascope }) => convertAssignments(ast, ascope.variables) }
+const assignmentsPass: Pass<Analyzed, Converted> = { name: "assignments", run: ({ ast, ascope }, ctx) => convertAssignments(ast, ascope.variables, ctx.positions) }
 
 // only the boxes that are needed (see passes/unbox.ts)
-const unboxPass: Pass<Converted, Unboxed> = { name: "unbox", run: ({ ast, boxes }, ctx) => removeBoxes(ast, boxes, ctx.intrinsics) }
+const unboxPass: Pass<Converted, Unboxed> = { name: "unbox", run: ({ ast, boxes }, ctx) => removeBoxes(ast, boxes, ctx.intrinsics, ctx.positions) }
 
 // what each lambda captures (see passes/closures.ts)
 const closuresPass: Pass<Unboxed, Closed> = { name: "closures", run: (unboxed, ctx) => ({ ...unboxed, captures: closureCaptures(unboxed.ast, ctx.intrinsics) }) }
 
 // the core forms to core forms (see lift.ts)
-const escapesPass: Pass<any, any> = { name: "block-escapes", run: ast => blockEscapes(ast) }
-const caseLambdasPass: Pass<any, any> = { name: "split-case-lambdas", run: ast => splitCaseLambdas(ast) }
-const liftPass: Pass<any, any> = { name: "lift-lambdas", run: ast => liftLambdas(ast) }
+const escapesPass: Pass<any, any> = { name: "block-escapes", run: (ast, ctx) => blockEscapes(ast, ctx.positions) }
+const caseLambdasPass: Pass<any, any> = { name: "split-case-lambdas", run: (ast, ctx) => splitCaseLambdas(ast, ctx.positions) }
+const liftPass: Pass<any, any> = { name: "lift-lambdas", run: (ast, ctx) => liftLambdas(ast, ctx.positions) }
 
 // the variables of each scope: which are assigned, captured, rest parameters (see AstAnalysis)
 const resolvePass: Pass<any, Analyzed> = {
@@ -53,7 +53,7 @@ const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numReg
 const cp0Pass: Pass<Converted, Converted> = {
     name: "cp0",
     run: (converted, ctx) => {
-        const { ast, assumed, boxes } = optimize(converted.ast, ctx.intrinsics)
+        const { ast, assumed, boxes } = optimize(converted.ast, ctx.intrinsics, ctx.positions)
         for (const pos of assumed) ctx.assumed.add(pos)
         return { ast, boxes: new Set([...converted.boxes, ...boxes]) }
     },
@@ -77,6 +77,7 @@ interface CmpOpts {
     nodes: Node[]
     scope: CompilerScope,
     pos?: SourcePos // position of the enclosing form
+    positions: Positions // where the program's forms come from
     blocks?: BlockTarget // enclosing %blocks, innermost first
     fnDepth?: number // how many %lambdas deep we are; escapes cannot cross one
     markRegions?: number[] // for each enclosing non-tail %with-mark, where it saved the marks (outermost first)
@@ -97,8 +98,9 @@ export class Compiler {
         if (!hasCore(intrinsics)) throw new Error("the compiler's intrinsics must start with the core operations (see newIntrinsics)")
     }
 
-    compile(trExpr: any, debug: boolean = this.debug, optimize: boolean = this.optimize): Code {
-        const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, assumed: new Set(), trace: this.trace }
+    // `positions`: where the forms of `trExpr` come from, as its reader or transpiler recorded them
+    compile(trExpr: any, positions: Positions = new Positions(), debug: boolean = this.debug, optimize: boolean = this.optimize): Code {
+        const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, assumed: new Set(), positions, trace: this.trace }
         try {
             const renamed = runPass(renamePass, trExpr, ctx)
             const escaped = runPass(escapesPass, renamed, ctx)
@@ -118,11 +120,11 @@ export class Compiler {
     // the IR of a top-level expression, its variables analysed
     readonly #generatePass: Pass<Closed, FunctionIR> = {
         name: "generate",
-        run: ({ ast, forwards, captures }) => {
+        run: ({ ast, forwards, captures }, ctx) => {
             const scope = new CompilerScope(null)
             const nodes: Node[] = []
             const retReg = scope.allocTemp()
-            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, forwards, captures })
+            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, forwards, captures, positions: ctx.positions })
             if (!this.#nodesEndsInRet(nodes)) {
                 nodes.push({ t: "Return", reg: retReg })
             }
@@ -147,7 +149,7 @@ export class Compiler {
         }
         if (expr.length === 0) throw new VMError(Msg.EmptyForm, [])
 
-        const pos = SOURCE_POS.get(expr)
+        const pos = opts.positions.get(expr)
         if (pos !== undefined && pos !== opts.pos) {
             opts.nodes.push({ t: "Pos", pos })
             try {
@@ -232,7 +234,7 @@ export class Compiler {
                     return
                 case INLINED:
                 case TAIL_INLINED:
-                    opts.nodes.push({ t: "InlineEnter", name: expr[1].description, at: SOURCE_POS.get(expr) ?? opts.pos ?? null, tail: operator === TAIL_INLINED })
+                    opts.nodes.push({ t: "InlineEnter", name: expr[1].description, at: opts.positions.get(expr) ?? opts.pos ?? null, tail: operator === TAIL_INLINED })
                     this.#compileBody(expr.slice(2), opts)
                     opts.nodes.push({ t: "InlineExit" })
                     return

@@ -1,4 +1,5 @@
 // A compiler pass: one job, from its input to its output. The compiler runs its passes in order (Compiler.compile)
+import type { Positions } from "../../common";
 import type { Intrinsics } from "../intrinsics";
 
 export type PassContext = {
@@ -9,6 +10,8 @@ export type PassContext = {
     // the intrinsics the optimizer folded or dropped calls of: every function compiled records them as used (see
     // Code.bind), as what it computes depends on them
     readonly assumed: Set<number>,
+    // where the program's forms come from, as its reader or transpiler recorded them; passes keep them on what they rebuild
+    readonly positions: Positions,
     // called with each pass's output, e.g. by tests, to see or check it
     readonly trace?: (pass: string, output: unknown) => void,
 };

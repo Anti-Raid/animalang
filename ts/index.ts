@@ -13,4 +13,4 @@ export { Cons, MCons } from './scheme/list';
 export { ASTStringifier } from './scheme/printer';
 
 export * as common from './common'
-export { ErrorObject, TRY_CALL, type TryCall } from './common'
+export { ErrorObject, Positions, TRY_CALL, type SourcePos, type TryCall } from './common'

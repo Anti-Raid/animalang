@@ -1,7 +1,7 @@
 // native-scheme: the core forms as text (reader.ts) with a little sugar (transformer.ts), a front end of its own,
 // separate from Scheme
 import { Anima } from "../anima";
-import { Env } from "../common";
+import { Env, Positions } from "../common";
 import type { AnimaOptions } from "../magicvm/meta";
 import { nativeFormat } from "./messages";
 import { readNative, type NativeReadOptions } from "./reader";
@@ -18,8 +18,8 @@ export const createNativeScheme = (options: AnimaOptions): Anima => {
     anima.intrinsics.setFormatter(nativeFormat);
     for (const sym of SUGAR) anima.intrinsics.reserved.set(sym, "special form");
     anima.attachFrontEnd({
-        read: (source, file) => readNative(source, file),
-        transform: ast => transformNative(ast, anima.intrinsics),
+        read: (source, file, positions) => readNative(source, file, { positions }),
+        transform: (ast, positions) => transformNative(ast, anima.intrinsics, positions),
         lambda: (params, body) => [LAMBDA, params, body],
     }, new Env());
     return anima;
@@ -30,5 +30,6 @@ export const createNativeScheme = (options: AnimaOptions): Anima => {
 export const compileNative = (anima: Anima, src: string, file?: string, options: NativeReadOptions = {}) => {
     const frontEnd = anima.frontEnd;
     const datum = options.datum ?? frontEnd?.datum?.bind(frontEnd);
-    return anima.compiler.compile(transformNative(readNative(src, file, { datum }), anima.intrinsics));
+    const positions = new Positions();
+    return anima.compiler.compile(transformNative(readNative(src, file, { datum, positions }), anima.intrinsics, positions), positions);
 };

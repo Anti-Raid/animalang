@@ -1,6 +1,6 @@
 // The transformer's output (core forms as Scheme lists) as the compiler's input: core forms as arrays (see
 // magicvm/README.md). Quoted data stays Scheme data; a vector literal, being an array, is quoted
-import { CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
+import { CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, Positions } from "../common";
 import { isCoreForm } from "../magicvm/core";
 import type { Intrinsics } from "../magicvm/intrinsics";
 import { Cons } from "./list";
@@ -23,8 +23,9 @@ const OP_APPLY = Symbol.for("%apply");
 // quoted data in core text as Scheme's: a list read there is a list
 export const schemeDatum = (x: any): any => Array.isArray(x) ? Cons.fromArray(x.map(schemeDatum)) : x;
 
-export const toCore = (e: any, intrinsics: Intrinsics): any => {
-    const toCore_ = (x: any) => toCore(x, intrinsics);
+// `positions`: where the forms come from; the arrays made of them keep it
+export const toCore = (e: any, intrinsics: Intrinsics, positions: Positions): any => {
+    const toCore_ = (x: any) => toCore(x, intrinsics, positions);
     const isIntrinsic = (x: any) => typeof x === "symbol" && !isCoreForm(x) && intrinsics.get(x) !== undefined;
     if (Array.isArray(e)) return [CORE_QUOTE, e];
     if (!(e instanceof Cons)) return e;
@@ -57,10 +58,7 @@ export const toCore = (e: any, intrinsics: Intrinsics): any => {
         case CORE_LET_STAR:
         case CORE_LETREC:
             out = [items[0], toArr(items[1]).map(b => {
-                const s = SOURCE_POS.get(b);
-                const binding = [b.car, toCore_(b.cdr.car)];
-                if (s !== undefined) SOURCE_POS.set(binding, s);
-                return binding;
+                return positions.keep([b.car, toCore_(b.cdr.car)], b);
             }), ...body(2)];
             break;
         case CORE_LET_VALUES:
@@ -81,7 +79,5 @@ export const toCore = (e: any, intrinsics: Intrinsics): any => {
             else if (isIntrinsic(items[0])) out = [CORE_INTCALL, items[0], ...body(1)];
             else out = [CORE_CALL, ...body(0)];
     }
-    const pos = SOURCE_POS.get(e);
-    if (pos !== undefined) SOURCE_POS.set(out, pos);
-    return out;
+    return positions.keep(out, e);
 };

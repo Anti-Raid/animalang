@@ -135,8 +135,38 @@ export const OP_DEFINE_GLOBAL = Symbol.for("%define-global");
 
 export type SourcePos = { file: string, line: number, col: number };
 
-// source positions of forms (core-form arrays, or a front end's own data), set by readers and by front ends and transpilers that build forms, read by the compiler
-export const SOURCE_POS = new WeakMap<object, SourcePos>();
+// Where forms come from: the positions of a program's forms (core-form arrays, or a front end's own data), which the
+// reader or transpiler that makes the forms fills in and hands to the compiler with them. One map per program
+export class Positions {
+    readonly #of = new WeakMap<object, SourcePos>();
+
+    get(form: any): SourcePos | undefined {
+        return typeof form === "object" && form !== null ? this.#of.get(form) : undefined;
+    }
+
+    has(form: any): boolean {
+        return this.get(form) !== undefined;
+    }
+
+    set(form: object, pos: SourcePos): void {
+        this.#of.set(form, pos);
+    }
+
+    // the positions `from` has of `form` and the forms inside it, as this map's too
+    adopt(form: any, from: Positions): void {
+        if (!Array.isArray(form) || from === this) return;
+        const pos = from.get(form);
+        if (pos !== undefined) this.#of.set(form, pos);
+        for (const x of form) this.adopt(x, from);
+    }
+
+    // `to`, at `from`'s position if it has one
+    readonly keep = <T>(to: T, from: any): T => {
+        const pos = this.get(from);
+        if (pos !== undefined && typeof to === "object" && to !== null) this.#of.set(to, pos);
+        return to;
+    };
+}
 
 export const formatPos = (pos: SourcePos | null | undefined) => pos ? `${pos.file}:${pos.line}:${pos.col}` : "?";
 

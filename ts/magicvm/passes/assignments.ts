@@ -10,7 +10,8 @@
 import { CORE_SET } from "../../common";
 import { BOXED } from "../lambda";
 import type { VariableMetadata } from "../scope";
-import { Lsrc, extend, keepPos, malformed, mapExprs } from "./lang";
+import type { Positions } from "../../common";
+import { Lsrc, extend, malformed, mapExprs } from "./lang";
 
 export const Lconv = extend(Lsrc, "Lconv", { add: { "%box": "exprs", "%unbox": "exprs", "%box!": "exprs", "%set-box!": "assign", "%boxed": "exprs", "%inlined": "label", "%tail-inlined": "label" } });
 
@@ -22,7 +23,8 @@ export const SET_BOX = Symbol.for("%set-box!");
 // the converted program, and the variables it made boxes of
 export type Converted = { ast: any, boxes: ReadonlySet<symbol> };
 
-export const convertAssignments = (ast: any, variables: ReadonlyMap<symbol, VariableMetadata>): Converted => {
+export const convertAssignments = (ast: any, variables: ReadonlyMap<symbol, VariableMetadata>, positions: Positions): Converted => {
+    const keepPos = positions.keep;
     const boxes = new Set<symbol>();
     const boxed = (sym: any): sym is symbol => {
         if (typeof sym !== "symbol" || variables.get(sym)?.mutable !== true) return false;
@@ -55,7 +57,7 @@ export const convertAssignments = (ast: any, variables: ReadonlyMap<symbol, Vari
             case "assign":
                 return keepPos([op === CORE_SET && boxed(e[1]) ? SET_BOX : op, e[1], walk(e[2])], e);
             default:
-                return mapExprs(Lsrc, e, walk);
+                return mapExprs(Lsrc, e, walk, positions);
         }
     };
     return { ast: walk(ast), boxes };

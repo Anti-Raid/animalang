@@ -12,11 +12,11 @@
 //  - (apply f x ... seq): %apply, or %intapply of an intrinsic, with the table's spread of seq if it has one
 import {
     CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_STAR,
-    CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LOOP, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS,
-    formatPos, type SourcePos,
+    CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LOOP, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, formatPos,
+    Positions, type SourcePos,
 } from "../common";
 import type { Intrinsics } from "../magicvm/intrinsics";
-import { Lsrc, keepPos, malformed, mapExprs } from "../magicvm/passes/lang";
+import { Lsrc, malformed, mapExprs } from "../magicvm/passes/lang";
 
 const CORE_APPLY = Symbol.for("%apply");
 
@@ -37,39 +37,41 @@ const WHEN = S("when"), UNLESS = S("unless"), AND = S("and"), OR = S("or"), APPL
 export const SUGAR: ReadonlySet<symbol> = new Set([LAMBDA, CASE_LAMBDA, DEFINE_GLOBAL, DEFINE_INTRINSIC, LET, LET_STAR, LETREC,
     LET_VALUES, RECEIVE, IF, SET, BEGIN, COND, ELSE, NOT, WHEN, UNLESS, AND, OR, APPLY]);
 
-const fail = (what: string, e: any): never => {
-    throw new NativeSyntaxError(what, SOURCE_POS.get(e) ?? null);
-};
-
-// [params, rest] of a formals list
-const formalsOf = (who: string, f: any, e: any): [symbol[], symbol | null] => {
-    if (typeof f === "symbol") return [[], f];
-    if (!Array.isArray(f)) fail(`${who}: formals must be a name or a list of names`, e);
-    const dot = f.indexOf(DOT);
-    const params = dot === -1 ? f : f.slice(0, dot);
-    const rest = dot === -1 ? null : f[dot + 1];
-    if (dot !== -1 && (dot !== f.length - 2 || typeof rest !== "symbol")) fail(`${who}: one name must follow .`, e);
-    if (!params.every((p: any) => typeof p === "symbol")) fail(`${who}: parameters must be names`, e);
-    return [params, rest];
-};
-
-const bindingsOf = (who: string, b: any, e: any): [symbol, any][] => {
-    if (!Array.isArray(b) || !b.every(x => Array.isArray(x) && x.length === 2 && typeof x[0] === "symbol")) {
-        fail(`${who}: bindings must be ((name init) ...)`, e);
-    }
-    return b;
-};
-
 const isIntrinsicName = (x: any): x is symbol => typeof x === "symbol" && x.description!.charCodeAt(0) === 37;
 
-// `intrinsics`: the table of the instance the code is for, which apply and define-intrinsic consult
-export const transformNative = (ast: any, intrinsics?: Intrinsics): any => {
+// `intrinsics`: the table of the instance the code is for, which apply and define-intrinsic consult; `positions`: where
+// the forms come from (see readNative), kept on the forms made of them
+export const transformNative = (ast: any, intrinsics?: Intrinsics, positions: Positions = new Positions()): any => {
+    const keepPos = positions.keep;
+    const fail = (what: string, e: any): never => {
+        throw new NativeSyntaxError(what, positions.get(e) ?? null);
+    };
+
+    // [params, rest] of a formals list
+    const formalsOf = (who: string, f: any, e: any): [symbol[], symbol | null] => {
+        if (typeof f === "symbol") return [[], f];
+        if (!Array.isArray(f)) fail(`${who}: formals must be a name or a list of names`, e);
+        const dot = f.indexOf(DOT);
+        const params = dot === -1 ? f : f.slice(0, dot);
+        const rest = dot === -1 ? null : f[dot + 1];
+        if (dot !== -1 && (dot !== f.length - 2 || typeof rest !== "symbol")) fail(`${who}: one name must follow .`, e);
+        if (!params.every((p: any) => typeof p === "symbol")) fail(`${who}: parameters must be names`, e);
+        return [params, rest];
+    };
+
+    const bindingsOf = (who: string, b: any, e: any): [symbol, any][] => {
+        if (!Array.isArray(b) || !b.every(x => Array.isArray(x) && x.length === 2 && typeof x[0] === "symbol")) {
+            fail(`${who}: bindings must be ((name init) ...)`, e);
+        }
+        return b;
+    };
+
     const walk = (e: any): any => {
         if (!Array.isArray(e) || e.length === 0) return e;
         const op = e[0];
         if (typeof op === "symbol" && SUGAR.has(op)) return keepPos(lower(e), e);
         if (!Lsrc.forms.has(op) || malformed(Lsrc, e) !== null) return e;
-        return mapExprs(Lsrc, e, walk);
+        return mapExprs(Lsrc, e, walk, positions);
     };
     const body = (items: any[]): any[] => items.map(walk);
     const seq = (items: any[], e: any): any => items.length === 1 ? walk(items[0]) : keepPos([CORE_BEGIN, ...body(items)], e);
@@ -115,7 +117,7 @@ export const transformNative = (ast: any, intrinsics?: Intrinsics): any => {
                 if (op === LET && typeof e[1] === "symbol") {
                     if (e.length < 4) fail("let: (let name ((name init) ...) body ...)", e);
                     const bindings = bindingsOf("let", e[2], e);
-                    return namedLet(e[1], bindings.map(b => b[0]), bindings.map(b => walk(b[1])), body(e.slice(3)), e);
+                    return namedLet(e[1], bindings.map(b => b[0]), bindings.map(b => walk(b[1])), body(e.slice(3)), e, positions);
                 }
                 if (e.length < 3) fail(`${op.description}: needs bindings and a body`, e);
                 const core = op === LET ? CORE_LET : op === LET_STAR ? CORE_LET_STAR : CORE_LETREC;
@@ -195,9 +197,10 @@ const mentions = (e: any, name: symbol): boolean => e === name || (Array.isArray
 // round's arguments, assigned right before the jump to it (every value computed first, so none is assigned before a call
 // and read after it), and the parameters are bound fresh from them every round, as calls would bind them; a
 // continuation captured in a round keeps that round's values. Else a %letrec of the procedure, called with the inits
-const namedLet = (name: symbol, params: symbol[], inits: any[], items: any[], e: any): any => {
+const namedLet = (name: symbol, params: symbol[], inits: any[], items: any[], e: any, positions: Positions): any => {
+    const keepPos = positions.keep;
     try {
-        return asLoop(name, params, inits, items);
+        return asLoop(name, params, inits, items, positions);
     } catch (err) {
         if (err !== NOT_A_LOOP) throw err;
     }
@@ -206,7 +209,8 @@ const namedLet = (name: symbol, params: symbol[], inits: any[], items: any[], e:
     return [CORE_LET, temps.map((t, i) => [t, inits[i]]), [CORE_LETREC, [[name, proc]], [CORE_CALL, name, ...temps]]];
 };
 
-const asLoop = (name: symbol, params: symbol[], inits: any[], items: any[]): any => {
+const asLoop = (name: symbol, params: symbol[], inits: any[], items: any[], positions: Positions): any => {
+    const keepPos = positions.keep;
     const carriers = params.map(p => Symbol(p.description));
     const done = Symbol("done"), next = Symbol("next");
     const binds = (names: any[]) => names.includes(name);

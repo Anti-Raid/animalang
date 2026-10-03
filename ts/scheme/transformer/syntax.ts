@@ -20,7 +20,7 @@ import {
     OP_RAISE,
     OP_CURRENT_MARKS,
     OP_CURRENT_STACK,
-    SOURCE_POS,
+    Positions,
 } from "../../common";
 import { Cons } from "../list";
 import { toCore } from "../core";
@@ -70,11 +70,11 @@ const OP_CASE = Symbol.for("case"), OP_ANIMA_MACRO = Symbol.for("anima-macro");
 
 // `e` with the symbols in `map` replaced where they are code: not in quoted data, the literal parts of a quasiquote, a
 // case's datums or a macro's keyword. `level` is the quasiquote nesting (0 in code)
-const renameIn = (e: any, map: ReadonlyMap<symbol, symbol>, level: number = 0): any => {
+const renameIn = (e: any, map: ReadonlyMap<symbol, symbol>, positions: Positions, level: number = 0): any => {
     if (typeof e === "symbol") return level === 0 ? map.get(e) ?? e : e;
     if (Array.isArray(e)) {
         if (level === 0) return e;
-        const out = e.map(x => renameIn(x, map, level));
+        const out = e.map(x => renameIn(x, map, positions, level));
         return out.some((x, i) => x !== e[i]) ? out : e;
     }
     if (!(e instanceof Cons)) return e;
@@ -85,18 +85,16 @@ const renameIn = (e: any, map: ReadonlyMap<symbol, symbol>, level: number = 0): 
     for (; p instanceof Cons; p = p.cdr) items.push(p.car);
     const tail = p;
     let next: any[];
-    if (head === QUASIQUOTE) next = [head, ...items.slice(1).map(x => renameIn(x, map, level + 1))];
-    else if (level > 0 && (head === UNQUOTE || head === SPLICE)) next = [head, ...items.slice(1).map(x => renameIn(x, map, level - 1))];
-    else if (level === 0 && head === OP_CASE) next = [head, renameIn(items[1], map), ...items.slice(2).map(c => c instanceof Cons ? cons(c.car, renameIn(c.cdr, map)) : c)];
-    else if (level === 0 && head === OP_ANIMA_MACRO) next = [head, items[1], ...items.slice(2).map(x => renameIn(x, map))];
-    else next = items.map(x => renameIn(x, map, level));
-    const newTail = renameIn(tail, map, level);
+    if (head === QUASIQUOTE) next = [head, ...items.slice(1).map(x => renameIn(x, map, positions, level + 1))];
+    else if (level > 0 && (head === UNQUOTE || head === SPLICE)) next = [head, ...items.slice(1).map(x => renameIn(x, map, positions, level - 1))];
+    else if (level === 0 && head === OP_CASE) next = [head, renameIn(items[1], map, positions), ...items.slice(2).map(c => c instanceof Cons ? cons(c.car, renameIn(c.cdr, map, positions)) : c)];
+    else if (level === 0 && head === OP_ANIMA_MACRO) next = [head, items[1], ...items.slice(2).map(x => renameIn(x, map, positions))];
+    else next = items.map(x => renameIn(x, map, positions, level));
+    const newTail = renameIn(tail, map, positions, level);
     if (newTail === tail && next.every((x, i) => x === items[i])) return e;
     let out: any = newTail;
     for (let i = next.length - 1; i >= 0; i--) out = cons(next[i], out);
-    const pos = SOURCE_POS.get(e);
-    if (pos !== undefined) SOURCE_POS.set(out, pos);
-    return out;
+    return positions.keep(out, e);
 };
 
 // the names of `names` that shadow a builtin, each given a fresh symbol of the same name for where it is bound
@@ -237,11 +235,7 @@ const namedLetAsLoop = (evaluator: MacroEvaluator, name: symbol, params: symbol[
     const done = Symbol("done");
     const next = Symbol("next");
 
-    const keepPos = (to: any, from: any) => {
-        const pos = SOURCE_POS.get(from);
-        if (pos !== undefined && to instanceof Cons) SOURCE_POS.set(to, pos);
-        return to;
-    };
+    const keepPos = evaluator.positions.keep;
     const binds = (formals: any): boolean => {
         while (formals instanceof Cons) {
             if (formals.car === name) return true;
@@ -454,7 +448,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         const map = renames(evaluator, bindings.map(b => b[0]));
         if (map.size > 0) {
             bindings = bindings.map(([name, init]) => [map.get(name) ?? name, init]);
-            expr = cons(expr.car, renameIn(expr.cdr, map));
+            expr = cons(expr.car, renameIn(expr.cdr, map, evaluator.positions));
         }
         return lowerBody(evaluator, expr.cdr, "let", (body, done) => {
             const inits = bindings.map(([name, init]) => list(name, done ? evaluator.transform(init) : init));
@@ -465,7 +459,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     evaluator.registerTransform(CORE_LETREC, (evaluator, expr, orig) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`letrec bad syntax`);
         const map = renames(evaluator, letBindings("letrec", expr.car).map(b => b[0]));
-        if (map.size > 0) expr = renameIn(expr, map);
+        if (map.size > 0) expr = renameIn(expr, map, evaluator.positions);
         const bindings = letBindings("letrec", expr.car);
         return lowerBody(evaluator, expr.cdr, "letrec", (body, done) => {
             const inits = bindings.map(([name, init]) => list(name, done ? evaluator.transform(init) : init));
@@ -488,8 +482,8 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             });
             const map = renames(evaluator, clauses.flatMap(([formals]) => formalNames(formals)));
             if (map.size > 0) {
-                clauses = clauses.map(([formals, init]) => [renameIn(formals, map), init]);
-                expr = cons(expr.car, renameIn(expr.cdr, map));
+                clauses = clauses.map(([formals, init]) => [renameIn(formals, map, evaluator.positions), init]);
+                expr = cons(expr.car, renameIn(expr.cdr, map, evaluator.positions));
             }
             return lowerBody(evaluator, expr.cdr, "let-values", (body, done) => {
                 const transformed = clauses.map(([formals, init]) => list(formals, done ? evaluator.transform(init) : init));
@@ -603,7 +597,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             if (map.size > 0) {
                 loopName = map.get(loopName) ?? loopName;
                 params.forEach((p, i) => { params[i] = map.get(p) ?? p; });
-                bodyCons = renameIn(bodyCons, map);
+                bodyCons = renameIn(bodyCons, map, evaluator.positions);
             }
             const loop = namedLetAsLoop(evaluator, loopName, params, exprs, bodyCons);
             if (loop !== null) return { expanded: loop, state: TransformState.ReturnImm };
@@ -631,11 +625,11 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (bindings.some(([name]) => evaluator.shadows(name))) {
             const map = new Map<symbol, symbol>();
             bindings = bindings.map(([name, init]) => {
-                const renamed = renameIn(init, map);
+                const renamed = renameIn(init, map, evaluator.positions);
                 renames(evaluator, [name], map);
                 return [map.get(name) ?? name, renamed];
             });
-            expr = cons(expr.car, renameIn(expr.cdr, map));
+            expr = cons(expr.car, renameIn(expr.cdr, map, evaluator.positions));
         }
         return lowerBody(evaluator, expr.cdr, "let*", (body, done) => {
             const inits = bindings.map(([name, init]) => list(name, done ? evaluator.transform(init) : init));
@@ -838,8 +832,8 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
     const lambdaTransform = (evaluator: MacroEvaluator, expr: any, orig: any) => {
         if (!(orig instanceof Cons) || orig.length < 3) throw new Error(`lambda syntax error`);
         const map = renames(evaluator, formalNames(expr.car));
-        const args = map.size > 0 ? renameIn(expr.car, map) : expr.car;
-        return lowerBody(evaluator, map.size > 0 ? renameIn(expr.cdr, map) : expr.cdr, "lambda", body => cons(CORE_LAMBDA, cons(args, body)));
+        const args = map.size > 0 ? renameIn(expr.car, map, evaluator.positions) : expr.car;
+        return lowerBody(evaluator, map.size > 0 ? renameIn(expr.cdr, map, evaluator.positions) : expr.cdr, "lambda", body => cons(CORE_LAMBDA, cons(args, body)));
     };
     evaluator.registerTransform(OP_LAMBDA, lambdaTransform);
     evaluator.registerTransform(CORE_LAMBDA, lambdaTransform);
@@ -892,7 +886,7 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (typeof onsym !== "symbol") throw new Error(`anima-macro onsym must be a constant symbol right now`);
         let cmpexpr = list(OP_LAMBDA, list(Symbol.for("orig")), expr.cdr.car);
         let trCmpExpr = evaluator.transform(cmpexpr);
-        let cmpExprBc = evaluator.expandcmp.compile(toCore(trCmpExpr, evaluator.intrinsics));
+        let cmpExprBc = evaluator.expandcmp.compile(toCore(trCmpExpr, evaluator.intrinsics, evaluator.positions), evaluator.positions);
         const res: Closure = evaluator.expandvm.evaluateRaw(cmpExprBc, evaluator.scope);
         evaluator.registerTransform(onsym, (evaluator, expr, orig) => {
             const resp = evaluator.expandvm.evaluateClosure(res, evaluator.scope, [orig]);

@@ -28,7 +28,7 @@ anima.evaluateRaw(anima.compileRaw(`(map (lambda (x) (clamp x 0 10)) '(-5 5 50))
 | `'x` | `(%quote x)` |
 | `; ...`, `#\| ... \|#`, `#;form` | comments: to the end of the line, a (nestable) block, the next form |
 
-Several forms are read as a `%begin` of them, and every list keeps where it was read, so errors and tracebacks point into the text. `datum` (by default the front end's `FrontEnd.datum`) is called on what each `(%quote x)` quotes, and on nothing else. What cannot be read is a `NativeReadError` (`what`, `at`).
+Several forms are read as a `%begin` of them, and where each list was read goes in the `positions` option (a `Positions`; `compileNative` makes one and hands it to the compiler), so errors and tracebacks point into the text. `datum` (by default the front end's `FrontEnd.datum`) is called on what each `(%quote x)` quotes, and on nothing else. What cannot be read is a `NativeReadError` (`what`, `at`).
 
 ## The language
 Every core form, written as stored: `(%lambda (() (x y) #null body ...))`, `(%if c a b)`, `(%block done ...)`. A call is always explicit, `%[f x]` (or `(%call f x)` / `(%intcall %name x)`); a bare `(f x)` is an error. The sugar (`transformer.ts`), whose names are keywords:

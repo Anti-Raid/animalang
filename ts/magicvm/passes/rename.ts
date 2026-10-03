@@ -3,10 +3,10 @@
 // shadowing: a symbol is one variable. Globals, block labels and quoted data are left as they are.
 // A binder code generation rejects (not a symbol, a special form, a front end's reserved name, an intrinsic's, or a name
 // bound twice in one group) is left as it is, so the same error is reported, at the same place
-import { CORE_SET, Msg, SOURCE_POS, SPECIAL_FORMS, VMError } from "../../common";
+import { CORE_SET, Msg, SPECIAL_FORMS, VMError, type Positions } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
-import { keepPos, malformed, mapExprs } from "./lang";
+import { malformed, mapExprs } from "./lang";
 import { Lconv, SET_BOX } from "./assignments";
 import type { Pass } from "./pass";
 
@@ -21,7 +21,8 @@ const traversable = (e: any[]): boolean => {
 type Env = ReadonlyMap<symbol, symbol>;
 
 // a function giving each binder in what it is given a fresh name (its free variables are left as they are)
-export const renamer = (intrinsics: Intrinsics) => {
+export const renamer = (intrinsics: Intrinsics, positions: Positions) => {
+    const keepPos = positions.keep;
     const canBind = (sym: any): sym is symbol =>
         typeof sym === "symbol" && !SPECIAL_FORMS.has(sym) && intrinsics.reserved.get(sym) === undefined && !isCoreForm(sym) && intrinsics.get(sym) === undefined;
 
@@ -43,7 +44,7 @@ export const renamer = (intrinsics: Intrinsics) => {
         if (!Array.isArray(e) || e.length === 0) return e;
         const op = e[0];
         const fail = (err: VMError) => {
-            err.at = SOURCE_POS.get(e) ?? null;
+            err.at = positions.get(e) ?? null;
             throw err;
         };
         if (!Lconv.forms.has(op)) fail(new VMError(Msg.BareCall, [op]));
@@ -90,10 +91,10 @@ export const renamer = (intrinsics: Intrinsics) => {
             case "assign":
                 return keepPos([op, op === CORE_SET || op === SET_BOX ? name(env, e[1]) : e[1], expr(e[2], env)], e);
             default:
-                return mapExprs(Lconv, e, x => expr(x, env));
+                return mapExprs(Lconv, e, x => expr(x, env), positions);
         }
     };
     return (ast: any) => expr(ast, new Map());
 };
 
-export const renamePass: Pass<any, any> = { name: "rename", run: (ast, ctx) => renamer(ctx.intrinsics)(ast) };
+export const renamePass: Pass<any, any> = { name: "rename", run: (ast, ctx) => renamer(ctx.intrinsics, ctx.positions)(ast) };

@@ -1,7 +1,7 @@
 // The languages the compiler's passes read and write: the core forms (arrays, see compiler.ts), declared once by the
 // shape of each form, and a language as the forms it allows. A later language is an earlier one with forms removed or
 // added (`extend`). The shapes drive every traversal (`parts`, `mapExprs`) and the check of a pass's output (`check`)
-import { SOURCE_POS } from "../../common";
+import { Positions } from "../../common";
 import { CORE_FORMS } from "../core";
 import { bodyOf, clausesOf, namesOf } from "../lambda";
 
@@ -54,18 +54,16 @@ export const Lsrc = language("Lsrc", {
     "%apply": "exprs",
 });
 
-export const keepPos = <T>(to: T, from: any): T => {
-    const pos = SOURCE_POS.get(from);
-    if (pos !== undefined && Array.isArray(to)) SOURCE_POS.set(to, pos);
-    return to;
-};
+// for traversals that never rebuild a form (subExprs, check): no positions to keep
+const NO_POSITIONS = new Positions();
 
 // Each expression position in `e` with the names bound around it (beyond those around `e`), and how to rebuild `e`
-// from new expressions for them. For a %let* (`seq`), each position's names add to those of the positions before it
+// from new expressions for them, keeping its positions in `positions`. For a %let* (`seq`), each position's names add to those of the positions before it
 // (see withBounds)
 export type Parts = { exprs: [any, symbol[]][], rebuild: (next: any[]) => any, seq?: boolean };
 
-export const parts = (lang: Language, e: any[]): Parts => {
+export const parts = (lang: Language, e: any[], positions: Positions = NO_POSITIONS): Parts => {
+    const keepPos = positions.keep;
     const same = (exprs: [any, symbol[]][], rebuild: (next: any[]) => any): Parts => ({ exprs, rebuild: next => keepPos(rebuild(next), e) });
     const op = e[0];
     switch (lang.forms.get(op)) {
@@ -135,8 +133,8 @@ export function* withBounds(p: Parts, bound: ReadonlySet<symbol>): Generator<[an
 export const subExprs = (lang: Language, e: any[]): any[] => parts(lang, e).exprs.map(([x]) => x);
 
 // `e` with `f` applied to each expression directly inside it, rebuilt (with its position) only if one changed
-export const mapExprs = (lang: Language, e: any[], f: (x: any) => any): any[] => {
-    const p = parts(lang, e);
+export const mapExprs = (lang: Language, e: any[], f: (x: any) => any, positions: Positions): any[] => {
+    const p = parts(lang, e, positions);
     let changed = false;
     const next = p.exprs.map(([x]) => {
         const y = f(x);

@@ -1,4 +1,4 @@
-import { SOURCE_POS } from '../common';
+import { Positions } from '../common';
 import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
@@ -126,8 +126,9 @@ describe('Anima', () => {
         it("takes positions from core forms a transpiler builds, and has no %at of its own", () => {
             const S = Symbol.for;
             const call = [S("%intcall"), S("%car"), S("t")];
-            SOURCE_POS.set(call, { file: "game.luau", line: 12, col: 5 });
-            evaluator.evaluateRaw(evaluator.compiler.compile([S("%define-global"), S("lua-fn"), [S("%lambda"), [[], [S("t")], null, call]]]));
+            const positions = new Positions();
+            positions.set(call, { file: "game.luau", line: 12, col: 5 });
+            evaluator.evaluateRaw(evaluator.compiler.compile([S("%define-global"), S("lua-fn"), [S("%lambda"), [[], [S("t")], null, call]]], positions));
             const err = errorOf(`(list (lua-fn '()))`);
             expect(err.animaTraceback).toContain("game.luau:12:5 in lua-fn");
             expect(() => runFile(`(%at "x" 1 2 (car '(1)))`)).toThrow("Variable '%at' is not defined");

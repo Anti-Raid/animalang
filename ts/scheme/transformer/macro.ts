@@ -1,4 +1,4 @@
-import { Env, CORE_QUOTE, OP_DEFINE_GLOBAL, SOURCE_POS } from "../../common"
+import { Env, CORE_QUOTE, OP_DEFINE_GLOBAL, Positions } from "../../common"
 import { Cons } from "../list"
 import { Compiler } from "../../magicvm/compiler"
 import { AnimaVM } from "../../magicvm/vm"
@@ -85,7 +85,8 @@ export class MacroEvaluator {
     // are ordinary globals everywhere in it. As in a Racket module, such a name cannot be read before its definition has
     // run: the program first binds it to Env.UNDEFINED (only where it is redefined for the first time, so a later program
     // does not undo an earlier one's definition)
-    transformProgram(ast: any): any {
+    transformProgram(ast: any, positions: Positions): any {
+        this.positions = positions
         const fresh: symbol[] = []
         const scan = (e: any) => {
             if (!(e instanceof Cons)) return
@@ -124,9 +125,15 @@ export class MacroEvaluator {
     #depth = -1
     #nesting = 0
 
-    transform(ast: any): any {
+    // where the forms of the program being transformed come from (see Positions): what the reader recorded, and kept on
+    // what the transformers make of them
+    positions: Positions = new Positions()
+
+    // `positions`: those of a new program's forms (not given when a transformer transforms part of its own)
+    transform(ast: any, positions?: Positions): any {
         // called from inside a transformer (e.g. for a lambda body): keep counting toward the expansion limit
         if (this.#depth >= 0) return this.#transform(ast, this.#depth)
+        if (positions !== undefined) this.positions = positions
         try {
             return this.#transform(ast, 0)
         } catch (e) {
@@ -177,10 +184,7 @@ export class MacroEvaluator {
     }
 
     #continue(ast: Cons, transformed: TransformResult, depth: number): any {
-        const pos = SOURCE_POS.get(ast);
-        if (pos !== undefined && transformed.expanded instanceof Cons && !SOURCE_POS.has(transformed.expanded)) {
-            SOURCE_POS.set(transformed.expanded, pos);
-        }
+        if (transformed.expanded instanceof Cons && !this.positions.has(transformed.expanded)) this.positions.keep(transformed.expanded, ast);
         // only expanding an expansion again counts toward the limit, so deep but finite nesting is fine
         switch (transformed.state) {
             case TransformState.Recurse:
@@ -205,8 +209,7 @@ export class MacroEvaluator {
         let out: any = curr;
         for (let i = cells.length - 1; i >= 0; i--) {
             out = new Cons(items[i], out);
-            const pos = SOURCE_POS.get(cells[i]);
-            if (pos !== undefined) SOURCE_POS.set(out, pos);
+            this.positions.keep(out, cells[i]);
         }
         return out;
     }

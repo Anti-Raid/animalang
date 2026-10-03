@@ -1,12 +1,12 @@
 // native-scheme's reader: s-expressions read straight into arrays. It names VM values only: `( ... )` (or `[ ... ]`) an
 // array, a name a symbol, numbers (and `123n` bigints), strings, `#t` / `#f`, `#null` and `#void` (undefined); `'x` is
 // (%quote x), `%[f x ...]` a call, (%call f x ...), or of an intrinsic, (%intcall %name x ...). `;` comments out the rest
-// of a line, `#| ... |#` what it encloses (nested too), and `#;` the next form. Every list keeps where it was read (SOURCE_POS). A front end's meaning for quoted data comes from
+// of a line, `#| ... |#` what it encloses (nested too), and `#;` the next form. Where each list was read goes in `positions`. A front end's meaning for quoted data comes from
 // `datum`, called on what each (%quote x) quotes
-import { CORE_BEGIN, CORE_CALL, CORE_INTCALL, CORE_QUOTE, SOURCE_POS, formatPos, type SourcePos } from "../common";
+import { CORE_BEGIN, CORE_CALL, CORE_INTCALL, CORE_QUOTE, Positions, formatPos, type SourcePos } from "../common";
 import { isCoreForm } from "../magicvm/core";
 
-export type NativeReadOptions = { datum?: (x: any) => any };
+export type NativeReadOptions = { datum?: (x: any) => any, positions?: Positions };
 
 export class NativeReadError extends Error {
     constructor(readonly what: string, readonly at: SourcePos) {
@@ -26,6 +26,7 @@ const LITERALS: Record<string, any> = { "#t": true, "#f": false, "#null": null, 
 // the forms in `src`: one is itself, several a %begin of them
 export const readNative = (src: string, file: string = "<native>", options: NativeReadOptions = {}): any => {
     const datum = options.datum;
+    const positions = options.positions ?? new Positions();
     let i = 0, line = 1, lineStart = 0;
     const here = (): SourcePos => ({ file, line, col: i - lineStart + 1 });
     const fail = (what: string, at: SourcePos): never => {
@@ -123,7 +124,7 @@ export const readNative = (src: string, file: string = "<native>", options: Nati
 
     const quoted = (x: any, at: SourcePos): any[] => {
         const out = [CORE_QUOTE, datum !== undefined ? datum(x) : x];
-        SOURCE_POS.set(out, at);
+        positions.set(out, at);
         return out;
     };
 
@@ -160,14 +161,14 @@ export const readNative = (src: string, file: string = "<native>", options: Nati
             if (call.length === 0) fail("%[] calls nothing", at);
             if (typeof head === "symbol" && isCoreForm(head)) fail(`%[ calls procedures and intrinsics; ${head.description} is a core form`, at);
             const out = typeof head === "symbol" && head.description!.charCodeAt(0) === PERCENT ? [CORE_INTCALL, ...call] : [CORE_CALL, ...call];
-            SOURCE_POS.set(out, at);
+            positions.set(out, at);
             return out;
         }
         if (c !== OPEN && c !== OPEN_BRACKET) return atom(at);
         i++;
         const list = items(c === OPEN ? CLOSE : CLOSE_BRACKET, at);
         if (list[0] === CORE_QUOTE && list.length === 2) return quoted(list[1], at);
-        SOURCE_POS.set(list, at);
+        positions.set(list, at);
         return list;
     };
 

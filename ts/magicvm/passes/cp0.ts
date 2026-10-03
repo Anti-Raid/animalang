@@ -12,13 +12,13 @@
 // whose binders code generation rejects, and lambdas that escape to a %block outside them, are left as they are, so their
 // errors stay. Globals are never inlined or
 // propagated: they can be changed
-import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LOOP, CORE_QUOTE, SOURCE_POS, SPECIAL_FORMS } from "../../common";
+import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LOOP, CORE_QUOTE, SPECIAL_FORMS, type Positions } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED, isLetrecLambda, isPadded, unwrapBoxed } from "../lambda";
 import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX, convertAssignments } from "./assignments";
 import { AstAnalysis } from "../analysis";
-import { keepPos, malformed, mapExprs, parts, subExprs, withBounds } from "./lang";
+import { malformed, mapExprs, parts, subExprs, withBounds } from "./lang";
 import { renamer } from "./rename";
 
 // a lambda of at most this many forms may be inlined at every call, within the budget; one called once always may. A
@@ -75,8 +75,8 @@ const sizeOf = (e: any, limit: number): number => {
     return n;
 };
 
-const lambdaName = (lambda: any): string => {
-    const pos = SOURCE_POS.get(lambda);
+const lambdaName = (lambda: any, positions: Positions): string => {
+    const pos = positions.get(lambda);
     return pos !== undefined ? `lambda@${pos.file}:${pos.line}` : "lambda";
 };
 
@@ -140,26 +140,29 @@ const freeIn = (e: any, bound: ReadonlySet<symbol>, out: Set<symbol>): Set<symbo
 // `boxes`: the variables boxes were made of in what was inlined (for the unbox pass)
 export type Optimized = { ast: any, assumed: ReadonlySet<number>, boxes: ReadonlySet<symbol> };
 
-export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
+export const optimize = (ast: any, intrinsics: Intrinsics, positions: Positions): Optimized => {
+    const keepPos = positions.keep;
     // the intrinsics whose calls were folded or dropped: the code still depends on what they are (see Code.bind)
     const assumed = new Set<number>();
     const locals = new Set<symbol>();
-    const copy = renamer(intrinsics);
+    const copy = renamer(intrinsics, positions);
     let budget = INLINE_BUDGET;
     const boxes = new Set<symbol>();
 
     // a known global's procedure as this pass takes its input: names of its own, its assigned locals boxes (null if it
     // refers to anything but intrinsics and its own variables, which may mean something else where it is inlined)
     const prepared = new Map<any, boolean>();
-    const prepare = (lambda: any): any[] | null => {
+    const prepare = (known: { lambda: any, positions: Positions }): any[] | null => {
+        const lambda = known.lambda;
         let closed = prepared.get(lambda);
         if (closed === undefined) {
             closed = freeIn(lambda, new Set(), new Set()).size === 0;
             prepared.set(lambda, closed);
+            if (closed) positions.adopt(lambda, known.positions);
         }
         if (!closed) return null;
         const own = copy(lambda);
-        const converted = convertAssignments(own, new AstAnalysis(intrinsics).analyze(own).variables);
+        const converted = convertAssignments(own, new AstAnalysis(intrinsics).analyze(own).variables, positions);
         for (const sym of converted.boxes) boxes.add(sym);
         return converted.ast;
     };
@@ -377,7 +380,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 return items.length === 0 || (items.length === 1 && isConst(items[0])) ? asExpr(items, e) : keepPos([op, e[1], ...items], e);
             }
         }
-        const next = mapExprs(Lconv, e, x => value(x));
+        const next = mapExprs(Lconv, e, x => value(x), positions);
         return ctx === "effect" && (op === BOX || op === UNBOX) && effectFree(next) ? VOID : next;
     };
 
@@ -414,7 +417,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     const inlined = (name: string, lambda: any[], call: any[], ctx: Ctx, k: K): any => {
         const [, params, rest] = lambda[1];
         // a lambda passed keeps its own name (the compiler names a lambda after the variable it is bound to)
-        const own = call.slice(2).map((x: any) => Array.isArray(x) && x[0] === CORE_LAMBDA ? [Symbol(lambdaName(x)), x] : null);
+        const own = call.slice(2).map((x: any) => Array.isArray(x) && x[0] === CORE_LAMBDA ? [Symbol(lambdaName(x, positions)), x] : null);
         const args = call.slice(2).map((x: any, i: number) => own[i]?.[0] ?? x);
         const extra = args.slice(params.length).map((x: any) => [Symbol("arg"), x]);
         const bindings = [...params.map((p: symbol, i: number) => [p, i < args.length ? args[i] : VOID]), ...extra];
@@ -452,7 +455,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         // a lambda applied, or a local bound to one: its body, its parameters bound to the arguments
         const head = aliasOf(op, k.env);
         if (inlinable(head) && fits(head[1], nargs)) {
-            return inlined(lambdaName(head), head, e, ctx, k);
+            return inlined(lambdaName(head, positions), head, e, ctx, k);
         }
         const info = typeof head === "symbol" ? k.env.get(head) : undefined;
         if (info?.k === "lambda" && !k.own.has(head) && fits(info.lambda[1], nargs)) {
@@ -466,7 +469,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         const known = typeof head === "symbol" && !locals.has(head) && !k.own.has(head) ? intrinsics.known.get(head) : undefined;
         if (known !== undefined && e.slice(2).some(x => knownProcedure(x, k.env))) {
             const size = sizeOf(known.lambda, KNOWN_SIZE);
-            const lambda = size <= KNOWN_SIZE && budget >= size && fits(known.lambda[1], nargs) ? prepare(known.lambda) : null;
+            const lambda = size <= KNOWN_SIZE && budget >= size && fits(known.lambda[1], nargs) ? prepare(known) : null;
             if (lambda !== null && inlinable(lambda)) {
                 budget -= size;
                 return inlined(known.name, lambda, e, ctx, { ...k, own: new Set([...k.own, head]) });

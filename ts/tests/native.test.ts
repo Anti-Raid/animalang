@@ -5,7 +5,7 @@ import { createScheme } from '../scheme';
 import { hostTailFrom } from '../magicvm/exec';
 import { ASTStringifier } from '../scheme/printer';
 import { impl } from '../magicvm/meta';
-import { SOURCE_POS } from '../common';
+import { Positions } from '../common';
 
 const S = Symbol.for;
 const s = new ASTStringifier();
@@ -26,7 +26,8 @@ describe("native-scheme's reader", () => {
         expect(readNative(`%[f x %[g]]`)).toEqual([S("%call"), S("f"), S("x"), [S("%call"), S("g")]]);
         expect(readNative(`%[%car x]`)).toEqual([S("%intcall"), S("%car"), S("x")]);
         expect(readNative(`%[(lambda (x) x) 1]`)).toEqual([S("%call"), [S("lambda"), [S("x")], S("x")], 1]);
-        expect(SOURCE_POS.get(readNative(` %[f]`, "t.ns"))).toEqual({ file: "t.ns", line: 1, col: 2 });
+        const positions = new Positions();
+        expect(positions.get(readNative(` %[f]`, "t.ns", { positions }))).toEqual({ file: "t.ns", line: 1, col: 2 });
         expect(() => readNative(`(a]`)).toThrow("] closes a list opened with (");
         expect(() => readNative(`%[f)`)).toThrow(") closes a list opened with [");
         expect(() => readNative(`%[]`)).toThrow("%[] calls nothing");
@@ -34,10 +35,11 @@ describe("native-scheme's reader", () => {
     });
 
     it("keeps where each list was read", () => {
-        const e = readNative(`(%begin\n  (%call f\n    (g)))`, "t.core");
-        expect(SOURCE_POS.get(e)).toEqual({ file: "t.core", line: 1, col: 1 });
-        expect(SOURCE_POS.get(e[1])).toEqual({ file: "t.core", line: 2, col: 3 });
-        expect(SOURCE_POS.get(e[1][2])).toEqual({ file: "t.core", line: 3, col: 5 });
+        const positions = new Positions();
+        const e = readNative(`(%begin\n  (%call f\n    (g)))`, "t.core", { positions });
+        expect(positions.get(e)).toEqual({ file: "t.core", line: 1, col: 1 });
+        expect(positions.get(e[1])).toEqual({ file: "t.core", line: 2, col: 3 });
+        expect(positions.get(e[1][2])).toEqual({ file: "t.core", line: 3, col: 5 });
     });
 
     it("reports what it cannot read, and where", () => {

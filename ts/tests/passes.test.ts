@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SOURCE_POS } from '../common';
+import { Positions } from '../common';
 import { createScheme } from '../scheme';
 import { ASTStringifier } from '../scheme/printer';
 import { opKinds, runNative } from './helpers';
@@ -40,11 +40,12 @@ describe("Languages", () => {
 
     it("rebuild a form only when an expression in it changed, keeping its position", () => {
         const e = [S("%if"), S("c"), 1, 2];
-        SOURCE_POS.set(e, { file: "t", line: 1, col: 2 });
-        expect(mapExprs(Lsrc, e, x => x)).toBe(e);
-        const next = mapExprs(Lsrc, e, x => x === 1 ? 10 : x);
+        const positions = new Positions();
+        positions.set(e, { file: "t", line: 1, col: 2 });
+        expect(mapExprs(Lsrc, e, x => x, positions)).toBe(e);
+        const next = mapExprs(Lsrc, e, x => x === 1 ? 10 : x, positions);
         expect(next).toEqual([S("%if"), S("c"), 10, 2]);
-        expect(SOURCE_POS.get(next)).toEqual({ file: "t", line: 1, col: 2 });
+        expect(positions.get(next)).toEqual({ file: "t", line: 1, col: 2 });
     });
 });
 

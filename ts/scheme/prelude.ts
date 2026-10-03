@@ -1,4 +1,4 @@
-import { IProcedure, Env } from "../common";
+import { IProcedure, Env, Positions } from "../common";
 import { TWINNED } from "./transformer/syntax";
 import type { Compiler } from "../magicvm/compiler";
 import type { AnimaVM } from "../magicvm/vm";
@@ -131,6 +131,7 @@ let PRELUDE_CODE: Code | null = null
 // the prelude's procedures, as core forms, the optimizer may inline (see Intrinsics.defineKnown): the public name of each,
 // and its %lambda
 let KNOWN: [string, any][] = []
+let PRELUDE_POSITIONS = new Positions()
 
 const CORE_BEGIN = Symbol.for("%begin"), CORE_LAMBDA = Symbol.for("%lambda"), DEFINE_GLOBAL = Symbol.for("%define-global")
 const knownIn = (core: any): [string, any][] => {
@@ -145,15 +146,16 @@ const knownIn = (core: any): [string, any][] => {
 // code cannot rebind
 export const loadPrelude = (cmp: Compiler, vm: AnimaVM, intrinsics: Intrinsics): Env => {
     if (PRELUDE_CODE === null) {
-        const core = transformNative(readNative(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, "<prelude>", { datum: schemeDatum }), intrinsics)
+        const positions = PRELUDE_POSITIONS = new Positions()
+        const core = transformNative(readNative(`${ALIAS_WRAPPERS}\n${STD_PRELUDE}`, "<prelude>", { datum: schemeDatum, positions }), intrinsics, positions)
         KNOWN = knownIn(core)
-        const compiled = cmp.compile(core, false)
+        const compiled = cmp.compile(core, positions, false)
         PRELUDE_CODE = compiled.fresh(new Map(), schemeBase())
     }
 
     for (const [name, lambda] of KNOWN) {
-        intrinsics.defineKnown(Symbol.for(name), lambda, name)
-        if (TWINNED.has(name)) intrinsics.defineKnown(Symbol.for(`@${name}`), lambda, name)
+        intrinsics.defineKnown(Symbol.for(name), lambda, name, PRELUDE_POSITIONS)
+        if (TWINNED.has(name)) intrinsics.defineKnown(Symbol.for(`@${name}`), lambda, name, PRELUDE_POSITIONS)
     }
 
     const privScope = stdPreludeScope()

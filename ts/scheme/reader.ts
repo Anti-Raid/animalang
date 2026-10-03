@@ -1,4 +1,4 @@
-import { SOURCE_POS, type SourcePos } from "../common";
+import { Positions, type SourcePos } from "../common";
 import { OP_BEGIN, OP_QUOTE, sourceSymbol } from "./symbols";
 import { Cons } from "./list";
 
@@ -70,7 +70,10 @@ export class ASP {
     #supportsDottedPairs: boolean = false // only bytecode compiler supports these, AST interpreter does not
     #file: string
     #tokenOffsets: number[] = []
-    constructor(str: string, supportsDottedPairs: boolean = false, file: string = "<input>") {
+    // `positions`: where each list read is recorded
+    readonly #positions: Positions
+    constructor(str: string, supportsDottedPairs: boolean = false, file: string = "<input>", positions: Positions = new Positions()) {
+        this.#positions = positions
         this.#str = str
         this.#currPos = 0
         this.#supportsDottedPairs = supportsDottedPairs
@@ -293,7 +296,7 @@ export class ASP {
                 for (let i = lst.length - 1; i >= 0; i--) {
                     tail = new Cons(lst[i], tail);
                 }
-                if (tail instanceof Cons) SOURCE_POS.set(tail, this.#posAt(startOffset));
+                if (tail instanceof Cons) this.#positions.set(tail, this.#posAt(startOffset));
                 return tail;
             }
 
@@ -315,7 +318,7 @@ export class ASP {
                     throw new ASPParseError("table literal requires an even number of key-value expressions", current);
                 }
                 const table = Cons.list(Symbol.for("table"), ...items);
-                if (table !== null) SOURCE_POS.set(table, this.#posAt(startOffset));
+                if (table !== null) this.#positions.set(table, this.#posAt(startOffset));
                 return table;
             }
 

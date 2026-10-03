@@ -17,7 +17,7 @@ The compiler's input is JS data, not a language's syntax tree: a form is an arra
 | `%set!`, `%define-global` | `[op, name, expr]` |
 | `%block`, `%escape` | `[op, label, expr ...]` |
 
-An array value (e.g. a vector literal) must be quoted, since an array is a form. Positions are attached to forms through `SOURCE_POS`. A front end converts its expanded code to this, leaving the data it quotes in its own representation.
+An array value (e.g. a vector literal) must be quoted, since an array is a form. Where forms come from is not in the forms: it is a `Positions` map (form to `file:line:col`, `common.ts`) the reader or transpiler fills in as it makes them, and hands to the compiler with them: `compiler.compile(ast, positions)`, or `anima.compileRawAst(ast, positions)`. One map per program; a form missing from it takes its enclosing form's position. A front end converts its expanded code to this, leaving the data it quotes in its own representation.
 
 ## Core Language
 
@@ -289,7 +289,7 @@ A non-tail resume from direct code instead runs the coroutine in a nested driver
 ## Debugging
 
 - **Names**: a lambda is named after what it is bound to (`%define-global`, `%set!`, a binding form), else `lambda@file:line`. A front end can rename the procedures it exports.
-- **Source positions**: a front end, or a transpiler building core forms, attaches positions to the forms it produces (`SOURCE_POS`); there is no position form in the core language. The compiler emits `Pos` IR nodes, which lower into `Code.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
+- **Source positions**: a front end, or a transpiler building core forms, records the positions of the forms it produces in the program's `Positions` (there is no position form in the core language). The passes keep them on the forms they rebuild (`Positions.keep`; `parts`/`mapExprs` take the map), and a known definition (`defineKnown`) carries the map it was read with, which the optimizer adopts where it inlines it. The compiler emits `Pos` IR nodes, which lower into `Code.lineTable` (`ip, file, line, col` entries); `positionAt(ip)` looks one up. Positions cost nothing at runtime.
 - **Tracebacks**: `%debug-frames` / `%debug-traceback` describe a snapshot `(%current-stack)` takes in the function that calls it, so written in the caller itself, that function is the first frame. A frame's position is that of the call it is waiting on. Frames removed by tail calls do not appear. Given a coroutine, they trace it instead: a suspended one from where it yielded, a normal one (waiting on a coroutine it resumed) from where it resumed it, and an unstarted or dead one as empty. The host can get a coroutine's traceback with `Anima.traceback(co)`.
 - **Unhandled errors**: the VM builds a traceback from the raising frame before giving up, and it is attached to the JS error as `animaTraceback`. For an error that escaped a coroutine, the coroutine's traceback is kept.
 - **Debug mode** (`implDebug`, i.e. `new Compiler(true)`): the compiled `Code` is flagged `debug`, and the AOT code for it

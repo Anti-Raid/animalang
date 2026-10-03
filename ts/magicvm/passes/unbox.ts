@@ -6,12 +6,14 @@ import { CORE_SET } from "../../common";
 import { AstAnalysis, markLiveAcrossCalls } from "../analysis";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED } from "../lambda";
-import { keepPos, malformed, mapExprs } from "./lang";
+import type { Positions } from "../../common";
+import { malformed, mapExprs } from "./lang";
 import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX } from "./assignments";
 
 export type Unboxed = { ast: any, forwards: ReadonlySet<symbol> };
 
-export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: Intrinsics): Unboxed => {
+export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: Intrinsics, positions: Positions): Unboxed => {
+    const keepPos = positions.keep;
     const analysis = new AstAnalysis(intrinsics);
     const scope = analysis.analyze(ast);
     markLiveAcrossCalls(ast, analysis, scope, intrinsics);
@@ -28,7 +30,7 @@ export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: In
         if (op === SET_BOX && unneeded(e[1])) return keepPos([CORE_SET, e[1], walk(e[2])], e);
         // a box made in place (which may be anywhere once the optimizer has inlined a procedure) that is not needed: nothing
         if (op === BOX_IN_PLACE && e.length === 2 && unneeded(e[1])) return undefined;
-        const next = mapExprs(Lconv, e, walk);
+        const next = mapExprs(Lconv, e, walk, positions);
         switch (Lconv.forms.get(op)) {
             case "lambda":
                 return keepPos([op, ...next.slice(1).map((c: any[]) => [c[0], c[1], c[2], ...c.slice(3).filter(x => !isUnneededBox(x))])], e);
