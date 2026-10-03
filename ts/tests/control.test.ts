@@ -178,6 +178,13 @@ describe('Anima', () => {
             `)).toBe('(42 (after body before))');
         });
 
+        it('runs %dynamic-wind as a core operation: its count checked, any values kept, in tail position too', () => {
+            expect(() => evaluator.compileRaw(`(%dynamic-wind (lambda () 1) (lambda () 2))`)).toThrow("%dynamic-wind: expected exactly 3 args, got 2");
+            expect(run(`(call-with-values (lambda () (%dynamic-wind (lambda () #f) (lambda () (values 1 2)) (lambda () #f))) list)`)).toBe("(1 2)");
+            expect(run(`(define (dw-tail n) (if (= n 0) 'done (%dynamic-wind (lambda () #f) (lambda () (dw-tail (- n 1))) (lambda () #f)))) (dw-tail 3000)`)).toBe("done");
+            expect(() => run(`(%dynamic-wind 5 (lambda () 1) (lambda () 2))`)).toThrow();
+        });
+
         it('re-executes before and after thunks when jumping with continuations', () => {
             expect(run(`
                 (define trace '())

@@ -1,18 +1,46 @@
 import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_BEGIN, CORE_IF, CORE_LAMBDA, CORE_QUOTE, CORE_SET, CORE_BLOCK, CORE_ESCAPE, CORE_LOOP, CORE_LET, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LET_STAR, CORE_WITH_MARK, OP_CURRENT_MARKS, CORE_CATCH, OP_DEFINE_GLOBAL, SOURCE_POS, type SourcePos } from "../common";
-import { AstAnalysis, isSpreadOf } from "./analysis";
+import { AstAnalysis, isSpreadOf, markLiveAcrossCalls } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
-import { liftLambdas } from "./lift";
+import { blockEscapes, liftLambdas, splitCaseLambdas } from "./lift";
 import { PAD, bodyOf, clausesOf, isPadded, isSingleLambda, optionsOf, paramsOf, restOf } from "./lambda";
-import { corePos } from "./exec";
+import { corePos, type Code } from "./exec";
+import { runPass, type Pass, type PassContext } from "./passes/pass";
+import { interruptsPass, type FunctionIR } from "./passes/interrupts";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
 // a body as one expression
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, ...body]
 
-const OP_DYNAMIC_WIND = Symbol.for("%dynamic-wind");
 const OP_APPLY = Symbol.for("%apply");
+
+type Analyzed = { ast: any, analyzer: AstAnalysis, ascope: AnalysisScope }
+
+// the core forms to core forms (see lift.ts)
+const escapesPass: Pass<any, any> = { name: "block-escapes", run: ast => blockEscapes(ast) }
+const caseLambdasPass: Pass<any, any> = { name: "split-case-lambdas", run: ast => splitCaseLambdas(ast) }
+const liftPass: Pass<any, any> = { name: "lift-lambdas", run: ast => liftLambdas(ast) }
+
+// the variables of each scope: which are assigned, captured, rest parameters (see AstAnalysis)
+const resolvePass: Pass<any, Analyzed> = {
+    name: "resolve",
+    run: (ast, ctx) => {
+        const analyzer = new AstAnalysis(ctx.intrinsics)
+        return { ast, analyzer, ascope: analyzer.analyze(ast) }
+    },
+}
+
+// which assigned variables are read after a call, and so are boxed with the captured ones (see VariableMetadata.isBoxed)
+const callLivenessPass: Pass<Analyzed, Analyzed> = {
+    name: "call-liveness",
+    run: (analyzed, ctx) => {
+        markLiveAcrossCalls(analyzed.ast, analyzed.analyzer, analyzed.ascope, ctx.intrinsics)
+        return analyzed
+    },
+}
+
+const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numRegs }, ctx) => new IR(ctx.intrinsics, ctx.debug).lower(nodes, numRegs) }
 
 // a %block that %escape can jump to: where its value goes and how its code ends
 interface BlockTarget {
@@ -45,34 +73,41 @@ interface CmpOpts {
 // Compiles core forms, as arrays (see README.md): `[op, operand ...]`, symbols as variable references, anything else
 // that is not an array as a literal
 export class Compiler {
+    // called with each pass's output (see PassContext)
+    trace?: (pass: string, output: unknown) => void
+
     constructor(readonly intrinsics: Intrinsics = newIntrinsics(), private readonly debug: boolean = false) {
         if (!hasCore(intrinsics)) throw new Error("the compiler's intrinsics must start with the core operations (see newIntrinsics)")
     }
 
-    compile(trExpr: any, debug: boolean = this.debug) {
+    compile(trExpr: any, debug: boolean = this.debug): Code {
+        const ctx: PassContext = { intrinsics: this.intrinsics, debug, trace: this.trace }
         try {
-            return this.#compileTop(trExpr, debug)
+            const escaped = runPass(escapesPass, trExpr, ctx)
+            const split = runPass(caseLambdasPass, escaped, ctx)
+            const lifted = runPass(liftPass, split, ctx)
+            const analyzed = runPass(callLivenessPass, runPass(resolvePass, lifted, ctx), ctx)
+            const ir = runPass(interruptsPass, runPass(this.#generatePass, analyzed, ctx), ctx)
+            return runPass(lowerPass, ir, ctx)
         } catch (err) {
             if (err instanceof VMError) err.format(this.intrinsics.format)
             throw err
         }
     }
 
-    #compileTop(trExpr: any, debug: boolean) {
-        trExpr = liftLambdas(trExpr)
-        // Step 1 is to analyze our variables so we know what to box and what not to box
-        let analyzer = new AstAnalysis(this.intrinsics)
-        const ascope = analyzer.analyze(trExpr)
-
-        const scope = new CompilerScope(null)
-        const nodes: Node[] = []
-        const retReg = scope.allocTemp(); // no need to free the temp reg as we return?
-        this.#compile(trExpr, {destReg: retReg, isTail: true, nodes, scope, ascope, analyzer})
-        if (!this.#nodesEndsInRet(nodes)) {
-            nodes.push({t: "Return", reg: retReg})
-        }
-        const ir = new IR(this.intrinsics, debug)
-        return ir.lower(nodes, scope.numRegs)
+    // the IR of a top-level expression, its variables analysed
+    readonly #generatePass: Pass<Analyzed, FunctionIR> = {
+        name: "generate",
+        run: ({ ast, analyzer, ascope }) => {
+            const scope = new CompilerScope(null)
+            const nodes: Node[] = []
+            const retReg = scope.allocTemp()
+            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, ascope, analyzer })
+            if (!this.#nodesEndsInRet(nodes)) {
+                nodes.push({ t: "Return", reg: retReg })
+            }
+            return { nodes, numRegs: scope.numRegs }
+        },
     }
 
     #compile(expr: any, opts: CmpOpts) {
@@ -156,9 +191,6 @@ export class Compiler {
                     return
                 case OP_CURRENT_MARKS:
                     if (opts.destReg !== undefined) opts.nodes.push({ t: "CurrentMarks", destReg: opts.destReg })
-                    return
-                case OP_DYNAMIC_WIND:
-                    this.#compileDynamicWind(expr, opts)
                     return
                 case CORE_CATCH:
                     this.#compileCatch(expr, opts)
@@ -325,13 +357,8 @@ export class Compiler {
 
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
-        const entry = lambdaNodes.length
+        lambdaNodes.push({ t: "FunctionEntry" })
         this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, ascope, fnDepth: (opts.fnDepth ?? 0) + 1 })
-        // a function that calls can recurse without end: it checks for interrupts on entry (one that only loops checks in
-        // its loops)
-        if (this.intrinsics.interrupts && lambdaNodes.some(n => n.t === "Call" || n.t === "TailCall" || (n.t === "HostCall" && n.pos !== corePos("%interrupt")))) {
-            lambdaNodes.splice(entry, 0, this.#interruptCheck())
-        }
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({t: "Return", reg: retReg})
         }
@@ -439,14 +466,8 @@ export class Compiler {
         opts.nodes.push({ t: "Loop", end })
         opts.nodes.push({ t: "Label", label: head })
         for (const e of expr.slice(1)) this.#compile(e, { ...opts, destReg: undefined, isTail: false })
-        if (this.intrinsics.interrupts) opts.nodes.push(this.#interruptCheck())
         opts.nodes.push({ t: "EndLoop", head })
         opts.nodes.push({ t: "Label", label: end })
-    }
-
-    // (%interrupt), which the compiler puts at loops' back-edges and the entries of functions that call
-    #interruptCheck(): Node {
-        return { t: "HostCall", pos: corePos("%interrupt"), startReg: 0, nargs: 0, isTail: false, destReg: undefined }
     }
 
     #nodesEndsInRet(nodes: Node[]) {
@@ -462,27 +483,6 @@ export class Compiler {
             return true // all of these ops alr return
         }
         return false
-    }
-
-    #compileDynamicWind(expr: any[], opts: CmpOpts) {
-        if (expr.length !== 4) {
-            throw new VMError(Msg.FormArgs, ["%dynamic-wind", "3 arguments (before, thunk, after)", expr.length - 1]);
-        }
-        // before and after are adjacent so they form the argument window of the wind runtime call
-        const block = opts.scope.regAlloc.allocBlock(3);
-        const beforeProcReg = block, afterProcReg = block + 1, thunkProcReg = block + 2;
-
-        this.#compile(expr[1], { ...opts, destReg: beforeProcReg, isTail: false });
-        this.#compile(expr[2], { ...opts, destReg: thunkProcReg, isTail: false });
-        this.#compile(expr[3], { ...opts, destReg: afterProcReg, isTail: false });
-
-        opts.nodes.push({ t: "Call", procReg: beforeProcReg, startReg: 0, nargs: 0 });
-        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%wind"), destReg, startReg: beforeProcReg, nargs: 2 }));
-        opts.nodes.push({ t: "Call", procReg: thunkProcReg, destReg: opts.destReg, startReg: 0, nargs: 0 });
-        this.#withDest(opts, undefined, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%end-wind"), destReg, startReg: 0, nargs: 0 }));
-        opts.nodes.push({ t: "Call", procReg: afterProcReg, startReg: 0, nargs: 0 });
-
-        opts.scope.regAlloc.freeBlock(block, 3);
     }
 
     // (%catch thunk handler [pre]): %call-catching gives the value of (thunk), or a Caught when it raised, after which the

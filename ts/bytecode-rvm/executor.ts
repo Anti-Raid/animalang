@@ -15,7 +15,9 @@ import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuat
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
 // register 0 with what a pre-unwind handler returned. `coroutineFinally` is under the procedure of a coroutine with a
 // finally thunk (in its register 1): it leaves the thunk's wind and calls it, then returns the procedure's value.
-export let helpers: { handlerReturned: Closure, escapeWith: Closure, prompt: Closure, coroutineFinally: Closure } | null = null;
+// `dynamicWind` is what (%dynamic-wind before thunk after) calls, with (before after thunk): it runs before, enters the
+// wind, runs thunk, leaves the wind and runs after, then returns thunk's value.
+export let helpers: { handlerReturned: Closure, escapeWith: Closure, prompt: Closure, coroutineFinally: Closure, dynamicWind: Closure } | null = null;
 export const raiseHelpers = () => helpers ??= {
     handlerReturned: helperClosure(1, [new ErrorObject(vmError(Msg.HandlerReturned))], [
         { k: "LoadConst", dst: 0, idx: 0 },
@@ -40,6 +42,15 @@ export const raiseHelpers = () => helpers ??= {
         { k: "Call", proc: 1, start: 0, nargs: 0, tail: false },
         { k: "Return", src: 0 },
     ], "coroutine-finally"),
+    dynamicWind: helperClosure(5, [], [
+        { k: "Call", proc: 0, start: 0, nargs: 0, tail: false },
+        { k: "IntCall", pos: corePos("%wind"), dst: 3, start: 0, nargs: 2 },
+        { k: "Call", proc: 2, start: 0, nargs: 0, tail: false },
+        { k: "MoveAcc", dst: 4 },
+        { k: "IntCall", pos: corePos("%end-wind"), dst: 3, start: 0, nargs: 0 },
+        { k: "Call", proc: 1, start: 0, nargs: 0, tail: false },
+        { k: "Return", src: 4 },
+    ], "dynamic-wind", 3),
 };
 
 const escapeTarget = (tok: EscapeContinuation, from: Frame | null): Frame | null => {
@@ -47,7 +58,7 @@ const escapeTarget = (tok: EscapeContinuation, from: Frame | null): Frame | null
     for (let f = from; f !== null; f = f.parent) if (f.escape === owner) return f;
     return null;
 };
-export const helperClosure = (numReg: number, constants: any[], body: DistributiveOmit<Op, "ip">[], name: string = "raise"): Closure => {
+export const helperClosure = (numReg: number, constants: any[], body: DistributiveOmit<Op, "ip">[], name: string = "raise", params: number = 0): Closure => {
     let ip = 0;
     const ops = body.map(op => { const full = { ...op, ip } as Op; ip += OP_SIZE[op.k]; return full; });
     const positions = new Set<number>();
@@ -55,7 +66,7 @@ export const helperClosure = (numReg: number, constants: any[], body: Distributi
     const used = [...positions].map(pos => CORE_INTRINSICS.entries[pos]).map(({ pos, name, leaf }) => ({ pos, name, leaf }));
     const code = new Code(constants, ops, ip, numReg, undefined, undefined, false, CORE_INTRINSICS, used);
     code.internal = true;
-    return new Closure(new ClosureTemplate([], null, code, [], name), [], name);
+    return new Closure(new ClosureTemplate(Array.from({ length: params }, () => Symbol()), null, code, [], name), [], name);
 };
 
 export class VMExecutor {
@@ -364,6 +375,11 @@ export class VMExecutor {
     }
 
     // --- continuations and dynamic-wind ---
+
+    // what %dynamic-wind calls (see raiseHelpers)
+    get dynamicWind(): Closure {
+        return raiseHelpers().dynamicWind;
+    }
 
     // direct code's %call/ec or %catch, as an exception it does not take leaves it: the frame rebuilt for it holds the
     // token, and a call not yet made is made with `marks`

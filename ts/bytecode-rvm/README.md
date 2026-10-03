@@ -64,17 +64,6 @@ Block names are labels, not variables. An `%escape` cannot leave a `%lambda` (a 
 
 Besides the core forms, the compiler directly recognizes the following low-level `%` intrinsics:
 
-### `%dynamic-wind`
-- **Form**: `(%dynamic-wind <before> <thunk> <after>)`
-- **Semantics**:
-  1. Calls `<before>` with 0 arguments.
-  2. Enters dynamic wind extent with `<before>` and `<after>`.
-  3. Calls `<thunk>` with 0 arguments and records its result.
-  4. Exits dynamic wind extent.
-  5. Calls `<after>` with 0 arguments.
-  6. Returns the result of `<thunk>`.
-  When a continuation crosses this dynamic extent, transitions automatically run the appropriate `<before>` and `<after>` thunks.
-
 ### `%call/cc`
 - **Form**: `(%call/cc <proc>)`, a control operation (see below)
 - **Semantics**:
@@ -171,7 +160,8 @@ The VM's own operations. They are intrinsics like any other (see host intrinsics
 | `%coroutine-yieldable?` | 0 | yes | whether `%coroutine-yield` would work here: inside a coroutine that is not being closed |
 | `%current-coroutine` | 1 | yes | the coroutine running now, or the argument outside any |
 | `%coroutine-close` | 1 | no | close a coroutine, running its pending dynamic-wind after-thunks |
-| `%wind`, `%end-wind` | 2 (before, after), 0 | yes | push / pop a wind point: the steps `%dynamic-wind` lowers to. They must be balanced |
+| `%dynamic-wind` | 3 (before, thunk, after) | no | calls before, then thunk inside the wind, then after; its value is thunk's. A continuation that leaves or re-enters the thunk runs after or before on the way. A tail call of a VM helper written as instructions (`dynamicWind` in `raiseHelpers`), which AOT code calls directly |
+| `%wind`, `%end-wind` | 2 (before, after), 0 | yes | push / pop a wind point: the steps of `%dynamic-wind`'s helper. They must be balanced |
 | `%caught?`, `%caught-value`, `%make-caught` | 1 | yes | test / unwrap / make the value a `%catch` produces when its thunk raised |
 | `%handler-key` | 0 | yes | the continuation-mark key the exception handlers live under |
 | `%barrier-key` | 0 | yes | the continuation-mark key of continuation barriers: a mark under it with a new object as its value guards its extent, so a full continuation captured inside cannot be called from outside it (`Msg.BarrierReentry`, checked when a continuation is called: every barrier value in its marks must be in the caller's); escaping out is allowed |
@@ -224,10 +214,14 @@ A procedure's argument count is an `Arity` (`arity.ts`): `min`, `max`, and for a
 
 ## Pipeline
 
+`Compiler.compile` runs the compiler's passes in order, each a `Pass` (`passes/pass.ts`) with one job: `block-escapes`, `split-case-lambdas` and `lift-lambdas` (core forms to core forms, `lift.ts`), `resolve` and `call-liveness` (`analysis.ts`), `generate` (IR nodes, `compiler.ts`), `interrupts` (`passes/interrupts.ts`) and `lower` (a `Code`, `ir.ts`). Setting `compiler.trace` gets each pass's output.
+
+The core forms are declared once, in `passes/lang.ts`: a language maps each form's head to its shape (how its operands are laid out: bindings, clauses, a label, plain expressions), and a later language is an earlier one with forms removed or added (`extend`). The generic traversals go through the shapes (lifting's, and the analysis's search for closures; passes that treat forms one by one, like `resolve`, `call-liveness` and `generate`, switch on the head themselves): `parts` gives a form's expressions with the names bound around each, and rebuilds it keeping its source position; `mapExprs` rebuilds it only if one changed. `check(lang, e)` checks that a tree is in a language, so a test can check any pass's output. Every pass so far reads and writes the front ends' language, `Lsrc`.
+
 1. A front end reads the source and lowers it to core forms (a call of a builtin becoming a call of its intrinsic).
-2. `lift.ts` first turns escapes into jumps: in `(%call/ec (%lambda (k) body ...))`, or the same with `%call/cc`, where `k` is never assigned and only ever called in the body itself (not inside a lambda in it, passed on, or used as a value), every call of `k` happens while the call is still running, so it can only be an escape, whichever kind of continuation it is. The body becomes a `%block` (in the same tail position) and each `(k v ...)` an `%escape` to it, carrying `(%values v ...)` for other than one value: no continuation is made, and escaping is a jump. A continuation captured in the body and resumed later resumes the frame holding the block, so an escape there lands where `k` would return to. It then splits local case-lambdas: a `%lambda` of several clauses bound by a `%let`, `%let*` or `%letrec` to a name that is never assigned gets a name per clause (bound in a `%letrec`), and each call of the name with a count a clause takes calls that clause, as a plain call; the procedure itself is only made (`%make-case-lambda` of the clauses) if the name is still used another way. Then it lifts lambdas: a `%letrec` lambda whose name is never assigned and only ever called gets its free local variables as extra parameters, passed by every call (the lifted lambdas it calls, itself included when it recurses, among them), so it captures nothing and compiles to a constant closure instead of one made each time the `%letrec` runs. It is not lifted if a variable it would receive is assigned, may not have its value yet when it is called (a `%letrec` value, see `lateValues`), or is shadowed at a call.
-3. `analysis.ts` works out which variables live in `Box`es: only assigned ones (with `%set!`), when they are captured (used from inside a nested `%lambda`; a `%let` is not a boundary) or live across a call, i.e. read after a call before being assigned again. A variable that is never assigned is copied into the closures that capture it.
-4. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers, and `IR.lower` turns those into a `Code` (its instructions plus a constant pool).
+2. `lift.ts` first turns escapes into jumps (`block-escapes`): in `(%call/ec (%lambda (k) body ...))`, or the same with `%call/cc`, where `k` is never assigned and only ever called in the body itself (not inside a lambda in it, passed on, or used as a value), every call of `k` happens while the call is still running, so it can only be an escape, whichever kind of continuation it is. The body becomes a `%block` (in the same tail position) and each `(k v ...)` an `%escape` to it, carrying `(%values v ...)` for other than one value: no continuation is made, and escaping is a jump. A continuation captured in the body and resumed later resumes the frame holding the block, so an escape there lands where `k` would return to. It then splits local case-lambdas: a `%lambda` of several clauses bound by a `%let`, `%let*` or `%letrec` to a name that is never assigned gets a name per clause (bound in a `%letrec`), and each call of the name with a count a clause takes calls that clause, as a plain call; the procedure itself is only made (`%make-case-lambda` of the clauses) if the name is still used another way. Then it lifts lambdas: a `%letrec` lambda whose name is never assigned and only ever called gets its free local variables as extra parameters, passed by every call (the lifted lambdas it calls, itself included when it recurses, among them), so it captures nothing and compiles to a constant closure instead of one made each time the `%letrec` runs. It is not lifted if a variable it would receive is assigned, may not have its value yet when it is called (a `%letrec` value, see `lateValues`), or is shadowed at a call.
+3. `analysis.ts` works out which variables live in `Box`es (`resolve`, then `call-liveness`): only assigned ones (with `%set!`), when they are captured (used from inside a nested `%lambda`; a `%let` is not a boundary) or live across a call, i.e. read after a call before being assigned again. A variable that is never assigned is copied into the closures that capture it.
+4. `compiler.ts` turns the expression into IR nodes (`ir.ts`) over numbered registers; with interrupts on, `interrupts` adds the checks (at each loop's back-edge, and at the entry each function marks with a `FunctionEntry` node if it calls); and `IR.lower` turns the nodes into a `Code` (its instructions plus a constant pool).
 5. `AotCompiler` compiles each function to JS functions when it first runs.
 
 ## Type facts

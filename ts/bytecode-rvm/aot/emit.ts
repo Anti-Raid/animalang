@@ -163,6 +163,11 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
         direct: s => `throw Suspend.stack(${s.args.length === 1 ? `stackSkip(${s.args[0]})` : "0"});`,
         continues: true,
     }],
+    // a call of the VM's helper, with (before after thunk): no request is made
+    ["%dynamic-wind", {
+        heap: s => `return executor.invoke(ctx, executor.dynamicWind, frame, [${s.args[0]}, ${s.args[2]}, ${s.args[1]}], 0, 3, ${s.isTail});`,
+        direct: (s, callArray) => `{ const proc = executor.dynamicWind, args = [${s.args[0]}, ${s.args[2]}, ${s.args[1]}]; ${callArray} }`,
+    }],
     ...["%apply-array", "%apply-fresh"].map((name): [string, ControlAot] => [name, {
         heap: s => `{ const args = ${applyArgsOf(name, s.args)}; return executor.invoke(ctx, ${s.args[0]}, frame, args, 0, args.length, ${s.isTail}); }`,
         direct: (s, callArray) => `{ const proc = ${s.args[0]}, args = ${applyArgsOf(name, s.args)}; ${callArray} }`,

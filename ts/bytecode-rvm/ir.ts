@@ -162,6 +162,9 @@ export type Node = {
     t: "MoveAcc",
     destReg: number
 } | {
+    // where a function's body starts, after its parameters are set up (emits nothing; see passes/interrupts.ts)
+    t: "FunctionEntry"
+} | {
     // marks where the following code came from (goes into the line table, emits nothing)
     t: "Pos",
     pos: SourcePos
@@ -205,6 +208,7 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
             case "LoadGlobal": push({ k: "LoadGlobal", dst: node.destReg, sym: cpool.push(node.sym) }); break
             case "SetGlobal": push({ k: "SetGlobal", src: node.srcReg, sym: cpool.push(node.sym) }); break
             case "Label": labels.set(node.label, ip); break
+            case "FunctionEntry": break
             case "If": case "ElseIf": jump(push({ k: "If", cond: node.reg, else: -1, elseif: node.t === "ElseIf" }), "else", node.elseLabel); break
             case "Else": jump(push({ k: "Else", end: -1 }), "end", node.endLabel); break
             case "EndIf": push({ k: "EndIf" }); break

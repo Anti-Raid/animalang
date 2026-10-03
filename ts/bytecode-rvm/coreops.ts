@@ -402,6 +402,8 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%end-wind", [0, 0], (regs, start, nargs, ctx) => { if (ctx.wind !== null) ctx.wind = ctx.wind.parent; }, {
         context: true, inline: () => `(ctx.wind !== null && (ctx.wind = ctx.wind.parent), undefined)`,
     });
+    // (%dynamic-wind before thunk after): a call of the VM's helper that runs them (see raiseHelpers in executor.ts)
+    core("%dynamic-wind", [3, 3], (regs, start, nargs, ctx, executor) => new HostTail(executor.dynamicWind, [regs[start], regs[start + 2], regs[start + 1]]), { context: true, leaf: false });
     core("%caught?", [1, 1], (regs, start) => regs[start] instanceof Caught, { inline: unaryInline((v, d) => `${v} instanceof ${d.Caught}`) });
     core("%caught-value", [1, 1], (regs, start) => regs[start].error, { inline: unaryInline(v => `${v}.error`) });
     core("%make-caught", [1, 1], (regs, start) => new Caught(regs[start]), { inline: unaryInline((v, d) => `new ${d.Caught}(${v})`) });

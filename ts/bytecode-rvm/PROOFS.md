@@ -6,9 +6,9 @@
 
 This file proves that four compiler steps preserve the meaning of a program:
 
-1. `blockEscapes` (`lift.ts`): an early-exit `%call/ec` or `%call/cc` becomes a `%block`.
-2. `splitCaseLambdas` (`lift.ts`): a local multi-clause `%lambda` becomes one binding per clause.
-3. `liftIn` (`lift.ts`): lambda lifting of `%letrec` lambdas.
+1. `blockEscapes` (`lift.ts`, the `block-escapes` pass): an early-exit `%call/ec` or `%call/cc` becomes a `%block`.
+2. `splitCaseLambdas` (`lift.ts`, the `split-case-lambdas` pass): a local multi-clause `%lambda` becomes one binding per clause.
+3. `liftIn` (`lift.ts`, the `lift-lambdas` pass): lambda lifting of `%letrec` lambdas.
 4. Liveness:
    - `CallLiveness` (`analysis.ts`) decides which assigned variables need a box;
    - `Liveness` (`aot/liveness.ts`) decides what resume code loads and spills.
@@ -28,14 +28,14 @@ They mean what a store-based machine gives them:
 **Assumptions.**
 
 - **A1: no shadowing of core forms or intrinsics.** The compiler rejects binding their names, so a symbol in operator position that names a form or intrinsic always means that form.
-- **A2: `assigned` is conservative.** `assignedNames` collects every symbol that appears as a `%set!` target anywhere in the program. If a binding is ever assigned, its name is in the set. Names are compared by symbol, so the set can only be too large.
+- **A2: `assigned` is conservative.** `assignedNames` collects every symbol that appears as a `%set!` target anywhere in the program. If a binding is ever assigned, its name is in the set. Names are compared by symbol, so the set can only be too large. Each of the three passes computes it on its own input; the passes before it neither add nor remove a `%set!`, so it is the set of the original program.
 - **A3: `%letrec` evaluation order,** as `#compileLetrec` compiles it:
   1. all lambda inits are made first; making a closure runs no code and cannot fail;
   2. their names are then set;
   3. the other ("value") inits run in order, and each name is set after its init.
 - **A4: `%escape` stays in one function.** An `%escape` only targets a `%block` of the same function. `#compileEscape` rejects anything else (`Msg.EscapeFromLambda`).
 - **A5: a value init's continuation runs once.** The continuation of a `%letrec` value init is not invoked again after that init has returned. R6RS requires this (11.4.6), and without it a value's binding is effectively assigned. Only §3 relies on A5. §4 does not: it holds without A5, see 4.3.
-- **A6: interrupt checks are not calls.** The `(%interrupt)` checks the compiler adds (see Interrupts in the README) are added after lifting and the core forms' liveness analysis, which never see one; AOT liveness, which works on the instructions, sees each as the host call it is. A check calls no procedure and captures no continuation: its handler can only continue, pause the running coroutine (which then resumes once, where it was) or stop the evaluation for good. So adding them changes nothing proved here.
+- **A6: interrupt checks are not calls.** The `(%interrupt)` checks (see Interrupts in the README) are added by the `interrupts` pass, to the IR, after lifting and the core forms' liveness analysis, which never see one; AOT liveness, which works on the instructions, sees each as the host call it is. A check calls no procedure and captures no continuation: its handler can only continue, pause the running coroutine (which then resumes once, where it was) or stop the evaluation for good. So adding them changes nothing proved here.
 
 **Notation.**
 
