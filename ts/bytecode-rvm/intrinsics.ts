@@ -60,6 +60,12 @@ export type IntrinsicOptions = {
     branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds },
     // marks logical negation (e.g. %not) so a branch testing it transposes then and else
     invertBranch?: boolean,
+    // for the optimizer (passes/cp0.ts), of a leaf that takes no context. `foldable`: a call of it on constants may run
+    // when compiling, its value used in its place: it has no effect, its value depends only on its arguments, and it is
+    // never a new object (a number, string, boolean, or one of its arguments or a part of one). A call that throws is
+    // left to run. `effectFree`: a call whose value is not used may be dropped: it has no effect and never throws
+    foldable?: boolean,
+    effectFree?: boolean,
 }
 
 export type Intrinsic = {
@@ -80,6 +86,8 @@ export type Intrinsic = {
     readonly refineArgs?: (known: ArgKinds) => ArgKinds,
     readonly branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds },
     readonly invertBranch?: boolean,
+    readonly foldable: boolean,
+    readonly effectFree: boolean,
 }
 
 // The intrinsics a compiler and VM are extended with: host functions called over a register window, inlined by AOT
@@ -152,6 +160,7 @@ export class Intrinsics {
         }
         if (options.sequence !== undefined && this[options.sequence] !== undefined) throw new Error(`the table already has a sequence ${options.sequence} intrinsic`)
         if (options.sequence !== undefined && !(options.leaf ?? false)) throw new Error(`the sequence ${options.sequence} intrinsic '${name}' must be a leaf`)
+        if ((options.foldable || options.effectFree) && (!(options.leaf ?? false) || options.context)) throw new Error(`the intrinsic '${name}' is foldable or effect-free, so must be a leaf that takes no context`)
         const deps: Record<string, string> = {}
         for (const [dep, value] of Object.entries(options.deps ?? {})) {
             let slot = this.deps.indexOf(value)
@@ -161,6 +170,7 @@ export class Intrinsics {
         const entry: Intrinsic = Object.freeze({
             name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, deps: Object.freeze(deps),
             refineArgs: options.refineArgs, branchNarrow: options.branchNarrow, invertBranch: options.invertBranch,
+            foldable: options.foldable ?? false, effectFree: options.effectFree ?? false,
         })
         this.entries.push(entry)
         this.fns.push(fn)

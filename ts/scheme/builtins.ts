@@ -536,6 +536,15 @@ const spreadList = (lst: any, into: any[] = []): any[] => {
 // Registers every builtin as the leaf intrinsic %name, always in the same order (so the cached prelude's intrinsics are at
 // the same positions in every instance). Lists are the table's sequences: rest parameters are lists (%list packs them),
 // and %spread makes the array %apply takes of one
+// for the optimizer (see IntrinsicOptions.foldable / effectFree): builtins whose value on constants may be computed when
+// compiling (no effect, depends only on the arguments, and never a new object), and those a call of which may be dropped
+// when its value is not used (no effect, never throws)
+const PREDICATES = ["null?", "pair?", "list?", "mpair?", "number?", "integer?", "exact-integer?", "bigint?", "boolean?", "void?", "symbol?", "string?",
+    "procedure?", "error?", "vector?", "table?", "continuation-mark-set?", "error-object?", "promise?", "continuation-prompt-tag?"];
+const FOLDABLE = new Set(["+", "-", "*", "/", "modulo", "remainder", "quotient", "=", "<", "<=", ">", ">=", "eq?", "eqv?", "equal?", "not",
+    "bigint", "exact", "inexact", "positive?", "negative?", "zero?", "even?", "odd?", "infinite?", "finite?", "nan?", "length", ...PREDICATES]);
+const EFFECT_FREE = new Set(["eq?", "eqv?", "equal?", "not", "cons", "list", "vector", "mcons", ...PREDICATES]);
+
 export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
     for (const { name, min, max, fn, inline, returns, refineArgs, branchNarrow, invertBranch } of SCHEME_BUILTINS) {
         intrinsics.register(`%${name}`, fn, {
@@ -548,13 +557,15 @@ export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
             refineArgs: refineArgs ?? (NUMERIC.has(name) ? refineNumeric : undefined),
             branchNarrow: branchNarrow ?? (NUMERIC_CMP.has(name) ? branchNumericCmp : undefined),
             invertBranch: invertBranch ?? (name === "not" ? true : undefined),
+            foldable: FOLDABLE.has(name),
+            effectFree: EFFECT_FREE.has(name),
         });
     }
     intrinsics.register("%list", (regs, start, nargs) => {
         let tail: Cons | null = null;
         for (let i = start + nargs - 1; i >= start; i--) tail = new Cons(regs[i], tail, start + nargs - i);
         return tail;
-    }, { leaf: true, sequence: "pack", inline: (args, _slow, _tmp, d) => args.reduceRight((tail, arg, i) => `new ${d.Cons}(${arg}, ${tail}, ${args.length - i})`, "null"), deps: INLINE_DEPS });
+    }, { leaf: true, sequence: "pack", effectFree: true, inline: (args, _slow, _tmp, d) => args.reduceRight((tail, arg, i) => `new ${d.Cons}(${arg}, ${tail}, ${args.length - i})`, "null"), deps: INLINE_DEPS });
     intrinsics.register("%spread", (regs, start) => spreadList(regs[start]), { args: [1, 1], leaf: true, sequence: "spread" });
     // promises: (%make-lazy thunk) is (delay-force (thunk)); see $force in the prelude
     intrinsics.register("%make-lazy", (regs, start) => new SchemePromise({ done: false, value: regs[start] }), { args: [1, 1], leaf: true });

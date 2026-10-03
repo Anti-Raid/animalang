@@ -418,7 +418,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
     }, { inline: ([x, v], slow, tmp, d) => `(${v} instanceof ${d.MultipleValues} ? new ${d.MultipleValues}([${x}, ...${v}.values]) : new ${d.MultipleValues}([${x}, ${v}]))` });
     core("%make-case-lambda", [1, Infinity], (regs, start, nargs) => new CaseLambda(regs.slice(start, start + nargs)));
-    core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)));
+    core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)), { effectFree: true });
     core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
     core("%debug-frames", [3, 3], (regs, start, nargs, ctx) => {
         const { frames, args } = debugTarget(ctx, regs, start);

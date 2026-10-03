@@ -232,6 +232,20 @@ describe('Anima', () => {
 })
 })
 
+describe("Optimizer properties", () => {
+    it("are declared by the front end, on leaves that take no context only", () => {
+        const anima = createScheme(impl)
+        const of = (name: string) => anima.intrinsics.byName(name)!
+        expect([of("%+").foldable, of("%+").effectFree]).toEqual([true, false])
+        expect([of("%cons").foldable, of("%cons").effectFree]).toEqual([false, true])
+        expect([of("%null?").foldable, of("%null?").effectFree]).toEqual([true, true])
+        expect([of("%vector-set!").foldable, of("%vector-set!").effectFree]).toEqual([false, false])
+        expect(of("%values").effectFree).toBe(true)
+        expect(() => anima.registerIntrinsic("%test-nonleaf", () => 1, { foldable: true })).toThrow("must be a leaf that takes no context")
+        expect(anima.registerIntrinsic("%test-host", () => 1, { leaf: true }).foldable).toBe(false)
+    })
+})
+
 describe("Instructions", () => {
     it("are listed by kind and fields", () => {
         const anima = createScheme(impl)
