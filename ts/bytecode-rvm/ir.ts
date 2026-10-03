@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { Code, Closure, ClosureTemplate, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import { Code, Closure, ClosureTemplate, type InlineSite, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import type { RestKind } from "./arity";
 import { UNPACK_REST, UNPACK_STRICT, type DistributiveOmit, type Op } from "./ops";
@@ -162,6 +162,15 @@ export type Node = {
     t: "MoveAcc",
     destReg: number
 } | {
+    // the code up to the matching InlineExit is the body of `name`, inlined at `at` (in tail position if `tail`):
+    // tracebacks show it as that procedure's frame (emits nothing; see Code.inlines)
+    t: "InlineEnter",
+    name: string,
+    at: SourcePos | null,
+    tail: boolean
+} | {
+    t: "InlineExit"
+} | {
     // where a function's body starts, after its parameters are set up (emits nothing; see passes/interrupts.ts)
     t: "FunctionEntry"
 } | {
@@ -192,6 +201,8 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
         return pos
     }
     const labels = new Map<JumpLabel, number>()
+    const inlines: InlineSite[] = []
+    const open: number[] = []
     const fixups: [op: any, field: string, label: JumpLabel][] = []
     const jump = (op: Op, field: string, label: JumpLabel) => fixups.push([op, field, label])
     for (const node of nodes) {
@@ -209,6 +220,12 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
             case "SetGlobal": push({ k: "SetGlobal", src: node.srcReg, sym: cpool.push(node.sym) }); break
             case "Label": labels.set(node.label, ip); break
             case "FunctionEntry": break
+            case "InlineEnter":
+                open.push(inlines.push({ start: ip, end: ip, name: node.name, at: node.at, tail: node.tail, parent: open.length > 0 ? open[open.length - 1] : -1 }) - 1)
+                break
+            case "InlineExit":
+                inlines[open.pop()!].end = ip
+                break
             case "If": case "ElseIf": jump(push({ k: "If", cond: node.reg, else: -1, elseif: node.t === "ElseIf" }), "else", node.elseLabel); break
             case "Else": jump(push({ k: "Else", end: -1 }), "end", node.endLabel); break
             case "EndIf": push({ k: "EndIf" }); break
@@ -259,21 +276,23 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
         if (target === undefined) throw new Error(`unresolved label ${label.id}`)
         op[field] = target
     }
-    return { ops, lineTable: new Uint32Array(lineTable), files, used, use }
+    return { ops, lineTable: new Uint32Array(lineTable), files, used, use, inlines }
 }
 
 export class IR {
-    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false) {}
+    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false, private readonly assumed: ReadonlySet<number> = new Set()) {}
 
     lower(nodes: Node[], numRegs: number, packRest: boolean = false): Code {
         const cpool = new ConstPool()
         const lowerTemplate = (t: ClosureTemplateIR) =>
             new ClosureTemplate(t.params, t.remParams, this.lower(t.code, t.numRegs, t.rest === "packed"), t.upvarLocs, t.name, t.rest, t.pad)
-        const { ops, lineTable, files, used, use } = lowerOps(nodes, this.table, cpool, lowerTemplate)
+        const { ops, lineTable, files, used, use, inlines } = lowerOps(nodes, this.table, cpool, lowerTemplate)
+        for (const pos of this.assumed) use(pos)
         const restPos = packRest ? use(this.table.pack!.pos) : -1
         const code = new Code(cpool.constants, ops, numRegs, lineTable, files, this.debug, used.size > 0 ? this.table : null, [...used.values()])
         code.restPos = restPos
         code.interrupts = this.table.interrupts
+        code.inlines = inlines
         return code
     }
 }

@@ -36,7 +36,7 @@ export class MacroEvaluator {
 
     // macros run with the same intrinsics as the code they expand
     constructor(options: AnimaOptions, readonly intrinsics: Intrinsics) {
-        this.expandcmp = new Compiler(intrinsics, options.debug)
+        this.expandcmp = new Compiler(intrinsics, options.debug, options.optimize)
         this.expandvm = new AnimaVM(intrinsics)
         this.#transformers = new Map<symbol, Transform>()
         this.scope = new Env()

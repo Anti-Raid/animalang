@@ -51,7 +51,7 @@ export class Anima {
         this.#options = options
         this.#intrinsics = newIntrinsics(base)
         this.#vm = new AnimaVM(this.#intrinsics)
-        this.#comp = new Compiler(this.#intrinsics, options.debug)
+        this.#comp = new Compiler(this.#intrinsics, options.debug, options.optimize)
     }
 
     // gives the instance a language: `scope` is where its code runs

@@ -46,7 +46,8 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
     });
 
     it("loads negative and non-integer literals through LOADCONST", () => {
-        const anima = createScheme(impl);
+        // unoptimized, as the optimizer folds the sum
+        const anima = createScheme({ ...impl, optimize: false });
         const bc = anima.compileRaw("(+ -42 -0.5 4294967296)") as Code;
         expect(bc.constants).toEqual(expect.arrayContaining([-42, -0.5, 4294967296]));
         expect(anima.evaluateRaw(bc)).toBe(4294967253.5);

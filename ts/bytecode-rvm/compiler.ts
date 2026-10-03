@@ -11,6 +11,8 @@ import { renamePass } from "./passes/rename";
 import { closureCaptures, type Captures } from "./passes/closures";
 import { BOX, BOX_IN_PLACE, SET_BOX, UNBOX, convertAssignments, type Converted } from "./passes/assignments";
 import { removeBoxes, type Unboxed } from "./passes/unbox";
+import { INLINED } from "./passes/cp0";
+import { optimize } from "./passes/cp0";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 
@@ -45,7 +47,17 @@ const resolvePass: Pass<any, Analyzed> = {
     },
 }
 
-const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numRegs }, ctx) => new IR(ctx.intrinsics, ctx.debug).lower(nodes, numRegs) }
+const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numRegs }, ctx) => new IR(ctx.intrinsics, ctx.debug, ctx.assumed).lower(nodes, numRegs) }
+
+// the optimizer (see passes/cp0.ts)
+const cp0Pass: Pass<Converted, Converted> = {
+    name: "cp0",
+    run: (converted, ctx) => {
+        const { ast, assumed } = optimize(converted.ast, ctx.intrinsics)
+        for (const pos of assumed) ctx.assumed.add(pos)
+        return { ...converted, ast }
+    },
+}
 
 // a %block that %escape can jump to: where its value goes and how its code ends
 interface BlockTarget {
@@ -81,19 +93,19 @@ export class Compiler {
     // called with each pass's output (see PassContext)
     trace?: (pass: string, output: unknown) => void
 
-    constructor(readonly intrinsics: Intrinsics = newIntrinsics(), private readonly debug: boolean = false) {
+    constructor(readonly intrinsics: Intrinsics = newIntrinsics(), private readonly debug: boolean = false, private readonly optimize: boolean = true) {
         if (!hasCore(intrinsics)) throw new Error("the compiler's intrinsics must start with the core operations (see newIntrinsics)")
     }
 
-    compile(trExpr: any, debug: boolean = this.debug): Code {
-        const ctx: PassContext = { intrinsics: this.intrinsics, debug, trace: this.trace }
+    compile(trExpr: any, debug: boolean = this.debug, optimize: boolean = this.optimize): Code {
+        const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, assumed: new Set(), trace: this.trace }
         try {
             const renamed = runPass(renamePass, trExpr, ctx)
             const escaped = runPass(escapesPass, renamed, ctx)
             const split = runPass(caseLambdasPass, escaped, ctx)
             const lifted = runPass(liftPass, split, ctx)
             const converted = runPass(assignmentsPass, runPass(resolvePass, lifted, ctx), ctx)
-            const unboxed = runPass(unboxPass, converted, ctx)
+            const unboxed = runPass(unboxPass, ctx.optimize ? runPass(cp0Pass, converted, ctx) : converted, ctx)
             const closed = runPass(closuresPass, unboxed, ctx)
             const ir = runPass(interruptsPass, runPass(this.#generatePass, closed, ctx), ctx)
             return runPass(lowerPass, ir, ctx)
@@ -217,6 +229,11 @@ export class Compiler {
                     return
                 case SET_BOX:
                     this.#compileSetBox(expr, opts)
+                    return
+                case INLINED:
+                    opts.nodes.push({ t: "InlineEnter", name: expr[1].description, at: SOURCE_POS.get(expr) ?? opts.pos ?? null, tail: opts.isTail })
+                    this.#compileBody(expr.slice(2), opts)
+                    opts.nodes.push({ t: "InlineExit" })
                     return
                 case OP_APPLY:
                     this.#compileApply(expr, opts)

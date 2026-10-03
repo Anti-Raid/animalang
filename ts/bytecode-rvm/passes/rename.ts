@@ -7,6 +7,7 @@ import { CORE_SET, SPECIAL_FORMS } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { Lsrc, keepPos, malformed, mapExprs } from "./lang";
+import type { Pass } from "./pass";
 
 // what renaming can walk: a lambda code generation accepts (any other fails to compile), and binding lists of arrays, as
 // code generation reads them (a binding's extra elements are ignored there too)
@@ -18,11 +19,11 @@ const traversable = (e: any[]): boolean => {
         default: return true;
     }
 };
-import type { Pass } from "./pass";
 
 type Env = ReadonlyMap<symbol, symbol>;
 
-const renamer = (intrinsics: Intrinsics) => {
+// a function giving each binder in what it is given a fresh name (its free variables are left as they are)
+export const renamer = (intrinsics: Intrinsics) => {
     const canBind = (sym: any): sym is symbol =>
         typeof sym === "symbol" && !SPECIAL_FORMS.has(sym) && intrinsics.reserved.get(sym) === undefined && !isCoreForm(sym) && intrinsics.get(sym) === undefined;
 

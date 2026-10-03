@@ -7,6 +7,9 @@ import { Closure, listing } from '../bytecode-rvm/exec';
 import { Anima } from '../anima';
 import { impl } from '../bytecode-rvm/meta';
 import { opKinds, registerTestIntrinsics } from './helpers';
+
+// what the passes before the optimizer make of a procedure (its listing, as the optimizer would change it)
+const unoptimizedProc = (src: string) => { const a = createScheme({ debug: false, optimize: false }); return a.evaluateRaw(a.compileRaw(src)) }
 import { hostYield } from '../bytecode-rvm/exec';
 
 describe("vm", () => {
@@ -1535,7 +1538,7 @@ describe('Anima', () => {
 
     describe('%let', () => {
         // whether a variable is boxed shows up as Box instructions in the procedure's code
-        const boxesIn = (src: string): number => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code).filter(k => k === "Box").length
+        const boxesIn = (src: string): number => opKinds(unoptimizedProc(src).tmpl.code).filter(k => k === "Box").length
 
         it('does not box variables that are only read inside a let', () => {
             expect(boxesIn(`(lambda (n) (let ((x 1)) (let* ((y (+ x n))) (+ x y n))))`)).toBe(0)
@@ -1604,7 +1607,7 @@ describe('Anima', () => {
         })
 
         it('lifts helpers that are only called, so no closure is made for them', () => {
-            const closuresIn = (src: string): number => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code).filter(k => k === "NewClosure").length
+            const closuresIn = (src: string): number => opKinds(unoptimizedProc(src).tmpl.code).filter(k => k === "NewClosure").length
             expect(run(`(define (ll1 k) (define (helper x) (+ k x)) (helper 1)) (ll1 5)`)).toBe("6")
             expect(closuresIn(`(lambda (k) (define (helper x) (+ k x)) (helper 1))`)).toBe(0)
             // recursive and mutually recursive helpers receive themselves and each other
@@ -1636,7 +1639,7 @@ describe('Anima', () => {
         })
 
         it('lifts a helper called where one of its free variables is shadowed, as locals have names of their own', () => {
-            const closuresIn = (src: string): number => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code).filter(k => k === "NewClosure").length
+            const closuresIn = (src: string): number => opKinds(unoptimizedProc(src).tmpl.code).filter(k => k === "NewClosure").length
             expect(closuresIn(`(lambda (k) (define (h) k) (let ((k 100)) (h)))`)).toBe(0)
             expect(run(`(define (lk6 k) (define (h) k) (let ((k 100)) (list (h) k))) (lk6 1)`)).toBe("(1 100)")
         })
@@ -1812,7 +1815,7 @@ describe('Anima', () => {
 
         it('a local case-lambda calls its clauses directly', () => {
             const made = (src: string) => {
-                const ops = opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code)
+                const ops = opKinds(unoptimizedProc(src).tmpl.code)
                 return { closures: ops.filter(k => k === "NewClosure").length, intrinsicCalls: ops.filter(k => k === "IntCall").length }
             }
             const local = `(lambda (k) (define f (case-lambda ((a) (+ a k)) ((a b) (f (+ a b))) ((a . r) (length r)))) (list (f 1) (f 1 2) (f 1 2 3 4)))`
@@ -1844,7 +1847,7 @@ describe('Anima', () => {
         })
 
         it('call/cc and call/ec whose k is only called in the body are blocks', () => {
-            const ops = (src: string) => opKinds(evaluator.evaluateRaw(evaluator.compileRaw(src)).tmpl.code)
+            const ops = (src: string) => opKinds(unoptimizedProc(src).tmpl.code)
             for (const cc of ["call/cc", "call/ec", "call-with-current-continuation"]) {
                 expect(run(`(list (+ 1 (${cc} (lambda (k) (+ 10 (k 5))))) (${cc} (lambda (k) 7)) (${cc} (lambda (k) (if #t (k 'early) 'late))))`)).toBe("(6 7 early)")
                 // no escape continuation or continuation is made at all

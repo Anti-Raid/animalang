@@ -518,15 +518,24 @@ export class StackSnapshot extends OpaqueValue {
     }
 }
 
+// The frames from `frame` out, as the program has them: a frame running code the optimizer inlined procedures into is
+// also the frames of those procedures, innermost first, the way it would be without inlining (a procedure inlined in
+// tail position replaced the frame it was called from)
 export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] => {
     const out: FrameInfo[] = [];
-    for (let f = frame, i = 0; f !== null; f = f.parent) {
+    let i = 0;
+    const push = (info: FrameInfo) => { if (i++ >= level) out.push(info); };
+    for (let f = frame; f !== null; f = f.parent) {
         if (f.code.internal) continue;
-        if (i++ >= level) out.push({
-            name: f.debugName,
-            pos: f.code.positionAt(Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)),
-            tails: markOwn(f.marks, f.mframe, TAIL_TRAIL, null),
-        });
+        const ip = Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0);
+        let pos = f.code.positionAt(ip);
+        let present = true;
+        for (const site of f.code.inlinedAt(ip)) {
+            if (present) push({ name: site.name, pos, tails: null });
+            pos = site.at;
+            present = !site.tail;
+        }
+        if (present) push({ name: f.debugName, pos, tails: markOwn(f.marks, f.mframe, TAIL_TRAIL, null) });
     }
     return out;
 };

@@ -4,6 +4,11 @@ import type { Intrinsics } from "../intrinsics";
 export type PassContext = {
     readonly intrinsics: Intrinsics,
     readonly debug: boolean,
+    // whether to run the optimizer (passes/cp0.ts)
+    readonly optimize: boolean,
+    // the intrinsics the optimizer folded or dropped calls of: every function compiled records them as used (see
+    // Code.bind), as what it computes depends on them
+    readonly assumed: Set<number>,
     // called with each pass's output, e.g. by tests, to see or check it
     readonly trace?: (pass: string, output: unknown) => void,
 };

@@ -20,6 +20,10 @@ export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExe
 // an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
 export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };
 
+// a procedure the optimizer inlined: its body is the code in [start, end), called at `at` (in tail position if `tail`)
+// from the code around it, which is the site `parent` (an index into Code.inlines) or the function itself (-1)
+export type InlineSite = { start: number, end: number, readonly name: string, readonly at: SourcePos | null, readonly tail: boolean, readonly parent: number };
+
 // instruction lists that several Code copies run (see Code.fresh)
 export const SHARED_OPS = new WeakSet<readonly Op[]>();
 
@@ -47,6 +51,8 @@ export class Code {
     public restPos: number = -1;
     // compiled with interrupt checks (see Intrinsics.setInterruptHandler)
     public interrupts: boolean = false;
+    // the procedures inlined into this code, for tracebacks (see inlinedAt)
+    public inlines: readonly InlineSite[] = [];
 
     // lineTable holds (ip, fileIdx, line, col) entries sorted by ip; each covers the code up to the next entry
     constructor(
@@ -136,6 +142,7 @@ export class Code {
         copies.set(this, copy);
         copy.restPos = this.restPos;
         copy.interrupts = this.interrupts;
+        copy.inlines = this.inlines;
         SHARED_OPS.add(this.ops);
         copy.bind(table);
         copy.constants = this.constants.map(c => {
@@ -149,6 +156,15 @@ export class Code {
             return c;
         });
         return copy;
+    }
+
+    // the procedures inlined around the instruction at `ip`, innermost first
+    inlinedAt(ip: number): InlineSite[] {
+        let at = -1;
+        this.inlines.forEach((site, i) => { if (site.start <= ip && ip < site.end) at = i; });
+        const out: InlineSite[] = [];
+        for (; at !== -1; at = this.inlines[at].parent) out.push(this.inlines[at]);
+        return out;
     }
 
     positionAt(ip: number): SourcePos | null {
