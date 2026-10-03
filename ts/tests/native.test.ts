@@ -20,6 +20,18 @@ describe("native-scheme's reader", () => {
         expect(readNative(`'(1 x)`)).toEqual([S("%quote"), [1, S("x")]]);
     });
 
+    it("reads [ ] as ( ), and %[ ] as a call", () => {
+        expect(readNative(`[a (b [c])]`)).toEqual([S("a"), [S("b"), [S("c")]]]);
+        expect(readNative(`%[f x %[g]]`)).toEqual([S("%call"), S("f"), S("x"), [S("%call"), S("g")]]);
+        expect(readNative(`%[%car x]`)).toEqual([S("%intcall"), S("%car"), S("x")]);
+        expect(readNative(`%[(lambda (x) x) 1]`)).toEqual([S("%call"), [S("lambda"), [S("x")], S("x")], 1]);
+        expect(SOURCE_POS.get(readNative(` %[f]`, "t.ns"))).toEqual({ file: "t.ns", line: 1, col: 2 });
+        expect(() => readNative(`(a]`)).toThrow("] closes a list opened with (");
+        expect(() => readNative(`%[f)`)).toThrow(") closes a list opened with [");
+        expect(() => readNative(`%[]`)).toThrow("%[] calls nothing");
+        expect(() => readNative(`%[%if a b]`)).toThrow("%if is a core form");
+    });
+
     it("keeps where each list was read", () => {
         const e = readNative(`(%begin\n  (%call f\n    (g)))`, "t.core");
         expect(SOURCE_POS.get(e)).toEqual({ file: "t.core", line: 1, col: 1 });

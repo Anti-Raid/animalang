@@ -1,8 +1,9 @@
-// native-scheme's reader: s-expressions read straight into arrays. It names VM values only: `( ... )` an array, a name a
-// symbol, numbers (and `123n` bigints), strings, `#t` / `#f`, `#null` and `#void` (undefined); `'x` is (%quote x), and
-// `;` starts a comment. Every list keeps where it was read (SOURCE_POS). A front end's meaning for quoted data comes from
+// native-scheme's reader: s-expressions read straight into arrays. It names VM values only: `( ... )` (or `[ ... ]`) an
+// array, a name a symbol, numbers (and `123n` bigints), strings, `#t` / `#f`, `#null` and `#void` (undefined); `'x` is
+// (%quote x), `%[f x ...]` a call, (%call f x ...), or of an intrinsic, (%intcall %name x ...), and `;` starts a comment. Every list keeps where it was read (SOURCE_POS). A front end's meaning for quoted data comes from
 // `datum`, called on what each (%quote x) quotes
-import { CORE_BEGIN, CORE_QUOTE, SOURCE_POS, formatPos, type SourcePos } from "../common";
+import { CORE_BEGIN, CORE_CALL, CORE_INTCALL, CORE_QUOTE, SOURCE_POS, formatPos, type SourcePos } from "../common";
+import { isCoreForm } from "../magicvm/core";
 
 export type NativeReadOptions = { datum?: (x: any) => any };
 
@@ -13,9 +14,9 @@ export class NativeReadError extends Error {
     }
 }
 
-const OPEN = 40, CLOSE = 41, QUOTE = 34, SEMI = 59, NL = 10, BACKSLASH = 92, APOSTROPHE = 39;
+const OPEN = 40, CLOSE = 41, OPEN_BRACKET = 91, CLOSE_BRACKET = 93, QUOTE = 34, SEMI = 59, NL = 10, BACKSLASH = 92, APOSTROPHE = 39, PERCENT = 37;
 const isSpace = (c: number) => c === 32 || c === 9 || c === NL || c === 13 || c === 12;
-const isDelimiter = (c: number) => isSpace(c) || c === OPEN || c === CLOSE || c === QUOTE || c === SEMI;
+const isDelimiter = (c: number) => isSpace(c) || c === OPEN || c === CLOSE || c === OPEN_BRACKET || c === CLOSE_BRACKET || c === QUOTE || c === SEMI;
 const NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i;
 const BIGINT = /^[+-]?\d+n$/;
 const ESCAPES: Record<string, string> = { n: "\n", t: "\t", r: "\r", "0": "\0", '"': '"', "\\": "\\" };
@@ -99,30 +100,48 @@ export const readNative = (src: string, file: string = "<native>", options: Nati
         return out;
     };
 
+    // the forms up to `close`, the list having opened at `at`
+    const items = (close: number, at: SourcePos): any[] => {
+        const out: any[] = [];
+        for (;;) {
+            skip();
+            if (i >= src.length) fail("unclosed list", at);
+            const c = src.charCodeAt(i);
+            if (c === close) break;
+            if (c === CLOSE || c === CLOSE_BRACKET) fail(`${String.fromCharCode(c)} closes a list opened with ${close === CLOSE ? "(" : "["}`, here());
+            out.push(form());
+        }
+        i++;
+        return out;
+    };
+
     const form = (): any => {
         const at = here();
         const c = src.charCodeAt(i);
         if (c === QUOTE) return string(at);
-        if (c === CLOSE) fail("unexpected )", at);
+        if (c === CLOSE || c === CLOSE_BRACKET) fail(`unexpected ${String.fromCharCode(c)}`, at);
         if (c === APOSTROPHE) {
             i++;
             skip();
             if (i >= src.length) fail("nothing after '", at);
             return quoted(form(), at);
         }
-        if (c !== OPEN) return atom(at);
-        i++;
-        const items: any[] = [];
-        for (;;) {
-            skip();
-            if (i >= src.length) fail("unclosed list", at);
-            if (src.charCodeAt(i) === CLOSE) break;
-            items.push(form());
+        if (c === PERCENT && src.charCodeAt(i + 1) === OPEN_BRACKET) {
+            i += 2;
+            const call = items(CLOSE_BRACKET, at);
+            const head = call[0];
+            if (call.length === 0) fail("%[] calls nothing", at);
+            if (typeof head === "symbol" && isCoreForm(head)) fail(`%[ calls procedures and intrinsics; ${head.description} is a core form`, at);
+            const out = typeof head === "symbol" && head.description!.charCodeAt(0) === PERCENT ? [CORE_INTCALL, ...call] : [CORE_CALL, ...call];
+            SOURCE_POS.set(out, at);
+            return out;
         }
+        if (c !== OPEN && c !== OPEN_BRACKET) return atom(at);
         i++;
-        if (items[0] === CORE_QUOTE && items.length === 2) return quoted(items[1], at);
-        SOURCE_POS.set(items, at);
-        return items;
+        const list = items(c === OPEN ? CLOSE : CLOSE_BRACKET, at);
+        if (list[0] === CORE_QUOTE && list.length === 2) return quoted(list[1], at);
+        SOURCE_POS.set(list, at);
+        return list;
     };
 
     const forms: any[] = [];
