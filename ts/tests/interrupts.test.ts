@@ -6,6 +6,7 @@ import { Code } from '../bytecode-rvm/vm';
 import { listing } from '../bytecode-rvm/exec';
 import { InterruptError, hostInterruptError, hostYield } from '../index';
 import type { Anima } from '../anima';
+import { expose } from './helpers';
 
 const s = new ASTStringifier();
 
@@ -134,31 +135,32 @@ describe("Interrupts", () => {
         const grinding = (a: Anima) => a.registerIntrinsic("%grind", (regs, start) => {
             for (let i = 0; i < regs[start]; i += 1000) a.checkInterrupt(1000);
             return "ground";
-        }, { args: [1, 1] });
+        }, { args: [1, 1] }) && expose(a, "%grind");
         // continuing
         let calls = 0;
         const a = make(() => { calls++; });
         grinding(a);
-        expect(run(a, `(%grind 10000000)`)).toBe('"ground"');
+        expect(run(a, `(grind 10000000)`)).toBe('"ground"');
         expect(calls).toBeGreaterThan(0);
         // stopping, where nothing can catch it
         const b = make(stopAt(1));
         grinding(b);
-        expect(stopped(b, `(try (lambda () (%grind 1000000000)) (lambda (e) 'caught))`)).toBe("timeout");
+        expect(stopped(b, `(try (lambda () (grind 1000000000)) (lambda (e) 'caught))`)).toBe("timeout");
         // pausing: after the intrinsic returns, at the coroutine's next check
         const c = make(c => c.coroutineYieldable() ? hostYield("tick") : undefined);
         grinding(c);
-        run(c, `(define rounds 0) (define co (coroutine-create (lambda () (let loop () (%grind 1000000) (set! rounds (+ rounds 1)) (loop)))))`);
+        run(c, `(define rounds 0) (define co (coroutine-create (lambda () (let loop () (grind 1000000) (set! rounds (+ rounds 1)) (loop)))))`);
         expect(run(c, `(coroutine-resume co)`)).toBe('"tick"');
         expect(Number(run(c, `rounds`))).toBeGreaterThan(0);
         // a pause where the code cannot pause is dropped
-        expect(run(c, `(%grind 10000000)`)).toBe('"ground"');
+        expect(run(c, `(grind 10000000)`)).toBe('"ground"');
     });
 
     it("stops from any host intrinsic that asks to", () => {
         const a = createScheme(vmImpl);
         a.registerIntrinsic("%cancel", () => hostInterruptError("cancelled"), { args: [0, 0] });
-        expect(stopped(a, `(try (lambda () (%cancel)) (lambda (e) 'caught))`)).toBe("cancelled");
+        expose(a, "%cancel");
+        expect(stopped(a, `(try (lambda () (cancel)) (lambda (e) 'caught))`)).toBe("cancelled");
     });
 
     it("checks only where code could run without end, and only when turned on", () => {

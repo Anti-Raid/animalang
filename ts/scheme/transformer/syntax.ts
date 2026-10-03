@@ -26,7 +26,7 @@ import { Cons } from "../list";
 import { toCore } from "../core";
 import { schemeFormat } from "../messages";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
-import { OP_CASE_LAMBDA, OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE } from "../symbols";
+import { OP_CASE_LAMBDA, OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE, ordinarySymbol } from "../symbols";
 import { SCHEME_ALIASES } from "../builtins";
 import type { Closure } from "../../bytecode-rvm/exec";
 
@@ -373,10 +373,28 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
         if (orig.length < 3) throw new Error(`%if requires at least a condition and a branch: (%if c1 e1 c2 e2 ... [else])`);
     }));
     coreForm(OP_BEGIN, CORE_BEGIN, () => {});
-    // quoted data is never transformed
-    coreForm(OP_QUOTE, CORE_QUOTE, orig => {
+    // quoted data is never transformed, but for the names read from source as no ordinary symbol (sourceSymbol)
+    const data = (x: any): any => {
+        if (typeof x === "symbol") return ordinarySymbol(x);
+        if (x instanceof Cons) {
+            const car = data(x.car), cdr = data(x.cdr);
+            return car === x.car && cdr === x.cdr ? x : Cons.pair(car, cdr);
+        }
+        if (Array.isArray(x)) {
+            const next = x.map(data);
+            return next.some((y, i) => y !== x[i]) ? next : x;
+        }
+        return x;
+    };
+    const quote = lowerTo(CORE_QUOTE, orig => {
         if (orig.length !== 2) throw new Error(`quote must be in format ["quote", expr] but have ${orig.length - 1} arguments`);
     }, TransformState.ReturnImm);
+    for (const head of [OP_QUOTE, CORE_QUOTE]) {
+        evaluator.registerTransform(head, (evaluator, expr, orig) => {
+            const res = quote(evaluator, expr, orig);
+            return { ...res, expanded: list(CORE_QUOTE, data(expr.car)) };
+        });
+    }
     const blockName = (form: string, orig: Cons) => {
         if (!(orig.cdr instanceof Cons) || typeof orig.cdr.car !== "symbol") throw new Error(`${form} requires a block name symbol`);
     };
@@ -1048,7 +1066,10 @@ export const registerCoreSyntax = (evaluator: MacroEvaluator) => {
             const nargs = expr === null ? 0 : expr instanceof Cons && !expr.isImproper() ? expr.length : -1;
             if (nargs < min || nargs > max) return { expanded: orig, state: TransformState.DoChildren };
             if (name !== OP_APPLY) return { expanded: cons(target, expr), state: TransformState.DoChildren };
+            // (apply + xs) applies the intrinsic + aliases, when it is a leaf (and + is still the builtin)
             const args = toArray(expr);
+            const applied = typeof args[0] === "symbol" && !evaluator.isRedefined(args[0]) ? SCHEME_ALIASES.get(args[0])?.target : undefined;
+            if (applied !== undefined && evaluator.intrinsics.get(applied)?.leaf) args[0] = applied;
             return { expanded: fromArray([target, ...args.slice(0, -1), list(Symbol.for("%spread"), args[args.length - 1])]), state: TransformState.DoChildren };
         });
     }

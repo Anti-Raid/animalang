@@ -1,5 +1,6 @@
 import { ASTStringifier } from '../scheme/printer';
 import { Anima } from '../anima';
+import { runNative } from './helpers';
 import { describe, it, expect } from 'vitest';
 import { createScheme } from '../scheme';
 import { Code, AnimaVM, AotCompiler } from '../bytecode-rvm/vm';
@@ -304,7 +305,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         };
         const narrow = () => ({ then: ["number", "number"] as const });
         const a = withNarrow({ branchNarrow: narrow }), b = withNarrow({ branchNarrow: narrow }), c = withNarrow({ branchNarrow: () => ({}) });
-        const code = (a.evaluateRaw(a.compileRaw("(lambda (x y) (if (%test-lt x y) x y))")) as Closure).tmpl.code as Code;
+        const code = (runNative(a, "(lambda (x y) (%if (%intcall %test-lt x y) x y))") as Closure).tmpl.code as Code;
         expect(code.runsWith(b.intrinsics)).toBe(true);
         expect(code.runsWith(c.intrinsics)).toBe(false);
     });

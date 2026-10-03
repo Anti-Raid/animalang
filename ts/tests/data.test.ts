@@ -3,6 +3,7 @@ import { Table } from '../scheme/table';
 import { LuaTable } from '../lua/table';
 import { ASTStringifier } from '../scheme/printer';
 import { ASPParseError } from '../scheme/reader';
+import { compileNative } from '../native';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
@@ -660,7 +661,7 @@ describe('Floats, Infinities & NaNs', () => {
     });
 
     it("records intrinsics by name and binds copies to another table", () => {
-        const bc = evaluator.compileRaw("(list (%test-add 1 2) (%test-call-or (lambda (x) x) 4))") as Code;
+        const bc = compileNative(evaluator, "(%intcall %list (%intcall %test-add 1 2) (%intcall %test-call-or (lambda (x) x) 4))") as Code;
         // the front end's (here %list) are recorded like any other
         expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%list", "%test-add", "%test-call-or"]);
 
@@ -682,7 +683,7 @@ describe('Floats, Infinities & NaNs', () => {
         };
         const wide = bounded(3), narrow = bounded(1);
         expect(narrow.intrinsics.byName("%test-count")!.pos).toBe(wide.intrinsics.byName("%test-count")!.pos);
-        const applied = wide.compileRaw("(apply %test-count '(1 2))") as Code;
+        const applied = compileNative(wide, "(%intapply %test-count (%intcall %spread '(1 2)))") as Code;
         expect(s.stringify(wide.evaluateRaw(applied))).toBe("2");
         expect(() => narrow.evaluateRaw(applied.fresh(new Map(), narrow.intrinsics))).toThrow("%test-count: expected 0 to 1 args, got 2");
         expect(s.stringify(wide.evaluateRaw(applied.fresh(new Map(), wide.intrinsics)))).toBe("2");
@@ -691,11 +692,11 @@ describe('Floats, Infinities & NaNs', () => {
     });
 
     it("refuses to bind code whose intrinsics changed from leaf to not a leaf, or back", () => {
-        const leafCode = evaluator.compileRaw("(%test-add 1 2)") as Code;
+        const leafCode = compileNative(evaluator, "(%intcall %test-add 1 2)") as Code;
         const other = createScheme(vmImpl);
         other.registerIntrinsic("%test-add", (regs, s) => regs[s] + regs[s + 1], { args: [2, 2] });
         expect(() => leafCode.fresh(new Map(), other.intrinsics)).toThrow("compiled with '%test-add' as a leaf, but it is registered as not a leaf");
-        const nonLeafCode = other.compileRaw("(%test-add 1 2)") as Code;
+        const nonLeafCode = compileNative(other, "(%intcall %test-add 1 2)") as Code;
         expect(() => nonLeafCode.fresh(new Map(), evaluator.intrinsics)).toThrow("compiled with '%test-add' as not a leaf, but it is registered as a leaf");
     });
 });

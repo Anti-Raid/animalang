@@ -124,6 +124,13 @@ describe("native-scheme", () => {
         expect(run(a, `(named-let f ((n 1)) (%if (%intcall %= n 1) f n))`).startsWith("#<procedure")).toBe(true);
         // a parameter of the loop's name hides it
         expect(run(a, `(named-let f ((f 5)) f)`)).toBe("5");
+        // an escape to a block that is not in tail position is not a tail call, even if an outer block of the same name
+        // is: (outer 1) here is an argument of +, so this is recursion (result 2), not a loop (result 1)
+        const shadowed = `(named-let outer ((i 0)) (%if (%intcall %= i 1) i (%block b (%intcall %+ 1 (%block b (%escape b (%call outer 1)))))))`;
+        expect(run(a, shadowed)).toBe("2");
+        expect(JSON.stringify(transformNative(readNative(shadowed)), (_, v) => typeof v === "symbol" ? v.description : v)).toContain('"%letrec"');
+        // defining a global of the loop's name leaves the loop alone
+        expect(run(a, `(%intcall %array (named-let loop ((i 0)) (%define-global loop 42) (%if (%intcall %= i 3) i (%call loop (%intcall %+ i 1)))) loop)`)).toBe("(3 42)");
     });
 
     it("gives each round of a named-let loop its own bindings, as calls would", () => {

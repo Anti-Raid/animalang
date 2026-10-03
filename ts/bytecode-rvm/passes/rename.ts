@@ -10,13 +10,10 @@ import { keepPos, malformed, mapExprs } from "./lang";
 import { Lconv, SET_BOX } from "./assignments";
 import type { Pass } from "./pass";
 
-// what renaming can walk: a lambda code generation accepts (any other fails to compile), and binding lists of arrays, as
-// code generation reads them (a binding's extra elements are ignored there too)
+// what renaming can walk: a lambda code generation accepts (any other fails to compile)
 const traversable = (e: any[]): boolean => {
     switch (Lconv.forms.get(e[0])) {
         case "lambda": return malformed(Lconv, e) === null;
-        case "let": case "letrec": case "let*": return Array.isArray(e[1]) && e[1].every(Array.isArray);
-        case "let-values": return Array.isArray(e[1]) && e[1].every((c: any) => Array.isArray(c) && Array.isArray(c[0]));
         default: return true;
     }
 };
@@ -45,10 +42,17 @@ export const renamer = (intrinsics: Intrinsics) => {
         if (typeof e === "symbol") return name(env, e);
         if (!Array.isArray(e) || e.length === 0) return e;
         const op = e[0];
-        if (!Lconv.forms.has(op)) {
-            const err = new VMError(Msg.BareCall, [op]);
+        const fail = (err: VMError) => {
             err.at = SOURCE_POS.get(e) ?? null;
             throw err;
+        };
+        if (!Lconv.forms.has(op)) fail(new VMError(Msg.BareCall, [op]));
+        const shape = Lconv.forms.get(op);
+        if ((shape === "let" || shape === "letrec" || shape === "let*") && !(Array.isArray(e[1]) && e[1].every((b: any) => Array.isArray(b) && b.length === 2))) {
+            fail(new VMError(Msg.FormArgs, [op.description, "bindings of a name and an init each", e.length - 1]));
+        }
+        if (shape === "let-values" && !(Array.isArray(e[1]) && e[1].every((c: any) => Array.isArray(c) && c.length === 3 && Array.isArray(c[0])))) {
+            fail(new VMError(Msg.FormArgs, [op.description, "clauses of (params) rest init", e.length - 1]));
         }
         if (!traversable(e)) return e;
         switch (Lconv.forms.get(op)) {

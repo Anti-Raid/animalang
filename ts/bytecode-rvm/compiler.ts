@@ -266,6 +266,14 @@ export class Compiler {
         throw new VMError(Msg.BareCall, [operator])
     }
 
+    #bindingsOf(form: string, expr: any[]): [symbol, any][] {
+        const bindings = expr[1]
+        if (!Array.isArray(bindings) || !bindings.every(b => Array.isArray(b) && b.length === 2)) {
+            throw new VMError(Msg.FormArgs, [form, "bindings of a name and an init each", expr.length - 1])
+        }
+        return bindings
+    }
+
     #intrinsicNamed(form: string, expr: any[]): Intrinsic {
         const intrinsic = typeof expr[1] === "symbol" ? this.intrinsics.get(expr[1]) : undefined
         if (intrinsic === undefined) throw new VMError(Msg.UnknownIntrinsic, [form, expr[1]])
@@ -444,6 +452,7 @@ export class Compiler {
 
     // (%block name body ...): the value of the body, or of an (%escape name value) jumping to its end
     #compileBlock(expr: any[], opts: CmpOpts) {
+        if (typeof expr[1] !== "symbol") throw new VMError(Msg.FormArgs, ["%block", "a block name symbol", expr.length - 1])
         const end = new JumpLabel()
         const target: BlockTarget = {
             name: expr[1], end, destReg: opts.destReg, isTail: opts.isTail, fnDepth: opts.fnDepth ?? 0,
@@ -455,6 +464,7 @@ export class Compiler {
     }
 
     #compileEscape(expr: any[], opts: CmpOpts) {
+        if (typeof expr[1] !== "symbol" || expr.length > 3) throw new VMError(Msg.FormArgs, ["%escape", "a block name symbol and at most a value", expr.length - 1])
         const name: symbol = expr[1]
         let target = opts.blocks
         while (target !== undefined && target.name !== name) target = target.parent
@@ -679,7 +689,7 @@ export class Compiler {
     // (%let* ((name init) ...) body ...): each init runs with the names before it bound, then its name is bound; all in
     // one block of the current function, as nested %lets would be, without the nesting
     #compileLetStar(expr: any[], opts: CmpOpts) {
-        const bindings: [symbol, any][] = expr[1]
+        const bindings: [symbol, any][] = this.#bindingsOf("%let*", expr)
         opts.scope.enterBlock()
         for (const binding of bindings) {
             const [sym, init] = binding
@@ -696,7 +706,7 @@ export class Compiler {
     }
 
     #compileLet(expr: any[], opts: CmpOpts) {
-        const bindings: [symbol, any][] = expr[1]
+        const bindings: [symbol, any][] = this.#bindingsOf("%let", expr)
 
         const initRegs: number[] = []
         const boxed: boolean[] = []
@@ -725,7 +735,7 @@ export class Compiler {
     // directly, and the upvars captured before it existed are filled in once it does (FixUpvar); an assigned name (or
     // one a closure may copy before its init has run, see lateValues) is a box
     #compileLetrec(expr: any[], opts: CmpOpts) {
-        const bindings: [symbol, any][] = expr[1]
+        const bindings: [symbol, any][] = this.#bindingsOf("%letrec", expr)
         const isLambda = bindings.map(([, init]) => isLetrecLambda(init))
         // a name the assignments pass boxed holds its box from the start, which its init sets
         const boxed = bindings.map(([, init]) => isBoxedInit(init))

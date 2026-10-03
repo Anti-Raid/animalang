@@ -15,6 +15,23 @@ export const OP_QUOTE  = Symbol.for("quote");
 export const OP_AND      = Symbol.for("and");
 export const OP_OR       = Symbol.for("or");
 export const OP_AT = Symbol.for("%at");
+
+// A name starting with % means nothing special in Scheme source: the reader makes it a symbol of its own (the same one
+// for the same name), which is no core form or intrinsic, so code reaches neither. Quoted, it is the ordinary symbol.
+// (%at file line col expr) stays reader syntax
+const ESCAPED = new Map<string, symbol>();
+const ORDINARY = new Map<symbol, symbol>();
+export const sourceSymbol = (name: string): symbol => {
+    if (name.charCodeAt(0) !== 37 || name === "%at") return Symbol.for(name);
+    let sym = ESCAPED.get(name);
+    if (sym === undefined) {
+        sym = Symbol(name);
+        ESCAPED.set(name, sym);
+        ORDINARY.set(sym, Symbol.for(name));
+    }
+    return sym;
+};
+export const ordinarySymbol = (sym: symbol): symbol => ORDINARY.get(sym) ?? sym;
 // (%case-lambda (%lambda formals body ...) ...): case-lambda's clauses, which toCore makes one %lambda of
 export const OP_CASE_LAMBDA = Symbol.for("%case-lambda");
 

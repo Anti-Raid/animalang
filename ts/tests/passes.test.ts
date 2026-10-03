@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { SOURCE_POS } from '../common';
 import { createScheme } from '../scheme';
 import { ASTStringifier } from '../scheme/printer';
-import { opKinds } from './helpers';
+import { opKinds, runNative } from './helpers';
 import { impl } from '../bytecode-rvm/meta';
 import { Lsrc, check, extend, mapExprs, parts, withBounds } from '../bytecode-rvm/passes/lang';
 import { Lconv } from '../bytecode-rvm/passes/assignments';
@@ -114,7 +114,7 @@ describe("The optimizer", () => {
         expect(run(`(define (rp) (define (g a . r) (list a r)) (list (g 1) (g 1 2 3))) (rp)`)).toBe("((1 ()) (1 (2 3)))");
         expect(run(`(define (ra) (define (g . xs) (apply + xs)) (g 1 2 3)) (ra)`)).toBe("6");
         // an applied intrinsic whose count does not fit still fails when it runs
-        expect(() => run(`(define (rb) (define (g . xs) (apply %car xs)) (g 1 2)) (rb)`)).toThrow("expected exactly 1 args, got 2");
+        expect(() => runNative(make(true), `(define (rb) (letrec ((g (lambda xs (%intapply %car (%intcall %spread xs))))) (%call g 1 2))) (%call rb)`)).toThrow("expected exactly 1 args, got 2");
         // a padded clause (Lua): missing parameters <#void>, extra arguments evaluated and dropped
         const S = Symbol.for;
         const anima = make(true);
@@ -152,7 +152,7 @@ describe("The optimizer", () => {
             `(define (tb-b) (define (inner x) (debug-traceback)) (inner 1)) (tb-b)`,
             `(define (tb-c) (define (h x) (car x)) (define (g x) (list (h x))) (list (g '(1)))) (tb-c)`,
             `(define (tb-d n) (define (twice f x) (f (f x))) (twice (lambda (y) (* y n)) 3)) (tb-d 2)`,
-            `(define (tb-e) (define (k) (list (vector-ref (%debug-frames (%current-stack 0) #() #f) 0))) (k)) (tb-e)`,
+            `(define (tb-e) (define (k) (list (car (debug-frames)))) (k)) (tb-e)`,
         ];
         for (const src of programs) expect(run(src, true), src).toBe(run(src, false));
         const err = (optimize: boolean) => { try { run(`(define (tb-f) (define (bad x) (car x)) (list (bad '()))) (tb-f)`, optimize); } catch (e: any) { return e.animaTraceback; } };

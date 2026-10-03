@@ -13,7 +13,8 @@ import { impl } from '../bytecode-rvm/meta';
 import { bindArgs, closureArity } from '../bytecode-rvm/arity';
 import { CORE_FORMS, hasCore, newIntrinsics } from '../bytecode-rvm/core';
 import { readdirSync, readFileSync } from 'fs';
-import { opKinds, registerTestIntrinsics } from './helpers';
+import { opKinds, registerTestIntrinsics, runNative } from './helpers';
+import { compileNative } from '../native';
 
 describe("vm", () => {
     const vmImpl = impl
@@ -38,33 +39,30 @@ describe('Anima', () => {
         bcCache[expr] = bc
         return s.stringify(evaluator.evaluateRaw(bc));
     };
+    const nrun = (expr: string) => s.stringify(runNative(evaluator, expr))
 
 
     describe('Host intrinsics', () => {
         it('calls leaf intrinsics, inline and not', () => {
-            expect(run(`(%test-add 1 2)`)).toBe("3")
-            expect(run(`(%test-add "a" "b")`)).toBe('"ab"')
-            expect(run(`(define (ht-sum n acc) (if (= n 0) acc (ht-sum (- n 1) (%test-add acc n)))) (ht-sum 100 0)`)).toBe("5050")
-            expect(() => run(`(%test-add 1)`)).toThrow()
+            expect(nrun(`(%intcall %test-add 1 2)`)).toBe("3")
+            expect(nrun(`(%intcall %test-add "a" "b")`)).toBe('"ab"')
+            expect(nrun(`(define (ht-sum n acc) (%if (%call = n 0) acc (%call ht-sum (%call - n 1) (%intcall %test-add acc n)))) (%call ht-sum 100 0)`)).toBe("5050")
+            expect(() => nrun(`(%intcall %test-add 1)`)).toThrow()
         })
 
         it('runs tail requests as Scheme calls', () => {
-            expect(run(`(%test-call-or 5)`)).toBe("5")
-            expect(run(`(%test-call-or (lambda (x) (* x 2)) 21)`)).toBe("42")
-            expect(run(`(%test-call-or + 1 2)`)).toBe("3")
-            expect(run(`(+ 1 (%test-call-or (lambda () 41)))`)).toBe("42")
-            expect(run(`(define (ht-loop n) (if (= n 0) 'ok (%test-call-or ht-loop (- n 1)))) (ht-loop 100000)`)).toBe("ok")
+            expect(nrun(`(%intcall %test-call-or 5)`)).toBe("5")
+            expect(nrun(`(%intcall %test-call-or (lambda (x) (%call * x 2)) 21)`)).toBe("42")
+            expect(nrun(`(%intcall %test-call-or + 1 2)`)).toBe("3")
+            expect(nrun(`(%call + 1 (%intcall %test-call-or (lambda () 41)))`)).toBe("42")
+            expect(nrun(`(define (ht-loop n) (%if (%call = n 0) 'ok (%intcall %test-call-or ht-loop (%call - n 1)))) (%call ht-loop 100000)`)).toBe("ok")
         })
 
         it('lets tail requests yield, re-enter and raise', () => {
-            expect(run(`(define ht-co (coroutine-create (lambda () (+ 1 (%test-call-or (lambda () (coroutine-yield 'y) 10))))))
-                        (list (coroutine-resume ht-co) (coroutine-resume ht-co))`)).toBe("(y 11)")
-            expect(run(`(define ht-k #f) (define ht-n 0)
-                        (define ht-r (+ 100 (%test-call-or (lambda () (call/cc (lambda (k) (set! ht-k k) 1))))))
-                        (set! ht-n (+ ht-n 1))
-                        (if (< ht-n 3) (ht-k ht-n) (list ht-r ht-n))`)).toBe("(102 3)")
-            expect(run(`(try (lambda () (%test-fail "boom")) (lambda (e) (error-message e)))`)).toBe('"boom"')
-            expect(run(`(try (lambda () (%test-call-or (lambda () (raise 'inner)))) (lambda (e) e))`)).toBe("inner")
+            expect(nrun(`(define ht-co (%call coroutine-create (lambda () (%call + 1 (%intcall %test-call-or (lambda () (%call coroutine-yield 'y) 10)))))) (%call list (%call coroutine-resume ht-co) (%call coroutine-resume ht-co))`)).toBe("(y 11)")
+            expect(nrun(`(define ht-k #f) (define ht-n 0) (define ht-r (%call + 100 (%intcall %test-call-or (lambda () (%call call/cc (lambda (k) (%set! ht-k k) 1)))))) (%set! ht-n (%call + ht-n 1)) (%if (%call < ht-n 3) (%call ht-k ht-n) (%call list ht-r ht-n))`)).toBe("(102 3)")
+            expect(nrun(`(%call try (lambda () (%intcall %test-fail "boom")) (lambda (e) (%call error-message e)))`)).toBe('"boom"')
+            expect(nrun(`(%call try (lambda () (%intcall %test-call-or (lambda () (%call raise 'inner)))) (lambda (e) e))`)).toBe("inner")
         })
 
         it('checks registrations, and freezing stops them but not compiling', () => {
@@ -77,33 +75,32 @@ describe('Anima', () => {
             expect(evaluator.freeze()).toBe(evaluator)
             expect(evaluator.intrinsics.frozen).toBe(true)
             expect(() => evaluator.registerIntrinsic("%test-late", () => 1)).toThrow("frozen")
-            expect(run(`(%test-add 40 2)`)).toBe("42")
+            expect(nrun(`(%intcall %test-add 40 2)`)).toBe("42")
         })
 
         it('keeps intrinsics per instance, and code keeps the ones it was compiled with', () => {
             const other = createScheme(vmImpl)
-            expect(() => other.evaluateRaw(other.compileRaw(`(%test-add 1 2)`))).toThrow()
+            expect(() => runNative(other, `(%intcall %test-add 1 2)`)).toThrow("%test-add is not an intrinsic")
             other.registerIntrinsic("%test-add", (regs, s) => regs[s] * regs[s + 1], { args: [2, 2], leaf: true })
-            expect(s.stringify(other.evaluateRaw(other.compileRaw(`(%test-add 3 4)`)))).toBe("12")
-            expect(run(`(%test-add 3 4)`)).toBe("7")
-            const mul = other.evaluateRaw(other.compileRaw(`(lambda (a b) (%test-add a b))`))
+            expect(s.stringify(runNative(other, `(%intcall %test-add 3 4)`))).toBe("12")
+            expect(nrun(`(%intcall %test-add 3 4)`)).toBe("7")
+            const mul = runNative(other, `(lambda (a b) (%intcall %test-add a b))`)
             expect(s.stringify(evaluator.evaluateClosure(mul, [3, 4]))).toBe("12")
         })
 
         it('does not let intrinsics be bound as variables', () => {
-            expect(() => run(`(lambda (%test-add) 1)`)).toThrow("which is an intrinsic")
-            expect(() => run(`(let ((%marks-first 1)) 1)`)).toThrow("which is an intrinsic")
-            expect(() => run(`(%test-add %test-add 1)`)).toThrow()
+            expect(() => nrun(`(lambda (%test-add) 1)`)).toThrow("which is an intrinsic")
+            expect(() => nrun(`(let ((%marks-first 1)) 1)`)).toThrow("which is an intrinsic")
+            expect(() => nrun(`(%intcall %test-add %test-add 1)`)).toThrow()
         })
 
         it('runs %if chains (c1 e1 c2 e2 ... [else]) as one flat IF ... ELSEIF ... ENDIF', () => {
-            expect(run(`(list (%if #f 1 #t 2 3) (%if #f 1 #f 2 3) (void? (%if #f 1 #f 2)) (%if 'a 1 #t 2))`)).toBe("(2 3 #t 1)")
+            expect(nrun(`(%call list (%if #f 1 #t 2 3) (%if #f 1 #f 2 3) (%call void? (%if #f 1 #f 2)) (%if 'a 1 #t 2))`)).toBe("(2 3 #t 1)")
             // conditions run in order, and stop at the first true one
-            expect(run(`(define ch-log '()) (define (ch-t x) (set! ch-log (cons x ch-log)) (= x 2))
-                        (list (%if (ch-t 1) 'a (ch-t 2) 'b (ch-t 3) 'c 'd) ch-log)`)).toBe("(b (2 1))")
+            expect(nrun(`(define ch-log '()) (define (ch-t x) (%set! ch-log (%call cons x ch-log)) (%call = x 2)) (%call list (%if (%call ch-t 1) 'a (%call ch-t 2) 'b (%call ch-t 3) 'c 'd) ch-log)`)).toBe("(b (2 1))")
             // branches keep tail position, and a variable assigned in them is seen after
             expect(run(`(define (ch-count n) (cond ((= n 0) 'done) ((< n 0) 'neg) (else (ch-count (- n 1))))) (ch-count 100000)`)).toBe("done")
-            expect(run(`(define (ch-set x) (let ((r 0)) (%if (= x 1) (set! r 'one) (= x 2) (set! r 'two) (set! r 'many)) r)) (list (ch-set 1) (ch-set 2) (ch-set 7))`)).toBe("(one two many)")
+            expect(nrun(`(define (ch-set x) (let ((r 0)) (%if (%call = x 1) (%set! r 'one) (%call = x 2) (%set! r 'two) (%set! r 'many)) r)) (%call list (%call ch-set 1) (%call ch-set 2) (%call ch-set 7))`)).toBe("(one two many)")
             const bc = evaluator.compileRaw(`(define (ch-f x) (cond ((= x 1) 'a) ((= x 2) 'b) (else 'c)))`) as Code
             const fn: Code = bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code
             expect(opKinds(fn).filter(k => k === "If" || k === "ElseIf" || k === "EndIf")).toEqual(["If", "ElseIf", "EndIf"])
@@ -143,9 +140,9 @@ describe('Anima', () => {
             // Anima code that catches it sees the same message
             expect(run("(try (lambda () (+ 1 (5 1))) (lambda (e) (error-message e)))")).toMatch(/:1: attempt to call a number value$/)
             expect(() => run("(define (fm-f a) a) (fm-f)")).toThrow("bad argument count to 'fm-f'")
-            expect(() => run("(apply %car '(1 2))")).toThrow("bad argument count to '%car'")
+            expect(() => runNative(lua, "(%intapply %car (%intcall %spread '(1 2)))")).toThrow("bad argument count to '%car'")
             // compile-time messages too
-            expect(() => lua.compileRaw("(%car 1 2)")).toThrow("bad argument count to '%car'")
+            expect(() => compileNative(lua, "(%intcall %car 1 2)")).toThrow("bad argument count to '%car'")
             expect(run(`(debug-traceback "m")`)).toMatch(/^m\nstack traceback \(lua\):\n/)
 
             // a formatter that only words values: every message shows them its way
@@ -225,11 +222,11 @@ describe('Anima', () => {
                 inline: ([p], slow, _tmp, d) => `(${p} instanceof ${d.Point} ? ${p}.x : ${slow})`,
             })
             other.scope.set(Symbol.for("pt"), new Point(5))
-            expect(s.stringify(other.evaluateRaw(other.compileRaw(`(define (px p) (%test-px p)) (px pt)`)))).toBe("5")
+            expect(s.stringify(runNative(other, `(define (px p) (%intcall %test-px p)) (%call px pt)`))).toBe("5")
             other.registerIntrinsic("%test-bad-dep", (regs, s) => regs[s], {
                 args: [1, 1], leaf: true, inline: ([a], _slow, _tmp, d) => `(${d.Missing}, ${a})`,
             })
-            const bad = other.compileRaw(`(%test-bad-dep 1)`)
+            const bad = compileNative(other, `(%intcall %test-bad-dep 1)`)
             expect(() => other.evaluateRaw(bad)).toThrow("uses 'Missing', which is not in its deps")
         })
     });
@@ -256,7 +253,7 @@ describe("Instructions", () => {
         const anima = createScheme(impl)
         const bc = anima.compileRaw(`
             (define (ds-ap f . xs) (apply f 1 xs))
-            (define (ds-sum . xs) (apply %+ xs))
+            (define (ds-sum . xs) (apply + xs))
             (define (ds-l f lst) (apply f lst))
             (let-values (((a . b) (values 1 2))) (if a (car b) (ds-ap ds-sum 1 '(2))))`) as Code
         const lines = listing(bc)
@@ -290,7 +287,7 @@ describe("Core operations", () => {
         expect(() => CORE_INTRINSICS.register("%x", () => null)).toThrow("frozen")
         expect(() => a.registerIntrinsic("%x", () => null, { context: true })).toThrow("only the VM's core operations do")
         // a leaf that takes the context is an IntCall like any other
-        const ops = (a.compileRaw("(%coroutine-create (lambda () 1))") as Code).ops
+        const ops = (compileNative(a, "(%intcall %coroutine-create (lambda () 1))") as Code).ops
         expect(ops.some(op => op.k === "IntCall" && op.pos === corePos("%coroutine-create"))).toBe(true)
     })
 
@@ -298,16 +295,16 @@ describe("Core operations", () => {
         {
             const vmImpl = impl
             const anima = createScheme(vmImpl)
-            const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)))
-            expect(run("(%list 1 2 3)")).toBe("(1 2 3)")
-            expect(run("(apply %list 1 '(2 3))")).toBe("(1 2 3)")
+            const run = (src: string) => new ASTStringifier().stringify(runNative(anima, src))
+            expect(run("(%intcall %list 1 2 3)")).toBe("(1 2 3)")
+            expect(run("(%intapply %list 1 (%intcall %spread '(2 3)))")).toBe("(1 2 3)")
             // one that takes the context, applied
-            expect(run("(let ((co (%coroutine-create (lambda () 1)))) (apply %coroutine-status (list co)))")).toBe("suspended")
-            expect(run("(let ((co (%coroutine-create (lambda () 1)))) (%coroutine-close co) (%coroutine-status co))")).toBe("dead")
-            expect(() => run("(%values->array 1 2)")).toThrow("%values->array: expected exactly 1 args, got 2")
+            expect(run("(let ((co (%intcall %coroutine-create (lambda () 1)))) (%intapply %coroutine-status (%intcall %spread (%intcall %list co))))")).toBe("suspended")
+            expect(run("(let ((co (%intcall %coroutine-create (lambda () 1)))) (%intcall %coroutine-close co) (%intcall %coroutine-status co))")).toBe("dead")
+            expect(() => run("(%intcall %values->array 1 2)")).toThrow("%values->array: expected exactly 1 args, got 2")
         }
         const anima = createScheme(impl)
-        const bc = anima.compileRaw("(%values 1 2)") as Code
+        const bc = compileNative(anima, "(%intcall %values 1 2)") as Code
         expect(listing(bc).some(line => /IntCall +pos=%values, /.test(line))).toBe(true)
     })
 })
@@ -322,15 +319,16 @@ describe("Control operations", () => {
                 expect(entry.leaf, name).toBe(false)
                 expect(anima.intrinsics.byName(name), name).toBe(entry)
             }
-            expect(run("(+ 1 (%call/cc (lambda (k) (k 41))))")).toBe("42")
+            const nrun = (src: string) => new ASTStringifier().stringify(runNative(anima, src))
+            expect(nrun("(%intcall %+ 1 (%intcall %call/cc (lambda (k) (%call k 41))))")).toBe("42")
             // a tail %call/cc is a tail call: a loop through it runs in constant space
-            expect(run("(define (cc-loop n) (if (= n 0) 'done (%call/cc (lambda (k) (cc-loop (- n 1)))))) (cc-loop 100000)")).toBe("done")
-            expect(run("(%catch (lambda () (%raise 'boom)) (lambda (e) (list 'caught e)))")).toBe("(caught boom)")
-            expect(() => run("(%raise 'boom 5)")).toThrow("%raise: continuable must be #t or #f")
-            expect(run("(define (cs-f skip) (vector-ref (vector-ref (%debug-frames (%current-stack skip) #() #f) 0) 0)) (cs-f 0)")).toBe('"cs-f"')
-            expect(() => run("(%current-stack -1)")).toThrow("%current-stack: expected a count of frames to skip")
-            expect(() => run("(%apply-array list '(1))")).toThrow("%apply: expected an array but got (1)")
-            expect(run("(let ((co (%coroutine-create (lambda (a) (+ a (%coroutine-yield (* a 2))))))) (list (%coroutine-resume co 5) (%coroutine-resume co 1)))")).toBe("(10 6)")
+            expect(nrun("(define (cc-loop n) (%if (%intcall %= n 0) 'done (%intcall %call/cc (lambda (k) (%call cc-loop (%intcall %- n 1)))))) (%call cc-loop 100000)")).toBe("done")
+            expect(nrun("(%catch (lambda () (%intcall %raise 'boom)) (lambda (e) (%intcall %list 'caught e)))")).toBe("(caught boom)")
+            expect(() => nrun("(%intcall %raise 'boom 5)")).toThrow("%raise: continuable must be #t or #f")
+            expect(nrun("(define (cs-f skip) (%intcall %vector-ref (%intcall %vector-ref (%intcall %debug-frames (%intcall %current-stack skip) (%intcall %vector) #f) 0) 0)) (%call cs-f 0)")).toBe('"cs-f"')
+            expect(() => nrun("(%intcall %current-stack -1)")).toThrow("%current-stack: expected a count of frames to skip")
+            expect(() => nrun("(%intcall %apply-array list '(1))")).toThrow("%apply: expected an array but got (1)")
+            expect(nrun("(let ((co (%intcall %coroutine-create (lambda (a) (%intcall %+ a (%intcall %coroutine-yield (%intcall %* a 2))))))) (%intcall %list (%intcall %coroutine-resume co 5) (%intcall %coroutine-resume co 1)))")).toBe("(10 6)")
             // the Scheme names are aliases: a call whose count does not fit calls the prelude procedure, which reports it
             expect(run("(list (call/cc (lambda (k) (k 1))) (dynamic-wind (lambda () 0) (lambda () 2) (lambda () 0)) (map call/cc (list (lambda (k) 3))))")).toBe("(1 2 (3))")
             expect(() => run("(raise 'a 'b)")).toThrow("raise: expected exactly 1 args, got 2")
@@ -338,13 +336,13 @@ describe("Control operations", () => {
             expect(run("(let ((call/cc (lambda (f) 'mine))) (call/cc 1))")).toBe("mine")
         }
         // AOT code carries control operations out at the call, with no request object
-        const co = createScheme(impl).compileRaw("(define (co-f v) (+ 1 (%coroutine-yield v)))") as Code
+        const co = compileNative(createScheme(impl), "(define (co-f v) (%intcall %+ 1 (%intcall %coroutine-yield v)))") as Code
         const coTmpl = co.constants.find((c: any) => c instanceof Closure)!.tmpl
         const src = AotCompiler.generateSource(coTmpl.code, coTmpl)
         expect(src).toContain("executor.coYield(ctx, frame, r")
         expect(src).toContain("throw Suspend.yield(r")
         expect(src).not.toContain("res.run(")
-        const bc = createScheme(impl).compileRaw("(define (cc-f g) (%call/cc g))") as Code
+        const bc = compileNative(createScheme(impl), "(define (cc-f g) (%intcall %call/cc g))") as Code
         const lines = listing(bc.constants.find((c: any) => c instanceof Closure)!.tmpl.code)
         expect(lines.some(line => /HostCall +pos=%call\/cc, start=r\d+, nargs=1, tail=true$/.test(line))).toBe(true)
     })
@@ -374,8 +372,8 @@ describe("Argument binding", () => {
         const tmpl = (anima.compileRaw("(define (ab-f a . r) r)") as Code).constants.find((c: any) => c instanceof Closure)!.tmpl
         expect(tmpl.arity).toEqual({ min: 1, max: Infinity, rest: "packed", params: 1, pad: false })
         expect(() => anima.evaluateRaw(anima.compileRaw("(define (ab-g a b) a) (ab-g 1)"))).toThrow("ab-g: expected exactly 2 args, got 1")
-        expect(() => anima.evaluateRaw(anima.compileRaw("(apply %car '(1 2))"))).toThrow("%car: expected exactly 1 args, got 2")
-        expect(() => anima.compileRaw("(%car 1 2)")).toThrow("%car: expected exactly 1 args, got 2")
+        expect(() => runNative(anima, "(%intapply %car (%intcall %spread '(1 2)))")).toThrow("%car: expected exactly 1 args, got 2")
+        expect(() => compileNative(anima, "(%intcall %car 1 2)")).toThrow("%car: expected exactly 1 args, got 2")
     })
 })
 describe("Compiler intrinsics", () => {
