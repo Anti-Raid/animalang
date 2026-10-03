@@ -1,5 +1,5 @@
-import type { Intrinsics } from "../bytecode-rvm/intrinsics";
-import { newIntrinsics } from "../bytecode-rvm/core";
+import type { Intrinsics } from "../magicvm/intrinsics";
+import { newIntrinsics } from "../magicvm/core";
 import { registerSchemeIntrinsics, SCHEME_ALIASES, SCHEME_TYPES } from "./builtins";
 import { SCHEME_SPECIAL_FORMS } from "./symbols";
 import { schemeFormat } from "./messages";

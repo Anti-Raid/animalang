@@ -3,9 +3,9 @@ import { SOURCE_POS } from '../common';
 import { createScheme } from '../scheme';
 import { ASTStringifier } from '../scheme/printer';
 import { opKinds, runNative } from './helpers';
-import { impl } from '../bytecode-rvm/meta';
-import { Lsrc, check, extend, mapExprs, parts, withBounds } from '../bytecode-rvm/passes/lang';
-import { Lconv } from '../bytecode-rvm/passes/assignments';
+import { impl } from '../magicvm/meta';
+import { Lsrc, check, extend, mapExprs, parts, withBounds } from '../magicvm/passes/lang';
+import { Lconv } from '../magicvm/passes/assignments';
 
 const S = Symbol.for;
 

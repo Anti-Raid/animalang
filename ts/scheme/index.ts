@@ -1,5 +1,5 @@
 import { Cons } from "./list";
-import type { AnimaOptions } from "../bytecode-rvm/meta";
+import type { AnimaOptions } from "../magicvm/meta";
 import { Anima } from "../anima";
 import { ASP } from "./reader";
 import { schemeDatum, toCore } from "./core";

@@ -10,7 +10,7 @@ import {
     CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_LOOP, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS,
     formatPos, type SourcePos,
 } from "../common";
-import { Lsrc, keepPos, malformed, mapExprs } from "../bytecode-rvm/passes/lang";
+import { Lsrc, keepPos, malformed, mapExprs } from "../magicvm/passes/lang";
 
 export class NativeSyntaxError extends Error {
     constructor(readonly what: string, readonly at: SourcePos | null) {

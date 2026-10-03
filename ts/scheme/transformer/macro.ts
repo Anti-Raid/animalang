@@ -1,10 +1,10 @@
 import { Env, CORE_QUOTE, OP_DEFINE_GLOBAL, SOURCE_POS } from "../../common"
 import { Cons } from "../list"
-import { Compiler } from "../../bytecode-rvm/compiler"
-import { AnimaVM } from "../../bytecode-rvm/vm"
-import type { AnimaOptions } from "../../bytecode-rvm/meta"
+import { Compiler } from "../../magicvm/compiler"
+import { AnimaVM } from "../../magicvm/vm"
+import type { AnimaOptions } from "../../magicvm/meta"
 import { OP_QUOTE, OP_AT, OP_BEGIN, OP_DEFINE } from "../symbols"
-import type { Intrinsics } from "../../bytecode-rvm/intrinsics";
+import type { Intrinsics } from "../../magicvm/intrinsics";
 
 export enum TransformState {
     Recurse, // check the new expr as if it was a new expr

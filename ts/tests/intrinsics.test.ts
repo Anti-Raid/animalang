@@ -4,14 +4,14 @@ import { schemeFormat } from '../scheme/messages';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
-import { Code, AotCompiler } from '../bytecode-rvm/vm';
-import { Closure, CORE_COUNT, CORE_INTRINSICS, corePos, listing } from '../bytecode-rvm/exec';
-import { Compiler } from '../bytecode-rvm/compiler';
-import { Intrinsics } from '../bytecode-rvm/intrinsics';
+import { Code, AotCompiler } from '../magicvm/vm';
+import { Closure, CORE_COUNT, CORE_INTRINSICS, corePos, listing } from '../magicvm/exec';
+import { Compiler } from '../magicvm/compiler';
+import { Intrinsics } from '../magicvm/intrinsics';
 import { Anima } from '../anima';
-import { impl } from '../bytecode-rvm/meta';
-import { bindArgs, closureArity } from '../bytecode-rvm/arity';
-import { CORE_FORMS, hasCore, newIntrinsics } from '../bytecode-rvm/core';
+import { impl } from '../magicvm/meta';
+import { bindArgs, closureArity } from '../magicvm/arity';
+import { CORE_FORMS, hasCore, newIntrinsics } from '../magicvm/core';
 import { readdirSync, readFileSync } from 'fs';
 import { opKinds, registerTestIntrinsics, runNative } from './helpers';
 import { compileNative } from '../native';
@@ -378,13 +378,13 @@ describe("Argument binding", () => {
 })
 describe("Compiler intrinsics", () => {
     it("are all documented in the compiler's README", () => {
-        const readme = readFileSync(new URL("../bytecode-rvm/README.md", import.meta.url), "utf8");
+        const readme = readFileSync(new URL("../magicvm/README.md", import.meta.url), "utf8");
         const documented = (name: string) => new RegExp("[`(]" + name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&") + "[`\\s)]").test(readme);
         expect([...[...CORE_FORMS.keys()].map(sym => Symbol.keyFor(sym)!), ...CORE_INTRINSICS.entries.map(entry => entry.name)].filter(name => !documented(name))).toEqual([]);
     });
 
     it("belong to a compiler that knows nothing of the Scheme front end", () => {
-        const dir = new URL("../bytecode-rvm/", import.meta.url);
+        const dir = new URL("../magicvm/", import.meta.url);
         const files = readdirSync(dir, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => `${(entry as any).parentPath ?? (entry as any).path}/${entry.name}`);
         const mentions = files.filter(file => /scheme/i.test(readFileSync(file, "utf8")) || /\bCons\b/.test(readFileSync(file, "utf8")));
         expect(mentions).toEqual([]);

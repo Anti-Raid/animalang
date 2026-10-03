@@ -1,11 +1,11 @@
 import { ASTStringifier } from '../scheme/printer';
 import { Msg } from '../common';
-import { listing } from '../bytecode-rvm/exec';
+import { listing } from '../magicvm/exec';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
-import { Code } from '../bytecode-rvm/vm';
+import { Code } from '../magicvm/vm';
 import { Anima } from '../anima';
-import { impl } from '../bytecode-rvm/meta';
+import { impl } from '../magicvm/meta';
 import { registerTestIntrinsics, runNative } from './helpers';
 import { compileNative } from '../native';
 

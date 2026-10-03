@@ -397,7 +397,7 @@ Since $\mathcal{R}$ is finite and $\mathbb{L}$ has finite height $h = 2$, any mo
 
 ### 7.2 Language-Agnostic Extensibility (Frontend Inversion of Control)
 
-To ensure the compiler core (`bytecode-rvm/`) remains decoupled from front-end language specifics (a dynamic language, Luau, etc.), type inference and flow narrowing are governed by front-end hooks on `IntrinsicOptions`:
+To ensure the compiler core (`magicvm/`) remains decoupled from front-end language specifics (a dynamic language, Luau, etc.), type inference and flow narrowing are governed by front-end hooks on `IntrinsicOptions`:
 1. `refineArgs?: (known: ArgKinds) => ArgKinds`: Declares what argument kinds can be inferred when an intrinsic completes execution without throwing an exception.
 2. `branchNarrow?: (known: ArgKinds) => { then?: ArgKinds, else?: ArgKinds }`: Declares what argument kinds hold on the truthy (`then`) and falsy (`else`) branches when a branch tests this intrinsic's result.
 3. `invertBranch?: boolean`: Marks logical negation operations (e.g. `%not`, Luau `not`) to transpose `then` and `else` branches recursively.

@@ -1,6 +1,6 @@
 # native-scheme
 
-The VM's core forms (see `bytecode-rvm/README.md`) as a language of its own, with a little sugar. It shares no code with the Scheme front end. Use it for code that works at the level of the VM: Scheme's prelude, the VM's tests, an embedder's wrappers around its intrinsics, and later what other languages lower to.
+The VM's core forms (see `magicvm/README.md`) as a language of its own, with a little sugar. It shares no code with the Scheme front end. Use it for code that works at the level of the VM: Scheme's prelude, the VM's tests, an embedder's wrappers around its intrinsics, and later what other languages lower to.
 
 ```ts
 import { createNativeScheme, compileNative } from "animalang";

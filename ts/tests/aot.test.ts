@@ -3,12 +3,12 @@ import { Anima } from '../anima';
 import { runNative } from './helpers';
 import { describe, it, expect } from 'vitest';
 import { createScheme } from '../scheme';
-import { Code, AnimaVM, AotCompiler } from '../bytecode-rvm/vm';
-import { Closure, corePos } from '../bytecode-rvm/exec';
-import { impl } from '../bytecode-rvm/meta';
-import { blockFacts } from '../bytecode-rvm/aot/facts';
-import type { AotBlock } from '../bytecode-rvm/aot/types';
-import { Intrinsics, type IntrinsicOptions } from '../bytecode-rvm/intrinsics';
+import { Code, AnimaVM, AotCompiler } from '../magicvm/vm';
+import { Closure, corePos } from '../magicvm/exec';
+import { impl } from '../magicvm/meta';
+import { blockFacts } from '../magicvm/aot/facts';
+import type { AotBlock } from '../magicvm/aot/types';
+import { Intrinsics, type IntrinsicOptions } from '../magicvm/intrinsics';
 import { codeOf } from './helpers';
 
 describe("JIT Compiler Runtime Compilation & Execution", () => {

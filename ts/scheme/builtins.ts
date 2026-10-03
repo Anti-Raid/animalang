@@ -5,7 +5,7 @@ import { add, div, exact, isExactInteger, isNum, modulo, mul, neg, quotient, rem
 import { Cons, MCons } from "./list";
 import { ContinuationMarkSet } from "../marks";
 import { hostError } from "../errors";
-import type { ArgKinds, InlineFn, IntrinsicFn, Intrinsics, Returns, TypeSystem } from "../bytecode-rvm/intrinsics";
+import type { ArgKinds, InlineFn, IntrinsicFn, Intrinsics, Returns, TypeSystem } from "../magicvm/intrinsics";
 
 // Scheme's builtins, one entry each: registered as the leaf intrinsic %name (with its AOT template, if any), called
 // directly as (name arg ...) (see SCHEME_ALIASES) and as a value through the prelude's $name wrapper. The argument count

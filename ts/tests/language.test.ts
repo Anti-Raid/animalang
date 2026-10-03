@@ -2,15 +2,15 @@ import { MissingVarError, Env, ErrorObject, OpaqueValue, TRY_CALL } from '../com
 import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
-import { Code, AnimaVM } from '../bytecode-rvm/vm';
-import { Closure, listing } from '../bytecode-rvm/exec';
+import { Code, AnimaVM } from '../magicvm/vm';
+import { Closure, listing } from '../magicvm/exec';
 import { Anima } from '../anima';
-import { impl } from '../bytecode-rvm/meta';
+import { impl } from '../magicvm/meta';
 import { expose, opKinds, registerTestIntrinsics, runNative } from './helpers';
 
 // what the passes before the optimizer make of a procedure (its listing, as the optimizer would change it)
 const unoptimizedProc = (src: string) => { const a = createScheme({ debug: false, optimize: false }); return a.evaluateRaw(a.compileRaw(src)) }
-import { hostYield } from '../bytecode-rvm/exec';
+import { hostYield } from '../magicvm/exec';
 
 describe("vm", () => {
     const vmImpl = impl

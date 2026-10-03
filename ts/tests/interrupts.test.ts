@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { createScheme } from '../scheme';
 import { ASTStringifier } from '../scheme/printer';
-import { impl } from '../bytecode-rvm/meta';
-import { Code } from '../bytecode-rvm/vm';
-import { listing } from '../bytecode-rvm/exec';
+import { impl } from '../magicvm/meta';
+import { Code } from '../magicvm/vm';
+import { listing } from '../magicvm/exec';
 import { InterruptError, hostInterruptError, hostYield } from '../index';
 import type { Anima } from '../anima';
 import { expose } from './helpers';

@@ -1,9 +1,9 @@
 import type { Anima } from '../anima';
-import { hostTailFrom } from '../bytecode-rvm/exec';
+import { hostTailFrom } from '../magicvm/exec';
 import { IProcedure } from '../common';
-import { Code, type UsedIntrinsic } from '../bytecode-rvm/code';
-import { CORE_INTRINSICS } from '../bytecode-rvm/coreops';
-import type { DistributiveOmit, Op } from '../bytecode-rvm/ops';
+import { Code, type UsedIntrinsic } from '../magicvm/code';
+import { CORE_INTRINSICS } from '../magicvm/coreops';
+import type { DistributiveOmit, Op } from '../magicvm/ops';
 import { hostError } from '../errors';
 import { compileNative } from '../native';
 

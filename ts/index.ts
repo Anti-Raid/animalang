@@ -1,10 +1,10 @@
 export * from './anima';
 export { createNativeScheme, compileNative, readNative, transformNative, NativeReadError, NativeSyntaxError, type NativeReadOptions } from './native';
 export { createScheme } from './scheme';
-export { impl as implRvm, implDebug as implRvmDebug } from './bytecode-rvm/meta'
-export { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions, type InlineFn } from './bytecode-rvm/intrinsics'
-export { hostCall, hostTail, hostTailFrom, hostYield, HostTail, hostInterruptError, InterruptError } from './bytecode-rvm/exec'
-export type { Code } from './bytecode-rvm/exec'
+export { impl as implRvm, implDebug as implRvmDebug } from './magicvm/meta'
+export { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions, type InlineFn } from './magicvm/intrinsics'
+export { hostCall, hostTail, hostTailFrom, hostYield, HostTail, hostInterruptError, InterruptError } from './magicvm/exec'
+export type { Code } from './magicvm/exec'
 export { Table } from './scheme/table';
 export { LuaTable } from './lua/table';
 export { Env } from './env';

@@ -1,9 +1,9 @@
 import { IProcedure, Env } from "../common";
 import { TWINNED } from "./transformer/syntax";
-import type { Compiler } from "../bytecode-rvm/compiler";
-import type { AnimaVM } from "../bytecode-rvm/vm";
-import type { Code } from "../bytecode-rvm/exec";
-import type { Intrinsics } from "../bytecode-rvm/intrinsics";
+import type { Compiler } from "../magicvm/compiler";
+import type { AnimaVM } from "../magicvm/vm";
+import type { Code } from "../magicvm/exec";
+import type { Intrinsics } from "../magicvm/intrinsics";
 import { readNative, transformNative } from "../native";
 import { schemeDatum } from "./core";
 import { ALIAS_WRAPPERS } from "./builtins";

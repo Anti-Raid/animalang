@@ -1,8 +1,8 @@
 // The transformer's output (core forms as Scheme lists) as the compiler's input: core forms as arrays (see
-// bytecode-rvm/README.md). Quoted data stays Scheme data; a vector literal, being an array, is quoted
+// magicvm/README.md). Quoted data stays Scheme data; a vector literal, being an array, is quoted
 import { CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_QUOTE, CORE_SET, OP_DEFINE_GLOBAL, SOURCE_POS } from "../common";
-import { isCoreForm } from "../bytecode-rvm/core";
-import type { Intrinsics } from "../bytecode-rvm/intrinsics";
+import { isCoreForm } from "../magicvm/core";
+import type { Intrinsics } from "../magicvm/intrinsics";
 import { Cons } from "./list";
 import { OP_CASE_LAMBDA } from "./symbols";
 import { ASTStringifier } from "./printer";

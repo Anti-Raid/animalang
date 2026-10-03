@@ -35,7 +35,7 @@ anima.evaluateRaw(anima.compileRaw(`
   (list (map (lambda (x) (clamp x 0 10)) '(-5 5 50)) (with-double (lambda (y) (+ y 1)) 5))`)); // ((0 5 10) 11)
 ```
 
-See `ts/bytecode-rvm/README.md` (intrinsics), `ts/scheme/README.md` (the Scheme front end) and `ts/native/README.md` (native-scheme) for the details.
+See `ts/magicvm/README.md` (intrinsics), `ts/scheme/README.md` (the Scheme front end) and `ts/native/README.md` (native-scheme) for the details.
 
 ## Specification
 

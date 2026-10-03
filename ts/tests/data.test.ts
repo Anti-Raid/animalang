@@ -7,9 +7,9 @@ import { compileNative } from '../native';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
-import { Code } from '../bytecode-rvm/vm';
+import { Code } from '../magicvm/vm';
 import { Anima } from '../anima';
-import { impl } from '../bytecode-rvm/meta';
+import { impl } from '../magicvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
 describe("LuaTable internals", () => {

@@ -2,7 +2,7 @@
 // separate from Scheme
 import { Anima } from "../anima";
 import { Env } from "../common";
-import type { AnimaOptions } from "../bytecode-rvm/meta";
+import type { AnimaOptions } from "../magicvm/meta";
 import { nativeFormat } from "./messages";
 import { readNative, type NativeReadOptions } from "./reader";
 import { LAMBDA, SUGAR, transformNative } from "./transformer";

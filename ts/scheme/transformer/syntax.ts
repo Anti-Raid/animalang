@@ -28,7 +28,7 @@ import { schemeFormat } from "../messages";
 import { MacroEvaluator, TransformState, type TransformResult } from "./macro";
 import { OP_CASE_LAMBDA, OP_DEFINE, OP_BEGIN, OP_LAMBDA, OP_LET, OP_IF, OP_COND, OP_ELSE, OP_SET, OP_LETREC, OP_LETREC_STAR, OP_LETSTAR, OP_AND, OP_OR, OP_QUOTE, ordinarySymbol } from "../symbols";
 import { SCHEME_ALIASES } from "../builtins";
-import type { Closure } from "../../bytecode-rvm/exec";
+import type { Closure } from "../../magicvm/exec";
 
 const OP_APPLY = Symbol.for("apply");
 

@@ -2,9 +2,9 @@ import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
-import { Code } from '../bytecode-rvm/vm';
+import { Code } from '../magicvm/vm';
 import { Anima } from '../anima';
-import { impl, implDebug } from '../bytecode-rvm/meta';
+import { impl, implDebug } from '../magicvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
 describe("vm", () => {

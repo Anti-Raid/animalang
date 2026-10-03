@@ -1,11 +1,11 @@
 import { Env, CORE_LAMBDA } from "./common"
-import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./bytecode-rvm/intrinsics"
-import type { CaseLambda } from "./bytecode-rvm/code"
-import { newIntrinsics } from "./bytecode-rvm/core"
-import { Compiler } from "./bytecode-rvm/compiler"
-import { AnimaVM } from "./bytecode-rvm/vm"
-import type { Code, Closure } from "./bytecode-rvm/exec"
-import type { AnimaOptions } from "./bytecode-rvm/meta"
+import { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions } from "./magicvm/intrinsics"
+import type { CaseLambda } from "./magicvm/code"
+import { newIntrinsics } from "./magicvm/core"
+import { Compiler } from "./magicvm/compiler"
+import { AnimaVM } from "./magicvm/vm"
+import type { Code, Closure } from "./magicvm/exec"
+import type { AnimaOptions } from "./magicvm/meta"
 
 // A language on top of the core: reads source into its syntax tree and lowers that to the core forms
 export interface FrontEnd {

@@ -3,7 +3,7 @@ import { compileNative, createNativeScheme, readNative, showValue, transformNati
 import { Anima } from '../anima';
 import { createScheme } from '../scheme';
 import { ASTStringifier } from '../scheme/printer';
-import { impl } from '../bytecode-rvm/meta';
+import { impl } from '../magicvm/meta';
 import { SOURCE_POS } from '../common';
 
 const S = Symbol.for;
