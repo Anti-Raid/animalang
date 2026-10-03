@@ -227,6 +227,7 @@ export class AotCompiler {
                     case "SetMark": insts.push({ k: "SetMark", key: op.key, val: op.val, at }); break;
                     case "MarkSave": case "MarkRestore": insts.push({ k: op.k, reg: op.reg, at }); break;
                     case "CurMarks": insts.push({ k: "CurMarks", dst: op.dst, at }); break;
+                    case "InlineSite": insts.push({ k: "SetSite", site: op.site, at }); break;
                     case "IntCall": case "IntApply": insts.push({ k: op.k, pos: op.pos, dst: op.dst, start: op.start, nargs: op.nargs, at }); break;
                     case "If": term = { k: "Branch", cond: op.cond, then: ip, else: op.else, elseif: op.elseif, at }; break;
                     case "Else": term = { k: "Jump", target: op.end, at }; break;

@@ -341,6 +341,8 @@ export class Frame {
     public winds: Map<WindPoint | null, WindPoint | null> | null = null;
     // exact position of the last instruction run, when debug code knows it better than ip
     public posIp: number = -1;
+    // the inlined procedure the frame is running (an index into Code.inlines, -1: none), for tracebacks
+    public isite: number = -1;
     // the escape continuation or catch token of the %call/ec or %catch this frame's pending call is, cleared when it resumes
     public escape: EscapeContinuation | null = null;
 
@@ -365,6 +367,7 @@ export class Frame {
 
     thaw(ctx: ExecutionContext): Frame {
         const copy = new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx, this.marks, this.mframe);
+        copy.isite = this.isite;
         copy.winds = this.winds;
         copy.escape = this.escape;
         return copy;
@@ -528,9 +531,10 @@ export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] 
     for (let f = frame; f !== null; f = f.parent) {
         if (f.code.internal) continue;
         const ip = Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0);
-        let pos = f.code.positionAt(ip);
+        let { site: inner, pos } = f.code.frameAt(f.isite, ip);
         let present = true;
-        for (const site of f.code.inlinedAt(ip)) {
+        for (let at = inner; at !== -1; at = f.code.inlines[at].parent) {
+            const site = f.code.inlines[at];
             if (present) push({ name: site.name, pos, tails: null });
             pos = site.at;
             present = !site.tail;
@@ -546,7 +550,7 @@ export const formatTraceback = (frames: FrameInfo[], msg: string | undefined, fm
 // where an error in `frame` happened
 export const errorPos = (frame: Frame | null): SourcePos | null => {
     for (let f = frame; f !== null; f = f.parent) {
-        if (!f.code.internal) return f.code.positionAt(Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0));
+        if (!f.code.internal) return f.code.frameAt(f.isite, Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)).pos;
     }
     return null;
 };

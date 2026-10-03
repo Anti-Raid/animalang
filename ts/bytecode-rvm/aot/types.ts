@@ -19,7 +19,8 @@ export type AotInst = { at?: number } & (
     | { k: "Unpack"; src: number; start: number; count: number; flags: number }
     | { k: "SetMark"; key: number; val: number }
     | { k: "MarkSave" | "MarkRestore"; reg: number }
-    | { k: "CurMarks"; dst: number });
+    | { k: "CurMarks"; dst: number }
+    | { k: "SetSite"; site: number });
 
 export type AotTerm = { at?: number } & (
     // `escape` jumps leave a %block early; `loopBack` jumps close a %loop

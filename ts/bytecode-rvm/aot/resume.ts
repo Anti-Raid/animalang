@@ -8,6 +8,7 @@ import { FunctionEmitter } from "./function";
 export class ResumeEmitter extends FunctionEmitter {
     protected readonly accExpr = "ctx.acc";
     protected readonly endOfCode = "return null;";
+    protected readonly siteVar = "frame.isite";
     // resume functions run from the driver loop, at the base of the js stack
     protected readonly depthCheck = "";
     protected upvarRef(idx: number): string { return `upvars[${idx}]`; }

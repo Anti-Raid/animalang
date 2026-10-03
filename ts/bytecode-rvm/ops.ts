@@ -33,7 +33,13 @@ export type Op = { ip: number } & (
     | { k: "MarkSave" | "MarkRestore"; reg: number }
     | { k: "CurMarks"; dst: number }
     | { k: "HostCall"; pos: number; start: number; nargs: number; tail: boolean }
-    | { k: "IntCall" | "IntApply"; pos: number; dst: number; start: number; nargs: number });
+    | { k: "IntCall" | "IntApply"; pos: number; dst: number; start: number; nargs: number }
+    // the code from here on runs in the inlined procedure `site` (an index into Code.inlines; -1: none), or has just
+    // returned from it (returnedFrom(site)), for tracebacks (see Code.frameAt)
+    | { k: "InlineSite"; site: number });
+
+// the InlineSite of code that has just returned from the inlined procedure `site`, into the one around it
+export const returnedFrom = (site: number): number => -site - 2;
 
 export type OpKind = Op["k"];
 

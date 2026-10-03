@@ -11,7 +11,7 @@ import { renamePass } from "./passes/rename";
 import { closureCaptures, type Captures } from "./passes/closures";
 import { BOX, BOX_IN_PLACE, SET_BOX, UNBOX, convertAssignments, type Converted } from "./passes/assignments";
 import { removeBoxes, type Unboxed } from "./passes/unbox";
-import { INLINED } from "./passes/cp0";
+import { INLINED, TAIL_INLINED } from "./passes/cp0";
 import { optimize } from "./passes/cp0";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
@@ -231,7 +231,8 @@ export class Compiler {
                     this.#compileSetBox(expr, opts)
                     return
                 case INLINED:
-                    opts.nodes.push({ t: "InlineEnter", name: expr[1].description, at: SOURCE_POS.get(expr) ?? opts.pos ?? null, tail: opts.isTail })
+                case TAIL_INLINED:
+                    opts.nodes.push({ t: "InlineEnter", name: expr[1].description, at: SOURCE_POS.get(expr) ?? opts.pos ?? null, tail: operator === TAIL_INLINED })
                     this.#compileBody(expr.slice(2), opts)
                     opts.nodes.push({ t: "InlineExit" })
                     return

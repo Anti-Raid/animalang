@@ -69,6 +69,7 @@ export class DirectEmitter extends FunctionEmitter {
         return out;
     }
     protected readonly endOfCode = "return undefined;";
+    protected readonly siteVar = "isite";
 
     protected recordIp(): string {
         return "";
@@ -80,6 +81,11 @@ export class DirectEmitter extends FunctionEmitter {
 
     protected windowCall(fn: string, start: number, nargs: number, withContext: boolean = false): string {
         return `${fn}([${this.argList(start, nargs)}], 0, ${nargs}${withContext ? ", ctx, executor" : ""})`;
+    }
+
+    // whether the code runs procedures the optimizer inlined (see Frame.isite)
+    get #hasSites(): boolean {
+        return this.blocks.some(b => b.insts.some(x => x.k === "SetSite"));
     }
 
     // the direct entry takes the parameters' values (the rest parameter's last) as js arguments
@@ -107,7 +113,7 @@ export class DirectEmitter extends FunctionEmitter {
             : "";
         this.emit(`
             function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
-                let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ""};
+                let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ""}${this.#hasSites ? ", isite = -1" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 ${uvDefs}
         `);
@@ -166,6 +172,7 @@ export class DirectEmitter extends FunctionEmitter {
                     } else {
                         const f = new Frame(closure, [${allRegs}], rip, null, ctx, marks, mframe);
                         ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : ""}
+                        ${this.#hasSites ? "f.isite = isite;" : ""}
                         sig.push(f);
                     }
                     throw sig;

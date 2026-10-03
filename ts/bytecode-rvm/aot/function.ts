@@ -85,6 +85,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // a call of `fn` over the register window (followed by ctx and executor for an intrinsic that takes the context)
     protected abstract windowCall(fn: string, start: number, nargs: number, withContext?: boolean): string;
 
+    // the inlined procedure the code is running (see Frame.isite)
+    protected abstract readonly siteVar: string;
+
     // where the value of the last call is (read by MoveAcc)
     protected abstract readonly accExpr: string;
 
@@ -211,6 +214,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`${this.marksVar} = r${inst.reg}; ${this.mframeVar} = r${inst.reg + 1};`);
             case "CurMarks":
                 return this.emit(`r${inst.dst} = new ContinuationMarkSet(${this.marksVar});`);
+            case "SetSite":
+                return this.emit(`${this.siteVar} = ${inst.site};`);
             case "Unpack": {
                 const moves = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i} = tmp[${i}];`);
                 if ((inst.flags & UNPACK_REST) !== 0) moves.push(`r${inst.start + inst.count} = restValues(tmp, ${inst.count});`);

@@ -2,7 +2,7 @@ import { ConstPool, type SourcePos } from "../common";
 import { Code, Closure, ClosureTemplate, type InlineSite, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import type { RestKind } from "./arity";
-import { UNPACK_REST, UNPACK_STRICT, type DistributiveOmit, type Op } from "./ops";
+import { UNPACK_REST, UNPACK_STRICT, returnedFrom, type DistributiveOmit, type Op } from "./ops";
 
 let nextLabelId = 0;
 
@@ -203,9 +203,16 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
     const labels = new Map<JumpLabel, number>()
     const inlines: InlineSite[] = []
     const open: number[] = []
+    // code that runs inlined procedures starts (and a self tail call restarts it) outside any: its first instruction,
+    // after the positions it starts at
+    let reset = nodes.some(n => n.t === "InlineEnter")
     const fixups: [op: any, field: string, label: JumpLabel][] = []
     const jump = (op: Op, field: string, label: JumpLabel) => fixups.push([op, field, label])
     for (const node of nodes) {
+        if (reset && node.t !== "Pos") {
+            push({ k: "InlineSite", site: -1 })
+            reset = false
+        }
         switch (node.t) {
             case "LoadValue": {
                 const v = node.constant
@@ -220,12 +227,18 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
             case "SetGlobal": push({ k: "SetGlobal", src: node.srcReg, sym: cpool.push(node.sym) }); break
             case "Label": labels.set(node.label, ip); break
             case "FunctionEntry": break
-            case "InlineEnter":
-                open.push(inlines.push({ start: ip, end: ip, name: node.name, at: node.at, tail: node.tail, parent: open.length > 0 ? open[open.length - 1] : -1 }) - 1)
+            case "InlineEnter": {
+                const site = inlines.push({ start: ip, end: ip, name: node.name, at: node.at, tail: node.tail, parent: open.length > 0 ? open[open.length - 1] : -1 }) - 1
+                open.push(site)
+                push({ k: "InlineSite", site })
                 break
-            case "InlineExit":
-                inlines[open.pop()!].end = ip
+            }
+            case "InlineExit": {
+                const site = open.pop()!
+                inlines[site].end = ip
+                push({ k: "InlineSite", site: returnedFrom(site) })
                 break
+            }
             case "If": case "ElseIf": jump(push({ k: "If", cond: node.reg, else: -1, elseif: node.t === "ElseIf" }), "else", node.elseLabel); break
             case "Else": jump(push({ k: "Else", end: -1 }), "end", node.endLabel); break
             case "EndIf": push({ k: "EndIf" }); break

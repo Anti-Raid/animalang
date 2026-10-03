@@ -158,13 +158,28 @@ export class Code {
         return copy;
     }
 
-    // the procedures inlined around the instruction at `ip`, innermost first
-    inlinedAt(ip: number): InlineSite[] {
-        let at = -1;
-        this.inlines.forEach((site, i) => { if (site.start <= ip && ip < site.end) at = i; });
-        const out: InlineSite[] = [];
-        for (; at !== -1; at = this.inlines[at].parent) out.push(this.inlines[at]);
-        return out;
+    // the inlined procedure a frame is running given its Frame.isite, and where in it, its last call being at `ip`: as
+    // for a frame of its own, the call it is in, the start of the procedure if it has made none, or the call of a
+    // procedure it inlined when that is the last call it made (or has just returned from)
+    frameAt(isite: number, ip: number): { site: number, pos: SourcePos | null } {
+        if (isite >= -1) return { site: isite, pos: this.positionIn(isite, ip) };
+        const from = this.inlines[-isite - 2];
+        return { site: from.parent, pos: ip < from.end ? from.at : this.positionIn(from.parent, ip) };
+    }
+
+    positionIn(site: number, ip: number): SourcePos | null {
+        if (site === -1) return this.inlines.length === 0 ? this.positionAt(ip) : this.#outside(-1, ip);
+        const s = this.inlines[site];
+        if (ip < s.start || ip >= s.end) return this.positionAt(Math.min(s.start + 1, s.end));
+        return this.#outside(site, ip);
+    }
+
+    // the position of `ip` in the code of `site`, outside the procedures inlined into it
+    #outside(site: number, ip: number): SourcePos | null {
+        let inner = -1;
+        this.inlines.forEach((s, i) => { if (s.start <= ip && ip < s.end && i > site && (inner === -1 || s.start >= this.inlines[inner].start)) inner = i; });
+        while (inner !== -1 && this.inlines[inner].parent !== site) inner = this.inlines[inner].parent;
+        return inner === -1 ? this.positionAt(ip) : this.inlines[inner].at;
     }
 
     positionAt(ip: number): SourcePos | null {

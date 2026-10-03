@@ -12,7 +12,7 @@ import { BOXED } from "../lambda";
 import type { VariableMetadata } from "../scope";
 import { Lsrc, extend, keepPos, malformed, mapExprs } from "./lang";
 
-export const Lconv = extend(Lsrc, "Lconv", { add: { "%box": "exprs", "%unbox": "exprs", "%box!": "exprs", "%set-box!": "assign", "%boxed": "exprs", "%inlined": "label" } });
+export const Lconv = extend(Lsrc, "Lconv", { add: { "%box": "exprs", "%unbox": "exprs", "%box!": "exprs", "%set-box!": "assign", "%boxed": "exprs", "%inlined": "label", "%tail-inlined": "label" } });
 
 export const BOX = Symbol.for("%box");
 export const UNBOX = Symbol.for("%unbox");

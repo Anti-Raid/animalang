@@ -79,7 +79,7 @@ export const closureCaptures = (ast: any, intrinsics: Intrinsics): Captures => {
                 return;
             case "label":
                 if (op === Symbol.for("%block")) return body(e.slice(2), fn, used, new Map(blocks).set(e[1], used));
-                if (op === Symbol.for("%inlined")) return body(e.slice(2), fn, used, blocks);
+                if (op === Symbol.for("%inlined") || op === Symbol.for("%tail-inlined")) return body(e.slice(2), fn, used, blocks);
                 if (e.length > 2) walk(e[2], fn, blocks.get(e[1]) ?? false, blocks);
                 return;
         }

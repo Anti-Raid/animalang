@@ -517,3 +517,32 @@ By guarding $CC\_tmpl.code.directArity \ne -1$ directly on the fast path, any te
 
 
 
+
+## 9. The optimizer (`cp0`, `passes/cp0.ts`)
+
+`cp0` runs between `assignments` and `unbox`. By A7 every local has one binder, and after `assignments` none is assigned (an assigned one is a box, whose binding is never assigned either). So a local variable's value is the one it was bound to, everywhere in its scope. Each rewrite below keeps the program's values, effects, errors and termination; the frames tracebacks show are kept by the inline table (9.6).
+
+### 9.1 Constants and copies
+A `%let`, `%let*` or `%letrec` binding of a constant, or of another local, is dropped and its uses replaced by the constant or the other variable. The binding is evaluated once, before its scope, and the variable is never assigned, so every use reads that value. A constant is a literal or a `%quote`d datum (the same object each time, as the constant pool gives); a local read has no effect and cannot fail. A global is never propagated: it can be assigned.
+
+### 9.2 Folding
+A call of an intrinsic declared `foldable` whose arguments are all constants is replaced by its value, computed when compiling, unless computing it throws, in which case the call stays and throws when it runs. `foldable` promises no effect, a value that depends only on the arguments, and no new object, so running it once while compiling, and using the value at each run, gives the same value as running it at each run (and `eq?` on it behaves the same). An `%if` whose test is a constant becomes the branch the test selects: only `#f` is false, as in the VM (the test, a constant, has no effect).
+
+### 9.3 Dead code
+An expression whose value is not used is dropped when it has no effect and cannot fail: constants, local reads, lambdas (making a closure runs nothing; a lambda whose binders code generation rejects is kept, so its error stays), `%box`/`%unbox` of such, and calls of `effectFree` intrinsics (which promise no effect and no failure) on such arguments, with the right number of arguments. A binding nothing uses any more is dropped under the same condition on its init. Nothing else is dropped, so every effect and every error stays, in order.
+
+### 9.4 Inlining
+A call `(f a1 … an)`, where `f` is a lambda or a local bound to one with `n` parameters (no rest, not padded), becomes `(%let ((x1 a1) … (xn an)) body)`:
+
+- **Order.** The call evaluates the operator (a variable read or a lambda: no effect) and then the arguments, left to right, then runs the body with the parameters bound; the `%let` evaluates the arguments left to right and then runs the body with the parameters bound.
+- **Environment.** The body's free variables are bound around the lambda, so (by A7, uniquely named) they are in scope at the call, and are never assigned, so they hold what the closure would have captured; a box is the same box. The copy inlined has fresh names for its binders (the rename pass), so A7 still holds.
+- **Escapes.** A lambda whose body escapes to a `%block` outside it is not inlined: the escape is an error in a lambda (A4), and inlining would remove it.
+- **Continuations and marks.** A continuation captured in the inlined body resumes the same computation as one captured in the called procedure: the rest of the body, then the rest of the caller. Marks set in the body are in a new logical frame when the call was not in tail position and in the caller's when it was, as for a call, since code generation compiles `%with-mark` by its own tail position.
+- **Termination.** A `%letrec`'s lambdas are not inlined in their own group, and a procedure is not inlined in its own inlined body, so inlining ends; small procedures are inlined within a total budget.
+- **Interrupts.** A check at a function's entry goes with the call it no longer makes; the code that remains still has its loops' checks, and the inlined code has none of its own unbounded loops without them, so interrupts still come (A6).
+
+### 9.5 What is recorded
+The intrinsics a fold or a drop relied on are recorded as used by every function compiled, so `Code.bind` and `Code.runsWith` still check them when the code moves to another table.
+
+### 9.6 Tracebacks
+Each inlined body is marked `(%inlined name …)`, or `%tail-inlined` when the call was in the tail position of the procedure around it (which the optimizer tracks itself, through inlined bodies and escapes). Lowering records each site's range, name, call position and parent (`Code.inlines`), and the code stores the site it runs in the frame (`Frame.isite`: entering, and having just returned from one). `frameInfos` expands a frame into the frames the procedures would have had, innermost first, dropping the caller of a tail-inlined one, as a tail call drops it. A frame's position is, as without inlining, its last call: inside the procedure, the start of the procedure if it has made none, or the call of the procedure it just returned from. The frames are always those of the unoptimized program. Where the optimizer removed a call entirely (nothing left to run, or folded), code that is not debug code may show a later, more exact position for the frame than the removed call's.

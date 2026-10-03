@@ -54,7 +54,7 @@ A core form binds variables or does not evaluate its operands the usual way. Pri
 | `(%box! <symbol>)` | A local variable (a parameter or `%let-values` variable) now holds a box of its value. |
 | `(%set-box! <symbol> <expr>)` | The box a local variable holds now holds `<expr>`'s value; `<#void>`. |
 | `(%boxed <init>)` | Only as a `%letrec` init: the name holds a box from the start of the `%letrec`, which `<init>` sets when it runs. |
-| `(%inlined <name> <body> ...)` | What the optimizer leaves where it inlined the procedure `<name>` (a label): the body, in the same tail position. Tracebacks show it as that procedure's frame (see the pipeline). |
+| `(%inlined <name> <body> ...)` | What the optimizer leaves where it inlined the procedure `<name>` (a label): the body, in the same tail position. Tracebacks show it as that procedure's frame (see the pipeline). `%tail-inlined`: the same, where the procedure was called in the tail position of the one around it, whose frame it then replaces. |
 
 Block names are labels, not variables. An `%escape` cannot leave a `%lambda` (a compile error); `%let` is not a lambda, so escapes pass through it. `break` is an escape to a block around a loop, `continue` an escape to a block around its body, and an early return an escape to a block around a function body. These compile to jumps inside one function (`BLOCK end`, `LOOP end`, `ENDLOOP head`, `JUMP target`), which the AOT direct entry emits as labeled JS blocks, `for (;;)` loops and `break`s. Variables assigned in a loop stay plain registers unless they are read after a call in the loop (see the boxing rule below).
 

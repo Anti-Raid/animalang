@@ -483,6 +483,7 @@ export class VMExecutor {
             const copy = new Frame(f.closure, f.regs.slice(), f.ip, parent, ctx, move(f.marks), f.mframe + shift);
             copy.escape = f.escape;
             copy.posIp = f.posIp;
+            copy.isite = f.isite;
             if (f.winds === null) {
                 copy.winds = winds;
             } else {
