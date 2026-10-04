@@ -53,10 +53,18 @@ which V8 compiles to native 64-bit arithmetic. `integer` in `integer.ts` is the 
 (`division by zero`, `integer overflow`, ...); `fromstring` reads as Luau's `strtoll` / `strtoull` do (saturating in
 base 10, wrapping otherwise). Integers never mix with numbers, as in Luau.
 
-**Deviation from Luau**: `+`, `-`, `*` and `/` work on two integers (Luau allows only `==` on them and gives `attempt to
-perform arithmetic (add) on integer`). They are `integer.add`, `sub`, `mul` and `div`: wrapping around 64 bits, and `/`
-dividing truncated, with `division by zero` and `integer overflow` as `integer.div` gives them. An integer with a number
-is still Luau's arithmetic error, and the other operators (`//`, `%`, `^`, unary `-`, `<`) are Luau's errors too.
+**Deviation from Luau**: every operator works on two integers (Luau allows only `==` on them and gives `attempt to
+perform arithmetic (add) on integer`), giving an integer, as the library's functions do:
+
+- `+`, `-`, `*`, unary `-`: `integer.add`, `sub`, `mul`, `neg`, wrapping around 64 bits.
+- `/`: `integer.div`, dividing truncated (`-7i / 2i` is `-3i`); `//` and `%`: `integer.idiv` and `mod`, floored. Each
+  gives `division by zero` and `integer overflow` as its function does.
+- `^`: `ipow` (`integer.ts`; Luau's library has no power), wrapping; with a negative exponent it is the truncated
+  `1 / a^-b` (`0i` but for `1i` and `-1i`, `division by zero` for `0i`).
+- `<`, `<=`, `>`, `>=`: signed, as `integer.lt` and so on.
+- `..`: an integer is written as `tostring` writes it (signed decimal).
+
+An integer with a number is still Luau's error, for every operator.
 
 The tests (`tests/luau-{number,buffer,vector,integer}.test.ts`) check them against Luau's own results, and with `LUAU` set,
 against thousands of random cases run by Luau.

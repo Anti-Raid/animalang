@@ -142,3 +142,14 @@ export const integer = {
         return scratch.getBigInt64(0, false);
     },
 };
+
+// a ^ b on two integers (not in Luau): wrapping, and for b < 0 the truncated 1 / a^-b
+export const ipow = (a: bigint, b: bigint): bigint => {
+    if (b < 0n) {
+        if (a === 0n) throw hostError("division by zero");
+        return a === 1n ? 1n : a === -1n ? ((-b) & 1n ? -1n : 1n) : 0n;
+    }
+    let r = 1n;
+    for (let x = a, e = b; e > 0n; e >>= 1n, x = I(x * x)) if (e & 1n) r = I(r * x);
+    return r;
+};

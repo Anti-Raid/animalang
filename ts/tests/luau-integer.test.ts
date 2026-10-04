@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { integer } from '../lua/integer';
+import { integer, ipow } from '../lua/integer';
 import { LuaBuffer } from '../lua/buffer';
 import { LuaTable } from '../lua/table';
 import { num2str } from '../lua/number';
@@ -28,6 +28,15 @@ describe("Luau integers", () => {
         expect(() => integer.extract(1n, 64n)).toThrow("invalid argument #2 to 'extract' (field cannot be negative)");
         expect(() => integer.extract(1n, 60n, 5n)).toThrow("trying to access non-existent bits");
         expect([integer.band(), integer.bor(), integer.btest(), integer.btest(1n, 2n)]).toEqual([-1n, 0n, true, false]);
+    });
+
+    it("raise to powers, wrapping, for ^ (not in Luau)", () => {
+        expect([ipow(2n, 10n), ipow(2n, 63n), ipow(2n, 64n), ipow(3n, 0n), ipow(-3n, 3n)]).toEqual([1024n, MIN, 0n, 1n, -27n]);
+        expect([ipow(2n, -1n), ipow(1n, -5n), ipow(-1n, -3n), ipow(-1n, -2n)]).toEqual([0n, 1n, -1n, 1n]);
+        expect(() => ipow(0n, -1n)).toThrow("division by zero");
+        let r = 1n;
+        for (let i = 0; i < 100; i++) r = BigInt.asIntN(64, r * 3n);
+        expect(ipow(3n, 100n)).toBe(r);
     });
 
     it("convert from numbers and strings as Luau does", () => {
