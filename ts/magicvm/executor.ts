@@ -204,7 +204,12 @@ export class VMExecutor {
         }
 
         const handler = this.#hooked(proc);
-        if (handler === null) throw vmError(Msg.NonProcedure, proc);
+        if (handler === null) {
+            const err = vmError(Msg.NonProcedure, proc);
+            // a tail call leaves no frame of its caller to say where it was
+            if (isTail && callerFrame !== null) err.at = errorPos(callerFrame);
+            throw err;
+        }
         const args = [proc];
         for (let i = 0; i < nargs; i++) args.push(callerArgs[startReg + i]);
         return this.invoke(ctx, handler, callerFrame, args, 0, args.length, isTail, marks, mframe);
@@ -221,7 +226,10 @@ export class VMExecutor {
     // procedure the value gives (TRY_CALL), with the value before `args`
     public callOther(ctx: ExecutionContext, value: any, args: any[], depth: number, marks: any, mframe: number): any {
         const handler = this.#hooked(value);
-        if (handler === null) throw Suspend.invoke(value, args);
+        if (handler === null) {
+            if (!(value instanceof IProcedure)) throw vmError(Msg.NonProcedure, value);
+            throw Suspend.invoke(value, args);
+        }
         const all = [value, ...args];
         if (handler instanceof CaseLambda) return this.callCase(ctx, handler, all, depth, marks, mframe);
         if (handler instanceof Closure) {

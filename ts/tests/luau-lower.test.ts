@@ -76,6 +76,25 @@ describe("Luau lowered control flow", () => {
     });
 });
 
+describe("Luau lowered functions", () => {
+    it("makes closures and calls them as Luau does", () => {
+        expect(run("local function fib(n) if n < 2 then return n end return fib(n - 1) + fib(n - 2) end return fib(20)")).toBe("6765");
+        expect(run("function add(a, b) return (a or 0) + (b or 0) end return add(1, 2), add(1), add(1, 2, 3), add()")).toBe("3\t1\t3\t0");
+        expect(run("local function counter() local n = 0 return function() n += 1 return n end end local c = counter() c() c() return c()")).toBe("3");
+        expect(run("local s = 0 for i = 1, 3 do local function g() return i end s += g() end return s")).toBe("6");
+        expect(run("local function noret() end local function bare() return end return noret(), bare()")).toBe("nil\tnil");
+        expect(run("local function f() for i = 1, 10 do if i == 3 then return i end end end return f()")).toBe("3");
+        expect(run("local function down(n) if n == 0 then return 'done' end return down(n - 1) end return down(100000)")).toBe("done");
+    });
+
+    it("reports calling what is not a function where it happens, tail call or not", () => {
+        expect(run("local x\nreturn x(1)")).toBe("error: t:2: attempt to call a nil value");
+        expect(run("local x = 5\nlocal y = x()")).toBe("error: t:2: attempt to call a number value");
+        expect(run("local function f()\n  local x = 'a'\n  return x()\nend\nreturn f()")).toBe("error: t:3: attempt to call a string value");
+        expect(run("local function f() return 1, 2 end")).toBe("error: t:1: returning several values from a function is not supported yet");
+    });
+});
+
 describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
     it("computes what Luau computes, and fails where it fails", () => {
         let seed = 7;
@@ -105,6 +124,39 @@ describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
             return run(p);
         });
         expect(actual).toEqual(expected);
+    });
+
+    it("calls functions as Luau does", () => {
+        let seed = 5;
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+        const plain = ["1", "2", "0", "-1", "0.5", "'10'", "3", "7"];
+        const rare = ["nil", "true", "'x'", "(a)(1)", "k()", "f"];
+        const calls = ["f(1, 2)", "f(a)", "f()", "f(1, 2, 3)", "g(b)", "g(1)", "h(3)", "h(a)", "a", "b"];
+        let atoms = plain;
+        const binops = ["+", "-", "*", "..", "==", "<", "and", "or"];
+        const expr = (depth: number, vars: string[] = []): string => {
+            if (depth === 0 || rand(3) === 0) return vars.length > 0 && rand(2) === 0 ? vars[rand(vars.length)] : rand(40) === 0 ? rare[rand(rare.length)] : atoms[rand(atoms.length)];
+            if (rand(6) === 0) return `(if ${expr(depth - 1, vars)} then ${expr(depth - 1, vars)} else ${expr(depth - 1, vars)})`;
+            return `(${expr(depth - 1, vars)} ${binops[rand(binops.length)]} ${expr(depth - 1, vars)})`;
+        };
+        const programs = Array.from({ length: 1500 }, () => [
+            `local a, b = ${(atoms = plain, expr(1))}, ${expr(1)}`,
+            `local function f(x, y) if ${expr(1, ["x", "y"])} then return ${expr(2, ["x", "y"])} end ${rand(2) ? `a = ${expr(1, ["x"])}` : ""} return y end`,
+            `local function h(n) if type(n) ~= "number" or n <= 0 then return 0 end return n + h(n - 1) end`.replace('type(n) ~= "number" or ', ""),
+            `local g = function(z) ${rand(2) ? `b = ${expr(1, ["z"])}` : ""} return ${expr(2, ["z"])} end`,
+            `local k = ${rand(3) === 0 ? "nil" : "function() return a end"}`,
+            (atoms = [...plain, ...calls], ""),
+            ...Array.from({ length: 1 + rand(3) }, () => rand(2) ? `${["a", "b"][rand(2)]} = ${expr(2)}` : `${["f", "g", "k"][rand(3)]}(${expr(1)}${rand(2) ? `, ${expr(1)}` : ""})`),
+            `return a, b, ${expr(2)}`,
+        ].join("\n"));
+        const quote = (s: string) => JSON.stringify(s);
+        const lua = programs.map(p => `do local f, err = loadstring(${quote(p)}, "=t") if not f then print("error: " .. err) else local r = table.pack(pcall(f)) if r[1] then local out = {} for i = 2, r.n do out[#out + 1] = tostring(r[i]) end print(table.concat(out, "\\t")) else print("error: " .. tostring(r[2])) end end end`);
+        const file = join(mkdtempSync(join(tmpdir(), "luau-")), "functions.luau");
+        writeFileSync(file, lua.join("\n"));
+        const expected = execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26 }).split("\n").slice(0, programs.length);
+        // functions print as their addresses, which differ
+        const actual = programs.map(p => run(p)).map(l => l.replace(/function: 0x[0-9a-f]+/g, "function"));
+        expect(actual).toEqual(expected.map(l => l.replace(/function: 0x[0-9a-f]+/g, "function")));
     });
 
     it("branches and loops as Luau does", () => {

@@ -117,7 +117,7 @@ export class DirectEmitter extends FunctionEmitter {
             : "";
         this.emit(`
             function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
-                let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ", dip = -1, derr"}${this.#hasSites ? ", isite = -1" : ""};
+                let ip = 0, rip = 0, tip = -1, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ", dip = -1, derr"}${this.#hasSites ? ", isite = -1" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 ${uvDefs}
         `);
@@ -169,6 +169,8 @@ export class DirectEmitter extends FunctionEmitter {
                     const sig = e instanceof Suspend ? e : Suspend.error(e);
                     sig.entered = closure;
                     if (rip === -1) {
+                        // a tail call that failed to call (no frame is left to say where it was)
+                        if (tip !== -1 && e instanceof VMError && e.at === null) e.at = closure.tmpl.code.positionAt(tip);
                         if (sig.innermost === null && sig.marks === undefined) {
                             sig.marks = marks;
                             sig.mframe = mframe;
@@ -177,6 +179,7 @@ export class DirectEmitter extends FunctionEmitter {
                         const f = new Frame(closure, [${allRegs}], rip, null, ctx, marks, mframe);
                         ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : "if (e === derr) f.posIp = dip;"}
                         ${this.#hasSites ? "f.isite = isite;" : ""}
+                        if (e instanceof VMError && e.at === null) e.at = errorPos(f);
                         sig.push(f);
                     }
                     throw sig;
@@ -323,7 +326,7 @@ export class DirectEmitter extends FunctionEmitter {
         const args = this.argList(start, nargs);
         const cache = site !== undefined ? `CC${site}` : null;
         return `
-            rip = -1;
+            rip = -1;${site !== undefined ? ` tip = ${site};` : ""}
             ${cache !== null ? `if (${proc} instanceof Closure && ${proc}.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
                 return ${cache}.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
             }` : ""}

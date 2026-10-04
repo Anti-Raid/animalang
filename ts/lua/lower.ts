@@ -1,7 +1,8 @@
 // Luau's tree (syntax/ast.ts) lowered to the VM's core forms. So far: locals, assignment (to locals and globals),
-// compound assignment, do, if, while, repeat, numeric for, break, continue, return, literals, and the operators; the rest
-// is "not supported yet"
-import { CORE_BEGIN, CORE_BLOCK, CORE_ESCAPE, CORE_IF, CORE_INTCALL, CORE_LET, CORE_LOOP, CORE_SET, type SourcePos } from "../common";
+// compound assignment, do, if, while, repeat, numeric for, break, continue, return, functions, calls, literals, and the
+// operators; the rest is "not supported yet"
+import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LETREC, CORE_LOOP, CORE_SET, type SourcePos } from "../common";
+import { PAD, clause } from "../magicvm/lambda";
 import { L, isForm, offsetOf, type ParseResult } from "./syntax/ast";
 import { Lexer } from "./syntax/lexer";
 import { Tok } from "./syntax/tokens";
@@ -12,8 +13,6 @@ export class LuauSyntaxError extends Error {
         super(`${pos.file}:${pos.line}: ${reason}`);
     }
 }
-
-const RETURN = Symbol("return");
 
 const ARITH: ReadonlyMap<symbol, string> = new Map([
     [L.ADD, "add"], [L.SUB, "sub"], [L.MUL, "mul"], [L.DIV, "div"], [L.IDIV, "idiv"], [L.MOD, "mod"], [L.POW, "pow"],
@@ -31,7 +30,11 @@ const values = (pos: SourcePos | null, exprs: any[]) => exprs.length === 1 ? exp
 type Loop = { brk: symbol, cont: symbol, repeat?: { stat: C.Repeat, locals: Map<symbol, number>, index: number } };
 
 class Lowering {
-    readonly #loops: Loop[] = [];
+    // the function being lowered: the block its return escapes from, the loops a break or continue may leave, and whether
+    // it is the chunk (which may return several values)
+    #loops: Loop[] = [];
+    #ret: symbol = Symbol("return");
+    #chunk = true;
 
     constructor(readonly parsed: ParseResult, readonly file: string, readonly source: string) {}
 
@@ -51,7 +54,7 @@ class Lowering {
     chunk(): any[] {
         const root = this.parsed.root;
         const pos = this.pos(root);
-        return [CORE_BLOCK, pos, RETURN, ...this.statements(root), intcall(pos, "%values")];
+        return [CORE_BLOCK, pos, this.#ret, ...this.statements(root), intcall(pos, "%values")];
     }
 
     // a block's statements as a list of forms, then `tail`; each local statement binds the rest of the block. `onEach` is
@@ -62,6 +65,10 @@ class Lowering {
             const stat = block[i] as C.Stat;
             onEach?.(i);
             if (stat[0] === L.LOCAL) rest = [this.local(stat as C.LocalStat, rest)];
+            else if (stat[0] === L.LOCALFN) {
+                const [, name, func] = stat as C.LocalFunction;
+                rest = [[CORE_LETREC, this.pos(stat), [[name, this.function(func)]], ...rest]];
+            }
             else rest = [this.statement(stat), ...rest];
         }
         return rest;
@@ -99,7 +106,9 @@ class Lowering {
             }
             case L.RETURN: {
                 const exprs = (stat as C.Return).slice(1, -1) as C.Expr[];
-                return [CORE_ESCAPE, pos, RETURN, values(pos, exprs.map(e => this.expr(e)))];
+                if (exprs.length > 1 && !this.#chunk) return this.unsupported(stat, "returning several values from a function");
+                const value = this.#chunk ? values(pos, exprs.map(e => this.expr(e))) : exprs.length === 0 ? undefined : this.expr(exprs[0]);
+                return [CORE_ESCAPE, pos, this.#ret, value];
             }
             case L.IF: {
                 const out: any[] = [CORE_IF, pos];
@@ -141,9 +150,9 @@ class Lowering {
                 this.#checkUntil(repeat, locals, index, stat);
                 return [CORE_IF, pos, this.test(repeat[2]), [CORE_ESCAPE, pos, loop.brk], [CORE_ESCAPE, pos, loop.cont]];
             }
-            case L.LOCALFN: return this.unsupported(stat, "local function");
             case L.FORIN: return this.unsupported(stat, "for ... in");
-            case L.CALL: case L.METHOD: return this.unsupported(stat, "a call");
+            case L.CALL: return this.call(stat as C.Call);
+            case L.METHOD: return this.unsupported(stat, "a method call");
         }
         return this.unsupported(stat, "this statement");
     }
@@ -212,6 +221,29 @@ class Lowering {
                         [CORE_ESCAPE, pos, loop.brk]]])]];
     }
 
+    // a padded closure, as Luau's functions take any number of arguments: missing ones are nil, extra ones dropped
+    function(func: C.Func): any[] {
+        const [, params, , block] = func;
+        const pos = this.pos(func);
+        const outer = { loops: this.#loops, ret: this.#ret, chunk: this.#chunk };
+        this.#loops = [];
+        this.#ret = Symbol("return");
+        this.#chunk = false;
+        try {
+            return [CORE_LAMBDA, pos, clause([PAD], params, null, [[CORE_BLOCK, pos, this.#ret, ...this.statements(block), undefined]])];
+        } finally {
+            this.#loops = outer.loops;
+            this.#ret = outer.ret;
+            this.#chunk = outer.chunk;
+        }
+    }
+
+    call(e: C.Call): any[] {
+        const [, f, ...rest] = e;
+        const args = rest.slice(0, -1) as C.Expr[];
+        return [CORE_CALL, this.pos(e), this.expr(f), ...args.map(a => this.expr(a))];
+    }
+
     // with a literal step, its sign picks the test when compiling
     #forTest(pos: SourcePos, step: C.Expr | null, i: symbol, limit: symbol, by: symbol): any {
         const literal = step === null ? 1 : typeof step === "number" ? step : isForm(step) && step[0] === L.NEG && typeof step[1] === "number" ? -step[1] : null;
@@ -273,9 +305,10 @@ class Lowering {
             }
             case L.LEN: return this.unsupported(e, "'#'");
             case L.VARARGS: return this.unsupported(e, "'...'");
-            case L.CALL: case L.METHOD: return this.unsupported(e, "a call");
+            case L.CALL: return this.call(e as C.Call);
+            case L.METHOD: return this.unsupported(e, "a method call");
             case L.INDEX: return this.unsupported(e, "indexing");
-            case L.FUNCTION: return this.unsupported(e, "a function");
+            case L.FUNCTION: return this.function(e as C.Func);
             case L.TABLE: return this.unsupported(e, "a table");
             case L.INTERP: return this.unsupported(e, "an interpolated string");
         }

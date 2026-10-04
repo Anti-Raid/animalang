@@ -7,8 +7,10 @@ whose language is Luau.
 
 ## Lowering
 So far: locals, assignment (to locals and globals, several at once), compound assignment, `do` blocks, `if`, `while`,
-`repeat`, numeric `for`, `break`, `continue`, `return` (several values), literals, if-expressions, and the operators
-but `#` (arithmetic, `..`, comparisons, `and`, `or`, `not`). Anything else is a positioned "not supported yet" error.
+`repeat`, numeric `for`, `break`, `continue`, `return`, functions (`function`, `local function`, `function name()`),
+calls, literals, if-expressions, and the operators but `#` (arithmetic, `..`, comparisons, `and`, `or`, `not`).
+Functions return one value or none (nil) so far; several values are the chunk's alone. Anything else is a positioned
+"not supported yet" error.
 
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
@@ -28,6 +30,10 @@ but `#` (arithmetic, `..`, comparisons, `and`, `or`, `not`). Anything else is a 
   a local the condition uses is Luau's compile error. A numeric `for` is Luau's `FORNPREP`/`FORNLOOP`: its three values
   are read as numbers once (`invalid 'for' limit (number expected, got nil)`), the loop goes on while
   `step > 0 ? i <= limit : limit <= i` (decided when compiling for a literal step), and each iteration binds a fresh local.
+- A function is a `%lambda` clause with the `pad` option: missing arguments are nil and extra ones dropped, as Luau
+  calls go. Its body is a `%block` its `return`s escape from; a `local function` is a `%letrec`, so it sees itself.
+  Calls are `%call`s; calling what is not a function is `attempt to call a nil value` where the call is, tail call or
+  not. Luau has no tail calls, but the VM's are not observable but in tracebacks (and in recursion that never runs out).
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
   (`messages.ts`) words them as Luau does: `file:line: message`. Syntax errors are `LuauSyntaxError`s, worded alike.
 

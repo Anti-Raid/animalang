@@ -1,7 +1,7 @@
 // The AOT compiler: splits a function's instructions into basic blocks, generates a function's JS source (resume.ts, direct.ts) and builds it,
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
 import { Intrinsics, type TypeSystem } from "../intrinsics";
-import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, packValues } from "../../common";
+import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, VMError, packValues } from "../../common";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
 import { DirectEmitter } from "./direct";
 import { ResumeEmitter } from "./resume";
@@ -14,7 +14,7 @@ import type { Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { blockStarts, type Op } from "../ops";
-import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
+import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
     markSet,
@@ -28,6 +28,8 @@ export const JIT_DEPS = {
     ErrorObject,
     Box,
     MissingVarError,
+    VMError,
+    errorPos,
     Closure,
     CaseLambda,
     WindPoint,
