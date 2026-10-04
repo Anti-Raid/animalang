@@ -4,14 +4,19 @@ import { hostError } from "./errors";
 export class Env {
     // bound to a name that is declared but not defined yet: lookups treat it as missing, and do not look further out
     static readonly UNDEFINED: unique symbol = Symbol("undefined");
+    // as `unbound`: reading an unbound global is an error
+    static readonly ERROR: unique symbol = Symbol("error");
 
     #map: Map<symbol, any> = new Map();
     #parent: Env | null;
     #frozen: boolean;
+    // what code reading an unbound global gets (e.g. Luau's nil), or Env.ERROR
+    readonly unbound: any;
 
-    constructor(parent: Env | null = null, frozen: boolean = false) {
+    constructor(parent: Env | null = null, frozen: boolean = false, options: { unbound?: any } = {}) {
         this.#parent = parent;
         this.#frozen = frozen;
+        this.unbound = "unbound" in options ? options.unbound : Env.ERROR;
     }
 
     get parent(): Env | null {
@@ -19,7 +24,7 @@ export class Env {
     }
 
     chained(frozen: boolean = false): Env {
-        return new Env(this, frozen);
+        return new Env(this, frozen, { unbound: this.unbound });
     }
 
     get frozen(): boolean {

@@ -79,6 +79,8 @@ export class DirectEmitter extends FunctionEmitter {
         return `dip = ${ip};`;
     }
 
+    protected readonly codeRef = "closure.tmpl.code";
+
     protected windowCall(fn: string, start: number, nargs: number, withContext: boolean = false): string {
         return `${fn}([${this.argList(start, nargs)}], 0, ${nargs}${withContext ? ", ctx, executor" : ""})`;
     }

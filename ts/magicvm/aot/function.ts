@@ -84,6 +84,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // a (regs, start, nargs)-style call of `fn` over the register window; runtime functions also take (ctx, executor) first
     // a call of `fn` over the register window (followed by ctx and executor for an intrinsic that takes the context)
     protected abstract windowCall(fn: string, start: number, nargs: number, withContext?: boolean): string;
+    // the running function's Code
+    protected abstract readonly codeRef: string;
 
     // the inlined procedure the code is running (see Frame.isite)
     protected abstract readonly siteVar: string;
@@ -177,10 +179,13 @@ export abstract class FunctionEmitter extends CodeEmitter {
                         if (cache.scope === ctx.scope && cache.version === Env.globalsVersion) {
                             r${inst.dst} = cache.value;
                         } else {
-                            const val = ctx.scope.lookup(CONSTANTS[${inst.sym}], MISSING);
+                            let val = ctx.scope.lookup(CONSTANTS[${inst.sym}], MISSING);
                             if (val === MISSING) {
-                                ${this.recordIp(inst.ip)}
-                                throw new MissingVarError(CONSTANTS[${inst.sym}]);
+                                if (ctx.scope.unbound === Env.ERROR) {
+                                    ${this.recordIp(inst.ip)}
+                                    throw new MissingVarError(CONSTANTS[${inst.sym}]);
+                                }
+                                val = ctx.scope.unbound;
                             }
                             ctx.scope.watch();
                             cache.scope = ctx.scope;
@@ -222,7 +227,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`tmp = unpackForBinding(r${inst.src}, ${inst.count}, ${inst.flags}); ${moves.join(" ")}`);
             }
             case "IntCall":
-                return this.emit(`r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)};`);
+                // non-debug code does not record where each operation is: an error the intrinsic raises gets the position here
+                if (this.debug || inst.at === undefined) return this.emit(`r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)};`);
+                return this.emit(`try { r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)}; } catch (e) { throw errorAt(e, ${this.codeRef}, ${inst.at}); }`);
             case "IntApply": {
                 // an array alone is the argument array itself: intrinsics never write to or keep it
                 const entry = this.table!.entries[inst.pos];

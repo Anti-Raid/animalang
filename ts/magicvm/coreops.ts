@@ -1,6 +1,6 @@
 // The VM's own operations as intrinsics (CORE_INTRINSICS, the start of every table), and the control requests the control
 // operations (and host intrinsics' HostTail) return for the VM to carry out at the call
-import { ErrorObject, Msg, MultipleValues, packValues, unpackValues, vmError } from "../common";
+import { ErrorObject, Msg, MultipleValues, VMError, packValues, unpackValues, vmError } from "../common";
 import { BARRIER, Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markValues } from "../marks";
 import type { Marks } from "../marks";
 import { CaseLambda, Closure, ClosureTemplate, Code } from "./code";
@@ -516,6 +516,13 @@ export const corePos = (name: string): number => {
 
 
 // an intrinsic's argument count checked at run time (for IntApply, whose count the compiler cannot know)
+// an error a leaf intrinsic raised in non-debug code (which does not record where each operation is), given the
+// position of its operation at `ip`
+export const errorAt = (e: any, code: Code, ip: number): any => {
+    if (e instanceof VMError && e.at === null) e.at = code.positionAt(ip);
+    return e;
+};
+
 export const applyIntrinsic = (fn: IntrinsicFn, name: string, min: number, max: number, args: any[], ctx: ExecutionContext, executor: VMExecutor): any => {
     if (args.length < min || args.length > max) throw vmError(Msg.Arity, name, min, max, args.length);
     return fn(args, 0, args.length, ctx, executor);

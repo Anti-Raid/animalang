@@ -11,7 +11,7 @@ import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
 import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS } from "../code";
 import type { Code, DirectFn, ResumeFn } from "../code";
-import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
+import { ControlRequest, HostTail, applyArgs, applyIntrinsic, errorAt, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { blockStarts, type Op } from "../ops";
 import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
@@ -52,6 +52,7 @@ export const JIT_DEPS = {
     HostTail,
     ControlRequest,
     applyIntrinsic,
+    errorAt,
     CatchToken,
     Caught,
     catchHere,

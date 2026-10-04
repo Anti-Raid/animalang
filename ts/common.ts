@@ -34,6 +34,9 @@ export enum Msg {
     BadSyntax, ParamNotSymbol, DuplicateParam, CannotBindBuiltin, CannotBindIntrinsic, IntrinsicAsValue, ApplyNonLeaf,
     NoClause, LambdaOption, UnreachableClause, BarrierReentry, NoPrompt, ErrorInHandler, CatchGuard,
     BareCall, UnknownIntrinsic,
+    // a front end's own message, args[0] its text, raised by its intrinsics so that it gets where it happened (`at`) and
+    // is worded by the formatter (e.g. prefixed with that position)
+    Text,
 }
 
 export type Formatter = (op: Msg, args: readonly any[], fmt: Formatter, at: SourcePos | null) => string;

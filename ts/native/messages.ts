@@ -87,6 +87,7 @@ export const nativeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.BareCall: return `bad syntax: ${name(a[0])} is not a core form (a call is (%call proc arg ...) or (%intcall %name arg ...))`;
         case Msg.UnknownIntrinsic: return `${a[0]}: ${name(a[1])} is not an intrinsic`;
         case Msg.ApplyNonLeaf: return `%intapply: ${a[0]} is not a leaf intrinsic, so it cannot be applied`;
+        case Msg.Text: return a[0];
         default: {
             const unworded: never = op;
             return `message ${unworded}`;
