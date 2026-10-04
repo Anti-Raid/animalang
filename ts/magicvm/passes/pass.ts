@@ -6,6 +6,8 @@ export type PassContext = {
     readonly debug: boolean,
     // whether to run the optimizer (passes/cp0.ts)
     readonly optimize: boolean,
+    // whether a continuation may run a frame of the code more than once (see AnimaOptions)
+    readonly reentrant: boolean,
     // the intrinsics the optimizer folded or dropped calls of: every function compiled records them as used (see
     // Code.bind), as what it computes depends on them
     readonly assumed: Set<number>,

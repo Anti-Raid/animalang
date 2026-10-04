@@ -51,6 +51,8 @@ export class Code {
     public restPos: number = -1;
     // compiled with interrupt checks (see Intrinsics.setInterruptHandler)
     public interrupts: boolean = false;
+    // whether a continuation may run a captured frame of it more than once (see AnimaOptions.reentrant)
+    public reentrant: boolean = true;
     // the procedures inlined into this code, for tracebacks (see inlinedAt)
     public inlines: readonly InlineSite[] = [];
 
@@ -139,6 +141,7 @@ export class Code {
         copies.set(this, copy);
         copy.restPos = this.restPos;
         copy.interrupts = this.interrupts;
+        copy.reentrant = this.reentrant;
         copy.inlines = this.inlines;
         SHARED_OPS.add(this.ops);
         copy.bind(table);

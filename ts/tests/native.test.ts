@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { compileNative, createNativeScheme, readNative, showValue, transformNative, NativeReadError } from '../native';
 import { Anima } from '../anima';
 import { createScheme } from '../scheme';
-import { hostTailFrom, listing } from '../magicvm/exec';
+import { Closure, ClosureTemplate, hostTailFrom, listing, type Code } from '../magicvm/exec';
 import { ASTStringifier } from '../scheme/printer';
 import { impl } from '../magicvm/meta';
 import { SyntaxPositions } from '../common';
@@ -113,6 +113,40 @@ describe("native-scheme", () => {
             (%call sum 10))`, "t.ns");
         expect(listing(code).join("\n")).not.toMatch(/Box/);
         expect(a.evaluateRaw(code)).toBe(45);
+    });
+
+    it("keeps assigned variables in registers across calls when its code is not re-entrant", () => {
+        const loop = `(define-global (id x) x)
+            (define-global (sum n) (let ((i 0) (t 0))
+                (%block done (%loop (%if (%intcall %< i n) (%begin (%set! t (%intcall %+ t (%call id i))) (%set! i (%intcall %+ i 1))) (%escape done t))))))`;
+        const deep = (code: Code): string[] => [...listing(code), ...code.constants.flatMap(c => c instanceof Closure ? deep(c.tmpl.code) : c instanceof ClosureTemplate ? deep(c.code) : [])];
+        const boxes = (a: Anima) => deep(a.compileRaw(loop, "t.ns")).join("\n").match(/Box/g)?.length ?? 0;
+        // re-entrant code boxes the counter, read after the call; code that is not re-entrant boxes nothing
+        expect(boxes(make())).toBeGreaterThan(0);
+        const a = make({ ...impl, reentrant: false });
+        expect(boxes(a)).toBe(0);
+        const run2 = (src: string) => a.evaluateRaw(a.compileRaw(src, "t.ns"));
+        run2(loop);
+        expect(run2(`(%call sum 100)`)).toBe(4950);
+        // a coroutine resumes its one suspended frame: assignments across yields are kept
+        run2(`(define-global co (%intcall %coroutine-create (lambda () (let ((t 0))
+            (%set! t (%intcall %+ t (%intcall %coroutine-yield 1))) (%set! t (%intcall %+ t (%intcall %coroutine-yield 2))) t))))`);
+        expect([run2(`(%intcall %coroutine-resume co)`), run2(`(%intcall %coroutine-resume co 10)`), run2(`(%intcall %coroutine-resume co 20)`)]).toEqual([1, 2, 30]);
+    });
+
+    it("refuses to run a captured frame of code that is not re-entrant a second time", () => {
+        const program = `(define-global saved #void) (define-global count 0)
+            (define-global (f) (let ((n 0)) (%set! n (%intcall %+ n (%intcall %call/cc (lambda (k) (%set! saved k) 1)))) n))
+            (define-global first (%call f))
+            (%set! count (%intcall %+ count 1))
+            (%if (%intcall %< count 3) (%call saved 10) (%intcall %push '() first))`;
+        const run2 = (a: Anima) => showValue(a.evaluateRaw(a.compileRaw(program, "t.ns")));
+        // re-entrant (the default): the continuation runs f's frame again, each time from its captured state
+        expect(run2(make())).toBe("(10)");
+        expect(() => run2(make({ ...impl, reentrant: false }))).toThrow("cannot re-enter a continuation through f: its code was compiled as not re-entrant");
+        // escaping through a continuation once is no re-entry
+        const a = make({ ...impl, reentrant: false });
+        expect(showValue(a.evaluateRaw(a.compileRaw(`(define-global (g k) (%call k 5) 6) (%intcall %+ 1 (%intcall %call/cc (lambda (k) (%call g k))))`, "t.ns")))).toBe("6");
     });
 
     it("tells a cached closure from other values at a call site", () => {

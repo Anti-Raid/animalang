@@ -11,10 +11,11 @@ import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX } from "./assignments";
 
 export type Unboxed = { ast: any, forwards: ReadonlySet<symbol> };
 
-export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: Intrinsics): Unboxed => {
+export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: Intrinsics, reentrant: boolean = true): Unboxed => {
     const analysis = new AstAnalysis(intrinsics);
     const scope = analysis.analyze(ast);
-    markLiveAcrossCalls(ast, analysis, scope, intrinsics);
+    // code no continuation re-enters needs a box only for what a closure captures
+    if (reentrant) markLiveAcrossCalls(ast, analysis, scope, intrinsics);
     const { variables } = scope;
     const unneeded = (sym: any) => typeof sym === "symbol" && boxes.has(sym) && variables.get(sym)?.isBoxed !== true;
     const forwards = new Set([...variables].filter(([, meta]) => meta.forwardsRest).map(([sym]) => sym));

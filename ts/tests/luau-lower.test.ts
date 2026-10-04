@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createLuau, toString } from '../lua';
 import { impl } from '../magicvm/meta';
 import { MultipleValues } from '../common';
+import { listing } from '../magicvm/exec';
 
 const luau = createLuau(impl);
 
@@ -85,6 +86,12 @@ describe("Luau lowered functions", () => {
         expect(run("local function noret() end local function bare() return end return noret(), bare()")).toBe("nil\tnil");
         expect(run("local function f() for i = 1, 10 do if i == 3 then return i end end end return f()")).toBe("3");
         expect(run("local function down(n) if n == 0 then return 'done' end return down(n - 1) end return down(100000)")).toBe("done");
+    });
+
+    it("keeps assigned locals in registers across calls (Luau code is never re-entered)", () => {
+        const src = "local g g = function() return 1 end local s = 0 for i = 1, 3 do s += g() end return s";
+        expect(listing(luau.compileRaw(src, "t")).join("\n")).not.toMatch(/Box/);
+        expect(run(src)).toBe("3");
     });
 
     it("reports calling what is not a function where it happens, tail call or not", () => {

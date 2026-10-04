@@ -285,7 +285,7 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
 }
 
 export class IR {
-    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false, private readonly assumed: ReadonlySet<number> = new Set()) {}
+    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false, private readonly assumed: ReadonlySet<number> = new Set(), private readonly reentrant: boolean = true) {}
 
     lower(nodes: Node[], numRegs: number, packRest: boolean = false): Code {
         const cpool = new ConstPool()
@@ -297,6 +297,7 @@ export class IR {
         const code = new Code(cpool.constants, ops, numRegs, this.debug, used.size > 0 ? this.table : null, [...used.values()])
         code.restPos = restPos
         code.interrupts = this.table.interrupts
+        code.reentrant = this.reentrant
         code.inlines = inlines
         return code
     }

@@ -34,6 +34,8 @@ Functions return one value or none (nil) so far; several values are the chunk's 
   calls go. Its body is a `%block` its `return`s escape from; a `local function` is a `%letrec`, so it sees itself.
   Calls are `%call`s; calling what is not a function is `attempt to call a nil value` where the call is, tail call or
   not. Luau has no tail calls, but the VM's are not observable but in tracebacks (and in recursion that never runs out).
+- Luau code is compiled as not re-entrant (`reentrant: false`): Luau has no continuations that run a frame twice
+  (a coroutine resumes its one suspended frame), so an assigned local needs a box only when a closure captures it.
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
   (`messages.ts`) words them as Luau does: `file:line: message`. Syntax errors are `LuauSyntaxError`s, worded alike.
 

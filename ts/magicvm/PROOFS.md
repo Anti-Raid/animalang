@@ -214,6 +214,8 @@ Only three things can make a register and the location it stands for disagree:
 
   None of these leaves two live copies that can each be written.
 
+**Code that is not re-entrant** (`AnimaOptions.reentrant: false`) gives up the boxes of (D2), and the VM gives up (D2) for it: a captured frame is run through a copy, by `Frame.thaw` (the frame going on, an escape to it, or a continuation called) or by `#compose`, and both call `Frame.resume`, which lets a frame of such code be copied once and raises `Msg.NotReentrant` the second time. So of a captured frame of that code at most one copy ever runs: there are never two live copies that can each be written, and its unboxed assigned variables behave as locations (Theorem 4 with the premise `liveAcrossCall(x)` replaced by this). Frames of re-entrant code in the same continuation are copied as before.
+
 A capture point is always a pending **non-leaf call** of the frame, because leaf intrinsics never call back into the VM. For frames further out, it is their own pending call, which is also a call.
 
 ### 4.2 `CallLiveness` (which variables get a box)

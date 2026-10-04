@@ -482,6 +482,7 @@ export class VMExecutor {
         let parent = returnTo;
         for (let i = k.frames.length - 1; i >= 0; i--) {
             const f = k.frames[i];
+            f.resume();
             const copy = new Frame(f.closure, f.regs.slice(), f.ip, parent, ctx, move(f.marks), f.mframe + shift);
             copy.escape = f.escape;
             copy.posIp = f.posIp;

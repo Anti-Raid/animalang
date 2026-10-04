@@ -28,7 +28,7 @@ type Closed = Unboxed & { captures: Captures }
 const assignmentsPass: Pass<Analyzed, Converted> = { name: "assignments", run: ({ ast, ascope }, ctx) => convertAssignments(ast, ascope.variables) }
 
 // only the boxes that are needed (see passes/unbox.ts)
-const unboxPass: Pass<Converted, Unboxed> = { name: "unbox", run: ({ ast, boxes }, ctx) => removeBoxes(ast, boxes, ctx.intrinsics) }
+const unboxPass: Pass<Converted, Unboxed> = { name: "unbox", run: ({ ast, boxes }, ctx) => removeBoxes(ast, boxes, ctx.intrinsics, ctx.reentrant) }
 
 // what each lambda captures (see passes/closures.ts)
 const closuresPass: Pass<Unboxed, Closed> = { name: "closures", run: (unboxed, ctx) => ({ ...unboxed, captures: closureCaptures(unboxed.ast, ctx.intrinsics) }) }
@@ -47,7 +47,7 @@ const resolvePass: Pass<any, Analyzed> = {
     },
 }
 
-const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numRegs }, ctx) => new IR(ctx.intrinsics, ctx.debug, ctx.assumed).lower(nodes, numRegs) }
+const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numRegs }, ctx) => new IR(ctx.intrinsics, ctx.debug, ctx.assumed, ctx.reentrant).lower(nodes, numRegs) }
 
 // the optimizer (see passes/cp0.ts)
 const cp0Pass: Pass<Converted, Converted> = {
@@ -93,13 +93,13 @@ export class Compiler {
     // called with each pass's output (see PassContext)
     trace?: (pass: string, output: unknown) => void
 
-    constructor(readonly intrinsics: Intrinsics = newIntrinsics(), private readonly debug: boolean = false, private readonly optimize: boolean = true) {
+    constructor(readonly intrinsics: Intrinsics = newIntrinsics(), private readonly debug: boolean = false, private readonly optimize: boolean = true, private readonly reentrant: boolean = true) {
         if (!hasCore(intrinsics)) throw new Error("the compiler's intrinsics must start with the core operations (see newIntrinsics)")
     }
 
     // `trExpr`: core forms, each [op, pos, operand ...] with where it comes from (see forms.ts)
     compile(trExpr: any, debug: boolean = this.debug, optimize: boolean = this.optimize): Code {
-        const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, assumed: new Set(), trace: this.trace }
+        const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, reentrant: this.reentrant, assumed: new Set(), trace: this.trace }
         try {
             const renamed = runPass(renamePass, trExpr, ctx)
             const escaped = runPass(escapesPass, renamed, ctx)

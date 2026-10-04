@@ -14,7 +14,8 @@ export { luauFormat, toString, typeName } from "./messages";
 type Read = { parsed: ParseResult, file: string, source: string };
 
 export const createLuau = (options: AnimaOptions): Anima => {
-    const anima = new Anima(options);
+    // Luau has no re-entrant continuations (coroutines resume their one suspended frame)
+    const anima = new Anima({ ...options, reentrant: false });
     anima.intrinsics.setFormatter(luauFormat);
     anima.intrinsics.setTypes(LUAU_TYPES);
     registerLuauOps(anima.intrinsics);

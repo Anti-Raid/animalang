@@ -345,6 +345,8 @@ export class Frame {
     public isite: number = -1;
     // the escape continuation or catch token of the %call/ec or %catch this frame's pending call is, cleared when it resumes
     public escape: EscapeContinuation | null = null;
+    // a captured frame that a copy has run from (see `resume`)
+    public resumed: boolean = false;
 
     // `marks`: the continuation marks visible in this frame; `mframe`: its logical frame (a tail call keeps its caller's)
     constructor(
@@ -365,7 +367,15 @@ export class Frame {
         return this.closure.debugName ?? "lambda";
     }
 
+    // a captured frame is about to run (as a copy): code that is not re-entrant keeps its assigned variables in the
+    // registers, so a second copy would not see what the first assigned
+    resume(): void {
+        if (this.resumed && !this.code.reentrant) throw vmError(Msg.NotReentrant, this.debugName);
+        this.resumed = true;
+    }
+
     thaw(ctx: ExecutionContext): Frame {
+        this.resume();
         const copy = new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx, this.marks, this.mframe);
         copy.isite = this.isite;
         copy.winds = this.winds;
