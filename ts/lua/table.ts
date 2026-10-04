@@ -1,7 +1,9 @@
-// Luau's table (VM/src/ltable.cpp, ported): an array part for keys 1..sizearray and a hash part of 2^k nodes, chained
-// with Brent's variation, sized and grown as Luau sizes them (rehash, computesizes, adjustasize), so `#t`, `next` and
-// the order of a traversal are Luau's. Keys hash as Luau hashes numbers, strings and booleans; other values (which Luau
-// hashes by address) hash by an id of their own. A `Map` beside the nodes finds a key without hashing it.
+// Luau's table: an array part for keys 1..sizearray (holes allowed), sized and grown as Luau sizes it (VM/src/ltable.cpp:
+// rehash, computesizes, adjustasize, getn), and a hash part. So `#t`, and the order Luau guarantees for a traversal
+// (keys 1..k in order, up to the first nil; Luau's generalized iteration RFC) are Luau's. The rest of the order is
+// unspecified in Luau, so the hash part is slots in insertion order with a `Map` to find a key's slot, not Luau's nodes:
+// its capacity is Luau's (2^k slots, counting keys whose value is nil, as Luau's nodes do), so the table resizes when
+// Luau's would, but for those Luau's hash collisions make earlier.
 // Weak tables (`__mode` "k", "v", "kv" on the metatable, read whenever it changes, as Luau reads it every collection):
 // a collectable key or value (a table, function, coroutine or other object; strings, numbers and booleans never are) is
 // held by a WeakRef, and an entry whose key or value was collected is gone, as Luau clears it. As in Luau, a weak key's
@@ -11,9 +13,6 @@ import { hostError } from "../errors";
 
 const MAXBITS = 26;
 const MAXSIZE = 1 << MAXBITS;
-// a node with no key (a free position)
-const FREE: unique symbol = Symbol("free");
-const DUMMY = -1;
 
 const ceillog2 = (x: number): number => x <= 1 ? 0 : 32 - Math.clz32(x - 1);
 
@@ -25,87 +24,19 @@ const arrayindex = (key: number): number => {
 
 const isCollectable = (v: any): v is object => (typeof v === "object" && v !== null) || typeof v === "function";
 
-const scratch = new DataView(new ArrayBuffer(8));
-const hashnum = (n: number): number => {
-    scratch.setFloat64(0, n, true);
-    let h1 = scratch.getUint32(0, true);
-    // the sign bit masked out, so -0 and 0 hash alike
-    let h2 = scratch.getUint32(4, true) & 0x7fffffff;
-    const m = 0x5bd1e995;
-    h1 ^= h2 >>> 18;
-    h1 = Math.imul(h1, m);
-    h2 ^= h1 >>> 22;
-    h2 = Math.imul(h2, m);
-    h1 ^= h2 >>> 17;
-    h1 = Math.imul(h1, m);
-    h2 ^= h1 >>> 19;
-    h2 = Math.imul(h2, m);
-    return h2 >>> 0;
-};
-
-// luaS_hash over a byte string
-export const hashstr = (str: string): number => {
-    let len = str.length;
-    let a = 0, b = 0, h = len >>> 0, at = 0;
-    const rol = (x: number, s: number) => ((x >>> s) | (x << (32 - s))) >>> 0;
-    const word = (i: number) => (str.charCodeAt(i) & 0xff | (str.charCodeAt(i + 1) & 0xff) << 8 | (str.charCodeAt(i + 2) & 0xff) << 16 | (str.charCodeAt(i + 3) & 0xff) << 24) >>> 0;
-    while (len >= 32) {
-        a = (a + word(at)) >>> 0;
-        b = (b + word(at + 4)) >>> 0;
-        h = (h + word(at + 8)) >>> 0;
-        a = (a ^ h) >>> 0; a = (a - rol(h, 14)) >>> 0;
-        b = (b ^ a) >>> 0; b = (b - rol(a, 11)) >>> 0;
-        h = (h ^ b) >>> 0; h = (h - rol(b, 25)) >>> 0;
-        at += 12;
-        len -= 12;
-    }
-    for (let i = len; i > 0; --i) h = (h ^ (((h << 5) >>> 0) + (h >>> 2) + (str.charCodeAt(at + i - 1) & 0xff))) >>> 0;
-    return h;
-};
-
-const hashpointer = (p: number): number => {
-    let h = p >>> 0;
-    h ^= h >>> 16;
-    h = Math.imul(h, 0x85ebca6b);
-    h ^= h >>> 13;
-    h = Math.imul(h, 0xc2b2ae35);
-    h ^= h >>> 16;
-    return h >>> 0;
-};
-
-// an object's stand-in for its address
-const ids = new WeakMap<object, number>();
-const otherIds = new Map<any, number>();
-let nextId = 1;
-const idOf = (v: any): number => {
-    const map: { get(k: any): number | undefined, set(k: any, v: number): any } = isCollectable(v) ? ids : otherIds;
-    let id = map.get(v);
-    if (id === undefined) map.set(v, id = (nextId++) * 16);
-    return id;
-};
-
-const hashOf = (key: any): number => {
-    switch (typeof key) {
-        case "number": return hashnum(key);
-        case "string": return hashstr(key);
-        case "boolean": return key ? 1 : 0;
-        default: return hashpointer(idOf(key));
-    }
-};
-
 export class LuaTable implements Datum, Iterable<[any, any]> {
     #array: any[] = [];
     #sizearray = 0;
-    #lsizenode = 0;
-    #dummy = true;
-    #nodeKey: any[] = [];
-    #nodeVal: any[] = [];
-    #nodeNext: number[] = [];
-    // as Luau's union: the free positions are before it, or (when it is negative) the negated boundary of the array part
-    #lastfree = 0;
-    // where each key's node is: strong keys in `#index`, collectable keys of a weak-key table in `#weakIndex`
+    // the hash part: its capacity (0, or 2^k), and its slots, keys whose values are nil included
+    #capacity = 0;
+    #keys: any[] = [];
+    #vals: any[] = [];
+    // each key's slot: strong keys in `#index`, collectable keys of a weak-key table in `#weakIndex`
     #index = new Map<any, number>();
     #weakIndex = new WeakMap<object, number>();
+    // as Luau's union: room left in the hash part, or (when it is negative) the negated boundary of the array part, which
+    // `rawlen` caches while there is no hash part
+    #lastfree = 0;
     #readonly = false;
     #metatable: LuaTable | null = null;
     // the weak mode the storage is in, and the metatable's mode stamp it was read at
@@ -115,10 +46,10 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     // bumped when this table's __mode changes, for the tables it is the metatable of
     #modeVersion = 0;
 
-    // luaH_new: room for `narray` array slots and `nhash` nodes
+    // luaH_new: room for `narray` array slots and `nhash` hash slots
     constructor(narray: number = 0, nhash: number = 0) {
         if (narray > 0) this.#setarrayvector(narray);
-        if (nhash > 0) this.#setnodevector(nhash);
+        if (nhash > 0) this.#sethashvector(nhash);
     }
 
     get sizearray(): number {
@@ -126,7 +57,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     }
 
     get sizenode(): number {
-        return this.#dummy ? 0 : 1 << this.#lsizenode;
+        return this.#capacity;
     }
 
     // --- weak mode ---
@@ -152,17 +83,16 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         if (weakKeys === this.#weakKeys && weakValues === this.#weakValues) return;
         // the same entries, held the new way
         const array = this.#array.map(v => this.#unwrap(v));
-        const keys = this.#nodeKey.map(k => this.#unwrapKey(k));
-        const vals = this.#nodeVal.map(v => this.#unwrap(v));
+        const keys = this.#keys.map(k => this.#unwrapKey(k));
+        const vals = this.#vals.map(v => this.#unwrap(v));
         this.#weakKeys = weakKeys;
         this.#weakValues = weakValues;
         this.#array = array.map(v => this.#wrap(v));
-        this.#nodeVal = vals.map(v => this.#wrap(v));
+        this.#vals = vals.map(v => this.#wrap(v));
         this.#index = new Map();
         this.#weakIndex = new WeakMap();
-        this.#nodeKey = keys.map((k, i) => {
-            if (k === FREE || k === undefined) return FREE;
-            this.#indexSet(k, i);
+        this.#keys = keys.map((k, i) => {
+            if (k !== undefined) this.#indexSet(k, i);
             return this.#wrapKey(k);
         });
     }
@@ -179,7 +109,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         return this.#weakKeys && isCollectable(k) ? new WeakRef(k) : k;
     }
 
-    // a node's key, or undefined if it was collected
+    // a slot's key, or undefined if it was collected
     #unwrapKey(k: any): any {
         return k instanceof WeakRef ? k.deref() : k;
     }
@@ -193,15 +123,10 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         else this.#index.set(k, i);
     }
 
-    #indexDelete(k: any): void {
-        if (this.#weakKeys && isCollectable(k)) this.#weakIndex.delete(k);
-        else this.#index.delete(k);
-    }
-
-    // a node's value, nil when its key or value was collected
-    #nodeValue(i: number): any {
-        const v = this.#unwrap(this.#nodeVal[i]);
-        if (v !== undefined && this.#weakKeys && this.#unwrapKey(this.#nodeKey[i]) === undefined) return undefined;
+    // a slot's value, nil when its key or value was collected
+    #slotValue(i: number): any {
+        const v = this.#unwrap(this.#vals[i]);
+        if (v !== undefined && this.#weakKeys && this.#unwrapKey(this.#keys[i]) === undefined) return undefined;
         return v;
     }
 
@@ -214,13 +139,13 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             if (k >= 1 && k <= this.#sizearray) return this.#unwrap(this.#array[k - 1]);
         }
         const i = this.#indexGet(key);
-        return i === undefined ? undefined : this.#nodeValue(i);
+        return i === undefined ? undefined : this.#slotValue(i);
     }
 
     #getnum(k: number): any {
         if (k >= 1 && k <= this.#sizearray) return this.#unwrap(this.#array[k - 1]);
         const i = this.#indexGet(k);
-        return i === undefined ? undefined : this.#nodeValue(i);
+        return i === undefined ? undefined : this.#slotValue(i);
     }
 
     rawget(key: any): any {
@@ -228,64 +153,20 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         return this.#get(key);
     }
 
-    // --- insertion (newkey_DEPRECATED, getfreepos, rehash_DEPRECATED, resize) ---
+    // --- insertion (newkey_DEPRECATED, rehash_DEPRECATED, resize) ---
 
-    #mainposition(key: any): number {
-        return this.#dummy ? DUMMY : hashOf(key) & ((1 << this.#lsizenode) - 1);
-    }
-
-    #getfreepos(): number {
-        while (this.#lastfree > 0) {
-            this.#lastfree--;
-            if (this.#nodeKey[this.#lastfree] === FREE) return this.#lastfree;
-        }
-        return -1;
-    }
-
-    // the slot `key` will be stored in: a node (its index), or, when it lands in the array part, -(index + 2)
+    // the slot `key` will be stored in: a hash slot (its index), or, when it lands in the array part, -(index + 2)
     #newkey(key: any): number {
-        // enforce the boundary invariant
-        if (typeof key === "number" && key === this.#sizearray + 1) {
+        // enforce the boundary invariant, and make room when the hash part is full
+        if ((typeof key === "number" && key === this.#sizearray + 1) || this.#keys.length >= this.#capacity) {
             this.#rehash(key);
             return this.#arrayornewkey(key);
         }
-        let mp = this.#mainposition(key);
-        if (mp === DUMMY || this.#nodeValue(mp) !== undefined) {
-            const n = this.#getfreepos();
-            if (n === -1) {
-                this.#rehash(key);
-                return this.#arrayornewkey(key);
-            }
-            const mk = this.#unwrapKey(this.#nodeKey[mp]);
-            const othern0 = mk === undefined ? mp : this.#mainposition(mk);
-            if (othern0 !== mp) {
-                // the colliding node is out of its main position: it moves to the free one
-                let othern = othern0;
-                while (othern + this.#nodeNext[othern] !== mp) othern += this.#nodeNext[othern];
-                this.#nodeNext[othern] = n - othern;
-                this.#nodeKey[n] = this.#nodeKey[mp];
-                this.#nodeVal[n] = this.#nodeVal[mp];
-                this.#nodeNext[n] = this.#nodeNext[mp];
-                if (mk !== undefined) this.#indexSet(mk, n);
-                if (this.#nodeNext[mp] !== 0) {
-                    this.#nodeNext[n] += mp - n;
-                    this.#nodeNext[mp] = 0;
-                }
-                this.#nodeVal[mp] = undefined;
-            } else {
-                // the colliding node is in its own main position: the new key goes to the free one
-                if (this.#nodeNext[mp] !== 0) this.#nodeNext[n] = (mp + this.#nodeNext[mp]) - n;
-                this.#nodeNext[mp] = n - mp;
-                mp = n;
-            }
-        }
-        // a key with a nil value whose node is taken over is gone
-        const old = this.#unwrapKey(this.#nodeKey[mp]);
-        if (old !== undefined && old !== FREE && this.#indexGet(old) === mp) this.#indexDelete(old);
-        this.#nodeKey[mp] = this.#wrapKey(key);
-        this.#nodeVal[mp] = undefined;
-        this.#indexSet(key, mp);
-        return mp;
+        const i = this.#keys.length;
+        this.#keys.push(this.#wrapKey(key));
+        this.#vals.push(undefined);
+        this.#indexSet(key, i);
+        return i;
     }
 
     #arrayornewkey(key: any): number {
@@ -298,7 +179,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
 
     #store(slot: number, val: any): void {
         if (slot <= -2) this.#array[-slot - 2] = this.#wrap(val);
-        else this.#nodeVal[slot] = this.#wrap(val);
+        else this.#vals[slot] = this.#wrap(val);
     }
 
     #computesizes(nums: number[], narray: number): [na: number, n: number] {
@@ -343,9 +224,9 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     // [all keys in use in the hash part, those that are array indexes]
     #numusehash(nums: number[]): [number, number] {
         let totaluse = 0, ause = 0;
-        for (let i = this.sizenode - 1; i >= 0; i--) {
-            if (this.#nodeValue(i) !== undefined) {
-                const k = this.#unwrapKey(this.#nodeKey[i]);
+        for (let i = 0; i < this.#keys.length; i++) {
+            if (this.#slotValue(i) !== undefined) {
+                const k = this.#unwrapKey(this.#keys[i]);
                 if (typeof k === "number") ause += this.#countint(k, nums);
                 totaluse++;
             }
@@ -354,7 +235,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     }
 
     #adjustasize(size: number, ek: any): number {
-        const tbound = !this.#dummy || size < this.#sizearray;
+        const tbound = this.#capacity !== 0 || size < this.#sizearray;
         const ekindex = typeof ek === "number" ? arrayindex(ek) : -1;
         while (size + 1 === ekindex || (tbound && this.#getnum(size + 1) !== undefined)) size++;
         return size;
@@ -387,23 +268,15 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         this.#sizearray = size;
     }
 
-    #setnodevector(size: number): void {
-        if (size === 0) {
-            this.#dummy = true;
-            this.#lsizenode = 0;
-            this.#nodeKey = [];
-            this.#nodeVal = [];
-            this.#nodeNext = [];
-        } else {
+    #sethashvector(size: number): void {
+        if (size !== 0) {
             const lsize = ceillog2(size);
             if (lsize > MAXBITS) throw hostError("table overflow");
             size = 1 << lsize;
-            this.#dummy = false;
-            this.#lsizenode = lsize;
-            this.#nodeKey = new Array(size).fill(FREE);
-            this.#nodeVal = new Array(size).fill(undefined);
-            this.#nodeNext = new Array(size).fill(0);
         }
+        this.#capacity = size;
+        this.#keys = [];
+        this.#vals = [];
         this.#index = new Map();
         this.#weakIndex = new WeakMap();
         this.#lastfree = size;
@@ -412,9 +285,9 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     #resize(nasize: number, nhsize: number): void {
         if (nasize > MAXSIZE || nhsize > MAXSIZE) throw hostError("table overflow");
         const oldasize = this.#sizearray;
-        const oldKeys = this.#nodeKey, oldVals = this.#nodeVal, oldsize = this.sizenode;
+        const oldKeys = this.#keys, oldVals = this.#vals;
         if (nasize > oldasize) this.#setarrayvector(nasize);
-        this.#setnodevector(nhsize);
+        this.#sethashvector(nhsize);
         if (nasize < oldasize) {
             const vanishing = this.#array.slice(nasize, oldasize);
             this.#sizearray = nasize;
@@ -424,14 +297,14 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
                 if (val !== undefined) this.#store(this.#newkey(nasize + i + 1), val);
             });
         }
-        for (let i = oldsize - 1; i >= 0; i--) {
+        for (let i = 0; i < oldKeys.length; i++) {
             const val = this.#unwrap(oldVals[i]);
             const key = this.#unwrapKey(oldKeys[i]);
-            if (val !== undefined && key !== undefined && key !== FREE) this.#store(this.#arrayornewkey(key), val);
+            if (val !== undefined && key !== undefined) this.#store(this.#arrayornewkey(key), val);
         }
     }
 
-    // luaH_set: `key` set to `val` (nil included: a new key gets a node even then, as in Luau)
+    // luaH_set: `key` set to `val` (nil included: a new key takes a slot even then, as it takes a node in Luau)
     rawset(key: any, val: any): this {
         if (this.#readonly) throw hostError("attempt to modify a readonly table");
         if (key === undefined) throw hostError("table index is nil");
@@ -446,8 +319,8 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             }
         }
         const i = this.#indexGet(key);
-        if (i !== undefined && this.#unwrapKey(this.#nodeKey[i]) !== undefined) {
-            this.#nodeVal[i] = this.#wrap(val);
+        if (i !== undefined) {
+            this.#vals[i] = this.#wrap(val);
             return this;
         }
         this.#store(this.#newkey(key), val);
@@ -485,7 +358,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         const size = this.#sizearray;
         const boundary = this.#getaboundary();
         if (boundary > 0) {
-            if (arr(size - 1) !== undefined && this.#dummy) return size;
+            if (arr(size - 1) !== undefined && this.#capacity === 0) return size;
             if (boundary < size && arr(boundary - 1) !== undefined && arr(boundary) === undefined) return boundary;
             const found = this.#updateaboundary(boundary);
             if (found > 0) return found;
@@ -503,7 +376,8 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         return size;
     }
 
-    // luaH_next: the entry after `key` (undefined, nil, to start), or undefined at the end
+    // luaH_next: the entry after `key` (undefined, nil, to start), or undefined at the end: the array part in order,
+    // then the hash part in the order its keys came
     next(key: any): [any, any] | undefined {
         if (this.#metatable !== null) this.#syncMode();
         let i: number;
@@ -521,9 +395,9 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             const v = this.#unwrap(this.#array[i]);
             if (v !== undefined) return [i + 1, v];
         }
-        for (i -= this.#sizearray; i < this.sizenode; i++) {
-            const v = this.#nodeValue(i);
-            if (v !== undefined) return [this.#unwrapKey(this.#nodeKey[i]), v];
+        for (i -= this.#sizearray; i < this.#keys.length; i++) {
+            const v = this.#slotValue(i);
+            if (v !== undefined) return [this.#unwrapKey(this.#keys[i]), v];
         }
         return undefined;
     }
@@ -548,14 +422,12 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         if (this.#readonly) throw hostError("attempt to modify a readonly table");
         for (let i = 0; i < this.#sizearray; i++) this.#array[i] = undefined;
         this.#maybesetaboundary(0);
-        if (!this.#dummy) {
-            const size = this.sizenode;
-            this.#lastfree = size;
-            this.#nodeKey.fill(FREE);
-            this.#nodeVal.fill(undefined);
-            this.#nodeNext.fill(0);
+        if (this.#capacity !== 0) {
+            this.#keys = [];
+            this.#vals = [];
             this.#index = new Map();
             this.#weakIndex = new WeakMap();
+            this.#lastfree = this.#capacity;
         }
     }
 
@@ -564,19 +436,17 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         const t = new LuaTable();
         t.#array = [...this.#array];
         t.#sizearray = this.#sizearray;
-        t.#lsizenode = this.#lsizenode;
-        t.#dummy = this.#dummy;
-        t.#nodeKey = [...this.#nodeKey];
-        t.#nodeVal = [...this.#nodeVal];
-        t.#nodeNext = [...this.#nodeNext];
+        t.#capacity = this.#capacity;
+        t.#keys = [...this.#keys];
+        t.#vals = [...this.#vals];
         t.#lastfree = this.#lastfree;
         t.#weakKeys = this.#weakKeys;
         t.#weakValues = this.#weakValues;
         t.#metatable = this.#metatable;
         t.#modeStamp = this.#modeStamp;
-        this.#nodeKey.forEach((k, i) => {
+        this.#keys.forEach((k, i) => {
             const key = this.#unwrapKey(k);
-            if (key !== undefined && key !== FREE) t.#indexSet(key, i);
+            if (key !== undefined) t.#indexSet(key, i);
         });
         return t;
     }
