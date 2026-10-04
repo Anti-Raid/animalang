@@ -258,7 +258,11 @@ export class VMExecutor {
         // a finished coroutine hands its value to its resumer, which may itself be a coroutine finishing through a tail resume
         while (true) {
             ctx.acc = val;
-            if (frame !== null) return frame;
+            if (frame !== null) {
+                // where an error raised in the frame was (see errorSite) no longer applies once it goes on
+                frame.posIp = -1;
+                return frame;
+            }
             if (ctx.pendingWind !== null) return this.advanceWindTransition(ctx);
             const co = ctx.coroutine;
             if (co === null || co.status !== "running" || co.closing) return null;

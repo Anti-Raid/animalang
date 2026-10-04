@@ -79,7 +79,9 @@ export class DirectEmitter extends FunctionEmitter {
         return `dip = ${ip};`;
     }
 
-    protected readonly codeRef = "closure.tmpl.code";
+    protected errorSite(at: number, err: string): string {
+        return `dip = ${at + 1}; derr = ${err};`;
+    }
 
     protected windowCall(fn: string, start: number, nargs: number, withContext: boolean = false): string {
         return `${fn}([${this.argList(start, nargs)}], 0, ${nargs}${withContext ? ", ctx, executor" : ""})`;
@@ -115,14 +117,14 @@ export class DirectEmitter extends FunctionEmitter {
             : "";
         this.emit(`
             function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
-                let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ""}${this.#hasSites ? ", isite = -1" : ""};
+                let ip = 0, rip = 0, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ", dip = -1, derr"}${this.#hasSites ? ", isite = -1" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 ${uvDefs}
         `);
         // a parameter whose kind has no check (guard) the front end can write stays checked in the body
         const types = this.table?.types ?? null;
         const guards = new Map<number, string>();
-        const kinds = this.debug || types === null ? new Map<number, Kind>() : this.#paramKinds(closureArity.params);
+        const kinds = types === null ? new Map<number, Kind>() : this.#paramKinds(closureArity.params);
         for (const [i, kind] of kinds) {
             const test = types!.guard(kind, `r${i}`, inlineDeps({ name: "the type system", deps: this.table!.typeDeps } as Intrinsic, this.usedDeps));
             if (test !== null) guards.set(i, test);
@@ -173,7 +175,7 @@ export class DirectEmitter extends FunctionEmitter {
                         }
                     } else {
                         const f = new Frame(closure, [${allRegs}], rip, null, ctx, marks, mframe);
-                        ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : ""}
+                        ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : "if (e === derr) f.posIp = dip;"}
                         ${this.#hasSites ? "f.isite = isite;" : ""}
                         sig.push(f);
                     }

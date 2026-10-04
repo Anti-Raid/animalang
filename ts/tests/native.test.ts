@@ -93,6 +93,18 @@ describe("native-scheme", () => {
     };
     const run = (a: Anima, src: string) => showValue(a.evaluateRaw(a.compileRaw(src, "t.ns")));
 
+    it("reports where an error was raised in non-debug code too", () => {
+        const a = make();
+        a.registerIntrinsic("%fail", () => { throw new Error("plain"); }, { args: [0, Infinity], leaf: true });
+        const errorOf = (src: string): any => { try { run(a, src); } catch (e) { return e; } throw new Error("no error"); };
+        const plain = errorOf(`(define-global (f x)\n  (%intcall %+ x 1)\n  (%intcall %fail x))\n(%call f 1)`);
+        expect(plain.animaTraceback).toMatch(/^plain\nstack traceback:\n  t\.ns:3:\d+ in f/);
+        const missing = errorOf(`(define-global (g)\n  (%intcall %+ 1 2)\n  (%intcall %+ nowhere 1))\n(%call g)`);
+        expect([missing.message, missing.at?.line]).toEqual(["unbound variable nowhere", 3]);
+        const applied = errorOf(`(define-global (h xs)\n  (%intcall %+ 1 2)\n  (%intapply %fail 1 xs))\n(%call h '(2))`);
+        expect(applied.animaTraceback).toMatch(/t\.ns:3:\d+ in h/);
+    });
+
     it("is the core forms, with calls written out", () => {
         const a = make();
         expect(run(a, `(%call (%lambda (() (x) #null (%intcall %+ x 1))) 41)`)).toBe("42");

@@ -60,7 +60,9 @@ export class ResumeEmitter extends FunctionEmitter {
         return `frame.posIp = ${ip};`;
     }
 
-    protected readonly codeRef = "frame.code";
+    protected errorSite(at: number): string {
+        return `frame.posIp = ${at + 1};`;
+    }
 
     protected windowCall(fn: string, start: number, nargs: number, withContext: boolean = false): string {
         const spills = windowRegs(start, nargs).map(r => `regs[${r}] = r${r}`);
