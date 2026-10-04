@@ -149,6 +149,25 @@ describe("native-scheme", () => {
         expect(showValue(a.evaluateRaw(a.compileRaw(`(define-global (g k) (%call k 5) 6) (%intcall %+ 1 (%intcall %call/cc (lambda (k) (%call g k))))`, "t.ns")))).toBe("6");
     });
 
+    it("binds the values of an inlined procedure without making multiple values", () => {
+        const a = make();
+        const noted: any[] = [];
+        a.registerIntrinsic("%note", (regs, st) => { noted.push(regs[st]); return regs[st]; }, { args: [1, 1], leaf: true });
+        const three = `(three (lambda (x) (let ((y (%intcall %+ x 1))) (%intcall %values x y (%intcall %note 9)))))`;
+        const core = (formals: string, body: string) => a.compileRaw(`(letrec (${three}) (%let-values ((${formals} (%call three 1))) ${body}))`, "t.ns");
+        // missing values are <#void>, extra ones are dropped but still evaluated
+        expect(listing(core("(p q) #null", "(%intcall %+ p q)")).join("\n")).not.toMatch(/Unpack|%values/);
+        expect([a.evaluateRaw(core("(p q) #null", "(%intcall %+ p q)")), noted.length]).toEqual([3, 1]);
+        expect(showValue(a.evaluateRaw(core("(p q r s) #null", "(%intcall %push (%intcall %push '() r) s)")))).toBe("(9 #void)");
+        // a rest variable takes the values as they are, and a strict form with another count is left to fail
+        expect(listing(core("(p) more", "more")).join("\n")).toMatch(/Unpack/);
+        expect(showValue(a.evaluateRaw(core("(p) more", "more")))).toBe("(2 9)");
+        const strict = (formals: string) => a.compileRaw(`(letrec (${three}) (let-values ((${formals} (%call three 1))) p))`, "t.ns");
+        expect(listing(strict("(p q r)")).join("\n")).not.toMatch(/Unpack/);
+        expect(a.evaluateRaw(strict("(p q r)"))).toBe(1);
+        expect(() => a.evaluateRaw(strict("(p q)"))).toThrow("expected 2 values but got 3");
+    });
+
     it("tells a cached closure from other values at a call site", () => {
         const a = make();
         a.registerIntrinsic("%object", (regs, st) => ({ tmpl: regs[st] }), { args: [1, 1], leaf: true });

@@ -64,6 +64,15 @@ const PROGRAMS: string[] = [
     `(let* ((a 1) (b (+ a 1)) (a (* b 10))) (list a b))`,
     `(let-values (((a b) (values 1 2)) ((c . d) (values 3 4 5))) (define (f) (list a b c d)) (f))`,
     `(define (ad-sh x) (let ((x (+ x 1))) (let ((f (lambda () x))) (let ((x 100)) (list x (f)))))) (ad-sh 1)`,
+    // the values of an inlined procedure, bound with no multiple values made
+    `(define (mv-a) (define (two x) (values x (+ x 1))) (let-values (((a b) (two 1))) (list a b))) (mv-a)`,
+    `(define (mv-b) (define (two x) (let ((y (* x 2))) (values x y))) (let-values (((a b) (two 5))) (set! a (+ a b)) (list a b))) (mv-b)`,
+    `(define (mv-c) (define (two x) (values x (car x))) (let-values (((a b) (two 1))) (list a b))) (mv-c)`,
+    `(define (mv-d) (define (two x) (values x (+ x 1))) (let-values (((a b c) (two 1))) (list a b c))) (mv-d)`,
+    `(define (mv-e) (define (three x) (values x x x)) (let-values (((a b) (three 1))) (list a b))) (mv-e)`,
+    `(define (mv-f) (define (two x) (values x (+ x 1))) (let-values (((a b) (two 1))) (lambda () (set! b (+ b a)) b))) ((mv-f))`,
+    `(define (mv-g) (define (two x) (let ((y (car x))) (values y y))) (call-with-values (lambda () (two '())) list)) (mv-g)`,
+    `(define (mv-h n) (define (two x) (if (= x 0) (values 0 0) (values x (* x x)))) (let-values (((a b) (two n))) (+ a b))) (list (mv-h 0) (mv-h 3))`,
 ];
 
 // programs where the optimizer removes a call entirely: an error after it in the same frame reports where it is, not the

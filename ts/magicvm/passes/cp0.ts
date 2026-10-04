@@ -12,7 +12,7 @@
 // whose binders code generation rejects, and lambdas that escape to a %block outside them, are left as they are, so their
 // errors stay. Globals are never inlined or
 // propagated: they can be changed
-import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LOOP, CORE_QUOTE, SPECIAL_FORMS } from "../../common";
+import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_VALUES_STRICT, CORE_LOOP, CORE_QUOTE, SPECIAL_FORMS } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED, isLetrecLambda, isPadded, unwrapBoxed } from "../lambda";
@@ -40,6 +40,7 @@ export const INLINED = Symbol.for("%inlined");
 export const TAIL_INLINED = Symbol.for("%tail-inlined");
 const WITH_MARK = Symbol.for("%with-mark");
 const APPLY = Symbol.for("%apply");
+const VALUES = Symbol.for("%values");
 const ARRAY = Symbol.for("%array");
 type Env = ReadonlyMap<symbol, Info>;
 // what the walk knows where it is: the variables bound to what it can use, the lambdas not to inline there (their own
@@ -82,6 +83,27 @@ const lambdaName = (lambda: any): string => {
 };
 
 // how often `sym` is used in the expressions `es`
+const escapesTo = (e: any, label: symbol): boolean =>
+    Array.isArray(e) && e[0] !== CORE_QUOTE && ((e[0] === CORE_ESCAPE && e[2] === label) || e.some(x => escapesTo(x, label)));
+
+// What an optimized expression gives as multiple values, when it comes to a (%values e ...) under the markers of
+// inlined procedures, blocks nothing escapes from, and %lets (what a call of a procedure that returns several values
+// is, once inlined): the expressions; `mark`, which puts one back under the markers (so an error in it is still shown
+// in the procedure's frame); and `around`, which binds the %lets' variables around a form
+type Values = { exprs: any[], mark: (x: any) => any, around: (form: any) => any };
+const valuesOf = (e: any, mark: (x: any) => any = x => x, around: (form: any) => any = x => x): Values | null => {
+    if (!Array.isArray(e)) return null;
+    if (e[0] === CORE_INTCALL && e[2] === VALUES) return { exprs: e.slice(3), mark, around };
+    if (e[0] === INLINED && e.length === 4) return valuesOf(e[3], x => mark(isConst(x) || typeof x === "symbol" ? x : [INLINED, e[1], e[2], x]), around);
+    if (e[0] === CORE_BLOCK && e.length === 4 && !escapesTo(e[3], e[2])) return valuesOf(e[3], mark, around);
+    if (e[0] === CORE_BEGIN && e.length === 3) return valuesOf(e[2], mark, around);
+    if (e[0] === CORE_LET && e.length === 4) {
+        const marked = (init: any) => Array.isArray(init) && init[0] === BOX && init.length === 3 ? [BOX, init[1], mark(init[2])] : mark(init);
+        return valuesOf(e[3], mark, form => around([CORE_LET, e[1], e[2].map((b: any[]) => [b[0], marked(b[1])]), form]));
+    }
+    return null;
+};
+
 const usesIn = (es: readonly any[], sym: symbol): number => {
     let n = 0;
     const walk = (x: any) => {
@@ -328,6 +350,23 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
             case "let-values": {
                 const clauses = e[2].map((c: any[]) => [c[0], c[1], value(c[2])]);
                 for (const n of clauses.flatMap((c: any[]) => c[1] === null ? c[0] : [...c[0], c[1]])) if (typeof n === "symbol") locals.add(n);
+                // the values of a (%values e ...): each name is bound to its expression, with no multiple values made
+                // (missing ones <#void>, extra ones still evaluated); a strict form with another count is left to fail
+                const [names, rest, init] = clauses.length === 1 ? clauses[0] : [[], true, null];
+                const found = rest === null && validBinders(names) ? valuesOf(init) : null;
+                if (found !== null && (op !== CORE_LET_VALUES_STRICT || found.exprs.length === names.length)) {
+                    const items = e.slice(3);
+                    const inner = new Map(k.env);
+                    const kept: any[][] = [];
+                    names.forEach((name: symbol, i: number) => {
+                        const v = i < found.exprs.length ? found.mark(found.exprs[i]) : VOID;
+                        if (!learn(inner, name, v, items)) kept.push([name, v]);
+                    });
+                    for (const x of found.exprs.slice(names.length)) kept.push([Symbol("_"), found.mark(x)]);
+                    const done = body(items, ctx, { ...k, env: inner });
+                    const bound = needed(kept, done);
+                    return found.around(bound.length === 0 ? asExpr(done, e) : [CORE_LET, pos, bound, ...done]);
+                }
                 return [op, pos, clauses, ...body(e.slice(3), ctx, k)];
             }
         }
