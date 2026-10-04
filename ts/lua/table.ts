@@ -10,6 +10,7 @@
 // value is held strongly
 import { DATUM, type Datum } from "../common";
 import { hostError } from "../errors";
+import { LuaVector } from "./vector";
 
 const MAXBITS = 26;
 const MAXSIZE = 1 << MAXBITS;
@@ -22,7 +23,16 @@ const arrayindex = (key: number): number => {
     return i === key ? i : -1;
 };
 
-const isCollectable = (v: any): v is object => (typeof v === "object" && v !== null) || typeof v === "function";
+const isCollectable = (v: any): v is object => (typeof v === "object" && v !== null && !(v instanceof LuaVector)) || typeof v === "function";
+
+const f32 = new Float32Array(1);
+const u32 = new Uint32Array(f32.buffer);
+const bits = (c: number): number => {
+    f32[0] = c;
+    const i = u32[0] === 0x80000000 ? 0 : u32[0];
+    return i ^ (i >>> 17);
+};
+const hashvec = (v: LuaVector): number => Math.imul(bits(v.x), 73856093) ^ Math.imul(bits(v.y), 19349663) ^ Math.imul(bits(v.z), 83492791);
 
 export class LuaTable implements Datum, Iterable<[any, any]> {
     #array: any[] = [];
@@ -34,6 +44,8 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     // each key's slot: strong keys in `#index`, collectable keys of a weak-key table in `#weakIndex`
     #index = new Map<any, number>();
     #weakIndex = new WeakMap<object, number>();
+    // the vector each vector key is stored as (equal vectors being one key), by hash
+    #vectors: Map<number, LuaVector[]> | null = null;
     // as Luau's union: room left in the hash part, or (when it is negative) the negated boundary of the array part, which
     // `rawlen` caches while there is no hash part
     #lastfree = 0;
@@ -130,6 +142,18 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         return v;
     }
 
+    #vectorKey(v: LuaVector): LuaVector | undefined {
+        return this.#vectors?.get(hashvec(v))?.find(k => k.equals(v));
+    }
+
+    #addVector(v: LuaVector): void {
+        this.#vectors ??= new Map();
+        const h = hashvec(v);
+        const bucket = this.#vectors.get(h);
+        if (bucket === undefined) this.#vectors.set(h, [v]);
+        else bucket.push(v);
+    }
+
     // --- lookup ---
 
     // luaH_get: the value of `key`, or undefined (nil)
@@ -150,6 +174,10 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
 
     rawget(key: any): any {
         if (this.#metatable !== null) this.#syncMode();
+        if (key instanceof LuaVector) {
+            key = this.#vectorKey(key);
+            if (key === undefined) return undefined;
+        }
         return this.#get(key);
     }
 
@@ -163,6 +191,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             return this.#arrayornewkey(key);
         }
         const i = this.#keys.length;
+        if (key instanceof LuaVector) this.#addVector(key);
         this.#keys.push(this.#wrapKey(key));
         this.#vals.push(undefined);
         this.#indexSet(key, i);
@@ -279,6 +308,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         this.#vals = [];
         this.#index = new Map();
         this.#weakIndex = new WeakMap();
+        this.#vectors = null;
         this.#lastfree = size;
     }
 
@@ -310,6 +340,10 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         if (key === undefined) throw hostError("table index is nil");
         if (typeof key === "number" && Number.isNaN(key)) throw hostError("table index is NaN");
         if (this.#metatable !== null) this.#syncMode();
+        if (key instanceof LuaVector) {
+            if (key.hasNaN) throw hostError("table index contains NaN");
+            key = this.#vectorKey(key) ?? key;
+        }
         if (key === "__mode") this.#modeVersion++;
         if (typeof key === "number") {
             const k = arrayindex(key);
@@ -386,7 +420,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             const k = typeof key === "number" ? arrayindex(key) : -1;
             if (k > 0 && k <= this.#sizearray) i = k - 1;
             else {
-                const n = this.#indexGet(key);
+                const n = this.#indexGet(key instanceof LuaVector ? this.#vectorKey(key) : key);
                 if (n === undefined) throw hostError("invalid key to 'next'");
                 i = n + this.#sizearray;
             }
@@ -427,6 +461,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             this.#vals = [];
             this.#index = new Map();
             this.#weakIndex = new WeakMap();
+            this.#vectors = null;
             this.#lastfree = this.#capacity;
         }
     }
@@ -447,6 +482,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         this.#keys.forEach((k, i) => {
             const key = this.#unwrapKey(k);
             if (key !== undefined) t.#indexSet(key, i);
+            if (key instanceof LuaVector) t.#addVector(key);
         });
         return t;
     }
