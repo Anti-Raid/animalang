@@ -51,7 +51,12 @@ Luau's `integer` (`lintlib.cpp`) is a JS bigint kept in the signed 64-bit range:
 `===` and `Map` keys (so table keys) compare it by value, and every result is wrapped back with `BigInt.asIntN(64, ...)`,
 which V8 compiles to native 64-bit arithmetic. `integer` in `integer.ts` is the library, all of it, with Luau's errors
 (`division by zero`, `integer overflow`, ...); `fromstring` reads as Luau's `strtoll` / `strtoull` do (saturating in
-base 10, wrapping otherwise). As in Luau, integers have no operators but `==`, and never mix with numbers.
+base 10, wrapping otherwise). Integers never mix with numbers, as in Luau.
+
+**Deviation from Luau**: `+`, `-`, `*` and `/` work on two integers (Luau allows only `==` on them and gives `attempt to
+perform arithmetic (add) on integer`). They are `integer.add`, `sub`, `mul` and `div`: wrapping around 64 bits, and `/`
+dividing truncated, with `division by zero` and `integer overflow` as `integer.div` gives them. An integer with a number
+is still Luau's arithmetic error, and the other operators (`//`, `%`, `^`, unary `-`, `<`) are Luau's errors too.
 
 The tests (`tests/luau-{number,buffer,vector,integer}.test.ts`) check them against Luau's own results, and with `LUAU` set,
 against thousands of random cases run by Luau.
