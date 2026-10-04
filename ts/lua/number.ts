@@ -112,10 +112,9 @@ export const str2number = (s: string): number | undefined => {
 
 const ULLONG_MAX = (1n << 64n) - 1n;
 
-// tonumber(s, base) for a base other than 10 (2..36): strtoull, so a negative wraps around 2^64 and an overflow is
-// ULLONG_MAX
-export const str2integer = (s: string, base: number): number | undefined => {
-    s = cstring(s);
+// strtoull's (and strtoll's) reading of `s` in `base`: the sign, the digits' value, and the index after them, or undefined
+// if there are no digits
+export const strtoint = (s: string, base: number): [neg: boolean, n: bigint, end: number] | undefined => {
     let i = 0;
     while (i < s.length && isspace(s[i])) i++;
     let neg = false;
@@ -128,8 +127,17 @@ export const str2integer = (s: string, base: number): number | undefined => {
     const start = i;
     let n = 0n;
     for (; digit(s[i]) >= 0; i++) n = n * BigInt(base) + BigInt(digit(s[i]));
-    if (i === start || !trailingSpace(s, i)) return undefined;
-    if (n > ULLONG_MAX) n = ULLONG_MAX;
-    else if (neg) n = (-n) & ULLONG_MAX;
-    return Number(n);
+    return i === start ? undefined : [neg, n, i];
 };
+
+// strtoull's value: a negative wraps around 2^64, an overflow is ULLONG_MAX
+export const ullong = (neg: boolean, n: bigint): bigint => n > ULLONG_MAX ? ULLONG_MAX : neg ? (-n) & ULLONG_MAX : n;
+
+// tonumber(s, base) for a base other than 10 (2..36)
+export const str2integer = (s: string, base: number): number | undefined => {
+    s = cstring(s);
+    const read = strtoint(s, base);
+    return read !== undefined && trailingSpace(s, read[2]) ? Number(ullong(read[0], read[1])) : undefined;
+};
+
+export { cstring, trailingSpace };

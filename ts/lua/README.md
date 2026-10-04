@@ -1,7 +1,7 @@
 # Luau
 
 The Luau front end, in progress: the parser (`syntax/`, see its README), Luau's table (`table.ts`), numbers as strings
-(`number.ts`), buffers (`buffer.ts`) and vectors (`vector.ts`). The lowering to the VM's core forms comes next.
+(`number.ts`), buffers (`buffer.ts`), vectors (`vector.ts`) and integers (`integer.ts`). The lowering to the VM's core forms comes next.
 
 ## Tables
 `LuaTable` is Luau's table, ported from Luau's `VM/src/ltable.cpp`, so that what a program can see of a table is Luau's:
@@ -38,7 +38,7 @@ bases (`strtoull`: a negative wraps around 2^64).
 `LuaBuffer` is Luau's buffer (`lbuflib.cpp`): little-endian reads and writes of every width, strings, `copyFrom`
 (`buffer.copy`), `fill`, `readbits` / `writebits`, with Luau's errors. Numbers are cast as Luau's C casts them on
 arm64 (saturating, NaN being 0; an unsigned through int64, so `1e30` writes `0xffffffff`). Checking an argument's type
-is the caller's. `readinteger` / `writeinteger` are behind a Luau flag and left out.
+is the caller's. `readinteger` / `writeinteger` read and write integers (see below).
 
 ## Vectors
 `LuaVector` is Luau's 3-wide vector: three float32 components, the arithmetic of `lvmutils.cpp` (`v+v`, `v-v`, `-v`,
@@ -46,5 +46,12 @@ and `*`, `/`, `//` between vectors or a vector and a number) and the `vector` li
 order Luau's source writes them, which is what x86-64 builds give. Luau's arm64 builds fuse the multiply-adds of
 `magnitude`, `normalize`, `cross`, `dot`, `angle` and `lerp`, so they can differ there in the last bit.
 
-The tests (`tests/luau-{number,buffer,vector}.test.ts`) check them against Luau's own results, and with `LUAU` set,
+## Integers
+Luau's `integer` (`lintlib.cpp`) is a JS bigint kept in the signed 64-bit range: `typeof` tells it from a number,
+`===` and `Map` keys (so table keys) compare it by value, and every result is wrapped back with `BigInt.asIntN(64, ...)`,
+which V8 compiles to native 64-bit arithmetic. `integer` in `integer.ts` is the library, all of it, with Luau's errors
+(`division by zero`, `integer overflow`, ...); `fromstring` reads as Luau's `strtoll` / `strtoull` do (saturating in
+base 10, wrapping otherwise). As in Luau, integers have no operators but `==`, and never mix with numbers.
+
+The tests (`tests/luau-{number,buffer,vector,integer}.test.ts`) check them against Luau's own results, and with `LUAU` set,
 against thousands of random cases run by Luau.

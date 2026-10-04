@@ -66,6 +66,9 @@ export class LuaBuffer implements Datum {
     readf32(offset: number): number { return this.#view.getFloat32(this.#at(offset, 4), true); }
     readf64(offset: number): number { return this.#view.getFloat64(this.#at(offset, 8), true); }
 
+    readinteger(offset: number): bigint { return this.#view.getBigInt64(this.#at(offset, 8), true); }
+    writeinteger(offset: number, value: bigint): void { this.#view.setBigInt64(this.#at(offset, 8), value, true); }
+
     writei8(offset: number, value: number): void { this.#view.setUint8(this.#at(offset, 1), toUnsigned(value) & 0xff); }
     writeu8(offset: number, value: number): void { this.writei8(offset, value); }
     writei16(offset: number, value: number): void { this.#view.setUint16(this.#at(offset, 2), toUnsigned(value) & 0xffff, true); }
