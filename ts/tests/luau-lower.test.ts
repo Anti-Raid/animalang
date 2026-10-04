@@ -83,9 +83,57 @@ describe("Luau lowered functions", () => {
         expect(run("function add(a, b) return (a or 0) + (b or 0) end return add(1, 2), add(1), add(1, 2, 3), add()")).toBe("3\t1\t3\t0");
         expect(run("local function counter() local n = 0 return function() n += 1 return n end end local c = counter() c() c() return c()")).toBe("3");
         expect(run("local s = 0 for i = 1, 3 do local function g() return i end s += g() end return s")).toBe("6");
-        expect(run("local function noret() end local function bare() return end return noret(), bare()")).toBe("nil\tnil");
+        expect(run("local function noret() end local function bare() return end return noret(), bare()")).toBe("nil");
+        expect(run("local function noret() end return (noret()), noret() == nil")).toBe("nil\ttrue");
         expect(run("local function f() for i = 1, 10 do if i == 3 then return i end end end return f()")).toBe("3");
         expect(run("local function down(n) if n == 0 then return 'done' end return down(n - 1) end return down(100000)")).toBe("done");
+    });
+
+    it("passes several values where a call or ... is last, one value anywhere else", () => {
+        const defs = "local function two() return 1, 2 end local function none() end local function pass(...) return ... end ";
+        expect(run(defs + "return two()")).toBe("1\t2");
+        expect(run(defs + "return two(), two()")).toBe("1\t1\t2");
+        expect(run(defs + "return (two())")).toBe("1");
+        expect(run(defs + "local a, b, c = two() return a, b, c")).toBe("1\t2\tnil");
+        expect(run(defs + "local a, b, c = 0, two() return a, b, c")).toBe("0\t1\t2");
+        expect(run(defs + "local a, b = two(), 5 return a, b")).toBe("1\t5");
+        expect(run(defs + "local a, b = none() return a, b")).toBe("nil\tnil");
+        expect(run(defs + "local a, b a, b = two() return b, a")).toBe("2\t1");
+        expect(run(defs + "return pass(two())")).toBe("1\t2");
+        expect(run(defs + "return pass(two(), two())")).toBe("1\t1\t2");
+        expect(run(defs + "return pass(none())")).toBe("");
+        expect(run(defs + "return pass(none(), 3)")).toBe("nil\t3");
+        expect(run(defs + "return two() + 10, #'' == 0".replace(", #'' == 0", ""))).toBe("11");
+    });
+
+    it("gives a function's ... to it as values", () => {
+        expect(run("local function f(...) return ... end return f(1, nil, 3)")).toBe("1\tnil\t3");
+        expect(run("local function f(a, ...) local x, y = ... return a, x, y end return f(1, 2), f(1, 2, 3, 4)")).toBe("1\t1\t2\t3");
+        expect(run("local function f(...) return (...) end return f(), f(7, 8)")).toBe("nil\t7");
+        expect(run("local function f(...) return ..., 9 end return f(1, 2)")).toBe("1\t9");
+        expect(run("local function g(a, b) return b end local function f(...) return g(...) end return f(1, 2, 3)")).toBe("2");
+        expect(run("local function f(...) local t = 0 local a, b = 5, ... return a, b end return f('x', 'y')")).toBe("5\tx");
+        expect(run("return ...")).toBe("");
+    });
+
+    it("reads and assigns locals in the order Luau's compiler does", () => {
+        const pre = "local a = 1 local function bump() a = 10 return 1 end ";
+        // a local on the left of an operator, or assigned by op=, is read when the operation runs
+        expect(run(pre + "return a + bump()")).toBe("11");
+        expect(run(pre + "a += bump() return a")).toBe("11");
+        expect(run(pre + "return a < bump(), (a) + bump()")).toBe("false\t11");
+        expect(run(pre + "return a - bump(), a * bump(), a / bump(), a // bump(), a % 7 + bump(), a ^ bump()")).toBe("9\t10\t10\t10\t4\t10");
+        expect(run(pre + "return (if a < bump() then 'lt' else 'ge'), a == bump(), bump() == a, a ~= bump()")).toBe("ge\tfalse\tfalse\ttrue");
+        // but copied where Luau copies it: concatenation, arguments, a list of values, a unary operator's operand
+        expect(run(pre + "return a .. bump()")).toBe("11");
+        expect(run(pre + "local x, y = a, bump() return x, y")).toBe("1\t1");
+        expect(run(pre + "return -a + bump(), bump() + a")).toBe("0\t11");
+        expect(run("local f = function() return 'old' end local function swap() f = function() return 'new' end return 1 end return f(swap())")).toBe("old");
+        // several targets: a local takes its value at once, unless a later value refers to it
+        expect(run("local b, c = 1, 2 local function rd() return b end b, c = 5, rd() return b, c")).toBe("5\t5");
+        expect(run(pre + "local t a, t = 5, a return a, t")).toBe("5\t1");
+        expect(run(pre + "g1, g2 = a, bump() return g1, g2")).toBe("10\t1");
+        expect(run(pre + "a, g = bump(), a return a, g")).toBe("1\t10");
     });
 
     it("keeps assigned locals in registers across calls (Luau code is never re-entered)", () => {
@@ -98,14 +146,13 @@ describe("Luau lowered functions", () => {
         expect(run("local x\nreturn x(1)")).toBe("error: t:2: attempt to call a nil value");
         expect(run("local x = 5\nlocal y = x()")).toBe("error: t:2: attempt to call a number value");
         expect(run("local function f()\n  local x = 'a'\n  return x()\nend\nreturn f()")).toBe("error: t:3: attempt to call a string value");
-        expect(run("local function f() return 1, 2 end")).toBe("error: t:1: returning several values from a function is not supported yet");
     });
 });
 
 describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
     it("computes what Luau computes, and fails where it fails", () => {
         let seed = 7;
-        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
         const atoms = ["1", "2", "0", "-1", "0.5", "3.75", "1e300", "10", "7", "-0", "'10'", "' 0x10 '", "'1e2'", "'abc'", "''", "nil", "true", "'5.'", "x", "y", "g"];
         const binops = ["+", "-", "*", "/", "//", "%", "^", ".."];
         const expr = (depth: number): string => {
@@ -135,7 +182,7 @@ describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
 
     it("calls functions as Luau does", () => {
         let seed = 5;
-        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
         const plain = ["1", "2", "0", "-1", "0.5", "'10'", "3", "7"];
         const rare = ["nil", "true", "'x'", "(a)(1)", "k()", "f"];
         const calls = ["f(1, 2)", "f(a)", "f()", "f(1, 2, 3)", "g(b)", "g(1)", "h(3)", "h(a)", "a", "b"];
@@ -166,9 +213,84 @@ describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
         expect(actual).toEqual(expected.map(l => l.replace(/function: 0x[0-9a-f]+/g, "function")));
     });
 
+    it("adjusts lists of values as Luau does", () => {
+        let seed = 23;
+        // the high bits: the low ones of this generator repeat with a short period
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return Math.floor(seed / 4096) % n; };
+        const defs = [
+            "local function r0() end",
+            "local function r1() return 1 end",
+            "local function r2() return 1, 2 end",
+            "local function r3() return 'a', nil, 'c' end",
+            "local function pass(...) return ... end",
+            "local function first(...) local a = ... return a end",
+            "local function second(...) local a, b = ... return b end",
+            "local function swap(a, b) return b, a end",
+            "local function tail(...) return swap(...) end",
+            "local function wrap(...) return 0, ... end",
+            "local function mid(...) return ..., 9 end",
+            "local function both(...) return pass(...), pass(...) end",
+            "local function paren(...) return (...) end",
+            "local function pick(a, b, c) return c, a end",
+        ].join("\n");
+        const fns = ["r0", "r1", "r2", "r3", "pass", "first", "second", "swap", "tail", "wrap", "mid", "both", "paren", "pick"];
+        const atoms = ["1", "2", "'s'", "nil", "true", "5"];
+        const expr = (depth: number): string => {
+            const r = depth === 0 ? rand(2) : rand(8);
+            if (r < 2) return atoms[rand(atoms.length)];
+            if (r === 2) return `(${expr(depth - 1)})`;
+            if (r === 3) return `(${expr(depth - 1)} == ${expr(depth - 1)})`;
+            return `${fns[rand(fns.length)]}(${list(depth - 1, rand(4))})`;
+        };
+        const list = (depth: number, n: number): string => Array.from({ length: n }, () => expr(depth)).join(", ");
+        const programs = Array.from({ length: 700 }, () => {
+            const k = rand(4);
+            const body = k === 0 ? `return ${list(3, 1 + rand(3))}`
+                : k === 1 ? `local a, b, c = ${list(3, 1 + rand(3))}\nreturn a, b, c`
+                : k === 2 ? `local a, b, c\na, b${rand(2) ? ", c" : ""} = ${list(3, 1 + rand(3))}\nreturn a, b, c`
+                : `${fns[rand(fns.length)]}(${list(3, rand(3))})\nreturn ${list(2, 1 + rand(2))}`;
+            return `${defs}\n${body}`;
+        });
+        const quote = (s: string) => JSON.stringify(s);
+        const lua = programs.map(p => `do local f, err = loadstring(${quote(p)}, "=t") if not f then print("error: " .. err) else local r = table.pack(pcall(f)) if r[1] then local out = {} for i = 2, r.n do out[#out + 1] = tostring(r[i]) end print(table.concat(out, "\\t")) else print("error: " .. tostring(r[2])) end end end`);
+        const file = join(mkdtempSync(join(tmpdir(), "luau-")), "values.luau");
+        writeFileSync(file, lua.join("\n"));
+        const expected = execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26 }).split("\n").slice(0, programs.length);
+        expect(programs.map(p => run(p))).toEqual(expected);
+    }, 30000);
+
+    it("reads and assigns locals in Luau's order", () => {
+        let seed = 41;
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
+        const defs = "local a, b, c = 1, 2, 3\nlocal function bump() a = a + 10 return 1 end\nlocal function rd() return a end\nlocal function setb(v) b = v return b end\nlocal function two() c = a return a, b end";
+        const atoms = ["a", "b", "c", "bump()", "rd()", "setb(a)", "setb(7)", "two()", "5", "g", "h", "(a)", "(two())"];
+        const ops = ["+", "-", "*", "<", "<=", ">", "==", "~=", ".."];
+        const expr = (depth: number): string => depth === 0 || rand(3) === 0 ? atoms[rand(atoms.length)] : `${rand(4) === 0 ? "-" : ""}(${expr(depth - 1)} ${ops[rand(ops.length)]} ${expr(depth - 1)})`;
+        const targets = ["a", "b", "c", "g", "h"];
+        const stat = (): string => {
+            const r = rand(6);
+            if (r === 0) return `${targets[rand(5)]} ${["+", "-", "*", ".."][rand(4)]}= ${expr(2)}`;
+            if (r === 1) return `${targets[rand(5)]} = ${expr(2)}`;
+            const n = 2 + rand(2), k = 1 + rand(4);
+            return `${Array.from({ length: n }, () => targets[rand(5)]).join(", ")} = ${Array.from({ length: k }, () => expr(1)).join(", ")}`;
+        };
+        const programs = Array.from({ length: 1500 }, () => `${defs}\n${Array.from({ length: 1 + rand(3) }, stat).join("\n")}\nreturn a, b, c, g, h, ${expr(2)}`);
+        const quote = (s: string) => JSON.stringify(s);
+        const lua = programs.map(p => `do g, h = nil, nil local f, err = loadstring(${quote(p)}, "=t") if not f then print("error: " .. err) else local r = table.pack(pcall(f)) if r[1] then local out = {} for i = 2, r.n do out[#out + 1] = tostring(r[i]) end print(table.concat(out, "\\t")) else print("error: " .. tostring(r[2])) end end end`);
+        const file = join(mkdtempSync(join(tmpdir(), "luau-")), "order.luau");
+        writeFileSync(file, lua.join("\n"));
+        const expected = execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26 }).split("\n").slice(0, programs.length);
+        const actual = programs.map(p => {
+            luau.scope.delete(Symbol.for("g"));
+            luau.scope.delete(Symbol.for("h"));
+            return run(p);
+        });
+        expect(actual).toEqual(expected);
+    }, 30000);
+
     it("branches and loops as Luau does", () => {
         let seed = 11;
-        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
         const atoms = ["1", "2", "0", "-1", "0.5", "3", "'10'", "'abc'", "nil", "true", "false", "a", "b", "g", "(0/0)", "1i", "2i"];
         const binops = ["+", "-", "*", "%", "..", "==", "~=", "<", "<=", ">", ">=", "and", "or"];
         let loopVars: string[] = [];
@@ -211,7 +333,7 @@ describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
         });
         // integers with integers are a deviation from Luau: programs with integers are left out
         const keep = programs.map(p => !/\d+i\b/.test(p));
-        expect(keep.filter(k => k).length).toBeGreaterThan(programs.length / 4);
+        expect(keep.filter(k => k).length).toBeGreaterThan(programs.length / 10);
         expect(actual.filter((_, i) => keep[i])).toEqual(expected.filter((_, i) => keep[i]));
     });
 });

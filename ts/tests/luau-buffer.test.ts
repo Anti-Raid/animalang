@@ -59,7 +59,7 @@ describe("Luau buffers", () => {
 describe.skipIf(!process.env.LUAU)("Luau buffers against Luau", () => {
     it("give what Luau gives for random programs", () => {
         let seed = 7;
-        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
         const values = [0, 1, -1, 255, 256, 300, -129, 65535, 65536, 2 ** 31, 2 ** 32 - 1, 2 ** 32, -(2 ** 31) - 1, 1e30, -1e30, 2 ** 63, 0.1, 2.9, -2.9, NaN, Infinity, 3.4e38, 1e-40];
         const lit = (n: number) => n !== n ? "0/0" : n === Infinity ? "math.huge" : n === -Infinity ? "-math.huge" : num2str(n);
         const num = () => rand(2) === 0 ? values[rand(values.length)] : rand(5000) - 100;

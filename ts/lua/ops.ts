@@ -1,5 +1,7 @@
 // Luau's operators (VM/src/lvmutils.cpp), as intrinsics: numbers, strings that read as numbers, vectors, and (a
 // deviation from Luau) integers with integers
+import { MultipleValues } from "../common";
+import { severalValues } from "../magicvm/coreops";
 import { luauError } from "./errors";
 import type { ArgKinds, InlineFn, Intrinsics, Returns, TypeSystem } from "../magicvm/intrinsics";
 import { integer, ipow } from "./integer";
@@ -196,6 +198,12 @@ export const registerLuauOps = (table: Intrinsics): void => {
     table.register("%luau-for-test", (regs, s) => regs[s + 2] > 0 ? regs[s] <= regs[s + 1] : regs[s + 1] <= regs[s], {
         ...bool, args: [3, 3], effectFree: true,
         inline: ([i, limit, step]) => `(${step} > 0 ? ${i} <= ${limit} : ${limit} <= ${i})`,
+    });
+    // an element of `...` (an array), nil past its end
+    table.register("%luau-arg", (regs, s) => regs[s][regs[s + 1]], { args: [2, 2], leaf: true, effectFree: true, inline: ([a, i]) => `${a}[${i}]` });
+    // whether a call gave other than one value
+    table.register("%luau-several?", (regs, s) => regs[s] instanceof MultipleValues, {
+        ...bool, foldable: false, args: [1, 1], effectFree: true, inline: ([v], _slow, _tmp, d) => `(${severalValues(v, d)})`, deps: { MultipleValues },
     });
     table.register("%luau-tostring", (regs, s) => toString(regs[s]), { args: [1, 1], leaf: true });
 };

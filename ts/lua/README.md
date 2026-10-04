@@ -8,9 +8,8 @@ whose language is Luau.
 ## Lowering
 So far: locals, assignment (to locals and globals, several at once), compound assignment, `do` blocks, `if`, `while`,
 `repeat`, numeric `for`, `break`, `continue`, `return`, functions (`function`, `local function`, `function name()`),
-calls, literals, if-expressions, and the operators but `#` (arithmetic, `..`, comparisons, `and`, `or`, `not`).
-Functions return one value or none (nil) so far; several values are the chunk's alone. Anything else is a positioned
-"not supported yet" error.
+calls, several values and `...`, literals, if-expressions, and the operators but `#` (arithmetic, `..`, comparisons,
+`and`, `or`, `not`). Anything else is a positioned "not supported yet" error.
 
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
@@ -34,6 +33,18 @@ Functions return one value or none (nil) so far; several values are the chunk's 
   calls go. Its body is a `%block` its `return`s escape from; a `local function` is a `%letrec`, so it sees itself.
   Calls are `%call`s; calling what is not a function is `attempt to call a nil value` where the call is, tail call or
   not. Luau has no tail calls, but the VM's are not observable but in tracebacks (and in recursion that never runs out).
+- Several values are the VM's (`%values`): a function returns what its `return` lists, nothing (`return`, or the end
+  of its body) being no values. A call or `...` gives all its values where it is last in a list (of returned values,
+  of arguments, of a `local` or an assignment, which take what they need: `%let-values`), and one value anywhere else
+  (`%first-value`, nil if there is none; so do parentheses). `return f()` stays a tail call. In `f(a, g())`, `g` is called
+  first, and when it gives one value, as most calls do, `f` is called as usual; only several values go through
+  `%apply`. A function's `...` is its rest parameter, an array (the chunk's is empty).
+- Luau's compiler keeps a function's own locals in registers and uses a register itself as an operand, so when a call
+  in an expression assigns a local the expression also reads, which value is read is Luau's compiler's doing; the
+  lowering does the same (checked against Luau): a local on the left of an arithmetic or comparison operator, or the
+  target of `op=`, is read after the other operand is evaluated; concatenation, arguments and lists of values copy it
+  first. With several targets (`compileStatAssign`), a local takes its value as soon as it is computed unless a value
+  computed later refers to it, and the other targets, and those locals, are assigned at the end.
 - Luau code is compiled as not re-entrant (`reentrant: false`): Luau has no continuations that run a frame twice
   (a coroutine resumes its one suspended frame), so an assigned local needs a box only when a closure captures it.
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter

@@ -39,7 +39,7 @@ describe("Luau numbers as strings", () => {
 
 describe.skipIf(!process.env.LUAU)("Luau numbers as strings against Luau", () => {
     let seed = 7;
-    const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+    const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
     const luau = (lines: string[]) => {
         const file = join(mkdtempSync(join(tmpdir(), "luau-")), "numbers.luau");
         writeFileSync(file, lines.join("\n"));

@@ -48,7 +48,7 @@ describe("Luau vectors", () => {
 describe.skipIf(!process.env.LUAU)("Luau vectors against Luau", () => {
     it("compute what Luau computes", () => {
         let seed = 7;
-        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
         const comps = [0, -0, 1, -1, 0.1, 2.5, -3.75, 1e-3, 123456.789, 1e30, 3e38, 1e-40, NaN, Infinity, -Infinity, 7, 1 / 3];
         const comp = () => rand(3) === 0 ? comps[rand(comps.length)] : (rand(2000000) - 1000000) / [1, 7, 1000, 3][rand(4)];
         const lit = (n: number) => n !== n ? "0/0" : n === Infinity ? "math.huge" : n === -Infinity ? "-math.huge" : num2str(n);

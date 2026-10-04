@@ -397,6 +397,10 @@ export const applyArgs = (regs: readonly any[], start: number, nargs: number): a
     return args;
 };
 
+// a template's test that `v` is multiple values. Not `v instanceof MultipleValues`: in generated code that costs several
+// times a call when `v` is a number (measured), and every call whose one value is wanted makes the test
+export const severalValues = (v: string, d: Readonly<Record<string, string>>): string => `${v}?.constructor === ${d.MultipleValues}`;
+
 // a one-argument template; the argument is always a register name, so it may be repeated freely
 export const unaryInline = (inline: (a: string, d: Readonly<Record<string, string>>) => string): InlineFn =>
     (args, slow, tmp, d) => args.length === 1 ? inline(args[0], d) : null;
@@ -441,7 +445,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%values-cons", [2, 2], (regs, start) => {
         const vals = regs[start + 1];
         return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
-    }, { inline: ([x, v], slow, tmp, d) => `(${v} instanceof ${d.MultipleValues} ? new ${d.MultipleValues}([${x}, ...${v}.values]) : new ${d.MultipleValues}([${x}, ${v}]))` });
+    }, { inline: ([x, v], slow, tmp, d) => `(${severalValues(v, d)} ? new ${d.MultipleValues}([${x}, ...${v}.values]) : new ${d.MultipleValues}([${x}, ${v}]))` });
     core("%make-case-lambda", [1, Infinity], (regs, start, nargs) => new CaseLambda(regs.slice(start, start + nargs)));
     core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)), { effectFree: true });
     core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
@@ -463,7 +467,11 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%first-value", [2, 2], (regs, start) => {
         const val = regs[start];
         return val instanceof MultipleValues ? (val.values.length > 0 ? val.values[0] : regs[start + 1]) : val;
-    }, { inline: ([v, missing], slow, tmp, d) => `(${v} instanceof ${d.MultipleValues} ? (${v}.values.length > 0 ? ${v}.values[0] : ${missing}) : ${v})` });
+    }, {
+        // a value of a known kind is one value: itself
+        returns: kinds => kinds[0],
+        inline: ([v, missing], slow, tmp, d, known) => known[0] !== undefined ? v : `(${severalValues(v, d)} ? (${v}.values.length > 0 ? ${v}.values[0] : ${missing}) : ${v})`,
+    });
     // (%marks-first set key missing) / (%marks->array set key): continuation-mark-set-first / its values, innermost first
     core("%marks-first", [3, 3], (regs, start) => markFirst(markSetArg("continuation-mark-set-first", regs[start]), regs[start + 1], regs[start + 2]));
     core("%marks->array", [2, 2], (regs, start) => markValues(markSetArg("continuation-mark-set->list", regs[start]), regs[start + 1]));

@@ -8,7 +8,6 @@ import { LuaBuffer } from '../lua/buffer';
 import { LuaTable } from '../lua/table';
 import { num2str } from '../lua/number';
 import { parseLuau } from '../lua/syntax/parser';
-import { show as showForm } from '../lua/syntax/print';
 
 const MIN = integer.minsigned, MAX = integer.maxsigned;
 
@@ -62,7 +61,7 @@ describe("Luau integers", () => {
 
 describe.skipIf(!process.env.LUAU)("Luau integers against Luau", () => {
     let seed = 7;
-    const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+    const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };
     const luau = (lines: string[]) => {
         const file = join(mkdtempSync(join(tmpdir(), "luau-")), "integers.luau");
         writeFileSync(file, lines.join("\n"));
@@ -112,12 +111,13 @@ describe.skipIf(!process.env.LUAU)("Luau integers against Luau", () => {
         const pieces = ["0", "1", "9", "f", "F", "_", "x", "b", "0x", "0b", "7fffffffffffffff", "8000000000000000", "9223372036854775807", "9223372036854775808", "ffffffffffffffff", "1".repeat(64), ".", "e"];
         const literals = Array.from({ length: 3000 }, () => (rand(4) === 0 ? "" : ["0x", "0b", "0X", ""][rand(4)]) + Array.from({ length: 1 + rand(3) }, () => pieces[rand(pieces.length)]).join("") + "i")
             .filter(l => /^[0-9]/.test(l));
-        const expected = luau(literals.map(l => `do local f, e = loadstring("return ${l}") if f then print(tostring(f())) else print((e:gsub("^.-:%d+: ", ""))) end end`));
+        const expected = luau(literals.map(l => `do local f, e = loadstring("return ${l}") if f then local ok, v = pcall(f) print(if ok and typeof(v) == "integer" then tostring(v) else "other") else print((e:gsub("^.-:%d+: ", ""))) end end`));
         const actual = literals.map(l => {
             const r = parseLuau(`return ${l}`);
             if (r.errors.length > 0) return r.errors[0].message;
             const v = (r.root[1] as any[])[1];
-            return typeof v === "bigint" ? String(v) : showForm(v);
+            // not one literal (e.g. 0Xb..i is 0Xb .. i): something else, as it is to Luau
+            return typeof v === "bigint" ? String(v) : "other";
         });
         expect(actual).toEqual(expected);
     });
