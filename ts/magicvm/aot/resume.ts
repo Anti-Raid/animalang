@@ -7,6 +7,7 @@ import { FunctionEmitter } from "./function";
 // the frame-based entry the driver loop uses: registers live in locals and are spilled to frame.regs whenever control may leave
 export class ResumeEmitter extends FunctionEmitter {
     protected readonly accExpr = "ctx.acc";
+    protected readonly accOne = "oneValue(ctx.acc)";
     protected readonly endOfCode = "return null;";
     protected readonly siteVar = "frame.isite";
     // resume functions run from the driver loop, at the base of the js stack

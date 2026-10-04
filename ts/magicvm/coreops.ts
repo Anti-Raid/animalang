@@ -473,7 +473,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         return val instanceof MultipleValues ? (val.values.length > 0 ? val.values[0] : regs[start + 1]) : val;
     }, {
         // a value of a known kind is one value: itself
-        returns: kinds => kinds[0],
+        returns: kinds => kinds[0], oneValue: true,
         inline: ([v, missing], slow, tmp, d, known) => known[0] !== undefined ? v : `(${severalValues(v, d)} ? (${v}.values.length > 0 ? ${v}.values[0] : ${missing}) : ${v})`,
     });
     // (%marks-first set key missing) / (%marks->array set key): continuation-mark-set-first / its values, innermost first

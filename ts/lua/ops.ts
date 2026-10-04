@@ -117,6 +117,9 @@ export const LUAU_TYPES: TypeSystem = {
     ofConstant: v => typeof v === "number" ? "number" : typeof v === "bigint" ? "integer" : undefined,
     guard: (kind, e) => kind === "number" ? `typeof ${e} === "number"` : kind === "integer" ? `typeof ${e} === "bigint"` : null,
     coerce: (kind, e) => kind === "number" ? `+${e}` : null,
+    // the lowering takes one value of a call before it binds or assigns it (a call it keeps whole is never returned
+    // from a variable)
+    oneValueVariables: true,
 };
 
 const sameKind: Returns = (kinds: ArgKinds) => kinds.every(k => k === "number") ? "number" : kinds.every(k => k === "integer") ? "integer" : undefined;
@@ -154,12 +157,12 @@ export const registerLuauOps = (table: Intrinsics): void => {
     for (const op of ARITH_OPS) {
         const unary = op === "unm";
         table.register(`%luau-${op}`, unary ? (regs, s) => arith(op, regs[s], regs[s]) : (regs, s) => arith(op, regs[s], regs[s + 1]), {
-            args: unary ? [1, 1] : [2, 2], leaf: true, foldable: true,
+            args: unary ? [1, 1] : [2, 2], leaf: true, foldable: true, oneValue: true,
             inline: arithInline(op), deps: { luaPow }, returns: sameKind, wants: "number",
         });
     }
     table.register("%luau-concat", (regs, s) => concat(regs[s], regs[s + 1]), {
-        args: [2, 2], leaf: true, foldable: true,
+        args: [2, 2], leaf: true, foldable: true, oneValue: true,
         inline: (args, slow) => `(typeof ${args[0]} === "string" && typeof ${args[1]} === "string" ? ${args[0]} + ${args[1]} : ${slow})`,
     });
     const bool = { leaf: true, foldable: true, returns: "boolean" } as const;
@@ -200,7 +203,7 @@ export const registerLuauOps = (table: Intrinsics): void => {
         inline: ([i, limit, step]) => `(${step} > 0 ? ${i} <= ${limit} : ${limit} <= ${i})`,
     });
     // an element of `...` (an array), nil past its end
-    table.register("%luau-arg", (regs, s) => regs[s][regs[s + 1]], { args: [2, 2], leaf: true, effectFree: true, inline: ([a, i]) => `${a}[${i}]` });
+    table.register("%luau-arg", (regs, s) => regs[s][regs[s + 1]], { args: [2, 2], leaf: true, effectFree: true, oneValue: true, inline: ([a, i]) => `${a}[${i}]` });
     // all of `...` as values (the array is never changed, so several values keep it)
     table.register("%luau-varargs", (regs, s) => regs[s].length === 1 ? regs[s][0] : new MultipleValues(regs[s]), {
         args: [1, 1], leaf: true, effectFree: true, deps: { MultipleValues },
@@ -210,5 +213,5 @@ export const registerLuauOps = (table: Intrinsics): void => {
     table.register("%luau-several?", (regs, s) => regs[s] instanceof MultipleValues, {
         ...bool, foldable: false, args: [1, 1], effectFree: true, inline: ([v], _slow, _tmp, d) => `(${severalValues(v, d)})`, deps: { MultipleValues },
     });
-    table.register("%luau-tostring", (regs, s) => toString(regs[s]), { args: [1, 1], leaf: true });
+    table.register("%luau-tostring", (regs, s) => toString(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
 };

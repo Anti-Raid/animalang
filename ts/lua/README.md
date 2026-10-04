@@ -36,7 +36,8 @@ calls, several values and `...`, literals, if-expressions, and the operators but
 - Several values are the VM's (`%values`): a function returns what its `return` lists, nothing (`return`, or the end
   of its body) being no values. A call or `...` gives all its values where it is last in a list (of returned values,
   of arguments, of a `local` or an assignment, which take what they need: `%let-values`), and one value anywhere else
-  (`%first-value`, nil if there is none; so do parentheses). `return f()` stays a tail call. In `f(a, g())`, `g` is called
+  (`%first-value`, nil if there is none; so do parentheses), which for a call is a call that asks its callee for one
+  value, so costs nothing. `return f()` stays a tail call. In `f(a, g())`, `g` is called
   first, and when it gives one value, as most calls do, `f` is called as usual; only several values go through
   `%apply`. A function's `...` is its rest parameter, an array (the chunk's is empty).
 - Luau's compiler keeps a function's own locals in registers and uses a register itself as an operand, so when a call

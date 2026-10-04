@@ -5,7 +5,7 @@ import { createScheme } from '../scheme';
 import { Closure, ClosureTemplate, hostTailFrom, listing, type Code } from '../magicvm/exec';
 import { ASTStringifier } from '../scheme/printer';
 import { impl } from '../magicvm/meta';
-import { SyntaxPositions } from '../common';
+import { SyntaxPositions, TRY_CALL } from '../common';
 
 const S = Symbol.for;
 const s = new ASTStringifier();
@@ -166,6 +166,33 @@ describe("native-scheme", () => {
         expect(listing(strict("(p q r)")).join("\n")).not.toMatch(/Unpack/);
         expect(a.evaluateRaw(strict("(p q r)"))).toBe(1);
         expect(() => a.evaluateRaw(strict("(p q)"))).toThrow("expected 2 values but got 3");
+    });
+
+    it("gives a call that wants one value the first, whatever way the procedure returns", () => {
+        const a = make();
+        a.registerIntrinsic("%callable", (regs, st) => ({ [TRY_CALL]: regs[st] }), { args: [1, 1], leaf: true });
+        const run2 = (src: string) => showValue(a.evaluateRaw(a.compileRaw(src, "t.ns")));
+        const one = (call: string) => `(%intcall %first-value ${call} #void)`;
+        // the call is one that asks for one value: nothing is checked after it
+        const code = a.compileRaw(`(define-global (id x) x) (%intcall %+ 1 ${one("(%call id 1)")})`, "t.ns");
+        expect(listing(code).join("\n")).toMatch(/Call .*one=true/);
+        expect(listing(code).join("\n")).not.toMatch(/%first-value/);
+        run2(`(define-global (two x) (%intcall %values x (%intcall %+ x 1)))
+              (define-global (none) (%intcall %values))
+              (define-global (via x) (%call two x))
+              (define-global (kept x) (let ((v (%intcall %values x 9))) v))
+              (define-global (deep n) (%if (%intcall %< n 1) (%intcall %values 'bottom 2) (%call deep (%intcall %+ n -1))))
+              (define-global (nest n) (%if (%intcall %< n 1) (%intcall %values 0 'x) (%intcall %+ 1 ${one("(%call nest (%intcall %+ n -1))")})))
+              (define-global wrapped (%intcall %callable (lambda (self x) (%intcall %values x self))))
+              (define-global (yielding x) (%intcall %coroutine-yield 'y) (%intcall %values x 2))`);
+        expect(run2(`(%intcall %array ${one("(%call two 1)")} ${one("(%call none)")} ${one("(%call via 5)")} ${one("(%call kept 7)")})`)).toBe("(1 #void 5 7)");
+        // the same procedures still return all their values to a caller that takes them
+        expect(run2(`(let-values (((p q) (%call via 5)) ((r s) (%call kept 7))) (%intcall %array p q r s))`)).toBe("(5 6 7 9)");
+        // through tail calls deeper than the js stack, through nested calls deeper than it, and through TRY_CALL
+        expect(run2(`(%intcall %array ${one("(%call deep 20000)")} ${one("(%call nest 20000)")} ${one("(%call wrapped 3)")})`)).toBe("(bottom 20000 3)");
+        // a procedure entered for one value that yields goes on in heap frames, and still gives one
+        expect(run2(`(define-global co (%intcall %coroutine-create (lambda () (%intcall %+ 100 ${one("(%call yielding 1)")}))))
+                     (%intcall %array (%intcall %coroutine-resume co) (%intcall %coroutine-resume co))`)).toBe("(y 101)");
     });
 
     it("tells a cached closure from other values at a call site", () => {

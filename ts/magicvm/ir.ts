@@ -67,6 +67,8 @@ export type Node = {
     destReg?: number,
     startReg: number,
     nargs: number,
+    // the call wants one value: the first the procedure returns, or <#void>
+    one?: boolean,
 } | {
     t: "TailCall",
     procReg: number,
@@ -259,8 +261,8 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
             case "EndLoop": jump(push({ k: "EndLoop", head: -1 }), "head", node.head); break
             case "Jump": jump(push({ k: "Jump", target: -1 }), "target", node.label); break
             case "Call":
-                push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: false })
-                if (node.destReg !== undefined) push({ k: "MoveAcc", dst: node.destReg })
+                push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: false, ...(node.one ? { one: true as const } : {}) })
+                if (node.destReg !== undefined) push({ k: "MoveAcc", dst: node.destReg, ...(node.one ? { one: true as const } : {}) })
                 break
             case "TailCall": push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: true }); break
             case "Return": push({ k: "Return", src: node.reg }); break

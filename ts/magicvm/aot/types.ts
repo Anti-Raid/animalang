@@ -14,7 +14,7 @@ export type AotInst = { at?: number } & (
     | { k: "SetGlobal"; src: number; sym: number }
     | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }
     | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
-    | { k: "MoveAcc"; dst: number }
+    | { k: "MoveAcc"; dst: number; one?: true }
     | { k: "IntCall" | "IntApply"; pos: number; dst: number; start: number; nargs: number }
     | { k: "Unpack"; src: number; start: number; count: number; flags: number }
     | { k: "SetMark"; key: number; val: number }
@@ -27,7 +27,7 @@ export type AotTerm = { at?: number } & (
     | { k: "Jump"; target: number; escape?: boolean; loopBack?: boolean }
     | { k: "Block" | "Loop"; body: number; end: number }
     | { k: "Branch"; cond: number; then: number; else: number; elseif: boolean }
-    | { k: "Call"; proc: number; start: number; nargs: number; resume: number }
+    | { k: "Call"; proc: number; start: number; nargs: number; resume: number; one?: true }
     | { k: "TailCall"; proc: number; start: number; nargs: number; ip: number }
     | { k: "MaybeSelfTailCall"; proc: number; start: number; nargs: number; ip: number; arity: Arity; restPos: number }
     | { k: "HostCall"; pos: number; start: number; nargs: number; isTail: boolean; resume: number }

@@ -225,9 +225,12 @@ export class VMExecutor {
 
     // the direct entry a call of `proc` with `nargs` arguments goes to (Code.entry), kept in the call site's `cache`; null
     // when it has none (it is not a closure, the js stack is too deep, or its code runs on heap frames)
-    public entry(proc: any, cache: CallCache | null, nargs: number, depth: number): DirectFn | null {
+    // `one`: for a call that wants one value, the entry that returns one (Code.oneFn, compiled here when first wanted)
+    public entry(proc: any, cache: CallCache | null, nargs: number, depth: number, one: boolean = false): DirectFn | null {
         if (proc?.constructor !== Closure || depth >= MAX_JS_DEPTH) return null;
-        const fn = proc.tmpl.code.entry(nargs);
+        const code: Code = proc.tmpl.code;
+        if (one && code.direct && code.oneFn === null) AotCompiler.compileOne(code, proc.tmpl);
+        const fn = code.entry(nargs, one);
         if (fn !== null && cache !== null) {
             cache.tmpl = proc.tmpl;
             cache.fn = fn;

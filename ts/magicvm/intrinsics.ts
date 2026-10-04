@@ -18,6 +18,9 @@ export type TypeSystem = {
     guard(kind: Kind, expr: string, d: Readonly<Record<string, string>>): string | null,
     coerce?(kind: Kind, expr: string): string | null,
     deps?: Record<string, unknown>,
+    // the front end's code never keeps multiple values in a variable (a parameter, a local, a global): what it reads
+    // from one is one value, which a procedure entered for one value may return as it is (see Code.oneFn)
+    oneValueVariables?: boolean,
 };
 
 // `known`: for each argument, its kind when certain (see aot/facts.ts), so the template may skip checking it
@@ -68,6 +71,8 @@ export type IntrinsicOptions = {
     // left to run. `effectFree`: a call whose value is not used may be dropped: it has no effect and never throws
     foldable?: boolean,
     effectFree?: boolean,
+    // it never returns multiple values (as one that declares the kind it returns does not either)
+    oneValue?: boolean,
 }
 
 export type Intrinsic = {
@@ -90,6 +95,7 @@ export type Intrinsic = {
     readonly invertBranch?: boolean,
     readonly foldable: boolean,
     readonly effectFree: boolean,
+    readonly oneValue: boolean,
 }
 
 // The intrinsics a compiler and VM are extended with: host functions called over a register window, inlined by AOT
@@ -175,7 +181,7 @@ export class Intrinsics {
         const entry: Intrinsic = Object.freeze({
             name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, deps: Object.freeze(deps),
             refineArgs: options.refineArgs, branchNarrow: options.branchNarrow, invertBranch: options.invertBranch,
-            foldable: options.foldable ?? false, effectFree: options.effectFree ?? false,
+            foldable: options.foldable ?? false, effectFree: options.effectFree ?? false, oneValue: options.oneValue ?? false,
         })
         this.entries.push(entry)
         this.fns.push(fn)

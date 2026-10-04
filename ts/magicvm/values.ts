@@ -1,6 +1,6 @@
 // The VM's runtime values and state: frames, execution contexts, wind points, continuations, coroutines, catch tokens,
 // stack snapshots, and Suspend (how direct code hands control to heap frames)
-import { ErrorObject, IProcedure, Msg, OpaqueValue, unpackValues, vmError } from "../common";
+import { ErrorObject, IProcedure, Msg, MultipleValues, OpaqueValue, unpackValues, vmError } from "../common";
 import type { Env, Formatter, SourcePos } from "../common";
 import { Caught, EXCEPTION_HANDLERS, Handlers, TAIL_TRAIL, markFirst, markOwn } from "../marks";
 import type { Marks, TailTrail } from "../marks";
@@ -18,6 +18,9 @@ export const unpackForBinding = (val: any, count: number, flags: number): any[] 
 };
 
 export const restValues = (vals: any[], count: number): any[] => vals.slice(count);
+
+// what a call that wants one value takes of what the procedure returned: its first value, <#void> of none
+export const oneValue = (val: any): any => val instanceof MultipleValues ? (val.values.length > 0 ? val.values[0] : undefined) : val;
 
 export class Box {
     constructor(public val: any) {}

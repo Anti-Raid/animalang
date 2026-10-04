@@ -6,6 +6,7 @@ import type { Arity } from "../arity";
 import { CORE_COUNT } from "../coreops";
 import { Intrinsics } from "../intrinsics";
 import { UNPACK_REST } from "../ops";
+import { MultipleValues } from "../../common";
 import type { Structure } from "./structure";
 import { CodeEmitter, inlineDeps } from "./code-emitter";
 import { CONTROL_AOT, type ControlAot } from "./control";
@@ -35,14 +36,74 @@ export abstract class FunctionEmitter extends CodeEmitter {
     protected facts: Facts = new Map();
     protected aliases: Aliases = new Map();
 
+    // the registers that hold one value (not multiple values) at the instruction being emitted, as far as the block
+    // shows; `oneValueRegs` is those that do wherever they are read
+    protected one = new Set<number>();
+    #plain: Set<number> | null = null;
+
     protected startBlock(facts: Facts | undefined): void {
         this.facts = new Map(facts ?? []);
         this.aliases = new Map();
+        this.one = new Set();
     }
 
     protected emitInstWithFacts(inst: AotInst): void {
         this.emitInst(inst);
         transfer(inst, this.facts, this.table, this.constants, this.aliases);
+        for (const [reg, isOne] of this.#defines(inst, r => this.one.has(r))) {
+            if (isOne) this.one.add(reg);
+            else this.one.delete(reg);
+        }
+    }
+
+    // the registers `inst` sets, and whether each then holds one value (`moved`: whether a register it copies does).
+    // Multiple values come from a call that did not ask for one, and from an intrinsic that does not say what it
+    // returns; a variable holds one value where the front end says its variables do (TypeSystem.oneValueVariables)
+    #defines(inst: AotInst, moved: (reg: number) => boolean): [number, boolean][] {
+        const variables = this.table?.types?.oneValueVariables === true;
+        switch (inst.k) {
+            case "LoadInt": case "NewClosure": case "CurMarks": case "Box": return [[inst.dst, true]];
+            case "LoadConst": return [[inst.dst, !(this.constants[inst.idx] instanceof MultipleValues)]];
+            case "LoadUpvar": case "LoadGlobal": case "Unbox": return [[inst.dst, variables]];
+            case "Move": return [[inst.dst, moved(inst.src)]];
+            case "MoveAcc": return [[inst.dst, inst.one === true]];
+            case "IntCall": case "IntApply": {
+                const entry = this.table!.entries[inst.pos];
+                return [[inst.dst, entry.oneValue || typeof entry.returns === "string"]];
+            }
+            case "Unpack": return Array.from({ length: inst.count + ((inst.flags & UNPACK_REST) !== 0 ? 1 : 0) }, (_, i): [number, boolean] => [inst.start + i, true]);
+            default: return [];
+        }
+    }
+
+    // whether `reg` holds one value where a block ends: it does where the block shows it, or if nothing in the function
+    // ever puts multiple values in it (`params`: the registers the arguments come in, which a caller may pass anything)
+    protected holdsOne(reg: number, params: number): boolean {
+        if (this.one.has(reg)) return true;
+        if (this.#plain === null) {
+            const variables = this.table?.types?.oneValueVariables === true;
+            const multi = new Set<number>(variables ? [] : Array.from({ length: params }, (_, i) => i));
+            for (let grew = true; grew;) {
+                grew = false;
+                for (const block of this.blocks) {
+                    for (const inst of block.insts) {
+                        for (const [reg, isOne] of this.#defines(inst, r => !multi.has(r))) {
+                            if (!isOne && !multi.has(reg)) {
+                                multi.add(reg);
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+            }
+            this.#plain = new Set(Array.from({ length: this.numReg }, (_, i) => i).filter(r => !multi.has(r)));
+        }
+        return this.#plain.has(reg);
+    }
+
+    // the js of the one value of `expr` (a variable), which may be multiple values
+    protected oneOf(expr: string): string {
+        return `(${expr}?.constructor === MultipleValues ? (${expr}.values.length > 0 ? ${expr}.values[0] : undefined) : ${expr})`;
     }
 
     // a branch's condition: a known boolean as it is
@@ -91,6 +152,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // the inlined procedure the code is running (see Frame.isite)
     protected abstract readonly siteVar: string;
 
+    // the value of the last call that wanted one value (read by MoveAcc): direct code's call gives it; heap code takes the
+    // first of what the call returned
+    protected abstract readonly accOne: string;
     // where the value of the last call is (read by MoveAcc)
     protected abstract readonly accExpr: string;
 
@@ -203,7 +267,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`r${inst.dst} = new Closure(CONSTANTS[${inst.tmpl}], [${captures}]);`);
             }
             case "MoveAcc":
-                return this.emit(`r${inst.dst} = ${this.accExpr};`);
+                return this.emit(`r${inst.dst} = ${inst.one ? this.accOne : this.accExpr};`);
             case "SetMark":
                 return this.emit(`${this.marksVar} = markSet(${this.marksVar}, ${this.mframeVar}, r${inst.key}, r${inst.val});`);
             case "MarkSave":

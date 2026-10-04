@@ -74,6 +74,8 @@ interface BlockTarget {
 interface CmpOpts {
     destReg?: number // where to store dest reg
     isTail: boolean // whether this is a tail-call or not (for tco)
+    // the %call being compiled wants one value (see #compileNormalCall)
+    one?: boolean
     nodes: Node[]
     scope: CompilerScope,
     pos?: SourcePos // position of the enclosing form
@@ -252,6 +254,12 @@ export class Compiler {
                 case CORE_INTCALL: {
                     const intrinsic = this.#intrinsicNamed("%intcall", expr)
                     const call = expr.slice(1)
+                    // (%first-value (%call f arg ...) <#void>): a call that wants one value, which the callee gives
+                    // itself when it is entered for one (see Code.oneFn), with nothing to check after it
+                    if (intrinsic.pos === corePos("%first-value") && call.length === 3 && call[2] === undefined && Array.isArray(call[1]) && call[1][0] === CORE_CALL && call[1].length >= 3) {
+                        this.#compile(call[1], { ...opts, isTail: false, one: true })
+                        return
+                    }
                     if (intrinsic.leaf) {
                         this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
                             this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "IntCall", pos: intrinsic.pos, destReg, startReg: start, nargs }))
@@ -670,6 +678,8 @@ export class Compiler {
 
     // a normal call
     #compileNormalCall(expr: any[], opts: CmpOpts) {
+        const one = opts.one === true
+        if (one) opts = { ...opts, one: false }
         // We need to compile the proc and place it on its own tempval
         const { procReg, isTemp } = this.#resolveProcReg(expr[0], opts);
 
@@ -681,7 +691,7 @@ export class Compiler {
         if (opts.isTail) {
             opts.nodes.push({t: "TailCall", nargs, procReg, startReg})
         } else {
-            opts.nodes.push({t: "Call", destReg: opts.destReg, nargs, procReg, startReg})
+            opts.nodes.push({t: "Call", destReg: opts.destReg, nargs, procReg, startReg, one})
         }
 
         opts.scope.regAlloc.freeBlock(startReg, nargs)

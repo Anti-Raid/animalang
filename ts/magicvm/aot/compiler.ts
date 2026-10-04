@@ -14,7 +14,7 @@ import type { CallCache, Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { blockStarts, type Op } from "../ops";
-import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, restValues, tailName, unpackForBinding } from "../values";
+import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, oneValue, restValues, tailName, unpackForBinding } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
     markSet,
@@ -24,6 +24,7 @@ export const JIT_DEPS = {
     MultipleValues,
     unpackForBinding,
     restValues,
+    oneValue,
     IProcedure,
     ErrorObject,
     Box,
@@ -127,7 +128,7 @@ export class AotCompiler {
     // the compiled source of shared instruction lists: copies of a Code (Code.fresh) only build their own functions.
     // Source that calls intrinsics also depends on what they generate: their positions, inline templates and deps' locals.
     // Instances that register the same intrinsics the same way (e.g. from the same front end) share it
-    static readonly #sources = new WeakMap<readonly Op[], { uses: readonly SourceUse[], types: TypeSystem | null, factory: Function }[]>();
+    static readonly #sources = new WeakMap<readonly Op[], { uses: readonly SourceUse[], types: TypeSystem | null, one: boolean, factory: Function }[]>();
 
     static #sameUses(a: readonly SourceUse[], b: readonly SourceUse[]): boolean {
         if (a.length !== b.length) return false;
@@ -142,17 +143,24 @@ export class AotCompiler {
         return true;
     }
 
-    public static generateFunction(code: Code, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
+    // the direct entry of `code` for a call that wants one value (Code.oneFn), compiled when a call first asks for it:
+    // most procedures are only ever called one way
+    public static compileOne(code: Code, tmpl: ClosureTemplate): void {
+        code.oneFn = this.generateFunction(code, tmpl, true).direct;
+    }
+
+    // `one`: only the direct entry, for one value
+    public static generateFunction(code: Code, tmpl?: ClosureTemplate, one: boolean = false): { resume: ResumeFn, direct: DirectFn | null } {
         const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch }; });
         let variants = this.#sources.get(code.ops);
         const types = code.table?.types ?? null;
-        let factory = variants?.find(v => v.types === types && this.#sameUses(v.uses, uses))?.factory;
+        let factory = variants?.find(v => v.types === types && v.one === one && this.#sameUses(v.uses, uses))?.factory;
         if (factory === undefined) {
             // parsing the source is most of the cost, so copies share the factory and only call it for their own functions
-            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "CALL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl));
+            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "CALL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl, one));
             if (SHARED_OPS.has(code.ops)) {
                 if (variants === undefined) this.#sources.set(code.ops, variants = []);
-                variants.push({ uses, types, factory });
+                variants.push({ uses, types, one, factory });
             }
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
@@ -171,20 +179,20 @@ export class AotCompiler {
         return output;
     }
 
-    public static generateSource(code: Code, tmpl?: ClosureTemplate): string {
+    public static generateSource(code: Code, tmpl?: ClosureTemplate, one: boolean = false): string {
         if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
         const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
         const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
         const usedDeps = new Set<string>();
         const structure = structureOf(code.ops);
-        const resume = this.#step("resume", () => {
+        const resume = one ? "null" : this.#step("resume", () => {
             const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
             out.emitFunction();
             return out.toString();
         });
         const direct = tmpl === undefined ? "null" : this.#step("direct", () => {
             const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
-            out.emitFunction(tmpl.arity);
+            out.emitFunction(tmpl.arity, one);
             return out.toString();
         });
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
@@ -228,7 +236,7 @@ export class AotCompiler {
                     case "SetGlobal": insts.push({ k: "SetGlobal", src: op.src, sym: op.sym, at }); break;
                     case "Move": case "Box": case "Unbox": case "SetBox": insts.push({ k: op.k, dst: op.dst, src: op.src, at }); break;
                     case "NewClosure": insts.push({ k: "NewClosure", dst: op.dst, tmpl: op.tmpl, captures: (code.constants[op.tmpl] as ClosureTemplate).upvarLocs, at }); break;
-                    case "MoveAcc": insts.push({ k: "MoveAcc", dst: op.dst, at }); break;
+                    case "MoveAcc": insts.push({ k: "MoveAcc", dst: op.dst, one: op.one, at }); break;
                     case "Unpack": insts.push({ k: "Unpack", src: op.src, start: op.start, count: op.count, flags: op.flags, at }); break;
                     case "SetMark": insts.push({ k: "SetMark", key: op.key, val: op.val, at }); break;
                     case "MarkSave": case "MarkRestore": insts.push({ k: op.k, reg: op.reg, at }); break;
@@ -242,7 +250,7 @@ export class AotCompiler {
                     case "EndLoop": term = { k: "Jump", target: op.head, loopBack: true, at }; break;
                     case "Jump": term = { k: "Jump", target: op.target, escape: true, at }; break;
                     case "Call":
-                        term = !op.tail ? { k: "Call", proc: op.proc, start: op.start, nargs: op.nargs, resume: ip, at }
+                        term = !op.tail ? { k: "Call", proc: op.proc, start: op.start, nargs: op.nargs, resume: ip, one: op.one, at }
                             : tmpl !== undefined && fitsArity(tmpl.arity, op.nargs)
                             ? { k: "MaybeSelfTailCall", proc: op.proc, start: op.start, nargs: op.nargs, ip, arity: tmpl.arity, restPos: tmpl.code.restPos, at }
                             : { k: "TailCall", proc: op.proc, start: op.start, nargs: op.nargs, ip, at };

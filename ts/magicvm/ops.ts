@@ -21,11 +21,13 @@ export type Op = { ip: number, where?: SourcePos | null } & (
     // end of a then branch: jump past the rest of the if
     | { k: "Else"; end: number }
     | { k: "EndIf" }
-    | { k: "Call"; proc: number; start: number; nargs: number; tail: boolean }
+    // `one`: the call wants one value, the first of what the procedure returns (or <#void>): see MoveAcc
+    | { k: "Call"; proc: number; start: number; nargs: number; tail: boolean; one?: true }
     | { k: "Return"; src: number }
     | { k: "NewClosure"; dst: number; tmpl: number }
     | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }
-    | { k: "MoveAcc"; dst: number }
+    // the value of the call before it; `one`: its first value (the call's `one`)
+    | { k: "MoveAcc"; dst: number; one?: true }
     // start of a %block / %loop ending at `end`
     | { k: "Block" | "Loop"; end: number }
     | { k: "EndLoop"; head: number }

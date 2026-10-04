@@ -360,20 +360,23 @@ class Lowering {
         return fixed.reduceRight((tail, e) => intcall(pos, "%values-cons", e, tail), this.call(last));
     }
 
-    // a call, whose value is all the values the function returns. An argument list ending in `...` or a call passes all
-    // of its values; a call that gives one value (as most do) is then an ordinary call
-    call(e: C.Call): any[] {
+    // a call, whose value is all the values the function returns, or with `one`, the first of them (nil of none). An
+    // argument list ending in `...` or a call passes all of its values; a call that gives one value (as most do) is
+    // then an ordinary call
+    call(e: C.Call, one: boolean = false): any[] {
         const pos = this.pos(e);
+        // (the VM makes a %call whose first value is taken a call that asks for one)
+        const made = (call: any[]) => one ? intcall(pos, "%first-value", call, undefined) : call;
         const args = e.slice(2, -1) as C.Expr[];
         const last = args[args.length - 1];
-        if (last === undefined || !isMulti(last)) return [CORE_CALL, pos, this.expr(e[1]), ...args.map(a => this.expr(a))];
+        if (last === undefined || !isMulti(last)) return made([CORE_CALL, pos, this.expr(e[1]), ...args.map(a => this.expr(a))]);
         const fixed = args.slice(0, -1).map(a => this.expr(a));
-        if (last[0] === L.VARARGS) return [CORE_APPLY, pos, this.expr(e[1]), ...fixed, this.#varargs];
+        if (last[0] === L.VARARGS) return made([CORE_APPLY, pos, this.expr(e[1]), ...fixed, this.#varargs]);
         const [f, v, ...temps] = [Symbol("f"), Symbol("v"), ...fixed.map(() => Symbol("a"))];
         return [CORE_LET, pos, [[f, this.expr(e[1])], ...temps.map((t, i) => [t, fixed[i]]), [v, this.call(last)]],
             [CORE_IF, pos, intcall(pos, "%luau-several?", v),
-                [CORE_APPLY, pos, f, ...temps, intcall(pos, "%values->array", v)],
-                [CORE_CALL, pos, f, ...temps, v]]];
+                made([CORE_APPLY, pos, f, ...temps, intcall(pos, "%values->array", v)]),
+                made([CORE_CALL, pos, f, ...temps, v])]];
     }
 
     // with a literal step, its sign picks the test when compiling
@@ -441,7 +444,7 @@ class Lowering {
             }
             case L.LEN: return this.unsupported(e, "'#'");
             case L.VARARGS: return intcall(pos, "%luau-arg", this.#varargs, 0);
-            case L.CALL: return intcall(pos, "%first-value", this.call(e as C.Call), undefined);
+            case L.CALL: return this.call(e as C.Call, true);
             case L.METHOD: return this.unsupported(e, "a method call");
             case L.INDEX: return this.unsupported(e, "indexing");
             case L.FUNCTION: return this.function(e as C.Func);

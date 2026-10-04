@@ -18,6 +18,11 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     protected readonly accExpr = "acc";
+    protected readonly accOne = "acc";
+    // the entry being emitted is the one for a call that wants one value (Code.oneFn): it returns the first of the
+    // values it would return, and its tail calls ask the same of what they call
+    #one = false;
+    #params = 0;
     protected upvarRef(idx: number): string { return `uv${idx}`; }
     protected setUpvarExpr(idx: number, val: string): string { return `closure.upvars[${idx}] = uv${idx} = ${val}`; }
     protected readonly marksVar = "marks";
@@ -92,7 +97,9 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     // the direct entry takes the parameters' values (the rest parameter's last) as js arguments
-    emitFunction(closureArity: Arity): void {
+    emitFunction(closureArity: Arity, one: boolean = false): void {
+        this.#one = one;
+        this.#params = closureArity.params + (closureArity.rest === "none" ? 0 : 1);
         this.#selfArity = closureArity.rest === "none" ? closureArity.params : -1;
         const arity = closureArity.params + (closureArity.rest === "none" ? 0 : 1);
         const params = Array.from({ length: arity }, (_, i) => `, a${i}`).join("");
@@ -191,6 +198,8 @@ export class DirectEmitter extends FunctionEmitter {
     #structuredBody(seed: Facts | null = null): string | null {
         const body = new DirectEmitter(this.blocks, this.structure, this.liveness, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
         body.#selfArity = this.#selfArity;
+        body.#one = this.#one;
+        body.#params = this.#params;
         body.#seed = seed;
         body.#specCheck = this.#specCheck;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
@@ -323,18 +332,20 @@ export class DirectEmitter extends FunctionEmitter {
     // a call of `proc` with the argument expressions `args`, whose value `use` takes ("acc =", or "return" for a tail
     // call): through the entry the site's cache keeps while the callee is a closure of the same template, else through
     // the entry the executor finds for it (a case-lambda's clause, called in its place), else as executor.callArray does.
-    // `frame` is the callee's logical frame
-    #callWith(proc: string, args: string[], use: string, marksExpr: string, frame: string, site?: number): string {
+    // `frame` is the callee's logical frame. `one`: the call wants one value, so it asks for the entry that returns one
+    // (and takes the first of what a call that has no such entry returns)
+    #callWith(proc: string, args: string[], use: string, marksExpr: string, frame: string, site: number | undefined, one: boolean): string {
         const cache = site !== undefined ? `CC${site}` : null;
         const head = `executor, depth + 1, ${marksExpr}, ${frame}`;
         const list = args.map(a => ", " + a).join("");
+        const slow = `executor.callArray(ctx, callee, [${args.join(", ")}], depth + 1, ${marksExpr}, ${frame})`;
         return `
             ${cache !== null ? `if (${proc}?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.direct && depth < MAX_JS_DEPTH) {
                 ${use} ${cache}.fn(ctx, ${proc}, ${head}${list});
             } else ` : ""}{
                 const callee = ${proc}?.constructor === CaseLambda ? ${proc}.select(${args.length}) : ${proc};
-                const fn = executor.entry(callee, ${cache}, ${args.length}, depth);
-                ${use} fn !== null ? fn(ctx, callee, ${head}${list}) : executor.callArray(ctx, callee, [${args.join(", ")}], depth + 1, ${marksExpr}, ${frame});
+                const fn = executor.entry(callee, ${cache}, ${args.length}, depth${one ? ", true" : ""});
+                ${use} fn !== null ? fn(ctx, callee, ${head}${list}) : ${one ? `oneValue(${slow})` : slow};
             }
         `;
     }
@@ -343,32 +354,39 @@ export class DirectEmitter extends FunctionEmitter {
     #tailCall(proc: string, start: number, nargs: number, site?: number): string {
         return `
             rip = -1;${site !== undefined ? ` tip = ${site};` : ""}
-            ${this.#callWith(proc, windowRegs(start, nargs).map(r => `r${r}`), "return", "marks", "mframe", site)}
+            ${this.#callWith(proc, windowRegs(start, nargs).map(r => `r${r}`), "return", "marks", "mframe", site, this.#one)}
         `;
     }
 
     // calls `proc` with the array `args` (both in scope), leaving the value in acc, or returning it for a tail call
     #callArray(isTail: boolean): string {
-        return `${isTail ? "return" : "acc ="} executor.callArray(ctx, proc, args, depth + 1, marks, ${isTail ? "mframe" : "mframe + 1"});`;
+        const call = `executor.callArray(ctx, proc, args, depth + 1, marks, ${isTail ? "mframe" : "mframe + 1"})`;
+        return isTail ? `return ${this.#returned(call)};` : `acc = ${call};`;
     }
 
-    #call(procReg: number, start: number, nargs: number, resume: number, site?: number): string {
+    // what the entry returns of `value` (an expression that may be multiple values)
+    #returned(value: string): string {
+        return this.#one ? `oneValue(${value})` : value;
+    }
+
+    #call(procReg: number, start: number, nargs: number, resume: number, site?: number, one: boolean = false): string {
         return `
             {
                 const proc = r${procReg};
                 rip = ${resume};
-                ${this.#callProc(windowRegs(start, nargs).map(r => `r${r}`), "marks", site)}
+                ${this.#callProc(windowRegs(start, nargs).map(r => `r${r}`), "marks", site, one)}
             }
         `;
     }
 
-    // calls `proc` (in scope) with `args`, leaving the value in acc: itself, when it is the running closure
-    #callProc(args: string[], marksExpr: string = "marks", site?: number): string {
+    // calls `proc` (in scope) with `args`, leaving the value in acc: itself, when it is the running closure and this
+    // entry returns what the call wants
+    #callProc(args: string[], marksExpr: string = "marks", site?: number, one: boolean = false): string {
         const list = args.map(a => ", " + a).join("");
         return `
-            ${args.length === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
+            ${args.length === this.#selfArity && one === this.#one ? `if (proc === closure && depth < MAX_JS_DEPTH) {
                 acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${list});
-            } else ` : ""}${this.#callWith("proc", args, "acc =", marksExpr, "mframe + 1", site)}
+            } else ` : ""}${this.#callWith("proc", args, "acc =", marksExpr, "mframe + 1", site, one)}
         `;
     }
 
@@ -384,7 +402,7 @@ export class DirectEmitter extends FunctionEmitter {
                 return this.emit(this.jump(term.body, next));
             case "Call":
                 return this.emit(`
-                    ${this.#call(term.proc, term.start, term.nargs, term.resume, term.at)}
+                    ${this.#call(term.proc, term.start, term.nargs, term.resume, term.at, term.one === true)}
                     ${this.jump(term.resume, next)}
                 `);
             case "HostCall": {
@@ -407,9 +425,9 @@ export class DirectEmitter extends FunctionEmitter {
                             ${this.#callArray(term.isTail)}
                         } else if (res instanceof ControlRequest) {
                             ${term.isTail ? this.tailMark("res") : ""}
-                            ${term.isTail ? "return" : "acc ="} res.direct(ctx, executor, closure, marks, mframe, ${term.isTail});
+                            ${term.isTail ? `return ${this.#returned(`res.direct(ctx, executor, closure, marks, mframe, true)`)};` : "acc = res.direct(ctx, executor, closure, marks, mframe, false);"}
                         } else {
-                            ${term.isTail ? "return res;" : "acc = res;"}
+                            ${term.isTail ? `return ${this.#returned("res")};` : "acc = res;"}
                         }
                     }
                     ${term.isTail ? "" : this.jump(term.resume, next)}
@@ -432,7 +450,8 @@ export class DirectEmitter extends FunctionEmitter {
                     }
                 `);
             case "Return":
-                return this.emit(`return r${term.reg};`);
+                // an entry for one value returns the first of several: nothing to do where the register holds one
+                return this.emit(`return ${this.#one && !this.holdsOne(term.reg, this.#params) ? this.oneOf(`r${term.reg}`) : `r${term.reg}`};`);
             default: {
                 const _: never = term;
             }

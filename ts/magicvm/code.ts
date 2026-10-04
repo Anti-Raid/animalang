@@ -37,8 +37,11 @@ export class Code {
     public direct: boolean = false;
     // how its closures bind their arguments (their template's arity), once compiled
     public arity: Arity | null = null;
-    // the entries of a closure with a rest parameter, by argument count
-    #restEntries: (DirectFn | undefined)[] = [];
+    // its direct entry for a call that wants one value: it returns the first of the values directFn would (<#void> of
+    // none), so its caller has nothing to check. Compiled when first asked for (AotCompiler.compileOne)
+    public oneFn: DirectFn | null = null;
+    // the entries of a closure with a rest parameter, by argument count: over directFn, and over oneFn
+    #restEntries: (DirectFn | undefined)[][] = [[], []];
     // how often a direct call of this function ended in a suspend for call/cc, a continuation, a yield or a resume (see
     // resumeSuspend)
     public controlSuspends: number = 0;
@@ -76,12 +79,14 @@ export class Code {
     // takes), or null when such a call has to go through heap frames: a padded closure's is its entry for any count
     // (missing arguments are undefined as js leaves them, extra ones ignored), and one with a rest parameter has an entry
     // per count that makes the rest of the arguments past its parameters
-    entry(nargs: number): DirectFn | null {
+    // `one`: over oneFn (which is compiled by then), for a call that wants one value
+    entry(nargs: number, one: boolean = false): DirectFn | null {
         if (!this.direct) return null;
+        const direct = one ? this.oneFn : this.directFn;
         const { params, rest, pad } = this.arity!;
-        if (rest === "none") return nargs === params || pad ? this.directFn : null;
+        if (rest === "none") return nargs === params || pad ? direct : null;
         if (nargs < params && !pad) return null;
-        return this.#restEntries[nargs] ??= restEntry(this.directFn!, this.arity!, nargs);
+        return this.#restEntries[one ? 1 : 0][nargs] ??= restEntry(direct!, this.arity!, nargs);
     }
 
     get pack(): IntrinsicFn | null {
