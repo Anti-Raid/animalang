@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { compileNative, createNativeScheme, readNative, showValue, transformNative, NativeReadError } from '../native';
 import { Anima } from '../anima';
 import { createScheme } from '../scheme';
-import { Closure, ClosureTemplate, hostTailFrom, listing, type Code } from '../magicvm/exec';
+import { AotCompiler, Closure, ClosureTemplate, hostTailFrom, listing, type Code } from '../magicvm/exec';
 import { ASTStringifier } from '../scheme/printer';
 import { impl } from '../magicvm/meta';
 import { SyntaxPositions, TRY_CALL } from '../common';
@@ -186,6 +186,10 @@ describe("native-scheme", () => {
               (define-global wrapped (%intcall %callable (lambda (self x) (%intcall %values x self))))
               (define-global (yielding x) (%intcall %coroutine-yield 'y) (%intcall %values x 2))`);
         expect(run2(`(%intcall %array ${one("(%call two 1)")} ${one("(%call none)")} ${one("(%call via 5)")} ${one("(%call kept 7)")})`)).toBe("(1 #void 5 7)");
+        // entered for one value, a procedure that returns several makes none
+        const two = a.scope.get(Symbol.for("two")) as Closure;
+        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, false)).toMatch(/new D\d+\(\[/);
+        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, true)).not.toMatch(/new D\d+\(\[|MultipleValues/);
         // the same procedures still return all their values to a caller that takes them
         expect(run2(`(let-values (((p q) (%call via 5)) ((r s) (%call kept 7))) (%intcall %array p q r s))`)).toBe("(5 6 7 9)");
         // through tail calls deeper than the js stack, through nested calls deeper than it, and through TRY_CALL

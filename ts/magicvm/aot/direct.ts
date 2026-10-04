@@ -2,13 +2,16 @@
 import { windowRegs } from "./liveness";
 import { blockFacts, type Facts } from "./facts";
 import { MAX_STRUCTURED_NESTING, STRUCTURE_MISMATCH } from "./types";
-import type { AotTerm } from "./types";
+import type { AotBlock, AotTerm } from "./types";
+import { corePos } from "../coreops";
 import type { Arity } from "../arity";
 import { type Intrinsic, type Kind } from "../intrinsics";
 import { inlineDeps } from "./code-emitter";
 import { FunctionEmitter } from "./function";
 
 // the frameless entry used by direct calls: arguments arrive as js arguments and the value is returned
+const VALUES_POS = corePos("%values");
+
 export class DirectEmitter extends FunctionEmitter {
     // a self tail call restarts the function at the same depth, whose entry check may not count (see %interrupt), so it
     // counts as a loop's back-edge does (a pause resumes the restarted call, whose arguments are in place)
@@ -23,6 +26,8 @@ export class DirectEmitter extends FunctionEmitter {
     // values it would return, and its tail calls ask the same of what they call
     #one = false;
     #params = 0;
+    // the (%values e ...) the block being emitted returns, when the entry is for one value: its Return returns the first
+    #first: string | null = null;
     protected upvarRef(idx: number): string { return `uv${idx}`; }
     protected setUpvarExpr(idx: number, val: string): string { return `closure.upvars[${idx}] = uv${idx} = ${val}`; }
     protected readonly marksVar = "marks";
@@ -246,7 +251,7 @@ export class DirectEmitter extends FunctionEmitter {
             const block = blocks[i];
             const next = i + 1 < blocks.length ? blocks[i + 1].start : this.structure.size;
             this.startBlock(this.entryFacts.get(block.start));
-            for (const x of block.insts) this.emitInstWithFacts(x);
+            this.emitInsts(block);
             const term = block.term;
             if (term.k === "Branch") {
                 const elseIp = term.else;
@@ -327,6 +332,22 @@ export class DirectEmitter extends FunctionEmitter {
             this.emitTerm(term, next);
             i++;
         }
+    }
+
+    // an entry for one value does not make the multiple values a block only returns: it returns the first of them
+    protected fused(block: AotBlock, index: number): number {
+        const inst = block.insts[index];
+        if (!this.#one || inst.k !== "IntCall" || inst.pos !== VALUES_POS || inst.nargs === 1 || index !== block.insts.length - 1) return 0;
+        const first = inst.nargs > 0 ? `r${inst.start}` : "undefined";
+        if (block.term.k === "Return" && block.term.reg === inst.dst) {
+            this.#first = first;
+            return 1;
+        }
+        // or the block goes on to one that only returns them (the end of the function's body): it returns here
+        const target = block.term.k === "Jump" ? this.blocks.find(b => b.start === (block.term as { target: number }).target) : undefined;
+        if (target === undefined || target.insts.length !== 0 || target.term.k !== "Return" || target.term.reg !== inst.dst) return 0;
+        this.emit(`return ${first};`);
+        return 1;
     }
 
     // a call of `proc` with the argument expressions `args`, whose value `use` takes ("acc =", or "return" for a tail
@@ -449,9 +470,13 @@ export class DirectEmitter extends FunctionEmitter {
                         ${this.#tailCall("proc", term.start, term.nargs, term.at)}
                     }
                 `);
-            case "Return":
+            case "Return": {
+                const first = this.#first;
+                this.#first = null;
+                if (first !== null) return this.emit(`return ${first};`);
                 // an entry for one value returns the first of several: nothing to do where the register holds one
                 return this.emit(`return ${this.#one && !this.holdsOne(term.reg, this.#params) ? this.oneOf(`r${term.reg}`) : `r${term.reg}`};`);
+            }
             default: {
                 const _: never = term;
             }

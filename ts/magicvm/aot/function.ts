@@ -47,13 +47,24 @@ export abstract class FunctionEmitter extends CodeEmitter {
         this.one = new Set();
     }
 
-    protected emitInstWithFacts(inst: AotInst): void {
-        this.emitInst(inst);
-        transfer(inst, this.facts, this.table, this.constants, this.aliases);
-        for (const [reg, isOne] of this.#defines(inst, r => this.one.has(r))) {
-            if (isOne) this.one.add(reg);
-            else this.one.delete(reg);
+    // a block's instructions. `fused` may emit some of them together itself, from `index` on: it says how many
+    protected emitInsts(block: AotBlock): void {
+        for (let i = 0; i < block.insts.length;) {
+            const fused = this.fused(block, i);
+            if (fused === 0) this.emitInst(block.insts[i]);
+            for (const end = i + Math.max(fused, 1); i < end; i++) {
+                const inst = block.insts[i];
+                transfer(inst, this.facts, this.table, this.constants, this.aliases);
+                for (const [reg, isOne] of this.#defines(inst, r => this.one.has(r))) {
+                    if (isOne) this.one.add(reg);
+                    else this.one.delete(reg);
+                }
+            }
         }
+    }
+
+    protected fused(_block: AotBlock, _index: number): number {
+        return 0;
     }
 
     // the registers `inst` sets, and whether each then holds one value (`moved`: whether a register it copies does).
@@ -176,7 +187,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
             const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.structure.size;
             this.emit(`case ${this.blocks[i].start}: {`);
             this.startBlock(undefined);
-            for (const inst of this.blocks[i].insts) this.emitInstWithFacts(inst);
+            this.emitInsts(this.blocks[i]);
             this.emitTerm(this.blocks[i].term, next);
             this.emit(`}`);
         }
