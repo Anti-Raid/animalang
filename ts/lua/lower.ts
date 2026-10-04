@@ -205,11 +205,18 @@ class Lowering {
         return [CORE_LET, pos, [[a, this.expr(from)], [b, this.expr(to)], [c, step === null ? 1 : this.expr(step)]],
             [CORE_LET, pos, [[i, intcall(pos, "%luau-for-number", a, "initial value")], [limit, intcall(pos, "%luau-for-number", b, "limit")], [by, intcall(pos, "%luau-for-number", c, "step")]],
                 this.loop(pos, loop => [CORE_LOOP, pos,
-                    [CORE_IF, pos, intcall(pos, "%luau-for-test", i, limit, by),
+                    [CORE_IF, pos, this.#forTest(pos, step, i, limit, by),
                         [CORE_BEGIN, pos,
                             [CORE_LET, pos, [[name, i]], [CORE_BLOCK, pos, loop.cont, ...this.statements(block)]],
                             [CORE_SET, pos, i, intcall(pos, "%luau-add", i, by)]],
                         [CORE_ESCAPE, pos, loop.brk]]])]];
+    }
+
+    // with a literal step, its sign picks the test when compiling
+    #forTest(pos: SourcePos, step: C.Expr | null, i: symbol, limit: symbol, by: symbol): any {
+        const literal = step === null ? 1 : typeof step === "number" ? step : isForm(step) && step[0] === L.NEG && typeof step[1] === "number" ? -step[1] : null;
+        if (literal === null || Number.isNaN(literal)) return intcall(pos, "%luau-for-test", i, limit, by);
+        return literal > 0 ? intcall(pos, "%luau-le", i, limit) : intcall(pos, "%luau-le", limit, i);
     }
 
     target(e: C.Expr): symbol {

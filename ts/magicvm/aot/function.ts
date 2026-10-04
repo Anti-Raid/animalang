@@ -231,8 +231,10 @@ export abstract class FunctionEmitter extends CodeEmitter {
             }
             case "IntCall":
                 // non-debug code does not record where each operation is: an error the intrinsic raises gets the position here
-                if (this.debug || inst.at === undefined) return this.emit(`r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)};`);
-                return this.emit(`try { r${inst.dst} = ${this.intrinsicCall(inst.pos, inst.start, inst.nargs)}; } catch (e) { ${this.errorSite(inst.at, "e")} throw e; }`);
+                // (an inlined template that never calls the intrinsic cannot raise its errors, so needs none)
+                const call = this.intrinsicCall(inst.pos, inst.start, inst.nargs);
+                if (this.debug || inst.at === undefined || !this.#callsIntrinsic(inst.pos, call)) return this.emit(`r${inst.dst} = ${call};`);
+                return this.emit(`try { r${inst.dst} = ${call}; } catch (e) { ${this.errorSite(inst.at, "e")} throw e; }`);
             case "IntApply": {
                 // an array alone is the argument array itself: intrinsics never write to or keep it
                 const entry = this.table!.entries[inst.pos];
@@ -245,6 +247,10 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 const _: never = inst;
             }
         }
+    }
+
+    #callsIntrinsic(pos: number, expr: string): boolean {
+        return expr.includes(`RT[${pos}]`) || expr.includes(`I${pos}(`);
     }
 
     // an expression calling the intrinsic at `pos`: its inline template, whose fallback is a call of its function over the

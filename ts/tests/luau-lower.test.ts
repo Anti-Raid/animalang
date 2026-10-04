@@ -65,6 +65,7 @@ describe("Luau lowered control flow", () => {
         expect(run("return nil and 1, false or 'x', 1 and 2, not nil, not 0, if 1 > 2 then 'a' else 'b'")).toBe("nil\tx\t2\ttrue\tfalse\tb");
         expect(run("return 1 < 2, 'a' < 'b', 'B' < 'a', nil == false, 0/0 == 0/0, 1i <= 1i")).toBe("true\ttrue\ttrue\tfalse\tfalse\ttrue");
         expect(run("for i = '1', '3' do g = i end return g")).toBe("3");
+        expect(run("local n = 0 for i = 1, 3, 0 do n += 1 end for i = 3, 1, -0 do n += 10 break end for i = 1, 3, 0/0 do n += 100 end return n")).toBe("10");
     });
 
     it("reports Luau's errors", () => {

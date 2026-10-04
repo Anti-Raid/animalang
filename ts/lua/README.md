@@ -27,7 +27,7 @@ but `#` (arithmetic, `..`, comparisons, `and`, `or`, `not`). Anything else is a 
   sees the body's locals, so it is tested inside them, and a `continue` there tests it too; a `continue` that jumps over
   a local the condition uses is Luau's compile error. A numeric `for` is Luau's `FORNPREP`/`FORNLOOP`: its three values
   are read as numbers once (`invalid 'for' limit (number expected, got nil)`), the loop goes on while
-  `step > 0 ? i <= limit : limit <= i`, and each iteration binds a fresh local.
+  `step > 0 ? i <= limit : limit <= i` (decided when compiling for a literal step), and each iteration binds a fresh local.
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
   (`messages.ts`) words them as Luau does: `file:line: message`. Syntax errors are `LuauSyntaxError`s, worded alike.
 

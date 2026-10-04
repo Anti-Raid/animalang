@@ -167,8 +167,10 @@ export const registerLuauOps = (table: Intrinsics): void => {
     table.register("%luau-not", (regs, s) => regs[s] === undefined || regs[s] === false, {
         ...bool, args: [1, 1], effectFree: true, inline: ([a]) => `(${a} === undefined || ${a} === false)`,
     });
-    const eqInline = (negate: boolean): InlineFn => ([a, b], slow) =>
-        `(${a} === ${b} ? ${!negate} : typeof ${a} === "object" && ${a} !== null ? ${slow} : ${negate})`;
+    // only two vectors are equal other than by ===
+    const eqInline = (negate: boolean): InlineFn => ([a, b], slow, _tmp, _d, known) =>
+        known.some(k => k !== undefined) ? `(${a} ${negate ? "!==" : "==="} ${b})`
+            : `(${a} === ${b} ? ${!negate} : typeof ${a} === "object" && ${a} !== null ? ${slow} : ${negate})`;
     table.register("%luau-eq", (regs, s) => rawequal(regs[s], regs[s + 1]), { ...bool, args: [2, 2], effectFree: true, inline: eqInline(false) });
     table.register("%luau-ne", (regs, s) => !rawequal(regs[s], regs[s + 1]), { ...bool, args: [2, 2], effectFree: true, inline: eqInline(true) });
     // a > b and a >= b are b < a and b <= a, as Luau compiles them (its messages say so)
