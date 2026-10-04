@@ -454,77 +454,40 @@ Since each check evaluates unconditionally to `true`, omitting the branch and em
 
 ---
 
-## 8. Monomorphic Direct Call Caching (Devirtualization)
+## 8. Call sites: one cached entry per site
 
-### 8.1 Context
-In Animalang's direct entry (`direct$`), non-self function calls currently execute a multi-branch dispatch on every invocation:
-1. `proc instanceof Closure`
-2. `proc.tmpl.code.directArity === nargs || proc.tmpl.code.directPad`
-3. `depth < MAX_JS_DEPTH`
-4. Dynamic property load: `proc.tmpl.code.directFn(...)`
+### 8.1 What a call needs
 
-This requires up to six property dereferences across three heap objects (`proc` $\to$ `tmpl` $\to$ `code` $\to$ `directFn`) and polymorphic dispatch checks on every call.
+A call of a closure from direct code is a JavaScript call of the closure's direct entry. What function that is, and what arguments it takes, depends on the callee and on the count the site passes:
 
-### 8.2 Transformation
-For each call site $S$, maintain a monomorphic inline cache `(CC_tmpl, CC_directFn)`:
-1. Fast path:
-   $$\text{if } (proc?.tmpl === CC\_tmpl \ \&\&\ CC\_tmpl.code.directArity !== -1 \ \&\&\ depth < MAX\_JS\_DEPTH)$$
-   $$\quad acc = CC\_directFn(ctx, proc, executor, depth + 1, \dots);$$
-2. Fallback path:
-   If the fast path condition fails, execute the full dispatch chain. If the callee is a closure with matching direct arity, update the cache:
-   $$CC\_tmpl = proc.tmpl; \quad CC\_directFn = proc.tmpl.code.directFn;$$
-3. Before its first call, a site's cache holds `NO_TEMPLATE`, a template of no closure whose `code.directArity` is $-1$.
+- `Code.entry(nargs)` gives it, or `null` when such a call has to go through heap frames. For a closure with no rest parameter it is the direct entry (`directFn`) when `nargs` is its parameter count, or when it is padded: the entry then takes any count, as JavaScript leaves missing arguments `undefined` (`<#void>`) and ignores extra ones. For a closure with a rest parameter it is a function made for that count (`restEntry`), which passes the positional parameters (`undefined` for those a padded closure is missing) and makes the rest of the arguments past them: with fewer arguments than parameters it is `null` unless the closure is padded.
+- `code.direct` says whether the code may be entered that way at all: it is set when the direct entry is compiled and cleared by `countControlSuspend`. `Code.entry` is `null` when it is clear.
 
-The fast path does not test `proc instanceof Closure`: measured, that test alone cost several times the call (V8 does not treat the class the generated code is given as a constant), and it is implied (Lemma below).
+`executor.entry(proc, cache, nargs, depth)` is `proc.tmpl.code.entry(nargs)` when `proc` is a `Closure` and `depth < MAX_JS_DEPTH`, else `null`; a non-null result is stored in `cache` as `(tmpl, fn)`. `executor.callArray(ctx, proc, args, depth, marks, mframe)` is the call of anything with its arguments in an array: a value that is not a procedure through its `TRY_CALL` procedure, a case-lambda through its clause, a closure through its direct entry when `Code.entry` has one for the count (bound the same way), and anything else by throwing `Suspend.invoke`, which runs the call on heap frames (where a wrong count is reported).
 
-### 8.3 Correctness Proof
+### 8.2 The site
 
-**Theorem 10 (Equivalence of Cached Direct Calls).**
-*Let $S$ be a call site with argument count $nargs$. If $proc?.tmpl \equiv CC\_tmpl$, $CC\_tmpl.code.directArity \ne -1$, and $depth < MAX\_JS\_DEPTH$, then invoking $CC\_directFn$ with $(ctx, proc, executor, depth + 1, \dots)$ produces identical effects, returns, and exceptions to executing the full direct dispatch chain.*
+Each call site $S$ with $nargs$ arguments has a cache $CC = (tmpl, fn)$, initially `(NO_TEMPLATE, null)`, where `NO_TEMPLATE` is the template of no closure and `NO_TEMPLATE.code.direct` is false. The site is
+
+1. if $proc?.tmpl \equiv CC.tmpl \wedge CC.tmpl.code.direct \wedge depth < MAX\_JS\_DEPTH$: call $CC.fn(ctx, proc, executor, depth + 1, \dots, args)$;
+2. else, with $callee$ the clause `proc.select(nargs)` if $proc$ is a `CaseLambda` and $proc$ otherwise, and $fn = $ `executor.entry(callee, CC, nargs, depth)`: call $fn(ctx, callee, \dots, args)$ if $fn \ne$ `null`, else `executor.callArray(ctx, callee, [args], ...)`.
+
+A call of the running closure itself with its own parameter count is tested first and calls `direct$`, as before.
+
+### 8.3 Correctness
+
+**Theorem 10.** *Branch 1 calls what branch 2 would.*
 
 *Proof.*
-0. **Lemma (the template identifies a closure).** $CC\_tmpl$ is `NO_TEMPLATE` or a `ClosureTemplate` stored by the fallback path, which stores it only from a value it found to be a `Closure`. `NO_TEMPLATE` fails $CC\_tmpl.code.directArity \ne -1$. A `ClosureTemplate` is the value of a `tmpl` property only on `Closure` objects (no other VM object has one, and the VM hands templates to no front end or host value), and $proc?.tmpl$ is `undefined` for `null`, `undefined` and primitives. So when the fast path's condition holds, $proc$ is a `Closure`.
-1. **Template Invariance.** In the VM model, a `ClosureTemplate` structure and its direct entry implementation `directFn` are immutable once generated.
-2. **Arity Conformance and Non-Deoptimized State.** The cache entry $(CC\_tmpl, CC\_directFn)$ is populated only after verifying that $CC\_tmpl.code.directArity \equiv nargs$ (or $CC\_tmpl.code.directPad$ is true). At any subsequent call where $proc.tmpl \equiv CC\_tmpl$ and $CC\_tmpl.code.directArity \ne -1$, $proc$ shares the verified arity without having suffered direct execution revocation.
-3. **Target Function Identity.** By definition of `Closure`, $proc.tmpl.code.directFn \equiv CC\_directFn$.
-4. **Depth Invariance.** The stack depth bound $depth < MAX\_JS\_DEPTH$ is evaluated identically on the fast path and on the full guard chain, preserving termination and recursion limit guarantees.
-5. **Fallback Safety.** If $proc$ is not a `Closure` (so, by the lemma, $proc?.tmpl \not\equiv CC\_tmpl$ or the cache is empty), if $proc.tmpl \not\equiv CC\_tmpl$, or if the procedure was deoptimized ($CC\_tmpl.code.directArity \equiv -1$), the fast path is bypassed, and the original complete dispatch chain executes without alteration.
+1. **The template identifies a closure.** $CC.tmpl$ is `NO_TEMPLATE` or a template `executor.entry` stored, which it stores only from a value whose constructor is `Closure`. `NO_TEMPLATE.code.direct` is false, so branch 1 is not taken on an empty cache. A `ClosureTemplate` is the value of a `tmpl` property only on `Closure` objects (no other VM object has one, and the VM hands templates to no front end or host value), and $proc?.tmpl$ is `undefined` for `null`, `undefined` and primitives. So in branch 1 $proc$ is a `Closure` with $proc.tmpl \equiv CC.tmpl$, and is its own $callee$.
+2. **The entry is the one for this call.** $CC.fn$ was `CC.tmpl.code.entry(nargs)` for this site's $nargs$, which is fixed. `Code.entry` depends only on the code's arity (immutable), its direct entry (immutable once compiled), `nargs`, and `code.direct`; the rest entries it makes are kept per count. So while `code.direct` holds, `executor.entry(proc, CC, nargs, depth)` returns that same function, given $depth < MAX\_JS\_DEPTH$, which branch 1 also tests.
+3. **Demotion.** `countControlSuspend` clears `code.direct`. Branch 1 tests it, so a demoted code's cached entry is never called; branch 2's `executor.entry` then returns `null` and `callArray` throws `Suspend.invoke`, the heap call. Without the test, a cached site would keep entering code whose direct calls keep suspending, paying a JavaScript exception unwind each time. □
 
-$\blacksquare$
+**Why no `instanceof`.** The cache test is `proc?.tmpl === CC.tmpl`, and a clause is told by `proc?.constructor === CaseLambda`. Measured, `proc instanceof Closure` in generated code cost about 8 ns, several times the call it guards (10 million calls: 107 ms with it, 22 ms without), as V8 does not treat the class the generated code is given as a constant; `executor.entry` and `callArray` test the constructor first for the same reason. Nothing extends `Closure` or `CaseLambda`. Reading `tmpl` off whatever is called makes that load see the shapes of the values called at the site, which at a site that calls closures is one shape.
 
-### 8.4 Structural Stability & JIT Safety Invariants
+**The cache object.** $CC$ is an object made before the code is compiled and passed to it as a constant (`CALL_CACHE[ip]`), with both fields present from the start: its shape never changes, and reading or writing a field is a load or store at a fixed offset, with no scope-chain lookup.
 
-**Lemma 8.1 (V8 Shape Stability and Context Avoidance).**
-*Allocating cache entries as fields in a fixed object $CC_{ip} = \{ tmpl: null, directFn: null \}$ passed through `CALL_CACHE` preserves a monomorphic hidden class (Shape/Map) across execution, avoiding mutable context-slot deoptimizations.*
-
-*Proof.*
-In V8 and modern JavaScript engines, mutable closure-captured variables (e.g. `let CC_tmpl`) allocated in an outer activation context are accessed via dynamic scope-chain lookups (`Context::get`) whenever reassigned, which prevents TurboFan from constant-folding or direct-offset loading.
-By allocating `CALL_CACHE[ip]` as an object literal instantiated before compilation and passed as a `const` reference $CC_{ip}$ in the factory closure:
-1. The object $\{ tmpl, directFn \}$ has a single transition tree and monomorphic Map throughout its entire lifecycle.
-2. Property reads $CC_{ip}.tmpl$ and $CC_{ip}.directFn$ compile to single memory-offset dereferences (`mov rax, [rcx + 12]`) without scope-chain traversal.
-3. Mutations $CC_{ip}.tmpl = \dots$ and $CC_{ip}.directFn = \dots$ occur in-place on pre-allocated object fields without altering the hidden class. □
-
-**Lemma 8.2 (Polymorphism Prevention via Instanceof Guard).**
-*Evaluating $proc \text{ instanceof Closure}$ prior to accessing $proc.tmpl$ prevents megamorphic inline cache transitions in V8.*
-
-*Proof.*
-If an inline cache fast path dereferences $proc.tmpl$ directly on arbitrary values, non-closure arguments (primitives, vectors, host objects, or `CaseLambda`) cause V8's LoadIC to observe multiple disparate hidden classes (or primitive wrapper objects), quickly transitioning the IC state from monomorphic to megamorphic.
-By guarding with $proc \text{ instanceof Closure}$ first:
-1. If $proc$ is not an instance of `Closure`, the branch immediately short-circuits.
-2. The property access $proc.tmpl$ is executed strictly and exclusively when $proc$ is known to be an instance of `Closure`.
-3. Consequently, V8's type feedback registers only the `Closure` hidden class, preserving monomorphic property access throughout JIT compilation. □
-
-**Lemma 8.3 (Control Transfer Bailout Invariance under `countControlSuspend`).**
-*When a procedure's direct execution incurs repeated control suspensions (continuations, escapes, or exceptions) exceeding `DIRECT_SUSPEND_LIMIT`, the VM signals intentional deoptimization to heap frames by setting `code.directArity = -1; code.directRestArity = -1; code.directPad = false;`. Including $CC\_tmpl.code.directArity \ne -1$ in the inline cache fast path ensures that deoptimized functions are never re-entered via direct entry, preserving the VM's suspension bailout invariant.*
-
-*Proof.*
-Under `countControlSuspend(code)` (`values.ts`), once $code.controlSuspends \ge DIRECT\_SUSPEND\_LIMIT$, direct mode execution is permanently revoked for that `Code` instance by assigning $code.directArity = -1$.
-Direct invocations of such procedures force heap frame allocation (`executor.callOther` / `callDirectRest`), avoiding repeated JavaScript exception unwinding (`Suspend.raise`).
-If the inline cache did not inspect $CC\_tmpl.code.directArity \ne -1$, cached call sites would bypass the arity guard and directly invoke $CC\_directFn$, executing direct entry and throwing uncaught `Suspend` exceptions on every suspension.
-By guarding $CC\_tmpl.code.directArity \ne -1$ directly on the fast path, any template demoted by `countControlSuspend` fails the fast path check and routes to the heap frame fallback, restoring efficient resumption semantics. □
-
-
-
+**What the generated code is spared.** The chain of cases (fixed count, padded, rest, case-lambda, `TRY_CALL`, continuation) is `executor.entry` and `executor.callArray`, written once; a site is the two branches above, whatever the callee turns out to be.
 
 ## 9. The optimizer (`cp0`, `passes/cp0.ts`)
 

@@ -99,8 +99,6 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     protected abstract readonly endOfCode: string;
 
-    // the check that one more nested direct call is allowed (as `&& ...`)
-    protected abstract readonly depthCheck: string;
     // access/assignment to an upvar slot: in heap code reads the local `upvars`; in direct code reads hoisted `uv${idx}`
     protected abstract upvarRef(idx: number): string;
     protected abstract setUpvarExpr(idx: number, val: string): string;
@@ -135,22 +133,6 @@ export abstract class FunctionEmitter extends CodeEmitter {
         return `ip = ${this.truthy(term.cond)} ? ${term.then} : ${term.else}; continue top;`;
     }
 
-
-    // (a closure is tested by its constructor: `x instanceof Closure` in generated code costs several times the call,
-    // as V8 does not know the class it is given to be a constant; nothing extends Closure or CaseLambda)
-    protected directGuard(proc: string, nargs: string): string {
-        return `${proc}?.constructor === Closure && (${proc}.tmpl.code.directArity === ${nargs} || ${proc}.tmpl.code.directPad)${this.depthCheck}`;
-    }
-
-    // a closure with a rest parameter whose direct entry takes `nargs` arguments as an array (see Code.directRestFn): a
-    // padded one takes any count
-    protected restEntryGuard(proc: string, nargs: string): string {
-        return `${proc}?.constructor === Closure && ${proc}.tmpl.code.directRestArity !== -1 && (${nargs} >= ${proc}.tmpl.code.directRestArity || ${proc}.tmpl.arity.pad)${this.depthCheck}`;
-    }
-
-    protected restGuard(proc: string, nargs: string): string {
-        return `${proc}?.constructor === Closure && ${proc}.tmpl.code.directRestArity !== -1 && ${nargs} >= ${proc}.tmpl.code.directRestArity${this.depthCheck}`;
-    }
 
     protected selfMoves(term: Extract<AotTerm, { k: "MaybeSelfTailCall" }>): string {
         // as bindArgs, over registers held in js variables: the rest value first, then the positionals, moving down

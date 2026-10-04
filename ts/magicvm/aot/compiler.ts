@@ -10,7 +10,7 @@ import { structureOf } from "./structure";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
 import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS } from "../code";
-import type { Code, DirectFn, DirectRestFn, ResumeFn } from "../code";
+import type { CallCache, Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { blockStarts, type Op } from "../ops";
@@ -64,7 +64,7 @@ export const JIT_DEPS = {
 // what a call site's cache holds before its first call: no value's template, and never directly callable. A site tests
 // `proc?.tmpl === cache.tmpl` alone (only a Closure has a template for its `tmpl`): `proc instanceof Closure` there costs
 // several times the call, as V8 does not know the class the generated code is given to be a constant
-const NO_TEMPLATE = { code: { directArity: -1, directRestArity: -1 } } as unknown as ClosureTemplate;
+const NO_TEMPLATE = { code: { direct: false } } as unknown as ClosureTemplate;
 
 export class AotCompiler {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
@@ -72,7 +72,7 @@ export class AotCompiler {
 
         // one try around the loop: any error ends the run
         try {
-            if (frame.ip === 0 && frame.code.directArity === 0 && !frame.code.internal && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
+            if (frame.ip === 0 && frame.code.direct && frame.code.arity!.params === 0 && frame.code.arity!.rest === "none" && !frame.code.internal && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
             while (frame !== null) {
                 const frameCtx: ExecutionContext = frame.ctx;
                 frame = executor.enter(frameCtx, frame);
@@ -114,14 +114,12 @@ export class AotCompiler {
     }
 
     public static compile(code: Code, tmpl?: ClosureTemplate): ResumeFn {
-        const { resume, direct, rest } = this.generateFunction(code, tmpl);
+        const { resume, direct } = this.generateFunction(code, tmpl);
         code.resumeFn = resume;
         if (direct !== null && tmpl !== undefined) {
             code.directFn = direct;
-            code.directRestFn = rest;
-            if (tmpl.arity.rest === "none") code.directArity = tmpl.arity.params;
-            else code.directRestArity = tmpl.arity.params;
-            code.directPad = tmpl.arity.pad && tmpl.arity.rest === "none";
+            code.arity = tmpl.arity;
+            code.direct = true;
         }
         return resume;
     }
@@ -144,7 +142,7 @@ export class AotCompiler {
         return true;
     }
 
-    public static generateFunction(code: Code, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null, rest: DirectRestFn | null } {
+    public static generateFunction(code: Code, tmpl?: ClosureTemplate): { resume: ResumeFn, direct: DirectFn | null } {
         const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch }; });
         let variants = this.#sources.get(code.ops);
         const types = code.table?.types ?? null;
@@ -159,8 +157,8 @@ export class AotCompiler {
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
-        const callCache: Record<number, { tmpl: ClosureTemplate, directFn: DirectFn | null, restFn: DirectRestFn | null }> = {};
-        for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: NO_TEMPLATE, directFn: null, restFn: null };
+        const callCache: Record<number, CallCache> = {};
+        for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: NO_TEMPLATE, fn: null };
         return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 
@@ -195,18 +193,7 @@ export class AotCompiler {
         const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
         const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
         const deps = [...usedDeps].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
-        return `${caches}${callCaches}${fns}${deps}const entries = {\nresume: ${resume},\ndirect: ${direct},\nrest: null\n};\n${this.#restEntry(tmpl)}return entries;`;
-    }
-
-    // a rest closure's direct entry over the array of its arguments: a call site calls it like any direct entry (its own
-    // function, so V8 can inline it), instead of going through the executor. A padded closure's missing arguments are
-    // undefined, as the array reads them
-    static #restEntry(tmpl?: ClosureTemplate): string {
-        if (tmpl === undefined || tmpl.arity.rest === "none") return "";
-        const n = tmpl.arity.params;
-        const positional = Array.from({ length: n }, (_, i) => `args[${i}], `).join("");
-        const rest = tmpl.arity.rest === "array" ? (n === 0 ? "args" : `args.slice(${n})`) : `closure.tmpl.code.pack(args, ${n}, Math.max(args.length - ${n}, 0))`;
-        return `const direct = entries.direct;\nentries.rest = function(ctx, closure, executor, depth, marks, mframe, args) { return direct(ctx, closure, executor, depth, marks, mframe, ${positional}${rest}); };\n`;
+        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${resume},\ndirect: ${direct}\n};`;
     }
 
     static #globalLoads(code: Code): number[] {

@@ -450,7 +450,9 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)), {
         effectFree: true, inline: (args, slow, tmp, d) => args.length === 1 ? args[0] : `new ${d.MultipleValues}([${args.join(", ")}])`,
     });
-    core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
+    core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice(), {
+        fresh: true, inline: ([v], slow, tmp, d) => `(${severalValues(v, d)} ? ${v}.values.slice() : [${v}])`,
+    });
     // a new array of the arguments: a rest parameter's value where the table has no sequences of its own (see cp0)
     core("%array", [0, Infinity], (regs, start, nargs) => regs.slice(start, start + nargs), { effectFree: true, fresh: true });
     core("%debug-frames", [3, 3], (regs, start, nargs, ctx) => {

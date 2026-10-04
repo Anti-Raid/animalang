@@ -18,7 +18,6 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     protected readonly accExpr = "acc";
-    protected readonly depthCheck = " && depth < MAX_JS_DEPTH";
     protected upvarRef(idx: number): string { return `uv${idx}`; }
     protected setUpvarExpr(idx: number, val: string): string { return `closure.upvars[${idx}] = uv${idx} = ${val}`; }
     protected readonly marksVar = "marks";
@@ -321,51 +320,36 @@ export class DirectEmitter extends FunctionEmitter {
         }
     }
 
+    // a call of `proc` with the argument expressions `args`, whose value `use` takes ("acc =", or "return" for a tail
+    // call): through the entry the site's cache keeps while the callee is a closure of the same template, else through
+    // the entry the executor finds for it (a case-lambda's clause, called in its place), else as executor.callArray does.
+    // `frame` is the callee's logical frame
+    #callWith(proc: string, args: string[], use: string, marksExpr: string, frame: string, site?: number): string {
+        const cache = site !== undefined ? `CC${site}` : null;
+        const head = `executor, depth + 1, ${marksExpr}, ${frame}`;
+        const list = args.map(a => ", " + a).join("");
+        return `
+            ${cache !== null ? `if (${proc}?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.direct && depth < MAX_JS_DEPTH) {
+                ${use} ${cache}.fn(ctx, ${proc}, ${head}${list});
+            } else ` : ""}{
+                const callee = ${proc}?.constructor === CaseLambda ? ${proc}.select(${args.length}) : ${proc};
+                const fn = executor.entry(callee, ${cache}, ${args.length}, depth);
+                ${use} fn !== null ? fn(ctx, callee, ${head}${list}) : executor.callArray(ctx, callee, [${args.join(", ")}], depth + 1, ${marksExpr}, ${frame});
+            }
+        `;
+    }
+
     // a tail call from direct code: stays direct when possible, otherwise suspends without rebuilding this frame
     #tailCall(proc: string, start: number, nargs: number, site?: number): string {
-        const args = this.argList(start, nargs);
-        const cache = site !== undefined ? `CC${site}` : null;
         return `
             rip = -1;${site !== undefined ? ` tip = ${site};` : ""}
-            ${cache !== null ? `if (${proc}?.tmpl === ${cache}.tmpl && depth < MAX_JS_DEPTH) {
-                if (${cache}.tmpl.code.directArity !== -1) return ${cache}.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
-                if (${cache}.tmpl.code.directRestArity !== -1) return ${cache}.restFn(ctx, ${proc}, executor, depth + 1, marks, mframe, [${args}]);
-            }` : ""}
-            if (${this.directGuard(proc, `${nargs}`)}) {
-                ${cache !== null ? `${cache}.tmpl = ${proc}.tmpl; ${cache}.directFn = ${proc}.tmpl.code.directFn;\n` : ""}const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
-                return val;
-            }
-            if (${this.restEntryGuard(proc, `${nargs}`)}) {
-                ${cache !== null ? `${cache}.tmpl = ${proc}.tmpl; ${cache}.restFn = ${proc}.tmpl.code.directRestFn;\n` : ""}const val = ${proc}.tmpl.code.directRestFn(ctx, ${proc}, executor, depth + 1, marks, mframe, [${args}]);
-                return val;
-            }
-            if (${proc}?.constructor === Closure && ${proc}.tmpl.arity.pad) return executor.callPadded(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
-            if (${proc}?.constructor === CaseLambda) {
-                const clause = ${proc}.select(${nargs});
-                if (${this.directGuard("clause", `${nargs}`)}) return clause.tmpl.code.directFn(ctx, clause, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
-                return executor.callCase(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
-            }
-            return executor.callOther(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
+            ${this.#callWith(proc, windowRegs(start, nargs).map(r => `r${r}`), "return", "marks", "mframe", site)}
         `;
     }
 
     // calls `proc` with the array `args` (both in scope), leaving the value in acc, or returning it for a tail call
     #callArray(isTail: boolean): string {
-        const done = isTail ? "return" : "acc =";
-        const frameArg = isTail ? "mframe" : "mframe + 1";
-        return `
-            if (${this.directGuard("proc", "args.length")}) {
-                ${done} executor.callDirect(ctx, proc, args, depth + 1, marks, ${frameArg});
-            } else if (${this.restGuard("proc", "args.length")}) {
-                ${done} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${frameArg});
-            } else if (proc?.constructor === Closure && proc.tmpl.arity.pad) {
-                ${done} executor.callPadded(ctx, proc, args, depth + 1, marks, ${frameArg});
-            } else if (proc?.constructor === CaseLambda) {
-                ${done} executor.callCase(ctx, proc, args, depth + 1, marks, ${frameArg});
-            } else {
-                ${done} executor.callOther(ctx, proc, args, depth + 1, marks, ${frameArg});
-            }
-        `;
+        return `${isTail ? "return" : "acc ="} executor.callArray(ctx, proc, args, depth + 1, marks, ${isTail ? "mframe" : "mframe + 1"});`;
     }
 
     #call(procReg: number, start: number, nargs: number, resume: number, site?: number): string {
@@ -373,35 +357,18 @@ export class DirectEmitter extends FunctionEmitter {
             {
                 const proc = r${procReg};
                 rip = ${resume};
-                ${this.#callProc(this.argList(start, nargs), nargs, "marks", site)}
+                ${this.#callProc(windowRegs(start, nargs).map(r => `r${r}`), "marks", site)}
             }
         `;
     }
 
-    // calls `proc` (in scope) with `args`, leaving the value in acc
-    #callProc(args: string, nargs: number, marksExpr: string = "marks", site?: number): string {
-        const cache = site !== undefined ? `CC${site}` : null;
+    // calls `proc` (in scope) with `args`, leaving the value in acc: itself, when it is the running closure
+    #callProc(args: string[], marksExpr: string = "marks", site?: number): string {
+        const list = args.map(a => ", " + a).join("");
         return `
-                ${nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
-                    acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
-                } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
-                    acc = ${cache}.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
-                } else if (proc?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directRestArity !== -1 && depth < MAX_JS_DEPTH) {
-                    acc = ${cache}.restFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1, [${args}]);
-                } else ` : ""}if (${this.directGuard("proc", `${nargs}`)}) {
-                    ${cache !== null ? `${cache}.tmpl = proc.tmpl; ${cache}.directFn = proc.tmpl.code.directFn;\n` : ""}acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
-                } else if (${this.restEntryGuard("proc", `${nargs}`)}) {
-                    ${cache !== null ? `${cache}.tmpl = proc.tmpl; ${cache}.restFn = proc.tmpl.code.directRestFn;\n` : ""}acc = proc.tmpl.code.directRestFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1, [${args}]);
-                } else if (proc?.constructor === Closure && proc.tmpl.arity.pad) {
-                    acc = executor.callPadded(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
-                } else if (proc?.constructor === CaseLambda) {
-                    const clause = proc.select(${nargs});
-                    acc = ${this.directGuard("clause", `${nargs}`)}
-                        ? clause.tmpl.code.directFn(ctx, clause, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""})
-                        : executor.callCase(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
-                } else {
-                    acc = executor.callOther(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
-                }
+            ${args.length === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
+                acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${list});
+            } else ` : ""}${this.#callWith("proc", args, "acc =", marksExpr, "mframe + 1", site)}
         `;
     }
 
@@ -426,7 +393,7 @@ export class DirectEmitter extends FunctionEmitter {
                     const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume) };
                     return this.emit(`
                         ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}
-                        ${control.direct(site, this.#callArray(term.isTail), (args, marks) => this.#callProc(args.join(", "), args.length, marks))}
+                        ${control.direct(site, this.#callArray(term.isTail), (args, marks) => this.#callProc(args, marks))}
                         ${term.isTail ? "" : this.jump(term.resume, next)}
                     `);
                 }

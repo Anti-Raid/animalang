@@ -265,9 +265,7 @@ export class VMContinuation extends IProcedure {
 // error pays for it every time: after DIRECT_SUSPEND_LIMIT of them, calls to it use heap frames, where those are cheap
 export const countControlSuspend = (code: Code): void => {
     if (++code.controlSuspends === DIRECT_SUSPEND_LIMIT) {
-        code.directArity = -1;
-        code.directRestArity = -1;
-        code.directPad = false;
+        code.direct = false;
     }
 };
 

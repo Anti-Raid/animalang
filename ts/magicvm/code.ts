@@ -16,8 +16,8 @@ export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecuto
 // `depth` counts nested direct calls on the js stack; past MAX_JS_DEPTH calls go through heap frames instead. `marks` is
 // the continuation's mark list and `mframe` the logical frame the function runs in (a tail call keeps its caller's)
 export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, ...args: any[]) => any;
-// the direct entry of a closure with a rest parameter, over the array of its arguments (which it may keep as the rest)
-export type DirectRestFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, args: any[]) => any;
+// what a call site keeps of its last callee: its template, and the entry for the site's argument count (Code.entry)
+export type CallCache = { tmpl: ClosureTemplate, fn: DirectFn | null };
 
 // an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
 export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };
@@ -32,12 +32,13 @@ export const SHARED_OPS = new WeakSet<readonly Op[]>();
 export class Code {
     public resumeFn: ResumeFn | null = null;
     public directFn: DirectFn | null = null;
-    public directRestFn: DirectRestFn | null = null;
-    public directArity: number = -1;
-    public directRestArity: number = -1;
-    // a padded closure with no rest parameter: its direct entry takes any count (JS fills missing arguments with
-    // undefined, <#void>, and ignores extra ones)
-    public directPad: boolean = false;
+    // whether calls may go through directFn: set when it is compiled, cleared when its calls keep suspending (see
+    // countControlSuspend), from when on they use heap frames
+    public direct: boolean = false;
+    // how its closures bind their arguments (their template's arity), once compiled
+    public arity: Arity | null = null;
+    // the entries of a closure with a rest parameter, by argument count
+    #restEntries: (DirectFn | undefined)[] = [];
     // how often a direct call of this function ended in a suspend for call/cc, a continuation, a yield or a resume (see
     // resumeSuspend)
     public controlSuspends: number = 0;
@@ -70,6 +71,18 @@ export class Code {
         // metadata: the intrinsics the code uses, by name (for binding to another table)
         public intrinsics: readonly UsedIntrinsic[] = []
     ) {}
+
+    // the direct entry for a call with `nargs` arguments, which it takes as its own (after the six every direct entry
+    // takes), or null when such a call has to go through heap frames: a padded closure's is its entry for any count
+    // (missing arguments are undefined as js leaves them, extra ones ignored), and one with a rest parameter has an entry
+    // per count that makes the rest of the arguments past its parameters
+    entry(nargs: number): DirectFn | null {
+        if (!this.direct) return null;
+        const { params, rest, pad } = this.arity!;
+        if (rest === "none") return nargs === params || pad ? this.directFn : null;
+        if (nargs < params && !pad) return null;
+        return this.#restEntries[nargs] ??= restEntry(this.directFn!, this.arity!, nargs);
+    }
 
     get pack(): IntrinsicFn | null {
         return this.restPos === -1 ? null : this.table!.fns[this.restPos];
@@ -192,6 +205,15 @@ export class Code {
 }
 
 export type UpVarLoc = { index: number; local: boolean };
+
+// a function of its own for each count (not one shared over an array), so V8 can inline it at the call sites that keep it
+const restEntry = (direct: DirectFn, arity: Arity, nargs: number): DirectFn => {
+    const args = Array.from({ length: nargs }, (_, i) => `a${i}`);
+    const positional = Array.from({ length: arity.params }, (_, i) => i < nargs ? `a${i}, ` : "undefined, ").join("");
+    const extra = args.slice(arity.params).join(", ");
+    const rest = arity.rest === "array" ? `[${extra}]` : `closure.tmpl.code.pack([${extra}], 0, ${Math.max(nargs - arity.params, 0)})`;
+    return new Function("direct", `return function(ctx, closure, executor, depth, marks, mframe${args.map(a => ", " + a).join("")}) { return direct(ctx, closure, executor, depth, marks, mframe, ${positional}${rest}); };`)(direct);
+};
 
 /** A template for a closure that can then be bound to a scope */
 export class ClosureTemplate {

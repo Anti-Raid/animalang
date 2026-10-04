@@ -6,6 +6,7 @@ import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
 import { bindArgs, checkArity } from "./arity";
 import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
+import type { CallCache, DirectFn } from "./code";
 import type { VMHost } from "./code";
 import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, helperClosure, tracebackMessage } from "./coreops";
 import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
@@ -222,25 +223,67 @@ export class VMExecutor {
         return handler instanceof IProcedure ? handler : null;
     }
 
-    // a call from direct code of what is not a closure or case-lambda: a continuation on heap frames, else the
-    // procedure the value gives (TRY_CALL), with the value before `args`
-    public callOther(ctx: ExecutionContext, value: any, args: any[], depth: number, marks: any, mframe: number): any {
-        const handler = this.#hooked(value);
-        if (handler === null) {
-            if (!(value instanceof IProcedure)) throw vmError(Msg.NonProcedure, value);
-            throw Suspend.invoke(value, args);
+    // the direct entry a call of `proc` with `nargs` arguments goes to (Code.entry), kept in the call site's `cache`; null
+    // when it has none (it is not a closure, the js stack is too deep, or its code runs on heap frames)
+    public entry(proc: any, cache: CallCache | null, nargs: number, depth: number): DirectFn | null {
+        if (proc?.constructor !== Closure || depth >= MAX_JS_DEPTH) return null;
+        const fn = proc.tmpl.code.entry(nargs);
+        if (fn !== null && cache !== null) {
+            cache.tmpl = proc.tmpl;
+            cache.fn = fn;
         }
-        const all = [value, ...args];
-        if (handler instanceof CaseLambda) return this.callCase(ctx, handler, all, depth, marks, mframe);
-        if (handler instanceof Closure) {
-            if (handler.tmpl.arity.pad) return this.callPadded(ctx, handler, all, depth, marks, mframe);
-            const code = handler.tmpl.code;
-            if (depth < MAX_JS_DEPTH) {
-                if (code.directArity === all.length) return this.callDirect(ctx, handler, all, depth, marks, mframe);
-                if (code.directRestArity !== -1 && all.length >= code.directRestArity) return this.callDirectRest(ctx, handler, all, depth, marks, mframe);
+        return fn;
+    }
+
+    // a call from direct code with its arguments in an array (a new one the caller gives up): of what a call site has
+    // no entry for, of `%apply`, of a host's request. A value that is not a procedure is called through the procedure it
+    // gives (TRY_CALL), with the value before the arguments. A closure (a case-lambda's clause) goes through its direct
+    // entry when it has one for the count, padded as it asks; anything else, a continuation among them, through heap
+    // frames (which report a wrong count)
+    public callArray(ctx: ExecutionContext, proc: any, args: any[], depth: number, marks: any, mframe: number): any {
+        let target = proc;
+        // (a closure is told by its constructor first: `instanceof` costs several times more, and nothing extends Closure)
+        if (target?.constructor !== Closure) {
+            if (!(proc instanceof IProcedure)) {
+                target = this.#hooked(proc);
+                if (target === null) throw vmError(Msg.NonProcedure, proc);
+                args = [proc, ...args];
+            }
+            if (target instanceof CaseLambda) target = target.select(args.length);
+        }
+        if (target?.constructor === Closure && depth < MAX_JS_DEPTH && target.tmpl.code.direct) {
+            const { code, arity } = target.tmpl;
+            const fn = code.directFn!, n = arity.params;
+            if (arity.pad) while (args.length < n) args.push(undefined);
+            if (arity.rest !== "none" ? args.length >= n : args.length === n || arity.pad) {
+                // the entry is called here, not through another method: the js stack's depth is counted in these calls.
+                // Spreading into a call is slow, so the common counts are written out
+                if (arity.rest === "none") {
+                    switch (n) {
+                        case 0: return fn(ctx, target, this, depth, marks, mframe);
+                        case 1: return fn(ctx, target, this, depth, marks, mframe, args[0]);
+                        case 2: return fn(ctx, target, this, depth, marks, mframe, args[0], args[1]);
+                        case 3: return fn(ctx, target, this, depth, marks, mframe, args[0], args[1], args[2]);
+                        case 4: return fn(ctx, target, this, depth, marks, mframe, args[0], args[1], args[2], args[3]);
+                    }
+                    args.length = n;
+                    return fn(ctx, target, this, depth, marks, mframe, ...args);
+                }
+                // a rest array with no parameters before it can be `args` itself
+                const rest = arity.rest === "array" ? (n === 0 ? args : args.slice(n)) : code.pack!(args, n, args.length - n);
+                switch (n) {
+                    case 0: return fn(ctx, target, this, depth, marks, mframe, rest);
+                    case 1: return fn(ctx, target, this, depth, marks, mframe, args[0], rest);
+                    case 2: return fn(ctx, target, this, depth, marks, mframe, args[0], args[1], rest);
+                    case 3: return fn(ctx, target, this, depth, marks, mframe, args[0], args[1], args[2], rest);
+                    case 4: return fn(ctx, target, this, depth, marks, mframe, args[0], args[1], args[2], args[3], rest);
+                }
+                args.length = n;
+                args.push(rest);
+                return fn(ctx, target, this, depth, marks, mframe, ...args);
             }
         }
-        throw Suspend.invoke(handler, all);
+        throw Suspend.invoke(target, args);
     }
 
     #jumpTo(ctx: ExecutionContext, frame: Frame | null, wind: WindPoint | null, val: any): Frame | null {
@@ -313,66 +356,6 @@ export class VMExecutor {
         if (arity.rest === "none" && !arity.pad) for (let i = 0; i < nargs; i++) closureRegs[i] = args[startOffset + i];
         else bindArgs(arity, closureRegs, args, startOffset, nargs, closure.tmpl.code.pack);
         return closureRegs;
-    }
-
-    // calls a closure's fixed-arity direct entry with an argument array
-    public callDirect(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
-        const fn = proc.tmpl.code.directFn!;
-        switch (args.length) {
-            case 0: return fn(ctx, proc, this, depth, marks, mframe);
-            case 1: return fn(ctx, proc, this, depth, marks, mframe, args[0]);
-            case 2: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1]);
-            case 3: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2]);
-            case 4: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2], args[3]);
-        }
-        return fn(ctx, proc, this, depth, marks, mframe, ...args);
-    }
-
-    // a call of a padded closure from direct code with another count than its parameters': the arguments padded with
-    // <#void> or cut to them, to its direct entry, else heap frames. `args` is a new array the caller gives up
-    public callPadded(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
-        const code = proc.tmpl.code;
-        const n = proc.tmpl.arity.params;
-        if (depth < MAX_JS_DEPTH && (code.directArity !== -1 || code.directRestArity !== -1)) {
-            while (args.length < n) args.push(undefined);
-            if (code.directArity !== -1) {
-                args.length = n;
-                return this.callDirect(ctx, proc, args, depth, marks, mframe);
-            }
-            return this.callDirectRest(ctx, proc, args, depth, marks, mframe);
-        }
-        throw Suspend.invoke(proc, args);
-    }
-
-    // a call of a case-lambda from direct code: its clause's direct entry, else heap frames
-    public callCase(ctx: ExecutionContext, proc: CaseLambda, args: any[], depth: number, marks: any, mframe: number): any {
-        const clause = proc.select(args.length);
-        if (clause.tmpl.arity.pad) return this.callPadded(ctx, clause, args, depth, marks, mframe);
-        const code = clause.tmpl.code;
-        if (depth < MAX_JS_DEPTH) {
-            if (code.directArity === args.length) return this.callDirect(ctx, clause, args, depth, marks, mframe);
-            if (code.directRestArity !== -1 && args.length >= code.directRestArity) return this.callDirectRest(ctx, clause, args, depth, marks, mframe);
-        }
-        throw Suspend.invoke(clause, args);
-    }
-
-    public callDirectRest(ctx: ExecutionContext, proc: Closure, args: any[], depth: number, marks: any, mframe: number): any {
-        const code = proc.tmpl.code;
-        const fn = code.directFn!;
-        const numPos = code.directRestArity;
-        // `args` is always a fresh array the caller gives up, so a rest array with no positional params can be it
-        const rest = proc.tmpl.arity.rest === "array" ? (numPos === 0 ? args : args.slice(numPos)) : code.pack!(args, numPos, args.length - numPos);
-        // spreading into the call is slow, so the common arities are called directly
-        switch (numPos) {
-            case 0: return fn(ctx, proc, this, depth, marks, mframe, rest);
-            case 1: return fn(ctx, proc, this, depth, marks, mframe, args[0], rest);
-            case 2: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], rest);
-            case 3: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2], rest);
-            case 4: return fn(ctx, proc, this, depth, marks, mframe, args[0], args[1], args[2], args[3], rest);
-        }
-        args.length = numPos;
-        args.push(rest);
-        return fn(ctx, proc, this, depth, marks, mframe, ...args);
     }
 
     // --- continuations and dynamic-wind ---

@@ -10,7 +10,6 @@ export class ResumeEmitter extends FunctionEmitter {
     protected readonly endOfCode = "return null;";
     protected readonly siteVar = "frame.isite";
     // resume functions run from the driver loop, at the base of the js stack
-    protected readonly depthCheck = "";
     protected upvarRef(idx: number): string { return `upvars[${idx}]`; }
     protected setUpvarExpr(idx: number, val: string): string { return `upvars[${idx}] = ${val}`; }
     protected readonly marksVar = "frame.marks";
@@ -90,12 +89,11 @@ export class ResumeEmitter extends FunctionEmitter {
     // frames on top of this frame's caller, as the call is a tail call.
     #tailCall(proc: string, args: string, nargs: string, heapCall: string): string {
         return `
-            if (frame.code.tailSuspends < ${DIRECT_SUSPEND_LIMIT} && (${this.directGuard(proc, nargs)} || ${this.restGuard(proc, nargs)})) {
+            const fn = frame.code.tailSuspends < ${DIRECT_SUSPEND_LIMIT} ? executor.entry(${proc}, null, ${nargs}, 0) : null;
+            if (fn !== null) {
                 let val;
                 try {
-                    val = ${proc}.tmpl.code.directArity !== -1
-                        ? ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, 1, frame.marks, frame.mframe${args === "" ? "" : ", " + args})
-                        : executor.callDirectRest(ctx, ${proc}, [${args}], 1, frame.marks, frame.mframe);
+                    val = fn(ctx, ${proc}, executor, 1, frame.marks, frame.mframe${args === "" ? "" : ", " + args});
                 } catch (e) {
                     if (!(e instanceof Suspend)) throw e;
                     frame.code.tailSuspends++;
@@ -151,10 +149,9 @@ export class ResumeEmitter extends FunctionEmitter {
                         const proc = r${term.proc};
                         frame.ip = ${term.resume};
                         ${this.#spills(live.spillsFor(term.resume, windowRegs(term.start, term.nargs)))}
-                        if (${this.directGuard("proc", `${term.nargs}`)}) {
-                            ${this.#directCall(`proc.tmpl.code.directFn(ctx, proc, executor, 1, frame.marks, frame.mframe + 1${term.nargs > 0 ? ", " + this.argList(term.start, term.nargs) : ""})`)}
-                        } else if (${this.restGuard("proc", `${term.nargs}`)}) {
-                            ${this.#directCall(`executor.callDirectRest(ctx, proc, [${this.argList(term.start, term.nargs)}], 1, frame.marks, frame.mframe + 1)`)}
+                        const fn = executor.entry(proc, null, ${term.nargs}, 0);
+                        if (fn !== null) {
+                            ${this.#directCall(`fn(ctx, proc, executor, 1, frame.marks, frame.mframe + 1${term.nargs > 0 ? ", " + this.argList(term.start, term.nargs) : ""})`)}
                         } else {
                             return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, false);
                         }
