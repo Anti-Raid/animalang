@@ -466,23 +466,27 @@ This requires up to six property dereferences across three heap objects (`proc` 
 ### 8.2 Transformation
 For each call site $S$, maintain a monomorphic inline cache `(CC_tmpl, CC_directFn)`:
 1. Fast path:
-   $$\text{if } (proc \text{ instanceof Closure } \&\&\ proc.tmpl === CC\_tmpl \ \&\&\ CC\_tmpl.code.directArity !== -1 \ \&\&\ depth < MAX\_JS\_DEPTH)$$
+   $$\text{if } (proc?.tmpl === CC\_tmpl \ \&\&\ CC\_tmpl.code.directArity !== -1 \ \&\&\ depth < MAX\_JS\_DEPTH)$$
    $$\quad acc = CC\_directFn(ctx, proc, executor, depth + 1, \dots);$$
 2. Fallback path:
    If the fast path condition fails, execute the full dispatch chain. If the callee is a closure with matching direct arity, update the cache:
    $$CC\_tmpl = proc.tmpl; \quad CC\_directFn = proc.tmpl.code.directFn;$$
+3. Before its first call, a site's cache holds `NO_TEMPLATE`, a template of no closure whose `code.directArity` is $-1$.
+
+The fast path does not test `proc instanceof Closure`: measured, that test alone cost several times the call (V8 does not treat the class the generated code is given as a constant), and it is implied (Lemma below).
 
 ### 8.3 Correctness Proof
 
 **Theorem 10 (Equivalence of Cached Direct Calls).**
-*Let $S$ be a call site with argument count $nargs$. If $proc \text{ instanceof Closure}$, $proc.tmpl \equiv CC\_tmpl$, $CC\_tmpl.code.directArity \ne -1$, and $depth < MAX\_JS\_DEPTH$, then invoking $CC\_directFn$ with $(ctx, proc, executor, depth + 1, \dots)$ produces identical effects, returns, and exceptions to executing the full direct dispatch chain.*
+*Let $S$ be a call site with argument count $nargs$. If $proc?.tmpl \equiv CC\_tmpl$, $CC\_tmpl.code.directArity \ne -1$, and $depth < MAX\_JS\_DEPTH$, then invoking $CC\_directFn$ with $(ctx, proc, executor, depth + 1, \dots)$ produces identical effects, returns, and exceptions to executing the full direct dispatch chain.*
 
 *Proof.*
+0. **Lemma (the template identifies a closure).** $CC\_tmpl$ is `NO_TEMPLATE` or a `ClosureTemplate` stored by the fallback path, which stores it only from a value it found to be a `Closure`. `NO_TEMPLATE` fails $CC\_tmpl.code.directArity \ne -1$. A `ClosureTemplate` is the value of a `tmpl` property only on `Closure` objects (no other VM object has one, and the VM hands templates to no front end or host value), and $proc?.tmpl$ is `undefined` for `null`, `undefined` and primitives. So when the fast path's condition holds, $proc$ is a `Closure`.
 1. **Template Invariance.** In the VM model, a `ClosureTemplate` structure and its direct entry implementation `directFn` are immutable once generated.
 2. **Arity Conformance and Non-Deoptimized State.** The cache entry $(CC\_tmpl, CC\_directFn)$ is populated only after verifying that $CC\_tmpl.code.directArity \equiv nargs$ (or $CC\_tmpl.code.directPad$ is true). At any subsequent call where $proc.tmpl \equiv CC\_tmpl$ and $CC\_tmpl.code.directArity \ne -1$, $proc$ shares the verified arity without having suffered direct execution revocation.
 3. **Target Function Identity.** By definition of `Closure`, $proc.tmpl.code.directFn \equiv CC\_directFn$.
 4. **Depth Invariance.** The stack depth bound $depth < MAX\_JS\_DEPTH$ is evaluated identically on the fast path and on the full guard chain, preserving termination and recursion limit guarantees.
-5. **Fallback Safety.** If $proc$ is not a `Closure`, if $proc.tmpl \not\equiv CC\_tmpl$, or if the procedure was deoptimized ($CC\_tmpl.code.directArity \equiv -1$), the fast path is bypassed, and the original complete dispatch chain executes without alteration.
+5. **Fallback Safety.** If $proc$ is not a `Closure` (so, by the lemma, $proc?.tmpl \not\equiv CC\_tmpl$ or the cache is empty), if $proc.tmpl \not\equiv CC\_tmpl$, or if the procedure was deoptimized ($CC\_tmpl.code.directArity \equiv -1$), the fast path is bypassed, and the original complete dispatch chain executes without alteration.
 
 $\blacksquare$
 

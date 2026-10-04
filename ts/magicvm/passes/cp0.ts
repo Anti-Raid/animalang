@@ -16,7 +16,7 @@ import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY,
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED, isLetrecLambda, isPadded, unwrapBoxed } from "../lambda";
-import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX, convertAssignments } from "./assignments";
+import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX, boxesIn, convertAssignments } from "./assignments";
 import { AstAnalysis } from "../analysis";
 import { malformed, mapExprs, parts, subExprs, withBounds } from "./lang";
 import { renamer } from "./rename";
@@ -461,7 +461,9 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
             const size = sizeOf(info.lambda, INLINE_SIZE);
             if (info.once || (size <= INLINE_SIZE && budget >= size)) {
                 if (!info.once) budget -= size;
-                return inlined(info.name, copy(info.lambda), e, ctx, { ...k, own: new Set([...k.own, head]) });
+                const body = copy(info.lambda);
+                boxesIn(body, boxes);
+                return inlined(info.name, body, e, ctx, { ...k, own: new Set([...k.own, head]) });
             }
         }
         // a known global's procedure, where it would pay: an argument it may call is a lambda or a known procedure

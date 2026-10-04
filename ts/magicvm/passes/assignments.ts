@@ -61,3 +61,18 @@ export const convertAssignments = (ast: any, variables: ReadonlyMap<symbol, Vari
     };
     return { ast: walk(ast), boxes };
 };
+
+// the variables a converted program has boxes of (those of a copy of converted code, whose names are new), into `boxes`
+export const boxesIn = (ast: any, boxes: Set<symbol>): void => {
+    if (!Array.isArray(ast) || ast.length === 0) return;
+    const op = ast[0];
+    const shape = Lconv.forms.get(op);
+    if (shape === "quote") return;
+    if (op === BOX_IN_PLACE && typeof ast[2] === "symbol") boxes.add(ast[2]);
+    if ((shape === "let" || shape === "let*" || shape === "letrec") && Array.isArray(ast[2])) {
+        for (const b of ast[2]) {
+            if (Array.isArray(b) && typeof b[0] === "symbol" && Array.isArray(b[1]) && (b[1][0] === BOX || b[1][0] === BOXED)) boxes.add(b[0]);
+        }
+    }
+    for (const x of ast) boxesIn(x, boxes);
+};

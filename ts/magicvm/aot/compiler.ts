@@ -61,6 +61,11 @@ export const JIT_DEPS = {
     EXCEPTION_HANDLERS,
 };
 
+// what a call site's cache holds before its first call: no value's template, and never directly callable. A site tests
+// `proc?.tmpl === cache.tmpl` alone (only a Closure has a template for its `tmpl`): `proc instanceof Closure` there costs
+// several times the call, as V8 does not know the class the generated code is given to be a constant
+const NO_TEMPLATE = { code: { directArity: -1 } } as unknown as ClosureTemplate;
+
 export class AotCompiler {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
         let frame: Frame | null = initialFrame;
@@ -153,8 +158,8 @@ export class AotCompiler {
         }
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
-        const callCache: Record<number, { tmpl: ClosureTemplate | null, directFn: DirectFn | null }> = {};
-        for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: null, directFn: null };
+        const callCache: Record<number, { tmpl: ClosureTemplate, directFn: DirectFn | null }> = {};
+        for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: NO_TEMPLATE, directFn: null };
         return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 

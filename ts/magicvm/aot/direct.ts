@@ -327,7 +327,7 @@ export class DirectEmitter extends FunctionEmitter {
         const cache = site !== undefined ? `CC${site}` : null;
         return `
             rip = -1;${site !== undefined ? ` tip = ${site};` : ""}
-            ${cache !== null ? `if (${proc} instanceof Closure && ${proc}.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
+            ${cache !== null ? `if (${proc}?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
                 return ${cache}.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
             }` : ""}
             if (${this.directGuard(proc, `${nargs}`)}) {
@@ -383,7 +383,7 @@ export class DirectEmitter extends FunctionEmitter {
         return `
                 ${nargs === this.#selfArity ? `if (proc === closure && depth < MAX_JS_DEPTH) {
                     acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
-                } else ` : ""}${cache !== null ? `if (proc instanceof Closure && proc.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
+                } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
                     acc = ${cache}.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
                 } else ` : ""}if (${this.directGuard("proc", `${nargs}`)}) {
                     ${cache !== null ? `${cache}.tmpl = proc.tmpl; ${cache}.directFn = proc.tmpl.code.directFn;\n` : ""}acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});

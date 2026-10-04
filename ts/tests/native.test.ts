@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { compileNative, createNativeScheme, readNative, showValue, transformNative, NativeReadError } from '../native';
 import { Anima } from '../anima';
 import { createScheme } from '../scheme';
-import { hostTailFrom } from '../magicvm/exec';
+import { hostTailFrom, listing } from '../magicvm/exec';
 import { ASTStringifier } from '../scheme/printer';
 import { impl } from '../magicvm/meta';
 import { SyntaxPositions } from '../common';
@@ -103,6 +103,30 @@ describe("native-scheme", () => {
         expect([missing.message, missing.at?.line]).toEqual(["unbound variable nowhere", 3]);
         const applied = errorOf(`(define-global (h xs)\n  (%intcall %+ 1 2)\n  (%intapply %fail 1 xs))\n(%call h '(2))`);
         expect(applied.animaTraceback).toMatch(/t\.ns:3:\d+ in h/);
+    });
+
+    it("keeps the assigned locals of an inlined procedure in registers", () => {
+        const a = make();
+        // `sum` is called once, so it is inlined; its counter and total are assigned, but nothing captures them
+        const code = a.compileRaw(`(letrec ((sum (lambda (n) (let ((i 0) (t 0))
+            (%block done (%loop (%if (%intcall %< i n) (%begin (%set! t (%intcall %+ t i)) (%set! i (%intcall %+ i 1))) (%escape done t))))))))
+            (%call sum 10))`, "t.ns");
+        expect(listing(code).join("\n")).not.toMatch(/Box/);
+        expect(a.evaluateRaw(code)).toBe(45);
+    });
+
+    it("tells a cached closure from other values at a call site", () => {
+        const a = make();
+        a.registerIntrinsic("%object", (regs, st) => ({ tmpl: regs[st] }), { args: [1, 1], leaf: true });
+        const run2 = (src: string) => a.evaluateRaw(a.compileRaw(src, "t.ns"));
+        run2(`(define-global (call-it f) (%intcall %+ 1 (%call f 1))) (define-global (tail-it f) (%call f 1)) (define-global (id x) x)`);
+        // the sites cache `id`, then see what is not a procedure
+        expect(run2(`(%intcall %+ (%call call-it id) (%call call-it id) (%call tail-it id))`)).toBe(5);
+        for (const other of [`#void`, `#null`, `5`, `"s"`, `(%intcall %object #null)`, `(%intcall %object #void)`, `(%intcall %object 1)`]) {
+            expect(() => run2(`(%call call-it ${other})`)).toThrow("not a procedure");
+            expect(() => run2(`(%call tail-it ${other})`)).toThrow("not a procedure");
+        }
+        expect(run2(`(%intcall %+ (%call call-it id) (%call tail-it (lambda (x) 10)))`)).toBe(12);
     });
 
     it("is the core forms, with calls written out", () => {
