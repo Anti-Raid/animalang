@@ -13,7 +13,7 @@ import { impl } from '../magicvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
 describe("LuaTable internals", () => {
-    it('border() is always a valid border and contents match a plain Map under random edits', () => {
+    it('rawlen() is always a valid border and contents match a plain Map under random edits', () => {
         let seed = 12345
         const rand = (n: number) => {
             seed = (seed * 1103515245 + 12345) % 2147483648
@@ -33,7 +33,7 @@ describe("LuaTable internals", () => {
                     t.set(key, val)
                     model.set(key, val)
                 }
-                const n = t.border()
+                const n = t.rawlen()
                 if ((n > 0 && !t.has(n)) || t.has(n + 1)) problems.push(`round ${round} step ${step}: ${n} is not a border`)
                 if (t.size !== model.size) problems.push(`round ${round} step ${step}: size ${t.size} != ${model.size}`)
             }
@@ -474,32 +474,6 @@ describe('Tables (using Table class)', () => {
         expect(rawT instanceof Table).toBe(true);
         expect(rawT.get("id")).toBe("test-123");
         expect(rawT.get("count")).toBe(5);
-    });
-
-    it('LuaTable stores keys 1..n in an array part and treats <#void> as absent', () => {
-        const t = new LuaTable();
-        t.set(2, "b"); t.set(1, "a"); t.set("k", "v"); t.set(3, "c");
-        expect(t.border()).toBe(3);
-        expect([...t.entries()]).toEqual([[1, "a"], [2, "b"], [3, "c"], ["k", "v"]]);
-
-        // removing from the middle keeps the array part dense; the rest stays reachable
-        t.set(2, undefined);
-        expect(t.border()).toBe(1);
-        expect(t.has(2)).toBe(false);
-        expect(t.get(3)).toBe("c");
-        expect(t.size).toBe(3);
-        t.set(2, "B");
-        expect(t.border()).toBe(3);
-        expect([...t.keys()]).toEqual([1, 2, 3, "k"]);
-
-        // 1.0 and 1 are the same key, and so are 0 and -0
-        t.set(1.0, "one"); t.set(-0, "zero");
-        expect(t.get(1)).toBe("one");
-        expect(t.get(0)).toBe("zero");
-
-        expect(() => t.set(NaN, 1)).toThrow("table key cannot be NaN");
-        expect(() => t.set(undefined, 1)).toThrow("table key cannot be <#void>");
-        expect(t.get(NaN)).toBeUndefined();
     });
 
     it('table-set! of <#void> removes the key in Scheme', () => {

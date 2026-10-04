@@ -4,5 +4,7 @@ import { configDefaults, defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     exclude: [...configDefaults.exclude, 'dist-test/**'],
+    // the weak-table tests collect garbage themselves (globalThis.gc); only the tests' workers get the flag
+    execArgv: ['--expose-gc'],
   },
 });
