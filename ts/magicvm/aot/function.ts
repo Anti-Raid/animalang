@@ -136,12 +136,20 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
 
+    // (a closure is tested by its constructor: `x instanceof Closure` in generated code costs several times the call,
+    // as V8 does not know the class it is given to be a constant; nothing extends Closure or CaseLambda)
     protected directGuard(proc: string, nargs: string): string {
-        return `${proc} instanceof Closure && (${proc}.tmpl.code.directArity === ${nargs} || ${proc}.tmpl.code.directPad)${this.depthCheck}`;
+        return `${proc}?.constructor === Closure && (${proc}.tmpl.code.directArity === ${nargs} || ${proc}.tmpl.code.directPad)${this.depthCheck}`;
+    }
+
+    // a closure with a rest parameter whose direct entry takes `nargs` arguments as an array (see Code.directRestFn): a
+    // padded one takes any count
+    protected restEntryGuard(proc: string, nargs: string): string {
+        return `${proc}?.constructor === Closure && ${proc}.tmpl.code.directRestArity !== -1 && (${nargs} >= ${proc}.tmpl.code.directRestArity || ${proc}.tmpl.arity.pad)${this.depthCheck}`;
     }
 
     protected restGuard(proc: string, nargs: string): string {
-        return `${proc} instanceof Closure && ${proc}.tmpl.code.directRestArity !== -1 && ${nargs} >= ${proc}.tmpl.code.directRestArity${this.depthCheck}`;
+        return `${proc}?.constructor === Closure && ${proc}.tmpl.code.directRestArity !== -1 && ${nargs} >= ${proc}.tmpl.code.directRestArity${this.depthCheck}`;
     }
 
     protected selfMoves(term: Extract<AotTerm, { k: "MaybeSelfTailCall" }>): string {
@@ -225,6 +233,11 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "SetSite":
                 return this.emit(`${this.siteVar} = ${inst.site};`);
             case "Unpack": {
+                // (%let-values of formals with no rest, not strict: one value, or the values of several, with no call)
+                if (inst.flags === 0) {
+                    const regs = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i}`);
+                    return this.emit(`tmp = r${inst.src}; if (tmp?.constructor === MultipleValues) { tmp = tmp.values; ${regs.map((r, i) => `${r} = tmp[${i}];`).join(" ")} } else { ${regs.map((r, i) => `${r} = ${i === 0 ? "tmp" : "undefined"};`).join(" ")} }`);
+                }
                 const moves = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i} = tmp[${i}];`);
                 if ((inst.flags & UNPACK_REST) !== 0) moves.push(`r${inst.start + inst.count} = restValues(tmp, ${inst.count});`);
                 return this.emit(`tmp = unpackForBinding(r${inst.src}, ${inst.count}, ${inst.flags}); ${moves.join(" ")}`);

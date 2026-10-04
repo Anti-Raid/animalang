@@ -16,6 +16,8 @@ export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecuto
 // `depth` counts nested direct calls on the js stack; past MAX_JS_DEPTH calls go through heap frames instead. `marks` is
 // the continuation's mark list and `mframe` the logical frame the function runs in (a tail call keeps its caller's)
 export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, ...args: any[]) => any;
+// the direct entry of a closure with a rest parameter, over the array of its arguments (which it may keep as the rest)
+export type DirectRestFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, args: any[]) => any;
 
 // an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
 export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };
@@ -30,6 +32,7 @@ export const SHARED_OPS = new WeakSet<readonly Op[]>();
 export class Code {
     public resumeFn: ResumeFn | null = null;
     public directFn: DirectFn | null = null;
+    public directRestFn: DirectRestFn | null = null;
     public directArity: number = -1;
     public directRestArity: number = -1;
     // a padded closure with no rest parameter: its direct entry takes any count (JS fills missing arguments with

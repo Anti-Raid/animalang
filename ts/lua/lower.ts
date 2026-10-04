@@ -71,18 +71,27 @@ class Lowering {
     chunk(): any[] {
         const root = this.parsed.root;
         const pos = this.pos(root);
-        return [CORE_BLOCK, pos, this.#ret, ...this.statements(root), [CORE_QUOTE, pos, NO_VALUES]];
+        return this.functionBody(pos, root);
     }
 
-    // a block's statements as a list of forms, then `tail`; each local statement binds the rest of the block. `onEach` is
-    // told the index of each statement before it is lowered
-    statements(block: C.Block, tail: any[] = [], onEach?: (i: number) => void): any[] {
+    // a function's body (or the chunk's): a block its returns escape from. A return that ends it is its value; without
+    // one it returns nothing
+    functionBody(pos: SourcePos, block: C.Block): any[] {
+        const last = block.length > 2 ? block[block.length - 2] as C.Stat : null;
+        if (last === null || last[0] !== L.RETURN) return [CORE_BLOCK, pos, this.#ret, ...this.statements(block), [CORE_QUOTE, pos, NO_VALUES]];
+        const before = [...block.slice(0, -2), block[block.length - 1]] as C.Block;
+        return [CORE_BLOCK, pos, this.#ret, ...this.statements(before, () => [this.values(this.pos(last), last.slice(1, -1) as C.Expr[])])];
+    }
+
+    // a block's statements as a list of forms, then `tail`'s (lowered with the block's locals declared); each local
+    // statement binds the rest of the block. `onEach` is told the index of each statement before it is lowered
+    statements(block: C.Block, tail: () => any[] = () => [], onEach?: (i: number) => void): any[] {
         for (let i = 1; i < block.length - 1; i++) {
             const stat = block[i] as C.Stat;
             if (stat[0] === L.LOCAL) this.#declare(...(stat as C.LocalStat)[1]);
             else if (stat[0] === L.LOCALFN) this.#declare((stat as C.LocalFunction)[1]);
         }
-        let rest: any[] = tail;
+        let rest: any[] = tail();
         for (let i = block.length - 2; i >= 1; i--) {
             const stat = block[i] as C.Stat;
             onEach?.(i);
@@ -179,8 +188,8 @@ class Lowering {
                 }
                 return this.loop(pos, loop => {
                     loop.repeat = { stat: stat as C.Repeat, locals, index: 0 };
-                    const check = [CORE_IF, pos, this.test(cond), [CORE_ESCAPE, pos, loop.brk]];
-                    return [CORE_LOOP, pos, [CORE_BLOCK, pos, loop.cont, ...this.statements(block, [check], i => loop.repeat!.index = i)]];
+                    const check = () => [[CORE_IF, pos, this.test(cond), [CORE_ESCAPE, pos, loop.brk]]];
+                    return [CORE_LOOP, pos, [CORE_BLOCK, pos, loop.cont, ...this.statements(block, check, i => loop.repeat!.index = i)]];
                 });
             }
             case L.FOR: return this.numericFor(stat as C.For, pos);
@@ -332,7 +341,7 @@ class Lowering {
         this.#varargs = rest;
         this.#declare(...params);
         try {
-            return [CORE_LAMBDA, pos, clause([PAD], params, rest, [[CORE_BLOCK, pos, this.#ret, ...this.statements(block), [CORE_QUOTE, pos, NO_VALUES]]])];
+            return [CORE_LAMBDA, pos, clause([PAD], params, rest, [this.functionBody(pos, block)])];
         } finally {
             this.#loops = outer.loops;
             this.#ret = outer.ret;
@@ -347,7 +356,7 @@ class Lowering {
         const last = exprs[exprs.length - 1];
         const fixed = exprs.slice(0, -1).map(e => this.expr(e));
         if (!isMulti(last)) return exprs.length === 1 ? this.expr(last) : intcall(pos, "%values", ...fixed, this.expr(last));
-        if (last[0] === L.VARARGS) return [CORE_INTAPPLY, pos, Symbol.for("%values"), ...fixed, this.#varargs];
+        if (last[0] === L.VARARGS) return fixed.length === 0 ? intcall(pos, "%luau-varargs", this.#varargs) : [CORE_INTAPPLY, pos, Symbol.for("%values"), ...fixed, this.#varargs];
         return fixed.reduceRight((tail, e) => intcall(pos, "%values-cons", e, tail), this.call(last));
     }
 

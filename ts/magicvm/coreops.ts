@@ -447,7 +447,9 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         return new MultipleValues([regs[start], ...(vals instanceof MultipleValues ? vals.values : [vals])]);
     }, { inline: ([x, v], slow, tmp, d) => `(${severalValues(v, d)} ? new ${d.MultipleValues}([${x}, ...${v}.values]) : new ${d.MultipleValues}([${x}, ${v}]))` });
     core("%make-case-lambda", [1, Infinity], (regs, start, nargs) => new CaseLambda(regs.slice(start, start + nargs)));
-    core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)), { effectFree: true });
+    core("%values", [0, Infinity], (regs, start, nargs) => packValues(regs.slice(start, start + nargs)), {
+        effectFree: true, inline: (args, slow, tmp, d) => args.length === 1 ? args[0] : `new ${d.MultipleValues}([${args.join(", ")}])`,
+    });
     core("%values->array", [1, 1], (regs, start) => unpackValues(regs[start]).slice());
     // a new array of the arguments: a rest parameter's value where the table has no sequences of its own (see cp0)
     core("%array", [0, Infinity], (regs, start, nargs) => regs.slice(start, start + nargs), { effectFree: true, fresh: true });

@@ -201,6 +201,11 @@ export const registerLuauOps = (table: Intrinsics): void => {
     });
     // an element of `...` (an array), nil past its end
     table.register("%luau-arg", (regs, s) => regs[s][regs[s + 1]], { args: [2, 2], leaf: true, effectFree: true, inline: ([a, i]) => `${a}[${i}]` });
+    // all of `...` as values (the array is never changed, so several values keep it)
+    table.register("%luau-varargs", (regs, s) => regs[s].length === 1 ? regs[s][0] : new MultipleValues(regs[s]), {
+        args: [1, 1], leaf: true, effectFree: true, deps: { MultipleValues },
+        inline: ([a], _slow, _tmp, d) => `(${a}.length === 1 ? ${a}[0] : new ${d.MultipleValues}(${a}))`,
+    });
     // whether a call gave other than one value
     table.register("%luau-several?", (regs, s) => regs[s] instanceof MultipleValues, {
         ...bool, foldable: false, args: [1, 1], effectFree: true, inline: ([v], _slow, _tmp, d) => `(${severalValues(v, d)})`, deps: { MultipleValues },

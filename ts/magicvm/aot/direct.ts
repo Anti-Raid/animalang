@@ -327,19 +327,20 @@ export class DirectEmitter extends FunctionEmitter {
         const cache = site !== undefined ? `CC${site}` : null;
         return `
             rip = -1;${site !== undefined ? ` tip = ${site};` : ""}
-            ${cache !== null ? `if (${proc}?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
-                return ${cache}.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
+            ${cache !== null ? `if (${proc}?.tmpl === ${cache}.tmpl && depth < MAX_JS_DEPTH) {
+                if (${cache}.tmpl.code.directArity !== -1) return ${cache}.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
+                if (${cache}.tmpl.code.directRestArity !== -1) return ${cache}.restFn(ctx, ${proc}, executor, depth + 1, marks, mframe, [${args}]);
             }` : ""}
             if (${this.directGuard(proc, `${nargs}`)}) {
                 ${cache !== null ? `${cache}.tmpl = ${proc}.tmpl; ${cache}.directFn = ${proc}.tmpl.code.directFn;\n` : ""}const val = ${proc}.tmpl.code.directFn(ctx, ${proc}, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
                 return val;
             }
-            if (${this.restGuard(proc, `${nargs}`)}) {
-                const val = executor.callDirectRest(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
+            if (${this.restEntryGuard(proc, `${nargs}`)}) {
+                ${cache !== null ? `${cache}.tmpl = ${proc}.tmpl; ${cache}.restFn = ${proc}.tmpl.code.directRestFn;\n` : ""}const val = ${proc}.tmpl.code.directRestFn(ctx, ${proc}, executor, depth + 1, marks, mframe, [${args}]);
                 return val;
             }
-            if (${proc} instanceof Closure && ${proc}.tmpl.arity.pad) return executor.callPadded(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
-            if (${proc} instanceof CaseLambda) {
+            if (${proc}?.constructor === Closure && ${proc}.tmpl.arity.pad) return executor.callPadded(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
+            if (${proc}?.constructor === CaseLambda) {
                 const clause = ${proc}.select(${nargs});
                 if (${this.directGuard("clause", `${nargs}`)}) return clause.tmpl.code.directFn(ctx, clause, executor, depth + 1, marks, mframe${nargs > 0 ? ", " + args : ""});
                 return executor.callCase(ctx, ${proc}, [${args}], depth + 1, marks, mframe);
@@ -357,9 +358,9 @@ export class DirectEmitter extends FunctionEmitter {
                 ${done} executor.callDirect(ctx, proc, args, depth + 1, marks, ${frameArg});
             } else if (${this.restGuard("proc", "args.length")}) {
                 ${done} executor.callDirectRest(ctx, proc, args, depth + 1, marks, ${frameArg});
-            } else if (proc instanceof Closure && proc.tmpl.arity.pad) {
+            } else if (proc?.constructor === Closure && proc.tmpl.arity.pad) {
                 ${done} executor.callPadded(ctx, proc, args, depth + 1, marks, ${frameArg});
-            } else if (proc instanceof CaseLambda) {
+            } else if (proc?.constructor === CaseLambda) {
                 ${done} executor.callCase(ctx, proc, args, depth + 1, marks, ${frameArg});
             } else {
                 ${done} executor.callOther(ctx, proc, args, depth + 1, marks, ${frameArg});
@@ -385,13 +386,15 @@ export class DirectEmitter extends FunctionEmitter {
                     acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
                 } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directArity !== -1 && depth < MAX_JS_DEPTH) {
                     acc = ${cache}.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
+                } else if (proc?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.directRestArity !== -1 && depth < MAX_JS_DEPTH) {
+                    acc = ${cache}.restFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1, [${args}]);
                 } else ` : ""}if (${this.directGuard("proc", `${nargs}`)}) {
                     ${cache !== null ? `${cache}.tmpl = proc.tmpl; ${cache}.directFn = proc.tmpl.code.directFn;\n` : ""}acc = proc.tmpl.code.directFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""});
-                } else if (${this.restGuard("proc", `${nargs}`)}) {
-                    acc = executor.callDirectRest(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
-                } else if (proc instanceof Closure && proc.tmpl.arity.pad) {
+                } else if (${this.restEntryGuard("proc", `${nargs}`)}) {
+                    ${cache !== null ? `${cache}.tmpl = proc.tmpl; ${cache}.restFn = proc.tmpl.code.directRestFn;\n` : ""}acc = proc.tmpl.code.directRestFn(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1, [${args}]);
+                } else if (proc?.constructor === Closure && proc.tmpl.arity.pad) {
                     acc = executor.callPadded(ctx, proc, [${args}], depth + 1, ${marksExpr}, mframe + 1);
-                } else if (proc instanceof CaseLambda) {
+                } else if (proc?.constructor === CaseLambda) {
                     const clause = proc.select(${nargs});
                     acc = ${this.directGuard("clause", `${nargs}`)}
                         ? clause.tmpl.code.directFn(ctx, clause, executor, depth + 1, ${marksExpr}, mframe + 1${nargs > 0 ? ", " + args : ""})
