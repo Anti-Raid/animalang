@@ -2,7 +2,7 @@
 // as Luau's C casts them (to int, or to unsigned through int64, saturating as on arm64, NaN being 0); checking that an
 // argument is a number (or a string that reads as one) is the caller's
 import { DATUM, type Datum } from "../common";
-import { hostError } from "../errors";
+import { luauError } from "./errors";
 
 const MAX_BUFFER_SIZE = 2 ** 30;
 
@@ -18,7 +18,7 @@ const toUnsigned = (d: number): number => {
     return r < 0 ? r + 2 ** 32 : r;
 };
 
-const outOfBounds = (): Error => hostError("buffer access out of bounds");
+const outOfBounds = (): Error => luauError("buffer access out of bounds");
 
 export class LuaBuffer implements Datum {
     readonly bytes: Uint8Array;
@@ -31,13 +31,13 @@ export class LuaBuffer implements Datum {
 
     static create(size: number): LuaBuffer {
         const n = toInt(size);
-        if (n < 0) throw hostError("invalid argument #1 to 'create' (size)");
-        if (n > MAX_BUFFER_SIZE) throw hostError("memory allocation error: block too big");
+        if (n < 0) throw luauError("invalid argument #1 to 'create' (size)");
+        if (n > MAX_BUFFER_SIZE) throw luauError("memory allocation error: block too big");
         return new LuaBuffer(new Uint8Array(n));
     }
 
     static fromstring(s: string): LuaBuffer {
-        if (s.length > MAX_BUFFER_SIZE) throw hostError("memory allocation error: block too big");
+        if (s.length > MAX_BUFFER_SIZE) throw luauError("memory allocation error: block too big");
         const bytes = new Uint8Array(s.length);
         for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
         return new LuaBuffer(bytes);
@@ -80,15 +80,15 @@ export class LuaBuffer implements Datum {
 
     readstring(offset: number, size: number): string {
         const n = toInt(size);
-        if (n < 0) throw hostError("invalid argument #3 to 'readstring' (size)");
+        if (n < 0) throw luauError("invalid argument #3 to 'readstring' (size)");
         const o = this.#at(offset, n);
         return bytesToString(this.bytes.subarray(o, o + n));
     }
 
     writestring(offset: number, s: string, count?: number): void {
         const n = count === undefined ? s.length : toInt(count);
-        if (n < 0) throw hostError("invalid argument #4 to 'writestring' (count)");
-        if (n > s.length) throw hostError("string length overflow");
+        if (n < 0) throw luauError("invalid argument #4 to 'writestring' (count)");
+        if (n > s.length) throw luauError("string length overflow");
         const o = this.#at(offset, n);
         for (let i = 0; i < n; i++) this.bytes[o + i] = s.charCodeAt(i);
     }
@@ -114,7 +114,7 @@ export class LuaBuffer implements Datum {
         const bit = toInt64(bitoffset);
         const n = toInt(bitcount);
         if (bit < 0) throw outOfBounds();
-        if (n < 0 || n > 32) throw hostError("bit count is out of range of [0; 32]");
+        if (n < 0 || n > 32) throw luauError("bit count is out of range of [0; 32]");
         if (bit + n > this.bytes.length * 8) throw outOfBounds();
         return [bit, n];
     }

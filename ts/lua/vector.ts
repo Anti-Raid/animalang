@@ -2,7 +2,7 @@
 // components, computed in float32 as Luau computes them. Equal vectors (component-wise ==, so -0 equals 0 and NaN
 // equals nothing) are one table key
 import { DATUM, type Datum } from "../common";
-import { hostError } from "../errors";
+import { luauError } from "./errors";
 import { num2str } from "./number";
 
 const f = Math.fround;
@@ -33,7 +33,7 @@ export class LuaVector implements Datum {
             if (ic === 1) return this.y;
             if (ic === 2) return this.z;
         }
-        throw hostError(`attempt to index vector with '${name}'`);
+        throw luauError(`attempt to index vector with '${name}'`);
     }
 
     tostring(): string {
@@ -103,7 +103,7 @@ export const vector = {
     sign: (v: LuaVector) => V(sign(v.x), sign(v.y), sign(v.z)),
     clamp: (v: LuaVector, min: LuaVector, max: LuaVector) => {
         for (const c of ["x", "y", "z"] as const) {
-            if (!(min[c] <= max[c])) throw hostError(`invalid argument #3 to 'clamp' (max.${c} must be greater than or equal to min.${c})`);
+            if (!(min[c] <= max[c])) throw luauError(`invalid argument #3 to 'clamp' (max.${c} must be greater than or equal to min.${c})`);
         }
         return V(clamp(v.x, min.x, max.x), clamp(v.y, min.y, max.y), clamp(v.z, min.z, max.z));
     },

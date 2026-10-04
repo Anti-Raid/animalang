@@ -9,7 +9,7 @@
 // held by a WeakRef, and an entry whose key or value was collected is gone, as Luau clears it. As in Luau, a weak key's
 // value is held strongly
 import { DATUM, TRY_CALL, type Datum } from "../common";
-import { hostError } from "../errors";
+import { luauError } from "./errors";
 import { LuaVector } from "./vector";
 
 const MAXBITS = 26;
@@ -307,7 +307,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     }
 
     #setarrayvector(size: number): void {
-        if (size > MAXSIZE) throw hostError("table overflow");
+        if (size > MAXSIZE) throw luauError("table overflow");
         for (let i = this.#sizearray; i < size; i++) this.#array[i] = undefined;
         this.#sizearray = size;
     }
@@ -315,7 +315,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     #sethashvector(size: number): void {
         if (size !== 0) {
             const lsize = ceillog2(size);
-            if (lsize > MAXBITS) throw hostError("table overflow");
+            if (lsize > MAXBITS) throw luauError("table overflow");
             size = 1 << lsize;
         }
         this.#capacity = size;
@@ -328,7 +328,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     }
 
     #resize(nasize: number, nhsize: number): void {
-        if (nasize > MAXSIZE || nhsize > MAXSIZE) throw hostError("table overflow");
+        if (nasize > MAXSIZE || nhsize > MAXSIZE) throw luauError("table overflow");
         const oldasize = this.#sizearray;
         const oldKeys = this.#keys, oldVals = this.#vals;
         if (nasize > oldasize) this.#setarrayvector(nasize);
@@ -351,12 +351,12 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
 
     // luaH_set: `key` set to `val` (nil included: a new key takes a slot even then, as it takes a node in Luau)
     rawset(key: any, val: any): this {
-        if (this.#readonly) throw hostError("attempt to modify a readonly table");
-        if (key === undefined) throw hostError("table index is nil");
-        if (typeof key === "number" && Number.isNaN(key)) throw hostError("table index is NaN");
+        if (this.#readonly) throw luauError("attempt to modify a readonly table");
+        if (key === undefined) throw luauError("table index is nil");
+        if (typeof key === "number" && Number.isNaN(key)) throw luauError("table index is NaN");
         if (this.#metatable !== null) this.#syncMode();
         if (key instanceof LuaVector) {
-            if (key.hasNaN) throw hostError("table index contains NaN");
+            if (key.hasNaN) throw luauError("table index contains NaN");
             key = this.#vectorKey(key) ?? key;
         }
         if (key === "__mode" || key === "__call") this.#metaVersion++;
@@ -436,7 +436,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             if (k > 0 && k <= this.#sizearray) i = k - 1;
             else {
                 const n = this.#indexGet(key instanceof LuaVector ? this.#vectorKey(key) : key);
-                if (n === undefined) throw hostError("invalid key to 'next'");
+                if (n === undefined) throw luauError("invalid key to 'next'");
                 i = n + this.#sizearray;
             }
         }
@@ -468,7 +468,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
 
     // luaH_clear: every entry gone, the sizes kept
     clear(): void {
-        if (this.#readonly) throw hostError("attempt to modify a readonly table");
+        if (this.#readonly) throw luauError("attempt to modify a readonly table");
         this.#metaVersion++;
         for (let i = 0; i < this.#sizearray; i++) this.#array[i] = undefined;
         this.#maybesetaboundary(0);

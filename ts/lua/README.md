@@ -1,7 +1,27 @@
 # Luau
 
-The Luau front end, in progress: the parser (`syntax/`, see its README), Luau's table (`table.ts`), numbers as strings
-(`number.ts`), buffers (`buffer.ts`), vectors (`vector.ts`) and integers (`integer.ts`). The lowering to the VM's core forms comes next.
+The Luau front end, in progress: the parser (`syntax/`, see its README), the lowering to the VM's core forms
+(`lower.ts`), the operators (`ops.ts`), Luau's table (`table.ts`), numbers as strings (`number.ts`), buffers
+(`buffer.ts`), vectors (`vector.ts`) and integers (`integer.ts`). `createLuau(options)` (`index.ts`) makes an instance
+whose language is Luau.
+
+## Lowering
+So far: locals, assignment (to locals and globals, several at once), compound assignment, `do` blocks, `return`
+(several values), literals, the arithmetic operators and `..`. Anything else is a positioned "not supported yet" error.
+
+- A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
+  the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
+  (`undefined`) as its `unbound` value, so an unassigned global reads as nil.
+- Operators are intrinsics (`%luau-add` ... `%luau-unm`, `%luau-concat`) doing what Luau's VM does: numbers, strings
+  that read as numbers (coerced as `tonumber` reads them), vectors as `lvmutils.cpp` allows, integers with integers,
+  and Luau's errors otherwise (`attempt to perform arithmetic (add) on nil and number`, `attempt to concatenate
+  boolean with string`). Their AOT templates compute numbers (and integers) inline, the rest in the slow path. The
+  type system's kinds are `number` and `integer`. Metamethods come later.
+- Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
+  (`messages.ts`) words them as Luau does: `file:line: message`. Syntax errors are `LuauSyntaxError`s, worded alike.
+
+`tests/luau-lower.test.ts` checks it, and with `LUAU` set compares random programs (results, error messages and lines)
+with Luau's own.
 
 ## Tables
 `LuaTable` is Luau's table, ported from Luau's `VM/src/ltable.cpp`, so that what a program can see of a table is Luau's:

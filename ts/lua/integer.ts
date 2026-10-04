@@ -2,7 +2,7 @@
 // typeof, === and Map keys tell it from a number and compare it by value. Every result is wrapped back to the range
 // (BigInt.asIntN(64, ...), which V8 compiles to native 64-bit arithmetic). Checking that an argument is an integer is the
 // caller's
-import { hostError } from "../errors";
+import { luauError } from "./errors";
 import { cstring, strtoint, trailingSpace, ullong } from "./number";
 
 const I = (x: bigint): bigint => BigInt.asIntN(64, x);
@@ -12,13 +12,13 @@ const MAX = (1n << 63n) - 1n;
 const MIN = -(1n << 63n);
 
 const divisor = (b: bigint): void => {
-    if (b === 0n) throw hostError("division by zero");
+    if (b === 0n) throw luauError("division by zero");
 };
 
 const field = (f: bigint, w: bigint, fArg: number, name: string): void => {
-    if (!(0n <= f && f <= 63n)) throw hostError(`invalid argument #${fArg} to '${name}' (field cannot be negative)`);
-    if (!(0n < w)) throw hostError(`invalid argument #${fArg + 1} to '${name}' (width must be positive)`);
-    if (f + w > 64n) throw hostError("trying to access non-existent bits");
+    if (!(0n <= f && f <= 63n)) throw luauError(`invalid argument #${fArg} to '${name}' (field cannot be negative)`);
+    if (!(0n < w)) throw luauError(`invalid argument #${fArg + 1} to '${name}' (width must be positive)`);
+    if (f + w > 64n) throw luauError("trying to access non-existent bits");
 };
 
 const scratch = new DataView(new ArrayBuffer(8));
@@ -31,7 +31,7 @@ export const integer = {
 
     fromstring: (s: string, base: number = 10): bigint | undefined => {
         base = Math.trunc(base);
-        if (!(2 <= base && base <= 36)) throw hostError("invalid argument #2 to 'fromstring' (base out of range)");
+        if (!(2 <= base && base <= 36)) throw luauError("invalid argument #2 to 'fromstring' (base out of range)");
         s = cstring(s);
         let read = strtoint(s, base);
         if (read === undefined) return undefined;
@@ -56,12 +56,12 @@ export const integer = {
 
     div: (a: bigint, b: bigint): bigint => {
         divisor(b);
-        if (a === MIN && b === -1n) throw hostError("integer overflow");
+        if (a === MIN && b === -1n) throw luauError("integer overflow");
         return a / b;
     },
     idiv: (a: bigint, b: bigint): bigint => {
         divisor(b);
-        if (a === MIN && b === -1n) throw hostError("integer overflow");
+        if (a === MIN && b === -1n) throw luauError("integer overflow");
         const q = a / b;
         return (a < 0n) !== (b < 0n) && a % b !== 0n ? q - 1n : q;
     },
@@ -86,7 +86,7 @@ export const integer = {
     min: (a: bigint, ...rest: bigint[]): bigint => rest.reduce((m, x) => x < m ? x : m, a),
     max: (a: bigint, ...rest: bigint[]): bigint => rest.reduce((m, x) => x > m ? x : m, a),
     clamp: (a: bigint, min: bigint, max: bigint): bigint => {
-        if (!(min <= max)) throw hostError("invalid argument #3 to 'clamp' (max must be greater than or equal to min)");
+        if (!(min <= max)) throw luauError("invalid argument #3 to 'clamp' (max must be greater than or equal to min)");
         return a < min ? min : a > max ? max : a;
     },
 
@@ -146,7 +146,7 @@ export const integer = {
 // a ^ b on two integers (not in Luau): wrapping, and for b < 0 the truncated 1 / a^-b
 export const ipow = (a: bigint, b: bigint): bigint => {
     if (b < 0n) {
-        if (a === 0n) throw hostError("division by zero");
+        if (a === 0n) throw luauError("division by zero");
         return a === 1n ? 1n : a === -1n ? ((-b) & 1n ? -1n : 1n) : 0n;
     }
     let r = 1n;
