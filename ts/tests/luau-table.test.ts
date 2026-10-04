@@ -4,6 +4,9 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LuaTable } from '../lua/table';
+import { TRY_CALL } from '../common';
+import { createNativeScheme } from '../native';
+import { impl } from '../magicvm/meta';
 
 const dump = (t: LuaTable) => [...t.entries()].map(([k, v]) => `${k}=${v}`).join(",");
 
@@ -58,6 +61,41 @@ describe("Luau tables", () => {
         expect(t.has("y")).toBe(false);
         t.clear();
         expect([dump(t), t.rawlen(), t.sizearray > 0]).toEqual(["", 0, true]);
+    });
+
+    it("call their metatable's __call, read again whenever it may have changed", () => {
+        const f = () => "f", g = () => "g";
+        const t = new LuaTable();
+        expect(t[TRY_CALL]).toBeUndefined();
+        const mt = new LuaTable().set("__call", f);
+        t.metatable = mt;
+        expect(t[TRY_CALL]).toBe(f);
+        mt.set("__call", g);
+        expect(t[TRY_CALL]).toBe(g);
+        t.metatable = new LuaTable().set("__call", f);
+        expect(t[TRY_CALL]).toBe(f);
+        t.metatable = mt;
+        expect(t[TRY_CALL]).toBe(g);
+        mt.clear();
+        expect(t[TRY_CALL]).toBeUndefined();
+        mt.set("__call", f);
+        expect([t[TRY_CALL], t.clone()[TRY_CALL]]).toEqual([f, f]);
+    });
+
+    it("are called through the VM as their __call, with the table first", () => {
+        const a = createNativeScheme(impl);
+        const t = new LuaTable().set("n", 40);
+        t.metatable = new LuaTable();
+        a.registerIntrinsic("%table", () => t, { args: [0, 0], leaf: true });
+        a.registerIntrinsic("%get", (regs, st) => regs[st].get(regs[st + 1]), { args: [2, 2], leaf: true });
+        a.registerIntrinsic("%set-call", (regs, st) => { regs[st].metatable.set("__call", regs[st + 1]); return regs[st]; }, { args: [2, 2], leaf: true });
+        a.registerIntrinsic("%+", (regs, st) => regs[st] + regs[st + 1], { args: [2, 2], leaf: true });
+        const run = (src: string) => a.evaluateRaw(a.compileRaw(src, "t.ns"));
+        expect(() => run(`(%call (%intcall %table) 1)`)).toThrow("not a procedure");
+        run(`(%intcall %set-call (%intcall %table) (lambda (self x) (%intcall %+ (%intcall %get self "n") x)))`);
+        expect(run(`(%call (%intcall %table) 2)`)).toBe(42);
+        run(`(%intcall %set-call (%intcall %table) (lambda (self x) x))`);
+        expect(run(`(%call (%intcall %table) 7)`)).toBe(7);
     });
 
     it("hold collectable values weakly with __mode 'v'", async () => {

@@ -19,6 +19,9 @@ The Luau front end, in progress: the parser (`syntax/`, see its README), Luau's 
   ephemerons: a weak key's value is held strongly. The `s` (shrinkable) mode is accepted; tables are not shrunk.
 - **Vector keys**: equal vectors (`-0` and `0` alike) are one key, found through a map from their hash to the vector
   first stored; a vector with a NaN component is `table index contains NaN`. Vectors are values, so never weak.
+- **Calls**: calling a table calls its metatable's `__call` with the table first (the VM's `TRY_CALL`). The table keeps
+  the `__call` it last read, read again only when the metatable changes or has its `__call`, `__mode` or contents
+  cleared (a version on the metatable), so a call is a field read.
 - **Also**: `freeze` / `frozen` (read-only tables), `clear` (Luau's: sizes kept), `clone` (same entries, sizes and order),
   Luau's errors (`table index is nil`, `table index is NaN`, `attempt to modify a readonly table`, `invalid key to
   'next'`), and the host's `get` / `set` / `has` / `delete` / iteration.

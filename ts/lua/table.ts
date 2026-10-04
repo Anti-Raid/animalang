@@ -8,7 +8,7 @@
 // a collectable key or value (a table, function, coroutine or other object; strings, numbers and booleans never are) is
 // held by a WeakRef, and an entry whose key or value was collected is gone, as Luau clears it. As in Luau, a weak key's
 // value is held strongly
-import { DATUM, type Datum } from "../common";
+import { DATUM, TRY_CALL, type Datum } from "../common";
 import { hostError } from "../errors";
 import { LuaVector } from "./vector";
 
@@ -55,8 +55,11 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     #weakKeys = false;
     #weakValues = false;
     #modeStamp = -1;
-    // bumped when this table's __mode changes, for the tables it is the metatable of
-    #modeVersion = 0;
+    // the metatable's __call, and the metatable's version it was read at
+    #call: any = undefined;
+    #callStamp = -1;
+    // bumped when this table's __mode or __call may have changed, for the tables it is the metatable of
+    #metaVersion = 0;
 
     // luaH_new: room for `narray` array slots and `nhash` hash slots
     constructor(narray: number = 0, nhash: number = 0) {
@@ -81,12 +84,24 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     set metatable(mt: LuaTable | null) {
         this.#metatable = mt;
         this.#modeStamp = -1;
+        this.#callStamp = -1;
         this.#syncMode();
+    }
+
+    // what calling the table calls instead, with the table first: its metatable's __call
+    get [TRY_CALL](): any {
+        const mt = this.#metatable;
+        if (mt === null) return undefined;
+        if (this.#callStamp !== mt.#metaVersion) {
+            this.#call = mt.rawget("__call");
+            this.#callStamp = mt.#metaVersion;
+        }
+        return this.#call;
     }
 
     #syncMode(): void {
         const mt = this.#metatable;
-        const stamp = mt === null ? 0 : mt.#modeVersion + 1;
+        const stamp = mt === null ? 0 : mt.#metaVersion + 1;
         if (stamp === this.#modeStamp) return;
         this.#modeStamp = stamp;
         const mode = mt === null ? undefined : mt.#get("__mode");
@@ -344,7 +359,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             if (key.hasNaN) throw hostError("table index contains NaN");
             key = this.#vectorKey(key) ?? key;
         }
-        if (key === "__mode") this.#modeVersion++;
+        if (key === "__mode" || key === "__call") this.#metaVersion++;
         if (typeof key === "number") {
             const k = arrayindex(key);
             if (k >= 1 && k <= this.#sizearray) {
@@ -454,6 +469,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     // luaH_clear: every entry gone, the sizes kept
     clear(): void {
         if (this.#readonly) throw hostError("attempt to modify a readonly table");
+        this.#metaVersion++;
         for (let i = 0; i < this.#sizearray; i++) this.#array[i] = undefined;
         this.#maybesetaboundary(0);
         if (this.#capacity !== 0) {
