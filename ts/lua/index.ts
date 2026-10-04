@@ -11,7 +11,7 @@ import type { ParseResult } from "./syntax/ast";
 export { LuauSyntaxError } from "./lower";
 export { luauFormat, toString, typeName } from "./messages";
 
-type Read = { parsed: ParseResult, file: string };
+type Read = { parsed: ParseResult, file: string, source: string };
 
 export const createLuau = (options: AnimaOptions): Anima => {
     const anima = new Anima(options);
@@ -26,9 +26,9 @@ export const createLuau = (options: AnimaOptions): Anima => {
                 const { line, column } = parsed.lines.pos(error.from);
                 throw new LuauSyntaxError({ file, line: line + 1, col: column + 1 }, error.message);
             }
-            return { parsed, file };
+            return { parsed, file, source };
         },
-        transform: ({ parsed, file }: Read) => lowerLuau(parsed, file),
+        transform: ({ parsed, file, source }: Read) => lowerLuau(parsed, file, source),
         lambda: () => { throw new Error("Luau has no procedure syntax for the host to compile"); },
     }, new Env(null, false, { unbound: undefined }));
     return anima;

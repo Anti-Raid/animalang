@@ -84,6 +84,32 @@ export const concat = (a: any, b: any): string => {
     return (typeof a === "number" ? num2str(a) : String(a)) + (typeof b === "number" ? num2str(b) : String(b));
 };
 
+// raw equality: the same value, or equal vectors (metamethods come later)
+export const rawequal = (a: any, b: any): boolean => a === b || (a instanceof LuaVector && a.equals(b));
+
+// luaV_lessthan / luaV_lessequal: numbers, strings (by bytes) and (a deviation from Luau) integers
+const ordered = (a: any, b: any): boolean => {
+    const t = typeof a;
+    return t === typeof b && (t === "number" || t === "string" || t === "bigint");
+};
+
+export const lessThan = (a: any, b: any): boolean => {
+    if (ordered(a, b)) return a < b;
+    throw luauError(`attempt to compare ${typeName(a)} < ${typeName(b)}`);
+};
+
+export const lessEqual = (a: any, b: any): boolean => {
+    if (ordered(a, b)) return a <= b;
+    throw luauError(`attempt to compare ${typeName(a)} <= ${typeName(b)}`);
+};
+
+// luaV_prepareFORN: a numeric for's initial value, limit or step, as a number
+export const forNumber = (v: any, what: string): number => {
+    const n = tonumber(v);
+    if (n === undefined) throw luauError(`invalid 'for' ${what} (number expected, got ${typeName(v)})`);
+    return n;
+};
+
 // Luau's kinds: numbers, and integers (bigints)
 export const LUAU_TYPES: TypeSystem = {
     ofConstant: v => typeof v === "number" ? "number" : typeof v === "bigint" ? "integer" : undefined,
@@ -133,6 +159,41 @@ export const registerLuauOps = (table: Intrinsics): void => {
     table.register("%luau-concat", (regs, s) => concat(regs[s], regs[s + 1]), {
         args: [2, 2], leaf: true, foldable: true,
         inline: (args, slow) => `(typeof ${args[0]} === "string" && typeof ${args[1]} === "string" ? ${args[0]} + ${args[1]} : ${slow})`,
+    });
+    const bool = { leaf: true, foldable: true, returns: "boolean" } as const;
+    table.register("%luau-truthy", (regs, s) => regs[s] !== undefined && regs[s] !== false, {
+        ...bool, args: [1, 1], effectFree: true, inline: ([a]) => `(${a} !== undefined && ${a} !== false)`,
+    });
+    table.register("%luau-not", (regs, s) => regs[s] === undefined || regs[s] === false, {
+        ...bool, args: [1, 1], effectFree: true, inline: ([a]) => `(${a} === undefined || ${a} === false)`,
+    });
+    const eqInline = (negate: boolean): InlineFn => ([a, b], slow) =>
+        `(${a} === ${b} ? ${!negate} : typeof ${a} === "object" && ${a} !== null ? ${slow} : ${negate})`;
+    table.register("%luau-eq", (regs, s) => rawequal(regs[s], regs[s + 1]), { ...bool, args: [2, 2], effectFree: true, inline: eqInline(false) });
+    table.register("%luau-ne", (regs, s) => !rawequal(regs[s], regs[s + 1]), { ...bool, args: [2, 2], effectFree: true, inline: eqInline(true) });
+    // a > b and a >= b are b < a and b <= a, as Luau compiles them (its messages say so)
+    const compare = (name: string, op: string, fn: (a: any, b: any) => boolean, swap: boolean) => {
+        table.register(name, swap ? (regs, s) => fn(regs[s + 1], regs[s]) : (regs, s) => fn(regs[s], regs[s + 1]), {
+            ...bool, args: [2, 2], wants: "number",
+            inline: (args, slow, _tmp, _d, known) => {
+                const [a, b] = swap ? [args[1], args[0]] : args;
+                const checks = [...new Set(args.filter((_, i) => known[i] !== "number"))].map(x => `typeof ${x} === "number"`);
+                return checks.length === 0 ? `(${a} ${op} ${b})` : `(${checks.join(" && ")} ? ${a} ${op} ${b} : ${slow})`;
+            },
+        });
+    };
+    compare("%luau-lt", "<", lessThan, false);
+    compare("%luau-le", "<=", lessEqual, false);
+    compare("%luau-gt", "<", lessThan, true);
+    compare("%luau-ge", "<=", lessEqual, true);
+    table.register("%luau-for-number", (regs, s) => forNumber(regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, returns: "number",
+        inline: ([v], slow) => `(typeof ${v} === "number" ? ${v} : ${slow})`,
+    });
+    // whether a numeric for goes on: the same test entering and looping, so NaNs behave alike
+    table.register("%luau-for-test", (regs, s) => regs[s + 2] > 0 ? regs[s] <= regs[s + 1] : regs[s + 1] <= regs[s], {
+        ...bool, args: [3, 3], effectFree: true,
+        inline: ([i, limit, step]) => `(${step} > 0 ? ${i} <= ${limit} : ${limit} <= ${i})`,
     });
     table.register("%luau-tostring", (regs, s) => toString(regs[s]), { args: [1, 1], leaf: true });
 };

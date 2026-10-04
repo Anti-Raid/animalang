@@ -6,8 +6,9 @@ The Luau front end, in progress: the parser (`syntax/`, see its README), the low
 whose language is Luau.
 
 ## Lowering
-So far: locals, assignment (to locals and globals, several at once), compound assignment, `do` blocks, `return`
-(several values), literals, the arithmetic operators and `..`. Anything else is a positioned "not supported yet" error.
+So far: locals, assignment (to locals and globals, several at once), compound assignment, `do` blocks, `if`, `while`,
+`repeat`, numeric `for`, `break`, `continue`, `return` (several values), literals, if-expressions, and the operators
+but `#` (arithmetic, `..`, comparisons, `and`, `or`, `not`). Anything else is a positioned "not supported yet" error.
 
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
@@ -17,6 +18,16 @@ So far: locals, assignment (to locals and globals, several at once), compound as
   and Luau's errors otherwise (`attempt to perform arithmetic (add) on nil and number`, `attempt to concatenate
   boolean with string`). Their AOT templates compute numbers (and integers) inline, the rest in the slow path. The
   type system's kinds are `number` and `integer`. Metamethods come later.
+- Conditions are Luau's truthiness (nil and false are false; the VM's is only false): a condition is
+  `%luau-truthy` of its value, except where it is a comparison or built of `and`, `or` and `not`, which branch directly.
+  `a and b` and `a or b` as values keep `a` in a temporary. Equality is raw (the same value, or equal vectors); `<` and
+  `<=` take two numbers, two strings (by bytes) or two integers, and `a > b` is `b < a`, as Luau compiles it and words
+  its errors (`attempt to compare string < number`).
+- Loops are a `%block` to break out of around a `%loop`, and the body a `%block` to continue to. A `repeat`'s condition
+  sees the body's locals, so it is tested inside them, and a `continue` there tests it too; a `continue` that jumps over
+  a local the condition uses is Luau's compile error. A numeric `for` is Luau's `FORNPREP`/`FORNLOOP`: its three values
+  are read as numbers once (`invalid 'for' limit (number expected, got nil)`), the loop goes on while
+  `step > 0 ? i <= limit : limit <= i`, and each iteration binds a fresh local.
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
   (`messages.ts`) words them as Luau does: `file:line: message`. Syntax errors are `LuauSyntaxError`s, worded alike.
 
