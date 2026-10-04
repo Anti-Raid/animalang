@@ -15,7 +15,7 @@ so precedence, error messages and their locations, and error recovery are Luau's
   expression first and then telling a call, an assignment and the contextual keywords (`type`, `export`, `continue`,
   `const`) apart.
 - **Forms** are arrays `[HEAD, ...operands, offset]`: `HEAD` is one of `L`'s symbols, and the last element is always where
-  the form starts in the source (`lines.pos(offset)` gives a line and column). Constants are themselves (numbers, byte
+  the form starts in the source (`lines.pos(offset)` gives a line and column). Constants are themselves (numbers, integers (`1i`, as bigints), byte
   strings, booleans, `L.NIL`); lists (of locals, of values) are plain arrays, told from forms by `isForm`. `print.ts`'s
   `show` writes a form as an s-expression.
 - **Names** are resolved as they are parsed: each declaration makes a symbol, and a use of the local is that symbol

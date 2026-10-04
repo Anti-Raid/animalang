@@ -1,6 +1,6 @@
 // The tree the parser makes, as prefix forms: [HEAD, ...operands, offset], HEAD one of L's symbols and offset where the
 // form starts in the source (`lines` of the parse result turns it into a line and column). Constants are themselves
-// (numbers, byte strings, booleans, L.NIL); a local is the symbol its declaration made, one per declaration, so two
+// (numbers, integers as bigints, byte strings, booleans, L.NIL); a local is the symbol its declaration made, one per declaration, so two
 // locals of one name are two symbols; lists (of locals, of values) are plain arrays. Types are checked but not kept
 import type { Lines } from "./tokens";
 
@@ -62,7 +62,7 @@ export const L = {
 // where a form starts in the source
 export type Offset = number;
 export type Local = symbol;
-export type Constant = number | string | boolean | typeof NIL;
+export type Constant = number | bigint | string | boolean | typeof NIL;
 
 export type BinaryHead =
     | typeof ADD | typeof SUB | typeof MUL | typeof DIV | typeof IDIV | typeof MOD | typeof POW | typeof CONCAT

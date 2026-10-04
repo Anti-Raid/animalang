@@ -127,6 +127,8 @@ describe("Luau parser", () => {
         expect(tree(`x = y :: number`)).toBe('(assign [(global "x")] [(one (global "y"))])');
         expect(tree(`x = #t, -1, ..., nil, true`)).toBe('(assign [(global "x")] [(# (global "t")) (neg 1) (...) nil true])');
         expect(tree(`x = 0x1F, 0b101, 1_000, .5, 1e3`)).toBe('(assign [(global "x")] [31 5 1000 0.5 1000])');
+        expect(tree(`x = 123i, 1_000i, 0xABABi, 0b1000_1000i, -5i, 0xFFFF_FFFF_FFFF_FFFFi, 0x8000000000000000i, 9223372036854775807i`))
+            .toBe('(assign [(global "x")] [123i 1000i 43947i 136i (neg 5i) -1i -9223372036854775808i 9223372036854775807i])');
     });
 
     it("parses every statement", () => {
@@ -217,6 +219,12 @@ describe("Luau parser", () => {
         ["local n = 0x", "(1,11): Malformed number"],
         ["local n = 1..2", "(1,11): Malformed number"],
         ["local n = 12abc", "(1,11): Malformed number"],
+        ["local n = 1.5i", "(1,11): Malformed integer"],
+        ["local n = 0xi", "(1,11): Malformed integer"],
+        ["local n = 0b12i", "(1,11): Malformed integer"],
+        ["local n = 9223372036854775808i", "(1,11): Integer overflow"],
+        ["local n = -9223372036854775808i", "(1,12): Integer overflow"],
+        ["local n = 0x1_0000_0000_0000_0000i", "(1,11): Integer overflow"],
         ["local s = \"abc", "(1,11): Malformed string; did you forget to finish it?"],
         ["local s = \"\\q\\400\"", "(1,11): String literal contains malformed escape sequence"],
         ["local s = `abc {x`", "(1,18): Malformed interpolated string; did you forget to add a '}'?"],

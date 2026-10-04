@@ -7,6 +7,8 @@ import { integer, ipow } from '../lua/integer';
 import { LuaBuffer } from '../lua/buffer';
 import { LuaTable } from '../lua/table';
 import { num2str } from '../lua/number';
+import { parseLuau } from '../lua/syntax/parser';
+import { show as showForm } from '../lua/syntax/print';
 
 const MIN = integer.minsigned, MAX = integer.maxsigned;
 
@@ -102,6 +104,20 @@ describe.skipIf(!process.env.LUAU)("Luau integers against Luau", () => {
             } catch (e: any) {
                 return "false\t" + e.message;
             }
+        });
+        expect(actual).toEqual(expected);
+    });
+
+    it("parse integer literals as Luau does", () => {
+        const pieces = ["0", "1", "9", "f", "F", "_", "x", "b", "0x", "0b", "7fffffffffffffff", "8000000000000000", "9223372036854775807", "9223372036854775808", "ffffffffffffffff", "1".repeat(64), ".", "e"];
+        const literals = Array.from({ length: 3000 }, () => (rand(4) === 0 ? "" : ["0x", "0b", "0X", ""][rand(4)]) + Array.from({ length: 1 + rand(3) }, () => pieces[rand(pieces.length)]).join("") + "i")
+            .filter(l => /^[0-9]/.test(l));
+        const expected = luau(literals.map(l => `do local f, e = loadstring("return ${l}") if f then print(tostring(f())) else print((e:gsub("^.-:%d+: ", ""))) end end`));
+        const actual = literals.map(l => {
+            const r = parseLuau(`return ${l}`);
+            if (r.errors.length > 0) return r.errors[0].message;
+            const v = (r.root[1] as any[])[1];
+            return typeof v === "bigint" ? String(v) : showForm(v);
         });
         expect(actual).toEqual(expected);
     });

@@ -70,7 +70,7 @@ const isTypeFollow = (k: Tok) => k === Tok.Pipe || k === Tok.Question || k === T
 // (no list starts with a head)
 const isHead = (e: unknown, head: symbol): boolean => Array.isArray(e) && e[0] === head;
 const isStatLast = (s: C.Stat) => s[0] === L.BREAK || s[0] === L.CONTINUE || s[0] === L.RETURN;
-const isConstantLiteral = (e: C.Expr) => typeof e === "number" || typeof e === "string" || typeof e === "boolean" || e === L.NIL;
+const isConstantLiteral = (e: C.Expr) => typeof e === "number" || typeof e === "bigint" || typeof e === "string" || typeof e === "boolean" || e === L.NIL;
 const isLiteralTable = (e: C.Expr): boolean => {
     if (!isHead(e, L.TABLE)) return false;
     const t = e as C.Table;
@@ -1356,6 +1356,7 @@ class Parser {
         // the common case: a short run of digits, valued by the lexer
         if (!Number.isNaN(lexed)) return this.#expr(lexed, from, to);
         const s = text.indexOf("_") === -1 ? text : text.replace(/_/g, "");
+        if (s.endsWith("i")) return this.#parseInteger(s, from, to);
         let value: number;
         const integer = (digits: string, base: 2 | 16): number | null => {
             if (!(base === 2 ? /^[01]+$/ : /^[0-9a-fA-F]+$/).test(digits)) return null;
@@ -1378,6 +1379,16 @@ class Parser {
             value = Number(s);
         }
         return this.#expr(value, from, to);
+    }
+
+    // an integer literal: decimal in the signed range, hex and binary any 64 bits (wrapping to signed)
+    #parseInteger(s: string, from: number, to: number): C.Expr {
+        const hex = /^0[xX]/.test(s), bin = /^0[bB]/.test(s);
+        const digits = s.slice(hex || bin ? 2 : 0, -1);
+        if (!(hex ? /^[0-9a-fA-F]+$/ : bin ? /^[01]+$/ : /^[0-9]+$/).test(digits)) return this.#exprError(from, to, "Malformed integer");
+        const n = BigInt(hex ? `0x${digits}` : bin ? `0b${digits}` : digits);
+        if (n >= (hex || bin ? 1n << 64n : 1n << 63n)) return this.#exprError(from, to, "Integer overflow");
+        return this.#expr(BigInt.asIntN(64, n), from, to);
     }
 
     #parseAttributedFunction(from: number, to: number): C.Expr {
