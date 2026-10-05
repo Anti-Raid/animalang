@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LuaTable } from '../lua/table';
+import { LuaTable, RecordShape } from '../lua/table';
 import { TRY_CALL } from '../common';
 import { createNativeScheme } from '../native';
 import { impl } from '../magicvm/meta';
@@ -144,6 +144,52 @@ describe("Luau tables", () => {
 });
 
 // what the tables give against what Luau gives, for random writes: run with LUAU set to a Luau binary
+describe("a table constructor's table", () => {
+    it("keeps its first values as its array part, and takes a last item's values past it", () => {
+        const t = LuaTable.of([1, 2], 4, 2);
+        expect([t.sizearray, t.sizenode, t.rawlen(), t.get(2), t.get(3)]).toEqual([4, 2, 2, 2, undefined]);
+        t.setlist(3, ["c", "d", "e"]);
+        expect([t.sizearray, t.rawlen(), t.get(5)]).toEqual([5, 5, "e"]);
+        t.setlist(6, []);
+        expect(t.sizearray).toBe(5);
+    });
+
+    it("leaves the array part alone when a key that is not an integer is added, as Luau does now", () => {
+        const t = new LuaTable(17, 0);
+        for (let i = 1; i <= 15; i++) t.set(i, i);
+        t.set(17, 1);
+        t.set(2.5, "x");
+        expect([t.sizearray, t.rawlen()]).toEqual([17, 17]);
+    });
+});
+
+describe("a table of fields", () => {
+    it("shares its shape's keys until it gets one of its own", () => {
+        const shape = new RecordShape(["x", "y"]);
+        const a = LuaTable.record(shape, [1, 2]), b = LuaTable.record(shape, [3, undefined]);
+        expect([a.get("x"), a.get("y"), b.get("x"), b.get("y"), a.sizenode, a.size, b.size]).toEqual([1, 2, 3, undefined, 2, 2, 1]);
+        a.set("z", 9);
+        b.set("w", 8);
+        expect([a.get("z"), a.get("w"), b.get("z"), b.get("w"), shape.keys]).toEqual([9, undefined, undefined, 8, ["x", "y"]]);
+        expect([...a].map(([k]) => k)).toEqual(["x", "y", "z"]);
+        expect([...LuaTable.record(shape, [5, 6])]).toEqual([["x", 5], ["y", 6]]);
+    });
+
+    it("finds a name where it last was, and anywhere else when it is not there", () => {
+        const cache = { slot: 0 };
+        const a = new LuaTable().set("p", 1).set("q", 2), b = new LuaTable().set("q", 3).set("p", 4);
+        expect([a.getfield("q", cache), cache.slot, b.getfield("q", cache), cache.slot, a.getfield("q", cache), a.getfield("nope", cache)]).toEqual([2, 1, 3, 0, 2, undefined]);
+        a.setfield("q", 20, cache);
+        a.setfield("r", 30, cache);
+        expect([a.get("q"), a.get("r"), cache.slot]).toEqual([20, 30, 2]);
+        // a slot outlives its value, and moves when the table is rebuilt
+        a.setfield("r", undefined, cache);
+        for (let i = 0; i < 8; i++) a.set(`k${i}`, i);
+        expect([a.getfield("r", cache), a.getfield("q", cache), a.getfield("k7", cache)]).toEqual([undefined, 20, 7]);
+        expect(() => a.freeze().setfield("q", 1, cache)).toThrow("attempt to modify a readonly table");
+    });
+});
+
 describe.skipIf(!process.env.LUAU)("Luau tables against Luau", () => {
     it("give Luau's lengths after every write and the traversal order Luau guarantees", () => {
         let seed = 7;

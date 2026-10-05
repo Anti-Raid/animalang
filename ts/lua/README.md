@@ -6,10 +6,11 @@ The Luau front end, in progress: the parser (`syntax/`, see its README), the low
 whose language is Luau.
 
 ## Lowering
-So far: locals, assignment (to locals and globals, several at once), compound assignment, `do` blocks, `if`, `while`,
-`repeat`, numeric `for`, `break`, `continue`, `return`, functions (`function`, `local function`, `function name()`),
-calls, several values and `...`, literals, if-expressions, and the operators but `#` (arithmetic, `..`, comparisons,
-`and`, `or`, `not`). Anything else is a positioned "not supported yet" error.
+So far: locals, assignment (to locals, globals and table entries, several at once), compound assignment, `do` blocks,
+`if`, `while`, `repeat`, numeric `for`, `break`, `continue`, `return`, functions (`function`, `local function`,
+`function a.b:c()`), calls and method calls, several values and `...`, table constructors, indexing, literals,
+if-expressions, and the operators (arithmetic, `..`, comparisons, `and`, `or`, `not`, `#`). Anything else (`for ... in`,
+interpolated strings) is a positioned "not supported yet" error. Metamethods and the standard library come later.
 
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
@@ -46,6 +47,35 @@ calls, several values and `...`, literals, if-expressions, and the operators but
   target of `op=`, is read after the other operand is evaluated; concatenation, arguments and lists of values copy it
   first. With several targets (`compileStatAssign`), a local takes its value as soon as it is computed unless a value
   computed later refers to it, and the other targets, and those locals, are assigned at the end.
+- A table constructor is `compileExprTable`'s: a table of the sizes Luau's compiler gives it (`%luau-table`: an array
+  slot per positional item, a hash slot per keyed one; keys `[1]`, `[2]`, ... in order go to the array part when there
+  are no other `[]` keys; a table of fields only has a slot per distinct name, as its `DUPTABLE` template has), then
+  the items in order: a keyed one is stored as an assignment is, so it overwrites a positional one before it and is
+  overwritten by one after it, and the last item, when it is a call or `...`, gives all its values (`%luau-setlist`).
+  An empty constructor bound to a local gets the sizes Luau predicts from the local's assignments (`shapes.ts`, Luau's
+  `TableShape.cpp`): a hash slot per field name assigned, an array slot per `t[1]`, `t[2]`, ... in order, or the bound
+  of a `for i = 1, k` (`k` up to 16) that assigns `t[i]`. Sizes decide when a table grows, and so `#t` of a table with
+  holes.
+- `t[k]`, `#v` and stores are `%luau-index`, `%luau-len` and `%luau-setindex` (`luaV_gettable`, `luaV_dolen`,
+  `luaV_settable`, without metamethods so far): a table's entry, a string's entry in the string library (empty until
+  the library is there, so nil), a vector's component; `attempt to index nil with 'name'` and `attempt to get length
+  of a number value` otherwise. Their templates test for a table inline. The kinds are `number`, `integer`, `string`
+  and `table`.
+- A key that is a string constant (`t.name`, `t["name"]`, a method's name) is Luau's `GETTABLEKS`, `SETTABLEKS` and
+  `NAMECALL`: `%luau-field`, `%luau-setfield` and `%luau-method`, which keep, where they are compiled, the slot the
+  name was last found in (the VM's per-site state), and look there first (`LuaTable.getfield`, `setfield`): tables
+  whose keys came in the same order have a name in the same slot, so a field access is a comparison and a read, with
+  no lookup. String constants are the engine's one object per string, so that comparison is of references. A
+  constructor of fields only, each name once, is `%luau-record`: a table that shares its keys and their index with
+  every table the same constructor makes (a `RecordShape`, Luau's `DUPTABLE` template) until it gets another key.
+- `obj:name(args)` is `LOP_NAMECALL`'s order: the object, the arguments, and only then the method is looked up
+  (`%luau-method`), so an argument that replaces the method is seen; a missing one is `attempt to call missing method
+  'name' of table`.
+- A local of the function that is an operand of an index, a store or a method call is its register in Luau, read when
+  the operation runs, after the other operands: `t[f()] = g()` stores into what `t` is after both calls. With several
+  targets, the objects and keys of indexed targets are evaluated first, and a local that is both assigned and indexed
+  by the statement is assigned last. `t[k] op= v` evaluates the object and key once, reads the entry, evaluates `v`,
+  then stores.
 - Luau code is compiled as not re-entrant (`reentrant: false`): Luau has no continuations that run a frame twice
   (a coroutine resumes its one suspended frame), so an assigned local needs a box only when a closure captures it.
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
@@ -54,13 +84,28 @@ calls, several values and `...`, literals, if-expressions, and the operators but
 `tests/luau-lower.test.ts` checks it, and with `LUAU` set compares random programs (results, error messages and lines)
 with Luau's own.
 
+Where it differs from Luau's compiler, in the sizes a table starts with only:
+- Luau knows a constructor's `[k]` key is a number when `k` folds to a constant, which includes locals never assigned;
+  the lowering only sees literals and arithmetic on them.
+- Luau predicts a hash slot for `t.name = v` but not for `t["name"] = v`; the tree does not tell them apart, so both
+  count here.
+
+Luau also resolves `a.b.c` on a global its chunk never assigns when the chunk is loaded (`GETIMPORT`); here it is read
+when it runs.
+
 ## Tables
 `LuaTable` is Luau's table, ported from Luau's `VM/src/ltable.cpp`, so that what a program can see of a table is Luau's:
 
 - **Layout**: an array part for keys `1..sizearray` (holes allowed) and a hash part with Luau's capacity (`2^k`
-  slots). Both are sized and grown as Luau sizes them (`rehash`, `computesizes`, `adjustasize`; the paths Luau uses by
-  default), so `#t` (`rawlen`, Luau's `getn` with its cached boundary) is Luau's. `t[k] = nil` on a missing key still
-  takes a slot, as it takes a node in Luau.
+  slots). Both are sized and grown as Luau sizes them now (`newkeytagged`, `rehash`, `resize`, `computesizes`,
+  `adjustasize`: the paths behind `LuauSplitTableLookups`, which its command line runs with), so `#t` (`rawlen`,
+  Luau's `getn` with its cached boundary) is Luau's: adding a key that is not an integer never resizes the array part,
+  an integer key recounts both parts, and keys moved while resizing never resize again. `t[k] = nil` on a missing key
+  still takes a slot, as it takes a node in Luau. A constructor's table is `LuaTable.of` (its first values become the
+  array part) and `setlist` (`LOP_SETLIST`, growing the array part as `luaH_resizearray` does). The hash part is full
+  when it has as many keys as slots; Luau's fills earlier when keys collide. `getfield` and `setfield` are `rawget`
+  and `rawset` of a string key given a cache of the slot it was last in, and `LuaTable.record` makes a table over a
+  shared `RecordShape`, copied when the table first adds a key.
 - **Hash part**: slots in insertion order, with a `Map` from key to slot, instead of Luau's hashed nodes. Luau
   guarantees only that a traversal (`next`) visits keys `1..k` in order, up to the first nil; that order is Luau's,
   and the rest comes in insertion order rather than Luau's hash order.

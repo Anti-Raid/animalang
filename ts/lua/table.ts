@@ -25,6 +25,48 @@ const arrayindex = (key: number): number => {
 
 const isCollectable = (v: any): v is object => (typeof v === "object" && v !== null && !(v instanceof LuaVector)) || typeof v === "function";
 
+// the index of a hash part with no keys (never written to): most tables have none, or none that are weak
+const NO_INDEX = new Map<any, number>();
+const NO_WEAK_INDEX = new WeakMap<object, number>();
+
+// the names of a constructor's fields, in order (as the template Luau copies such a table from, LOP_DUPTABLE)
+// (its parts are private, so a constant pool that freezes what it is given leaves the keys an ordinary array: reading a
+// frozen one is several times slower)
+export class RecordShape {
+    readonly #keys: string[];
+    readonly #index: Map<string, number>;
+
+    constructor(names: readonly string[]) {
+        this.#keys = [...names];
+        this.#index = new Map(names.map((name, i) => [name, i]));
+    }
+
+    get keys(): string[] {
+        return this.#keys;
+    }
+
+    get index(): Map<string, number> {
+        return this.#index;
+    }
+}
+
+// where a key was last found in a hash part: its slot in tables whose keys came in the same order (Luau's predicted slot)
+export type SlotCache = { slot: number };
+
+// setnodevector: the hash part's capacity for `size` slots
+const hashsize = (size: number): number => {
+    if (size === 0) return 0;
+    const lsize = ceillog2(size);
+    if (lsize > MAXBITS) throw luauError("table overflow");
+    return 1 << lsize;
+};
+
+// an element of an array part: a weak table's may be a reference that has been cleared
+const at = (array: any[], weak: boolean, i: number): any => {
+    const v = array[i];
+    return weak && v instanceof WeakRef ? v.deref() : v;
+};
+
 const f32 = new Float32Array(1);
 const u32 = new Uint32Array(f32.buffer);
 const bits = (c: number): number => {
@@ -42,8 +84,10 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     #keys: any[] = [];
     #vals: any[] = [];
     // each key's slot: strong keys in `#index`, collectable keys of a weak-key table in `#weakIndex`
-    #index = new Map<any, number>();
-    #weakIndex = new WeakMap<object, number>();
+    #index = NO_INDEX;
+    #weakIndex = NO_WEAK_INDEX;
+    // `#keys` and `#index` are a record shape's, shared with the other tables made from it until this one gets a key
+    #shared = false;
     // the vector each vector key is stored as (equal vectors being one key), by hash
     #vectors: Map<number, LuaVector[]> | null = null;
     // as Luau's union: room left in the hash part, or (when it is negative) the negated boundary of the array part, which
@@ -64,7 +108,61 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     // luaH_new: room for `narray` array slots and `nhash` hash slots
     constructor(narray: number = 0, nhash: number = 0) {
         if (narray > 0) this.#setarrayvector(narray);
-        if (nhash > 0) this.#sethashvector(nhash);
+        if (nhash > 0) this.#lastfree = this.#capacity = hashsize(nhash);
+    }
+
+    // a constructor's table (LOP_NEWTABLE and the SETLIST of its first items): `values` are its array part's first
+    // values, and become the array part itself
+    static of(values: any[], narray: number, nhash: number): LuaTable {
+        const t = new LuaTable(0, nhash);
+        if (values.length > MAXSIZE || narray > MAXSIZE) throw luauError("table overflow");
+        for (let i = values.length; i < narray; i++) values.push(undefined);
+        t.#array = values;
+        t.#sizearray = values.length;
+        return t;
+    }
+
+    // LOP_DUPTABLE: a table with `shape`'s keys and `values` for them (which become its values)
+    static record(shape: RecordShape, values: any[]): LuaTable {
+        const t = new LuaTable();
+        t.#keys = shape.keys;
+        t.#index = shape.index;
+        t.#vals = values;
+        t.#lastfree = t.#capacity = hashsize(values.length);
+        t.#shared = true;
+        return t;
+    }
+
+    // LOP_GETTABLEKS: rawget of a string key, tried first in the slot `cache` has
+    getfield(key: string, cache: SlotCache): any {
+        if (this.#metatable !== null) this.#syncMode();
+        const slot = cache.slot;
+        if (this.#keys[slot] === key) return at(this.#vals, this.#weakValues, slot);
+        const i = this.#index.get(key);
+        if (i === undefined) return undefined;
+        cache.slot = i;
+        return at(this.#vals, this.#weakValues, i);
+    }
+
+    // LOP_SETTABLEKS: rawset of a string key, tried first in the slot `cache` has
+    setfield(key: string, val: any, cache: SlotCache): void {
+        if (this.#metatable !== null) this.#syncMode();
+        const slot = cache.slot;
+        if (this.#keys[slot] === key && !this.#readonly && key !== "__mode" && key !== "__call") {
+            this.#vals[slot] = this.#weakValues ? this.#wrap(val) : val;
+            return;
+        }
+        this.rawset(key, val);
+        const i = this.#index.get(key);
+        if (i !== undefined) cache.slot = i;
+    }
+
+    // LOP_SETLIST: `values` stored from index `start` on, in the array part, which grows to hold them
+    setlist(start: number, values: readonly any[]): void {
+        const last = start + values.length - 1;
+        // (luaH_resizearray)
+        if (last > this.#sizearray) this.#resize(this.#adjustasize(last, -1), this.#capacity);
+        for (let i = 0; i < values.length; i++) this.#array[start + i - 1] = this.#wrap(values[i]);
     }
 
     get sizearray(): number {
@@ -116,8 +214,9 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         this.#weakValues = weakValues;
         this.#array = array.map(v => this.#wrap(v));
         this.#vals = vals.map(v => this.#wrap(v));
-        this.#index = new Map();
-        this.#weakIndex = new WeakMap();
+        this.#shared = false;
+        this.#index = NO_INDEX;
+        this.#weakIndex = NO_WEAK_INDEX;
         this.#keys = keys.map((k, i) => {
             if (k !== undefined) this.#indexSet(k, i);
             return this.#wrapKey(k);
@@ -129,7 +228,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     }
 
     #unwrap(v: any): any {
-        return v instanceof WeakRef ? v.deref() : v;
+        return this.#weakValues && v instanceof WeakRef ? v.deref() : v;
     }
 
     #wrapKey(k: any): any {
@@ -138,7 +237,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
 
     // a slot's key, or undefined if it was collected
     #unwrapKey(k: any): any {
-        return k instanceof WeakRef ? k.deref() : k;
+        return this.#weakKeys && k instanceof WeakRef ? k.deref() : k;
     }
 
     #indexGet(k: any): number | undefined {
@@ -146,8 +245,13 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     }
 
     #indexSet(k: any, i: number): void {
-        if (this.#weakKeys && isCollectable(k)) this.#weakIndex.set(k, i);
-        else this.#index.set(k, i);
+        if (this.#weakKeys && isCollectable(k)) {
+            if (this.#weakIndex === NO_WEAK_INDEX) this.#weakIndex = new WeakMap();
+            this.#weakIndex.set(k, i);
+        } else {
+            if (this.#index === NO_INDEX) this.#index = new Map();
+            this.#index.set(k, i);
+        }
     }
 
     // a slot's value, nil when its key or value was collected
@@ -189,36 +293,55 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
 
     rawget(key: any): any {
         if (this.#metatable !== null) this.#syncMode();
-        if (key instanceof LuaVector) {
+        if (typeof key === "object" && key instanceof LuaVector) {
             key = this.#vectorKey(key);
             if (key === undefined) return undefined;
         }
         return this.#get(key);
     }
 
-    // --- insertion (newkey_DEPRECATED, rehash_DEPRECATED, resize) ---
+    // --- insertion (newkeytagged, rehash, resize) ---
 
     // the slot `key` will be stored in: a hash slot (its index), or, when it lands in the array part, -(index + 2)
     #newkey(key: any): number {
+        const intkey = typeof key === "number" && (key | 0) === key ? key : null;
         // enforce the boundary invariant, and make room when the hash part is full
-        if ((typeof key === "number" && key === this.#sizearray + 1) || this.#keys.length >= this.#capacity) {
-            this.#rehash(key);
-            return this.#arrayornewkey(key);
+        if (intkey === this.#sizearray + 1 || this.#keys.length >= this.#capacity) {
+            this.#rehash(intkey);
+            if (intkey !== null && intkey >= 1 && intkey <= this.#sizearray) return -(intkey - 1) - 2;
+            return this.#newkey(key);
+        }
+        return this.#insert(key);
+    }
+
+    // a new slot of the hash part for `key`
+    #insert(key: any): number {
+        if (this.#shared) {
+            this.#keys = this.#keys.slice();
+            this.#index = new Map(this.#index);
+            this.#shared = false;
         }
         const i = this.#keys.length;
-        if (key instanceof LuaVector) this.#addVector(key);
+        if (typeof key === "object" && key instanceof LuaVector) this.#addVector(key);
         this.#keys.push(this.#wrapKey(key));
         this.#vals.push(undefined);
         this.#indexSet(key, i);
         return i;
     }
 
-    #arrayornewkey(key: any): number {
-        if (typeof key === "number") {
+    // reinsertkey: where `key` goes while the table is being resized, which never resizes it again
+    #reinsert(key: any, checkarraypart: boolean): number {
+        if (checkarraypart && typeof key === "number") {
             const k = arrayindex(key);
             if (k >= 1 && k <= this.#sizearray) return -(k - 1) - 2;
         }
-        return this.#newkey(key);
+        return this.#insert(key);
+    }
+
+    #hashslotsused(): number {
+        let n = 0;
+        for (let i = 0; i < this.#keys.length; i++) if (this.#slotValue(i) !== undefined) n++;
+        return n;
     }
 
     #store(slot: number, val: any): void {
@@ -278,30 +401,38 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         return [totaluse, ause];
     }
 
-    #adjustasize(size: number, ek: any): number {
+    // `extraintkey`: the integer key being added, or -1
+    #adjustasize(size: number, extraintkey: number): number {
         const tbound = this.#capacity !== 0 || size < this.#sizearray;
-        const ekindex = typeof ek === "number" ? arrayindex(ek) : -1;
-        while (size + 1 === ekindex || (tbound && this.#getnum(size + 1) !== undefined)) size++;
+        while (size + 1 === extraintkey || (tbound && this.#getnum(size + 1) !== undefined)) size++;
         return size;
     }
 
-    #rehash(ek: any): void {
+    // room for one more key, `newintkey` when it is an integer: any other key leaves the array part as it is
+    #rehash(newintkey: number | null): void {
+        if (newintkey === null) {
+            this.#resize(this.#sizearray, this.#hashslotsused() + 1);
+            return;
+        }
         const nums = new Array(MAXBITS + 1).fill(0);
         let nasize = this.#numusearray(nums);
         let totaluse = nasize;
         const [hashuse, hashints] = this.#numusehash(nums);
         totaluse += hashuse;
         nasize += hashints;
-        if (typeof ek === "number") nasize += this.#countint(ek, nums);
+        if (newintkey > 0 && newintkey <= MAXSIZE) {
+            nums[ceillog2(newintkey)]++;
+            nasize++;
+        }
         totaluse++;
         const [na, n] = this.#computesizes(nums, nasize);
         nasize = n;
         let nh = totaluse - na;
-        const nadjusted = this.#adjustasize(nasize, ek);
+        const nadjusted = this.#adjustasize(nasize, newintkey);
         const aextra = nadjusted - nasize;
         if (aextra !== 0) {
             nh -= aextra;
-            nasize = this.#adjustasize(nadjusted + aextra, ek);
+            nasize = this.#adjustasize(nadjusted + aextra, newintkey);
         }
         this.#resize(nasize, nh);
     }
@@ -313,16 +444,13 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     }
 
     #sethashvector(size: number): void {
-        if (size !== 0) {
-            const lsize = ceillog2(size);
-            if (lsize > MAXBITS) throw luauError("table overflow");
-            size = 1 << lsize;
-        }
+        size = hashsize(size);
         this.#capacity = size;
         this.#keys = [];
         this.#vals = [];
-        this.#index = new Map();
-        this.#weakIndex = new WeakMap();
+        this.#shared = false;
+        this.#index = NO_INDEX;
+        this.#weakIndex = NO_WEAK_INDEX;
         this.#vectors = null;
         this.#lastfree = size;
     }
@@ -337,15 +465,16 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
             const vanishing = this.#array.slice(nasize, oldasize);
             this.#sizearray = nasize;
             this.#array.length = nasize;
+            // (a key of the vanishing slice cannot be in the new array part)
             vanishing.forEach((v, i) => {
                 const val = this.#unwrap(v);
-                if (val !== undefined) this.#store(this.#newkey(nasize + i + 1), val);
+                if (val !== undefined) this.#store(this.#reinsert(nasize + i + 1, false), val);
             });
         }
         for (let i = 0; i < oldKeys.length; i++) {
             const val = this.#unwrap(oldVals[i]);
             const key = this.#unwrapKey(oldKeys[i]);
-            if (val !== undefined && key !== undefined) this.#store(this.#arrayornewkey(key), val);
+            if (val !== undefined && key !== undefined) this.#store(this.#reinsert(key, true), val);
         }
     }
 
@@ -355,7 +484,7 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         if (key === undefined) throw luauError("table index is nil");
         if (typeof key === "number" && Number.isNaN(key)) throw luauError("table index is NaN");
         if (this.#metatable !== null) this.#syncMode();
-        if (key instanceof LuaVector) {
+        if (typeof key === "object" && key instanceof LuaVector) {
             if (key.hasNaN) throw luauError("table index contains NaN");
             key = this.#vectorKey(key) ?? key;
         }
@@ -382,18 +511,14 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         if (this.#lastfree <= 0) this.#lastfree = -boundary;
     }
 
-    #getaboundary(): number {
-        return this.#lastfree < 0 ? -this.#lastfree : this.#sizearray;
-    }
-
     #updateaboundary(boundary: number): number {
-        const arr = (i: number) => this.#unwrap(this.#array[i]);
-        if (boundary < this.#sizearray && arr(boundary - 1) === undefined) {
-            if (boundary >= 2 && arr(boundary - 2) !== undefined) {
+        const a = this.#array, weak = this.#weakValues;
+        if (boundary < this.#sizearray && at(a, weak, boundary - 1) === undefined) {
+            if (boundary >= 2 && at(a, weak, boundary - 2) !== undefined) {
                 this.#maybesetaboundary(boundary - 1);
                 return boundary - 1;
             }
-        } else if (boundary + 1 < this.#sizearray && arr(boundary) !== undefined && arr(boundary + 1) === undefined) {
+        } else if (boundary + 1 < this.#sizearray && at(a, weak, boundary) !== undefined && at(a, weak, boundary + 1) === undefined) {
             this.#maybesetaboundary(boundary + 1);
             return boundary + 1;
         }
@@ -403,22 +528,22 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
     // luaH_getn: #t
     rawlen(): number {
         if (this.#metatable !== null) this.#syncMode();
-        const arr = (i: number) => this.#unwrap(this.#array[i]);
+        const a = this.#array, weak = this.#weakValues;
         const size = this.#sizearray;
-        const boundary = this.#getaboundary();
+        const boundary = this.#lastfree < 0 ? -this.#lastfree : size;
         if (boundary > 0) {
-            if (arr(size - 1) !== undefined && this.#capacity === 0) return size;
-            if (boundary < size && arr(boundary - 1) !== undefined && arr(boundary) === undefined) return boundary;
+            if (at(a, weak, size - 1) !== undefined && this.#capacity === 0) return size;
+            if (boundary < size && at(a, weak, boundary - 1) !== undefined && at(a, weak, boundary) === undefined) return boundary;
             const found = this.#updateaboundary(boundary);
             if (found > 0) return found;
         }
-        if (size > 0 && arr(size - 1) === undefined) {
+        if (size > 0 && at(a, weak, size - 1) === undefined) {
             let base = 0, rest = size;
             for (let half = rest >> 1; half !== 0; half = rest >> 1) {
-                if (arr(base + half) !== undefined) base += half;
+                if (at(a, weak, base + half) !== undefined) base += half;
                 rest -= half;
             }
-            const found = (arr(base) !== undefined ? 1 : 0) + base;
+            const found = (at(a, weak, base) !== undefined ? 1 : 0) + base;
             this.#maybesetaboundary(found);
             return found;
         }
@@ -475,8 +600,9 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         if (this.#capacity !== 0) {
             this.#keys = [];
             this.#vals = [];
-            this.#index = new Map();
-            this.#weakIndex = new WeakMap();
+            this.#shared = false;
+            this.#index = NO_INDEX;
+            this.#weakIndex = NO_WEAK_INDEX;
             this.#vectors = null;
             this.#lastfree = this.#capacity;
         }

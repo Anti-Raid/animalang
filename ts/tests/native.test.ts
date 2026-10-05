@@ -200,6 +200,21 @@ describe("native-scheme", () => {
                      (%intcall %array (%intcall %coroutine-resume co) (%intcall %coroutine-resume co))`)).toBe("(y 101)");
     });
 
+    it("gives an intrinsic's template state of its own at each place it is called", () => {
+        const a = make();
+        const sites: { calls: number }[] = [];
+        a.registerIntrinsic("%counted", (regs, st) => regs[st], {
+            args: [1, 1], leaf: true,
+            site: () => { const s = { calls: 0 }; sites.push(s); return s; },
+            inline: ([x], _slow, _tmp, _d, _known, site) => `(${site}.calls++, ${x})`,
+        });
+        const code = a.compileRaw(`(define-global (f n) (%if (%intcall %< n 1) (%intcall %counted 0) (%intcall %+ (%intcall %counted n) (%call f (%intcall %+ n -1)))))
+                                   (%call f 5)`, "t.ns");
+        expect(a.evaluateRaw(code)).toBe(15);
+        // one state for each call in f (an entry compiled another way has its own)
+        expect(sites.map(s => s.calls).filter(n => n > 0).sort()).toEqual([1, 5]);
+    });
+
     it("gives a call whose values are bound at once those values, whatever way the procedure returns", () => {
         const a = make();
         a.registerIntrinsic("%callable", (regs, st) => ({ [TRY_CALL]: regs[st] }), { args: [1, 1], leaf: true });

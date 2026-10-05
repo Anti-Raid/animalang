@@ -6,7 +6,8 @@ import { luauError } from "./errors";
 import type { ArgKinds, InlineFn, Intrinsics, Returns, TypeSystem } from "../magicvm/intrinsics";
 import { integer, ipow } from "./integer";
 import { toString, typeName } from "./messages";
-import { num2str, str2number } from "./number";
+import { cstring, num2str, str2number } from "./number";
+import { LuaTable, type SlotCache } from "./table";
 import { LuaVector, vadd, vdiv, vidiv, vmul, vsub, vunm } from "./vector";
 
 export type ArithOp = "add" | "sub" | "mul" | "div" | "idiv" | "mod" | "pow" | "unm";
@@ -112,10 +113,49 @@ export const forNumber = (v: any, what: string): number => {
     return n;
 };
 
-// Luau's kinds: numbers, and integers (bigints)
+// luaG_indexerror (a long key is not quoted, and C prints a string up to its first NUL)
+const indexError = (t: any, key: any): Error =>
+    luauError(typeof key === "string" && key.length <= 64 ? `attempt to index ${typeName(t)} with '${cstring(key)}'` : `attempt to index ${typeName(t)} with ${typeName(key)}`);
+
+// luaV_gettable, without metamethods (they come later): a table's entry, a string's entry in the string library
+// (`strings`, its metatable's __index), a vector's component
+export const index = (strings: LuaTable, t: any, key: any): any => {
+    if (t instanceof LuaTable) return t.rawget(key);
+    if (typeof t === "string") return strings.rawget(key);
+    if (t instanceof LuaVector && typeof key === "string" && key.length === 1) {
+        const c = (key.charCodeAt(0) | 32) - 120;
+        if (c >= 0 && c < 3) return c === 0 ? t.x : c === 1 ? t.y : t.z;
+    }
+    throw indexError(t, key);
+};
+
+// luaV_settable, without metamethods
+export const setindex = (t: any, key: any, value: any): void => {
+    if (!(t instanceof LuaTable)) throw indexError(t, key);
+    t.rawset(key, value);
+};
+
+// luaV_dolen: #v
+export const len = (v: any): number => {
+    if (typeof v === "string") return v.length;
+    if (v instanceof LuaTable) return v.rawlen();
+    throw luauError(`attempt to get length of a ${typeName(v)} value`);
+};
+
+// what obj:name(...) calls (LOP_NAMECALL)
+export const method = (strings: LuaTable, obj: any, name: string): any => {
+    const m = index(strings, obj, name);
+    if (m === undefined) throw luauError(`attempt to call missing method '${cstring(name)}' of ${typeName(obj)}`);
+    return m;
+};
+
+// what a field access keeps where it is compiled: the slot its name was last found in (Luau's predicted slot)
+const slotCache = (): SlotCache => ({ slot: 0 });
+
+// Luau's kinds: numbers, integers (bigints), strings and tables
 export const LUAU_TYPES: TypeSystem = {
-    ofConstant: v => typeof v === "number" ? "number" : typeof v === "bigint" ? "integer" : undefined,
-    guard: (kind, e) => kind === "number" ? `typeof ${e} === "number"` : kind === "integer" ? `typeof ${e} === "bigint"` : null,
+    ofConstant: v => typeof v === "number" ? "number" : typeof v === "bigint" ? "integer" : typeof v === "string" ? "string" : undefined,
+    guard: (kind, e) => kind === "number" ? `typeof ${e} === "number"` : kind === "integer" ? `typeof ${e} === "bigint"` : kind === "string" ? `typeof ${e} === "string"` : null,
     coerce: (kind, e) => kind === "number" ? `+${e}` : null,
     // the lowering takes one value of a call before it binds or assigns it (a call it keeps whole is never returned
     // from a variable)
@@ -162,8 +202,11 @@ export const registerLuauOps = (table: Intrinsics): void => {
         });
     }
     table.register("%luau-concat", (regs, s) => concat(regs[s], regs[s + 1]), {
-        args: [2, 2], leaf: true, foldable: true, oneValue: true,
-        inline: (args, slow) => `(typeof ${args[0]} === "string" && typeof ${args[1]} === "string" ? ${args[0]} + ${args[1]} : ${slow})`,
+        args: [2, 2], leaf: true, foldable: true, returns: "string",
+        inline: (args, slow, _tmp, _d, known) => {
+            const checks = args.filter((_, i) => known[i] !== "string").map(x => `typeof ${x} === "string"`);
+            return checks.length === 0 ? `(${args[0]} + ${args[1]})` : `(${checks.join(" && ")} ? ${args[0]} + ${args[1]} : ${slow})`;
+        },
     });
     const bool = { leaf: true, foldable: true, returns: "boolean" } as const;
     table.register("%luau-truthy", (regs, s) => regs[s] !== undefined && regs[s] !== false, {
@@ -214,4 +257,51 @@ export const registerLuauOps = (table: Intrinsics): void => {
         ...bool, foldable: false, args: [1, 1], effectFree: true, inline: ([v], _slow, _tmp, d) => `(${severalValues(v, d)})`, deps: { MultipleValues },
     });
     table.register("%luau-tostring", (regs, s) => toString(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+
+    // the string library, which a string is indexed through (empty until the library is there)
+    const strings = new LuaTable();
+    const isTable = (v: string, d: Readonly<Record<string, string>>) => `${v}?.constructor === ${d.LuaTable}`;
+    // (narray nhash value ...): a constructor's table, with the items before its first keyed one
+    table.register("%luau-table", (regs, s, n) => LuaTable.of(regs.slice(s + 2, s + n), regs[s], regs[s + 1]), {
+        args: [2, Infinity], leaf: true, returns: "table", deps: { LuaTable },
+        inline: ([narray, nhash, ...values], _slow, _tmp, d) => values.length === 0 ? `new ${d.LuaTable}(${narray}, ${nhash})` : `${d.LuaTable}.of([${values.join(", ")}], ${narray}, ${nhash})`,
+    });
+    // (table start array): the values of a constructor's last item, a call or `...`
+    table.register("%luau-setlist", (regs, s) => regs[s].setlist(regs[s + 1], regs[s + 2]), { args: [3, 3], leaf: true, oneValue: true });
+    table.register("%luau-index", (regs, s) => index(strings, regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, oneValue: true, deps: { LuaTable },
+        inline: ([t, k], slow, _tmp, d, known) => known[0] === "table" ? `${t}.rawget(${k})` : `(${isTable(t, d)} ? ${t}.rawget(${k}) : ${slow})`,
+    });
+    table.register("%luau-setindex", (regs, s) => setindex(regs[s], regs[s + 1], regs[s + 2]), {
+        args: [3, 3], leaf: true, oneValue: true, deps: { LuaTable },
+        // (its errors are the table's own too: the slow path is in the expression, so they get where they happened)
+        inline: ([t, k, v], slow, _tmp, d) => `(${isTable(t, d)} ? ${t}.rawset(${k}, ${v}) : ${slow})`,
+    });
+    // (shape value ...): a table of fields only, each name once (LOP_DUPTABLE and its stores)
+    table.register("%luau-record", (regs, s, n) => LuaTable.record(regs[s], regs.slice(s + 1, s + n)), {
+        args: [1, Infinity], leaf: true, returns: "table", deps: { LuaTable },
+        inline: ([shape, ...values], _slow, _tmp, d) => `${d.LuaTable}.record(${shape}, [${values.join(", ")}])`,
+    });
+    // t.name and t.name = v (LOP_GETTABLEKS, LOP_SETTABLEKS): %luau-index and %luau-setindex of a name, which a table
+    // looks for first where the same code last found it
+    table.register("%luau-field", (regs, s) => index(strings, regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, oneValue: true, deps: { LuaTable }, site: slotCache,
+        inline: ([t, k], slow, _tmp, d, known, site) => {
+            const get = site === undefined ? `${t}.rawget(${k})` : `${t}.getfield(${k}, ${site})`;
+            return known[0] === "table" ? get : `(${isTable(t, d)} ? ${get} : ${slow})`;
+        },
+    });
+    table.register("%luau-setfield", (regs, s) => setindex(regs[s], regs[s + 1], regs[s + 2]), {
+        args: [3, 3], leaf: true, oneValue: true, deps: { LuaTable }, site: slotCache,
+        inline: ([t, k, v], slow, _tmp, d, _known, site) => `(${isTable(t, d)} ? ${site === undefined ? `${t}.rawset(${k}, ${v})` : `${t}.setfield(${k}, ${v}, ${site})`} : ${slow})`,
+    });
+    table.register("%luau-len", (regs, s) => len(regs[s]), {
+        args: [1, 1], leaf: true, returns: "number", deps: { LuaTable },
+        inline: ([v], slow, _tmp, d, known) => known[0] === "table" ? `${v}.rawlen()` : known[0] === "string" ? `${v}.length`
+            : `(typeof ${v} === "string" ? ${v}.length : ${isTable(v, d)} ? ${v}.rawlen() : ${slow})`,
+    });
+    table.register("%luau-method", (regs, s) => method(strings, regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, oneValue: true, deps: { LuaTable }, site: slotCache,
+        inline: ([o, name], slow, tmp, d, _known, site) => `((${tmp} = ${isTable(o, d)} ? ${site === undefined ? `${o}.rawget(${name})` : `${o}.getfield(${name}, ${site})`} : undefined) !== undefined ? ${tmp} : ${slow})`,
+    });
 };

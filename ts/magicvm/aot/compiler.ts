@@ -139,7 +139,7 @@ export class AotCompiler {
             const x = a[i], y = b[i];
             // name and bounds are written into the source of IntApply
             // and the type facts rules, which the source relies on
-            if (x.pos !== y.pos || x.inline !== y.inline || x.name !== y.name || x.min !== y.min || x.max !== y.max || !Intrinsics.sameFacts(x, y)) return false;
+            if (x.pos !== y.pos || x.inline !== y.inline || (x.site === undefined) !== (y.site === undefined) || x.name !== y.name || x.min !== y.min || x.max !== y.max || !Intrinsics.sameFacts(x, y)) return false;
             const dx = Object.entries(x.deps), dy = y.deps;
             if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
         }
@@ -154,13 +154,13 @@ export class AotCompiler {
 
     // `want`: only the direct entry, for that many values
     public static generateFunction(code: Code, tmpl?: ClosureTemplate, want: number = 0): { resume: ResumeFn, direct: DirectFn | null } {
-        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch } = code.table!.entries[pos]; return { pos, inline, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch }; });
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, site, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch } = code.table!.entries[pos]; return { pos, inline, site, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch }; });
         let variants = this.#sources.get(code.ops);
         const types = code.table?.types ?? null;
         let factory = variants?.find(v => v.types === types && v.want === want && this.#sameUses(v.uses, uses))?.factory;
         if (factory === undefined) {
             // parsing the source is most of the cost, so copies share the factory and only call it for their own functions
-            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "CALL_CACHE", "RT", "DEPS", this.generateSource(code, tmpl, want));
+            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "CALL_CACHE", "SITE_CACHE", "RT", "DEPS", this.generateSource(code, tmpl, want));
             if (SHARED_OPS.has(code.ops)) {
                 if (variants === undefined) this.#sources.set(code.ops, variants = []);
                 variants.push({ uses, types, want, factory });
@@ -170,7 +170,9 @@ export class AotCompiler {
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
         const callCache: Record<number, CallCache> = {};
         for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: NO_TEMPLATE, fn: null };
-        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, code.table?.fns ?? [], code.table?.deps ?? []);
+        const siteCache: Record<number, object> = {};
+        for (const { ip, pos } of this.#intrinsicSites(code)) siteCache[ip] = code.table!.entries[pos].site!();
+        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, siteCache, code.table?.fns ?? [], code.table?.deps ?? []);
     }
 
     // called with each step's output when generating source: the blocks, their liveness, the resume and direct entries
@@ -199,7 +201,8 @@ export class AotCompiler {
             return out.toString();
         });
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
-        const callCaches = this.#callSites(code).map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("");
+        const callCaches = this.#callSites(code).map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("")
+            + this.#intrinsicSites(code).map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
         // positions never change once registered, so each intrinsic's function and deps are read once, into locals
         const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
         const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
@@ -209,6 +212,11 @@ export class AotCompiler {
 
     static #globalLoads(code: Code): number[] {
         return code.ops.filter(op => op.k === "LoadGlobal").map(op => op.ip);
+    }
+
+    // the calls of leaf intrinsics that keep state of their own where they are called (IntrinsicOptions.site)
+    static #intrinsicSites(code: Code): { ip: number, pos: number }[] {
+        return code.ops.flatMap(op => op.k === "IntCall" && code.table!.entries[op.pos].site !== undefined ? [{ ip: op.ip, pos: op.pos }] : []);
     }
 
     static #callSites(code: Code): number[] {

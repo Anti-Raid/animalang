@@ -24,7 +24,8 @@ export type TypeSystem = {
 };
 
 // `known`: for each argument, its kind when certain (see aot/facts.ts), so the template may skip checking it
-export type InlineFn = (args: string[], slow: string, tmp: string, d: Readonly<Record<string, string>>, known: ArgKinds) => string | null;
+// `site`: the variable holding this call's own state (see `site` below), when the intrinsic has one and the call is a leaf's
+export type InlineFn = (args: string[], slow: string, tmp: string, d: Readonly<Record<string, string>>, known: ArgKinds, site?: string) => string | null;
 
 // Reads only regs[start .. start+nargs), and never writes to regs or keeps it: in heap code it is the caller's frame's
 // registers. A non-leaf may return hostTail(proc, ...args) instead of a value. `ctx` and `executor` (the running
@@ -43,6 +44,10 @@ export type IntrinsicOptions = {
     inline?: InlineFn,
     // values the inline template refers to, by name: the template reads them as ${d.name}
     deps?: Record<string, unknown>,
+    // state of its own for each place compiled code calls it (a cache of what the call last found, say): made by this
+    // for every such place in every function compiled, and given to the template, which alone uses it. Nothing a
+    // program can see may depend on it
+    site?: () => object,
     // needs the execution context: called with (regs, start, nargs, ctx, executor), and its inline template may
     // use `ctx` and `executor`. Only for the VM's core operations: they are the same in every table, so code compiled
     // against one calls them the same way in any other
@@ -88,6 +93,7 @@ export type Intrinsic = {
     readonly returns: Returns | undefined,
     readonly wants: Kind | undefined,
     readonly inline: InlineFn | undefined,
+    readonly site: (() => object) | undefined,
     // the local variable holding each dep in generated code (D<slot> for DEPS[slot])
     readonly deps: Readonly<Record<string, string>>,
     readonly refineArgs?: (known: ArgKinds) => ArgKinds,
@@ -179,7 +185,7 @@ export class Intrinsics {
             deps[dep] = `D${slot}`
         }
         const entry: Intrinsic = Object.freeze({
-            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, deps: Object.freeze(deps),
+            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, site: options.site, deps: Object.freeze(deps),
             refineArgs: options.refineArgs, branchNarrow: options.branchNarrow, invertBranch: options.invertBranch,
             foldable: options.foldable ?? false, effectFree: options.effectFree ?? false, oneValue: options.oneValue ?? false,
         })

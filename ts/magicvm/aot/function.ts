@@ -307,7 +307,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "IntCall":
                 // non-debug code does not record where each operation is: an error the intrinsic raises gets the position here
                 // (an inlined template that never calls the intrinsic cannot raise its errors, so needs none)
-                const call = this.intrinsicCall(inst.pos, inst.start, inst.nargs);
+                const call = this.intrinsicCall(inst.pos, inst.start, inst.nargs, inst.at);
                 if (this.debug || inst.at === undefined || !this.#callsIntrinsic(inst.pos, call)) return this.emit(`r${inst.dst} = ${call};`);
                 return this.emit(`try { r${inst.dst} = ${call}; } catch (e) { ${this.errorSite(inst.at, "e")} throw e; }`);
             case "IntApply": {
@@ -331,7 +331,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // an expression calling the intrinsic at `pos`: its inline template, whose fallback is a call of its function over the
     // register window. A call that is the fast path goes through the hoisted local I<pos>, which V8 may inline; a template's
     // fallback goes through RT[pos], so V8 does not inline the function into the cold path (which slows the hot one)
-    protected intrinsicCall(pos: number, start: number, nargs: number): string {
+    // `at`: where the call is, for one that has state of its own there (SC<ip>, see IntrinsicOptions.site)
+    protected intrinsicCall(pos: number, start: number, nargs: number, at?: number): string {
         const entry = this.table!.entries[pos];
         const direct = this.windowCall(`I${pos}`, start, nargs, entry.context);
         if (entry.inline === undefined) return direct;
@@ -341,7 +342,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
         const slow = this.windowCall(`RT[${pos}]`, start, nargs, entry.context);
         const result = Intrinsics.resultKind(entry, known);
         const typedSlow = result === undefined ? slow : result === "boolean" ? `!!${slow}` : this.table?.types?.coerce?.(result, slow) ?? slow;
-        const inlined = entry.inline(regs.map(r => `r${r}`), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known);
+        const site = entry.site !== undefined && at !== undefined ? `SC${at}` : undefined;
+        const inlined = entry.inline(regs.map(r => `r${r}`), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known, site);
         return inlined ?? direct;
     }
 
