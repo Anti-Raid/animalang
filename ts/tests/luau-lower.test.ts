@@ -106,6 +106,13 @@ describe("Luau lowered functions", () => {
         expect(run(defs + "return two() + 10, #'' == 0".replace(", #'' == 0", ""))).toBe("11");
     });
 
+    it("binds the values of a call that is not inlined", () => {
+        const defs = "function two(a) return a, a + 1 end function three(a) return a, a + 1, a + 2 end function one(a) return a end function none() end function pass(...) return ... end function via(a) return two(a) end ";
+        expect(run(defs + "local s = 0 for i = 1, 100 do local a, b = three(i) local x, y, z = two(i) if z == nil then s += a + b + x + y end end return s")).toBe("20400");
+        expect(run(defs + "local a, b = one(5) local c, d = none() local e, f = via(7) local g, h = pass(1, 2, 3) local i, j = pass(4) return a, b, c, d, e, f, g, h, i, j")).toBe("5\tnil\tnil\tnil\t7\t8\t1\t2\t4\tnil");
+        expect(run(defs + "local a, b a, b = two(1) local c, d = (two(5)) return a, b, c, d")).toBe("1\t2\t5\tnil");
+    });
+
     it("gives a function's ... to it as values", () => {
         expect(run("local function f(...) return ... end return f(1, nil, 3)")).toBe("1\tnil\t3");
         expect(run("local function f(a, ...) local x, y = ... return a, x, y end return f(1, 2), f(1, 2, 3, 4)")).toBe("1\t1\t2\t3");
@@ -254,6 +261,43 @@ describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
         const quote = (s: string) => JSON.stringify(s);
         const lua = programs.map(p => `do local f, err = loadstring(${quote(p)}, "=t") if not f then print("error: " .. err) else local r = table.pack(pcall(f)) if r[1] then local out = {} for i = 2, r.n do out[#out + 1] = tostring(r[i]) end print(table.concat(out, "\\t")) else print("error: " .. tostring(r[2])) end end end`);
         const file = join(mkdtempSync(join(tmpdir(), "luau-")), "values.luau");
+        writeFileSync(file, lua.join("\n"));
+        const expected = execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26 }).split("\n").slice(0, programs.length);
+        expect(programs.map(p => run(p))).toEqual(expected);
+    }, 30000);
+
+    it("binds the values of calls that are not inlined as Luau does", () => {
+        let seed = 61;
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return Math.floor(seed / 4096) % n; };
+        // globals: the optimizer leaves their calls as calls
+        const defs = [
+            "function r0() end",
+            "function r1(a) return a end",
+            "function r2(a) return a, 2 end",
+            "function r3(a) return a, nil, 'c' end",
+            "function r4(a) return a, 2, 3, 4 end",
+            "function pass(...) return ... end",
+            "function swap(a, b) return b, a end",
+            "function via(a) return r3(a) end",
+            "function pick(a) if a == 1 then return a, 'one' elseif a == 2 then return a end return a, 'x', 'y' end",
+            "function rec(n) if n == 0 then return 'end', 1, 2 end return rec(n - 1) end",
+            "function sum(n) if n == 0 then return 0, 0 end local a, b = sum(n - 1) return a + 1, b + n end",
+        ].join("\n");
+        const calls = ["r0()", "r1(1)", "r2(1)", "r3(2)", "r4(5)", "pass()", "pass(1)", "pass(1, 2)", "pass(1, 2, 3, 4)", "swap(1, 2)", "via(3)", "pick(1)", "pick(2)", "pick(3)", "rec(3)", "sum(4)", "pass(r3(1))", "(r2(1))", "r2(i)", "swap(i, a)"];
+        const names = ["a", "b", "c", "d"];
+        const line = (): string => {
+            const targets = names.slice(0, 1 + rand(4)).join(", "), call = calls[rand(calls.length)];
+            switch (rand(4)) {
+                case 0: return `local ${targets} = ${call}`;
+                case 1: return `${targets} = ${call}`;
+                case 2: return `for i = 1, 3 do ${targets} = ${call} end`;
+                default: return `do local p, q, r = ${call} a, b, c = r, q, p end`;
+            }
+        };
+        const programs = Array.from({ length: 600 }, () => `${defs}\nlocal a, b, c, d\nlocal i = 0\n${Array.from({ length: 2 + rand(5) }, line).join("\n")}\nreturn a, b, c, d`);
+        const quote = (s: string) => JSON.stringify(s);
+        const lua = programs.map(p => `do local f, err = loadstring(${quote(p)}, "=t") if not f then print("error: " .. err) else local r = table.pack(pcall(f)) if r[1] then local out = {} for i = 2, r.n do out[#out + 1] = tostring(r[i]) end print(table.concat(out, "\\t")) else print("error: " .. tostring(r[2])) end end end`);
+        const file = join(mkdtempSync(join(tmpdir(), "luau-")), "bound.luau");
         writeFileSync(file, lua.join("\n"));
         const expected = execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26 }).split("\n").slice(0, programs.length);
         expect(programs.map(p => run(p))).toEqual(expected);

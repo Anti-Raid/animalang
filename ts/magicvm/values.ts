@@ -22,6 +22,21 @@ export const restValues = (vals: any[], count: number): any[] => vals.slice(coun
 // what a call that wants one value takes of what the procedure returned: its first value, <#void> of none
 export const oneValue = (val: any): any => val instanceof MultipleValues ? (val.values.length > 0 ? val.values[0] : undefined) : val;
 
+// what an entry for several values returns (see Code.entry) when it has left them in VB, from where its caller takes
+// them at once, leaving the slots empty
+export const MULTI = Object.freeze({ multi: true });
+export const VALUES_MAX = 255;
+export const VB: any[] = Array.from({ length: VALUES_MAX }, () => undefined);
+
+// what an entry for `want` values returns of `val`, which it did not make itself: one value as it is, more in VB
+export const manyValues = (val: any, want: number): any => {
+    if (!(val instanceof MultipleValues)) return val;
+    const values = val.values;
+    if (values.length < 2) return values.length === 1 ? values[0] : undefined;
+    for (let i = Math.min(values.length, want) - 1; i >= 0; i--) VB[i] = values[i];
+    return MULTI;
+};
+
 export class Box {
     constructor(public val: any) {}
 }

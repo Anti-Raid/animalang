@@ -9,7 +9,7 @@ import { DIRECT_SUSPEND_LIMIT } from "../values";
 //    spilled): statements that return the frame to run next, or with `continues`, set ctx.acc and carry on. `spills`
 //    spills the live registers, for a `continues` operation that leaves the frame only sometimes
 //  - direct: direct code, after rip is set: statements that throw a Suspend, or set acc (return it, in tail position),
-//    or declare `proc` and `args` and then run `callArray`, which calls proc with args (see DirectEmitter.#callArray)
+//    or declare `proc` and `args` and then run `callArray`, which calls proc with args (see DirectEmitter.#call)
 //    or `call`, which calls `proc` (in scope) with args, leaving its value in acc
 //  - tailProc: in tail position, the first argument is what debug code records as the tail call
 // `resume`: the ip after the call, which the emitter stores (frame.ip, rip) before the template unless `setsResume`;

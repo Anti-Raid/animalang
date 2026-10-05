@@ -22,7 +22,8 @@ export type Op = { ip: number, where?: SourcePos | null } & (
     | { k: "Else"; end: number }
     | { k: "EndIf" }
     // `one`: the call wants one value, the first of what the procedure returns (or <#void>): see MoveAcc
-    | { k: "Call"; proc: number; start: number; nargs: number; tail: boolean; one?: true }
+    // `many`: the call's values are bound at once to that many names (see Unpack's `many`)
+    | { k: "Call"; proc: number; start: number; nargs: number; tail: boolean; one?: true; many?: number }
     | { k: "Return"; src: number }
     | { k: "NewClosure"; dst: number; tmpl: number }
     | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }
@@ -33,7 +34,7 @@ export type Op = { ip: number, where?: SourcePos | null } & (
     | { k: "EndLoop"; head: number }
     // an %escape: jump to the end of a %block
     | { k: "Jump"; target: number }
-    | { k: "Unpack"; src: number; start: number; count: number; flags: number }
+    | { k: "Unpack"; src: number; start: number; count: number; flags: number; many?: true }
     | { k: "SetMark"; key: number; val: number }
     | { k: "MarkSave" | "MarkRestore"; reg: number }
     | { k: "CurMarks"; dst: number }

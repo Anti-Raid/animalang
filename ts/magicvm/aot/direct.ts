@@ -22,12 +22,13 @@ export class DirectEmitter extends FunctionEmitter {
 
     protected readonly accExpr = "acc";
     protected readonly accOne = "acc";
-    // the entry being emitted is the one for a call that wants one value (Code.oneFn): it returns the first of the
-    // values it would return, and its tail calls ask the same of what they call
-    #one = false;
+    protected readonly buffered = true;
+    // how many values the calls of the entry being emitted want (Code.wanted; 0: all of them). Its tail calls ask the
+    // same of what they call
+    #want = 0;
     #params = 0;
-    // the (%values e ...) the block being emitted returns, when the entry is for one value: its Return returns the first
-    #first: string | null = null;
+    // how the Return of the block being emitted returns the (%values e ...) the block made, in an entry for a count
+    #valuesReturn: string | null = null;
     protected upvarRef(idx: number): string { return `uv${idx}`; }
     protected setUpvarExpr(idx: number, val: string): string { return `closure.upvars[${idx}] = uv${idx} = ${val}`; }
     protected readonly marksVar = "marks";
@@ -102,8 +103,8 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     // the direct entry takes the parameters' values (the rest parameter's last) as js arguments
-    emitFunction(closureArity: Arity, one: boolean = false): void {
-        this.#one = one;
+    emitFunction(closureArity: Arity, want: number = 0): void {
+        this.#want = want;
         this.#params = closureArity.params + (closureArity.rest === "none" ? 0 : 1);
         this.#selfArity = closureArity.rest === "none" ? closureArity.params : -1;
         const arity = closureArity.params + (closureArity.rest === "none" ? 0 : 1);
@@ -203,7 +204,7 @@ export class DirectEmitter extends FunctionEmitter {
     #structuredBody(seed: Facts | null = null): string | null {
         const body = new DirectEmitter(this.blocks, this.structure, this.liveness, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
         body.#selfArity = this.#selfArity;
-        body.#one = this.#one;
+        body.#want = this.#want;
         body.#params = this.#params;
         body.#seed = seed;
         body.#specCheck = this.#specCheck;
@@ -334,81 +335,61 @@ export class DirectEmitter extends FunctionEmitter {
         }
     }
 
-    // an entry for one value does not make the multiple values a block only returns: it returns the first of them
+    // an entry for a count does not make the multiple values a block only returns: it returns the first of them, or
+    // leaves as many as are wanted in VB
     protected fused(block: AotBlock, index: number): number {
         const inst = block.insts[index];
-        if (!this.#one || inst.k !== "IntCall" || inst.pos !== VALUES_POS || inst.nargs === 1 || index !== block.insts.length - 1) return 0;
-        const first = inst.nargs > 0 ? `r${inst.start}` : "undefined";
+        if (this.#want === 0 || inst.k !== "IntCall" || inst.pos !== VALUES_POS || inst.nargs === 1 || index !== block.insts.length - 1) return 0;
+        const given = windowRegs(inst.start, Math.min(inst.nargs, this.#want));
+        const returns = given.length === 0 ? "return undefined;" : this.#want === 1 ? `return r${given[0]};`
+            : `${given.map((r, i) => `VB[${i}] = r${r};`).join(" ")} return MULTI;`;
         if (block.term.k === "Return" && block.term.reg === inst.dst) {
-            this.#first = first;
+            this.#valuesReturn = returns;
             return 1;
         }
         // or the block goes on to one that only returns them (the end of the function's body): it returns here
         const target = block.term.k === "Jump" ? this.blocks.find(b => b.start === (block.term as { target: number }).target) : undefined;
         if (target === undefined || target.insts.length !== 0 || target.term.k !== "Return" || target.term.reg !== inst.dst) return 0;
-        this.emit(`return ${first};`);
+        this.emit(returns);
         return 1;
     }
 
-    // a call of `proc` with the argument expressions `args`, whose value `use` takes ("acc =", or "return" for a tail
-    // call): through the entry the site's cache keeps while the callee is a closure of the same template, else through
-    // the entry the executor finds for it (a case-lambda's clause, called in its place), else as executor.callArray does.
-    // `frame` is the callee's logical frame. `one`: the call wants one value, so it asks for the entry that returns one
-    // (and takes the first of what a call that has no such entry returns)
-    #callWith(proc: string, args: string[], use: string, marksExpr: string, frame: string, site: number | undefined, one: boolean): string {
-        const cache = site !== undefined ? `CC${site}` : null;
-        const head = `executor, depth + 1, ${marksExpr}, ${frame}`;
-        const list = args.map(a => ", " + a).join("");
-        const slow = `executor.callArray(ctx, callee, [${args.join(", ")}], depth + 1, ${marksExpr}, ${frame})`;
-        return `
-            ${cache !== null ? `if (${proc}?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.direct && depth < MAX_JS_DEPTH) {
-                ${use} ${cache}.fn(ctx, ${proc}, ${head}${list});
-            } else ` : ""}{
-                const callee = ${proc}?.constructor === CaseLambda ? ${proc}.select(${args.length}) : ${proc};
-                const fn = executor.entry(callee, ${cache}, ${args.length}, depth${one ? ", true" : ""});
-                ${use} fn !== null ? fn(ctx, callee, ${head}${list}) : ${one ? `oneValue(${slow})` : slow};
-            }
-        `;
-    }
-
-    // a tail call from direct code: stays direct when possible, otherwise suspends without rebuilding this frame
-    #tailCall(proc: string, start: number, nargs: number, site?: number): string {
-        return `
-            rip = -1;${site !== undefined ? ` tip = ${site};` : ""}
-            ${this.#callWith(proc, windowRegs(start, nargs).map(r => `r${r}`), "return", "marks", "mframe", site, this.#one)}
-        `;
-    }
-
-    // calls `proc` with the array `args` (both in scope), leaving the value in acc, or returning it for a tail call
-    #callArray(isTail: boolean): string {
-        const call = `executor.callArray(ctx, proc, args, depth + 1, marks, ${isTail ? "mframe" : "mframe + 1"})`;
-        return isTail ? `return ${this.#returned(call)};` : `acc = ${call};`;
-    }
-
     // what the entry returns of `value` (an expression that may be multiple values)
-    #returned(value: string): string {
-        return this.#one ? `oneValue(${value})` : value;
+    #returned(value: string, want: number = this.#want): string {
+        return want === 0 ? value : want === 1 ? `oneValue(${value})` : `manyValues(${value}, ${want})`;
     }
 
-    #call(procReg: number, start: number, nargs: number, resume: number, site?: number, one: boolean = false): string {
+    // a call of `proc` (in scope), leaving its value in acc, or returning it for a tail call. `args` are the argument
+    // expressions, or null for the array `args` (in scope). `want`: how many values the call wants (a tail call wants what
+    // this entry's calls do). Expressions go to this entry itself for the running closure, else to the entry the site's cache
+    // keeps for the callee's template, else to the one the executor finds, else as executor.callArray does
+    #call({ args, tail, site, want = 0, marks = "marks" }: { args: string[] | null, tail: boolean, site?: number, want?: number, marks?: string }): string {
+        if (tail) want = this.#want;
+        const use = tail ? "return" : "acc =";
+        const frame = tail ? "mframe" : "mframe + 1";
+        const array = (callee: string, list: string) => {
+            const call = `executor.callArray(ctx, ${callee}, ${list}, depth + 1, ${marks}, ${frame})`;
+            return this.#returned(call, want);
+        };
+        if (args === null) return `${use} ${array("proc", "args")};`;
+        const cache = site !== undefined ? `CC${site}` : null;
+        const rest = `executor, depth + 1, ${marks}, ${frame}${args.map(a => ", " + a).join("")}`;
         return `
-            {
-                const proc = r${procReg};
-                rip = ${resume};
-                ${this.#callProc(windowRegs(start, nargs).map(r => `r${r}`), "marks", site, one)}
+            ${tail ? `rip = -1;${site !== undefined ? ` tip = ${site};` : ""}` : ""}
+            ${!tail && args.length === this.#selfArity && want === this.#want ? `if (proc === closure && depth < MAX_JS_DEPTH) {
+                acc = direct$(ctx, proc, ${rest});
+            } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.direct && depth < MAX_JS_DEPTH) {
+                ${use} ${cache}.fn(ctx, proc, ${rest});
+            } else ` : ""}{
+                const callee = proc?.constructor === CaseLambda ? proc.select(${args.length}) : proc;
+                const fn = executor.entry(callee, ${cache}, ${args.length}, depth${want !== 0 ? `, ${want}` : ""});
+                ${use} fn !== null ? fn(ctx, callee, ${rest}) : ${array("callee", `[${args.join(", ")}]`)};
             }
         `;
     }
 
-    // calls `proc` (in scope) with `args`, leaving the value in acc: itself, when it is the running closure and this
-    // entry returns what the call wants
-    #callProc(args: string[], marksExpr: string = "marks", site?: number, one: boolean = false): string {
-        const list = args.map(a => ", " + a).join("");
-        return `
-            ${args.length === this.#selfArity && one === this.#one ? `if (proc === closure && depth < MAX_JS_DEPTH) {
-                acc = direct$(ctx, proc, executor, depth + 1, ${marksExpr}, mframe + 1${list});
-            } else ` : ""}${this.#callWith("proc", args, "acc =", marksExpr, "mframe + 1", site, one)}
-        `;
+    #args(term: { start: number, nargs: number }): string[] {
+        return windowRegs(term.start, term.nargs).map(r => `r${r}`);
     }
 
     protected emitTerm(term: AotTerm, next: number): void {
@@ -423,16 +404,20 @@ export class DirectEmitter extends FunctionEmitter {
                 return this.emit(this.jump(term.body, next));
             case "Call":
                 return this.emit(`
-                    ${this.#call(term.proc, term.start, term.nargs, term.resume, term.at, term.one === true)}
+                    {
+                        const proc = r${term.proc};
+                        rip = ${term.resume};
+                        ${this.#call({ args: this.#args(term), tail: false, site: term.at, want: term.one === true ? 1 : term.many ?? 0 })}
+                    }
                     ${this.jump(term.resume, next)}
                 `);
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume) };
+                    const site = { args: this.#args(term), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume) };
                     return this.emit(`
                         ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}
-                        ${control.direct(site, this.#callArray(term.isTail), (args, marks) => this.#callProc(args, marks))}
+                        ${control.direct(site, this.#call({ args: null, tail: term.isTail }), (args, marks) => this.#call({ args, tail: false, marks }))}
                         ${term.isTail ? "" : this.jump(term.resume, next)}
                     `);
                 }
@@ -443,7 +428,7 @@ export class DirectEmitter extends FunctionEmitter {
                         if (res instanceof HostTail) {
                             ${term.isTail ? this.tailMark("res") : ""}
                             const proc = res.proc, args = res.args;
-                            ${this.#callArray(term.isTail)}
+                            ${this.#call({ args: null, tail: term.isTail })}
                         } else if (res instanceof ControlRequest) {
                             ${term.isTail ? this.tailMark("res") : ""}
                             ${term.isTail ? `return ${this.#returned(`res.direct(ctx, executor, closure, marks, mframe, true)`)};` : "acc = res.direct(ctx, executor, closure, marks, mframe, false);"}
@@ -455,7 +440,7 @@ export class DirectEmitter extends FunctionEmitter {
                 `);
             }
             case "TailCall":
-                return this.emit(`{ const proc = r${term.proc}; ${this.#tailCall("proc", term.start, term.nargs, term.at)} }`);
+                return this.emit(`{ const proc = r${term.proc}; ${this.#call({ args: this.#args(term), tail: true, site: term.at })} }`);
             case "MaybeSelfTailCall":
                 return this.emit(`
                     {
@@ -467,15 +452,21 @@ export class DirectEmitter extends FunctionEmitter {
                             ${this.#specCheck !== null ? `spec = ${this.#specCheck};` : ""}
                             continue top;
                         }
-                        ${this.#tailCall("proc", term.start, term.nargs, term.at)}
+                        ${this.#call({ args: this.#args(term), tail: true, site: term.at })}
                     }
                 `);
             case "Return": {
-                const first = this.#first;
-                this.#first = null;
-                if (first !== null) return this.emit(`return ${first};`);
+                const made = this.#valuesReturn;
+                this.#valuesReturn = null;
+                if (made !== null) return this.emit(made);
                 // an entry for one value returns the first of several: nothing to do where the register holds one
-                return this.emit(`return ${this.#one && !this.holdsOne(term.reg, this.#params) ? this.oneOf(`r${term.reg}`) : `r${term.reg}`};`);
+                const value = `r${term.reg}`;
+                if (this.#want === 0 || this.holdsOne(term.reg, this.#params)) return this.emit(`return ${value};`);
+                if (this.#want === 1) return this.emit(`return ${this.oneOf(value)};`);
+                // multiple values made elsewhere: the first few are moved here (as manyValues does), without a call
+                const moves = Array.from({ length: this.#want }, (_, i) => `VB[${i}] = ${i < 2 ? `tmp[${i}]` : `tmp.length > ${i} ? tmp[${i}] : undefined`}`);
+                const spill = this.#want <= 4 ? `(tmp = ${value}.values, tmp.length < 2 ? tmp[0] : (${moves.join(", ")}, MULTI))` : `manyValues(${value}, ${this.#want})`;
+                return this.emit(`return ${value}?.constructor === MultipleValues ? ${spill} : ${value};`);
             }
             default: {
                 const _: never = term;

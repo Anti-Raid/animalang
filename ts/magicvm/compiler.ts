@@ -15,6 +15,7 @@ import { INLINED, TAIL_INLINED } from "./passes/cp0";
 import { optimize } from "./passes/cp0";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
+import { VALUES_MAX } from "./values";
 
 // a body as one expression
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, null, ...body]
@@ -76,6 +77,8 @@ interface CmpOpts {
     isTail: boolean // whether this is a tail-call or not (for tco)
     // the %call being compiled wants one value (see #compileNormalCall)
     one?: boolean
+    // the %call being compiled has its values bound at once to this many names (see #compileLetValues)
+    many?: number
     nodes: Node[]
     scope: CompilerScope,
     pos?: SourcePos // position of the enclosing form
@@ -255,7 +258,7 @@ export class Compiler {
                     const intrinsic = this.#intrinsicNamed("%intcall", expr)
                     const call = expr.slice(1)
                     // (%first-value (%call f arg ...) <#void>): a call that wants one value, which the callee gives
-                    // itself when it is entered for one (see Code.oneFn), with nothing to check after it
+                    // itself when it is entered for one (see Code.wanted), with nothing to check after it
                     if (intrinsic.pos === corePos("%first-value") && call.length === 3 && call[2] === undefined && Array.isArray(call[1]) && call[1][0] === CORE_CALL && call[1].length >= 3) {
                         this.#compile(call[1], { ...opts, isTail: false, one: true })
                         return
@@ -433,10 +436,12 @@ export class Compiler {
         const blocks: { start: number, size: number }[] = []
         for (const [names, rest, init] of clauses) {
             const valReg = opts.scope.allocTemp()
-            this.#compile(init, { ...opts, destReg: valReg, isTail: false })
+            // names bound to the values of a call, any missing <#void>: the call asks for that many (see Code.entry)
+            const many = !strict && rest === null && names.length >= 2 && names.length <= VALUES_MAX && Array.isArray(init) && init[0] === CORE_CALL && init.length >= 3
+            this.#compile(init, { ...opts, destReg: valReg, isTail: false, ...(many ? { many: names.length } : {}) })
             const size = names.length + (rest !== null ? 1 : 0)
             const start = opts.scope.regAlloc.allocBlock(size)
-            opts.nodes.push({ t: "Unpack", srcReg: valReg, startReg: start, count: names.length, rest: rest !== null, strict })
+            opts.nodes.push({ t: "Unpack", srcReg: valReg, startReg: start, count: names.length, rest: rest !== null, strict, many })
             const pack = this.intrinsics.pack
             if (rest !== null && pack !== undefined) {
                 const reg = start + names.length
@@ -678,8 +683,8 @@ export class Compiler {
 
     // a normal call
     #compileNormalCall(expr: any[], opts: CmpOpts) {
-        const one = opts.one === true
-        if (one) opts = { ...opts, one: false }
+        const one = opts.one === true, many = opts.many
+        if (one || many !== undefined) opts = { ...opts, one: false, many: undefined }
         // We need to compile the proc and place it on its own tempval
         const { procReg, isTemp } = this.#resolveProcReg(expr[0], opts);
 
@@ -691,7 +696,7 @@ export class Compiler {
         if (opts.isTail) {
             opts.nodes.push({t: "TailCall", nargs, procReg, startReg})
         } else {
-            opts.nodes.push({t: "Call", destReg: opts.destReg, nargs, procReg, startReg, one})
+            opts.nodes.push({t: "Call", destReg: opts.destReg, nargs, procReg, startReg, one, many})
         }
 
         opts.scope.regAlloc.freeBlock(startReg, nargs)

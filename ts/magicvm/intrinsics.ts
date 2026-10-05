@@ -19,7 +19,7 @@ export type TypeSystem = {
     coerce?(kind: Kind, expr: string): string | null,
     deps?: Record<string, unknown>,
     // the front end's code never keeps multiple values in a variable (a parameter, a local, a global): what it reads
-    // from one is one value, which a procedure entered for one value may return as it is (see Code.oneFn)
+    // from one is one value, which a procedure entered for one value may return as it is (see Code.wanted)
     oneValueVariables?: boolean,
 };
 

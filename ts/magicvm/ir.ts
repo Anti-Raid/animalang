@@ -69,6 +69,8 @@ export type Node = {
     nargs: number,
     // the call wants one value: the first the procedure returns, or <#void>
     one?: boolean,
+    // its values are bound at once to this many names
+    many?: number,
 } | {
     t: "TailCall",
     procReg: number,
@@ -116,7 +118,8 @@ export type Node = {
     startReg: number,
     count: number,
     rest: boolean,
-    strict: boolean
+    strict: boolean,
+    many?: boolean
 } | {
     // set a continuation mark on the current frame
     t: "SetMark",
@@ -256,12 +259,12 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
             case "MoveAcc": push({ k: "MoveAcc", dst: node.destReg }); break
             case "IntCall": push({ k: "IntCall", pos: use(node.pos), dst: node.destReg, start: node.startReg, nargs: node.nargs }); break
             case "IntApply": push({ k: "IntApply", pos: use(node.pos), dst: node.destReg, start: node.startReg, nargs: node.nargs }); break
-            case "Unpack": push({ k: "Unpack", src: node.srcReg, start: node.startReg, count: node.count, flags: (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0) }); break
+            case "Unpack": push({ k: "Unpack", src: node.srcReg, start: node.startReg, count: node.count, flags: (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0), ...(node.many ? { many: true as const } : {}) }); break
             case "Block": case "Loop": jump(push({ k: node.t, end: -1 }), "end", node.end); break
             case "EndLoop": jump(push({ k: "EndLoop", head: -1 }), "head", node.head); break
             case "Jump": jump(push({ k: "Jump", target: -1 }), "target", node.label); break
             case "Call":
-                push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: false, ...(node.one ? { one: true as const } : {}) })
+                push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: false, ...(node.one ? { one: true as const } : {}), ...(node.many !== undefined ? { many: node.many } : {}) })
                 if (node.destReg !== undefined) push({ k: "MoveAcc", dst: node.destReg, ...(node.one ? { one: true as const } : {}) })
                 break
             case "TailCall": push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: true }); break

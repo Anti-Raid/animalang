@@ -6,6 +6,7 @@ import { AotCompiler, Closure, ClosureTemplate, hostTailFrom, listing, type Code
 import { ASTStringifier } from '../scheme/printer';
 import { impl } from '../magicvm/meta';
 import { SyntaxPositions, TRY_CALL } from '../common';
+import { VB } from '../magicvm/values';
 
 const S = Symbol.for;
 const s = new ASTStringifier();
@@ -188,8 +189,8 @@ describe("native-scheme", () => {
         expect(run2(`(%intcall %array ${one("(%call two 1)")} ${one("(%call none)")} ${one("(%call via 5)")} ${one("(%call kept 7)")})`)).toBe("(1 #void 5 7)");
         // entered for one value, a procedure that returns several makes none
         const two = a.scope.get(Symbol.for("two")) as Closure;
-        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, false)).toMatch(/new D\d+\(\[/);
-        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, true)).not.toMatch(/new D\d+\(\[|MultipleValues/);
+        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, 0)).toMatch(/new D\d+\(\[/);
+        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, 1)).not.toMatch(/new D\d+\(\[|MultipleValues/);
         // the same procedures still return all their values to a caller that takes them
         expect(run2(`(let-values (((p q) (%call via 5)) ((r s) (%call kept 7))) (%intcall %array p q r s))`)).toBe("(5 6 7 9)");
         // through tail calls deeper than the js stack, through nested calls deeper than it, and through TRY_CALL
@@ -197,6 +198,46 @@ describe("native-scheme", () => {
         // a procedure entered for one value that yields goes on in heap frames, and still gives one
         expect(run2(`(define-global co (%intcall %coroutine-create (lambda () (%intcall %+ 100 ${one("(%call yielding 1)")}))))
                      (%intcall %array (%intcall %coroutine-resume co) (%intcall %coroutine-resume co))`)).toBe("(y 101)");
+    });
+
+    it("gives a call whose values are bound at once those values, whatever way the procedure returns", () => {
+        const a = make();
+        a.registerIntrinsic("%callable", (regs, st) => ({ [TRY_CALL]: regs[st] }), { args: [1, 1], leaf: true });
+        const run2 = (src: string) => showValue(a.evaluateRaw(a.compileRaw(src, "t.ns")));
+        const bound = (names: string, call: string) => `(%let-values (((${names}) #null ${call})) (%intcall %array ${names}))`;
+        // the call asks for as many values as there are names
+        const code = a.compileRaw(`(define-global (id x) x) ${bound("p q", "(%call id 1)")}`, "t.ns");
+        expect(listing(code).join("\n")).toMatch(/Call .*many=2[\s\S]*Unpack .*many=true/);
+        run2(`(define-global (two x) (%intcall %values x (%intcall %+ x 1)))
+              (define-global (three x) (%intcall %values x 8 9))
+              (define-global (none) (%intcall %values))
+              (define-global (id x) x)
+              (define-global (via x) (%call two x))
+              (define-global (kept x) (let ((v (%call three x))) v))
+              (define-global (deep n) (%if (%intcall %< n 1) (%intcall %values 'bottom 2) (%call deep (%intcall %+ n -1))))
+              (define-global (nest n) (%if (%intcall %< n 1) (%intcall %values 0 0)
+                  (%let-values (((p q) #null (%call nest (%intcall %+ n -1)))) (%intcall %values (%intcall %+ p 1) (%intcall %+ q 2)))))
+              (define-global wrapped (%intcall %callable (lambda (self x) (%intcall %values x 4))))
+              (define-global (yielding x) (%intcall %coroutine-yield 'y) (%intcall %values x 2))`);
+        // more values than names, then fewer (nothing is left over from the call before), none, and one
+        expect(run2(`(%intcall %array ${bound("p q", "(%call three 1)")} ${bound("p q r", "(%call two 1)")} ${bound("p q", "(%call none)")} ${bound("p q", "(%call id 5)")})`))
+            .toBe("((1 8) (1 2 #void) (#void #void) (5 #void))");
+        // entered for two values, a procedure that returns several makes no multiple values
+        const two = a.scope.get(Symbol.for("two")) as Closure;
+        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, 2)).toMatch(/VB\[1\] = /);
+        expect(AotCompiler.generateSource(two.tmpl.code, two.tmpl, 2)).not.toMatch(/new D\d+\(\[/);
+        // through a tail call, multiple values made elsewhere, calls deeper than the js stack, and TRY_CALL
+        expect(run2(`(%intcall %array ${bound("p q", "(%call via 5)")} ${bound("p q", "(%call kept 7)")} ${bound("p q", "(%call deep 20000)")} ${bound("p q", "(%call nest 20000)")} ${bound("p q", "(%call wrapped 3)")})`))
+            .toBe("((5 6) (7 8) (bottom 2) (20000 40000) (3 4))");
+        // a procedure that yields goes on in heap frames, and one whose frame a continuation runs again returns again
+        expect(run2(`(define-global co (%intcall %coroutine-create (lambda () ${bound("p q", "(%call yielding 1)")})))
+                     (%intcall %array (%intcall %coroutine-resume co) (%intcall %coroutine-resume co))`)).toBe("(y (1 2))");
+        expect(run2(`(define-global saved #void) (define-global count 0)
+                     (define-global (again) (%intcall %values (%intcall %call/cc (lambda (k) (%set! saved k) 1)) count))
+                     (define-global got ${bound("p q", "(%call again)")})
+                     (%set! count (%intcall %+ count 1))
+                     (%if (%intcall %< count 3) (%call saved 10) got)`)).toBe("(10 2)");
+        expect(VB.every(v => v === undefined)).toBe(true);
     });
 
     it("tells a cached closure from other values at a call site", () => {

@@ -63,6 +63,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
         }
     }
 
+    // whether a call that asks for several values may get them in VB (see Code.entry)
+    protected readonly buffered: boolean = false;
+
     protected fused(_block: AotBlock, _index: number): number {
         return 0;
     }
@@ -293,6 +296,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 // (%let-values of formals with no rest, not strict: one value, or the values of several, with no call)
                 if (inst.flags === 0) {
                     const regs = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i}`);
+                    // the call asked for them: they are in VB, or it is one value
+                    if (inst.many && this.buffered) return this.emit(`tmp = r${inst.src}; if (tmp === MULTI) { ${regs.map((r, i) => `${r} = VB[${i}];`).join(" ")} ${regs.map((_, i) => `VB[${i}] = `).join("")}undefined; } else { ${regs.map((r, i) => `${r} = ${i === 0 ? "tmp" : "undefined"};`).join(" ")} }`);
                     return this.emit(`tmp = r${inst.src}; if (tmp?.constructor === MultipleValues) { tmp = tmp.values; ${regs.map((r, i) => `${r} = tmp[${i}];`).join(" ")} } else { ${regs.map((r, i) => `${r} = ${i === 0 ? "tmp" : "undefined"};`).join(" ")} }`);
                 }
                 const moves = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i} = tmp[${i}];`);

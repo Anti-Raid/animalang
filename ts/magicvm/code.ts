@@ -37,11 +37,13 @@ export class Code {
     public direct: boolean = false;
     // how its closures bind their arguments (their template's arity), once compiled
     public arity: Arity | null = null;
-    // its direct entry for a call that wants one value: it returns the first of the values directFn would (<#void> of
-    // none), so its caller has nothing to check. Compiled when first asked for (AotCompiler.compileOne)
-    public oneFn: DirectFn | null = null;
-    // the entries of a closure with a rest parameter, by argument count: over directFn, and over oneFn
-    #restEntries: (DirectFn | undefined)[][] = [[], []];
+    // its direct entries for calls that say how many values they want, by that count. For one, it returns the first of
+    // the values directFn would (<#void> of none), so its caller has nothing to check. For more, it leaves up to that many
+    // in VB and returns MULTI, or returns its one value: its caller takes them at once (PROOFS.md, 8.5). Compiled when
+    // first asked for (AotCompiler.compileWant)
+    public wanted: (DirectFn | undefined)[] = [];
+    // the entries of a closure with a rest parameter, by wanted count and argument count
+    #restEntries: (DirectFn | undefined)[][] = [];
     // how often a direct call of this function ended in a suspend for call/cc, a continuation, a yield or a resume (see
     // resumeSuspend)
     public controlSuspends: number = 0;
@@ -79,14 +81,14 @@ export class Code {
     // takes), or null when such a call has to go through heap frames: a padded closure's is its entry for any count
     // (missing arguments are undefined as js leaves them, extra ones ignored), and one with a rest parameter has an entry
     // per count that makes the rest of the arguments past its parameters
-    // `one`: over oneFn (which is compiled by then), for a call that wants one value
-    entry(nargs: number, one: boolean = false): DirectFn | null {
+    // `want`: over wanted[want] (which is compiled by then), for a call that wants that many values (0: all of them)
+    entry(nargs: number, want: number = 0): DirectFn | null {
         if (!this.direct) return null;
-        const direct = one ? this.oneFn : this.directFn;
+        const direct = want === 0 ? this.directFn : this.wanted[want]!;
         const { params, rest, pad } = this.arity!;
         if (rest === "none") return nargs === params || pad ? direct : null;
         if (nargs < params && !pad) return null;
-        return this.#restEntries[one ? 1 : 0][nargs] ??= restEntry(direct!, this.arity!, nargs);
+        return (this.#restEntries[want] ??= [])[nargs] ??= restEntry(direct!, this.arity!, nargs);
     }
 
     get pack(): IntrinsicFn | null {
