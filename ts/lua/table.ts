@@ -30,8 +30,7 @@ const NO_INDEX = new Map<any, number>();
 const NO_WEAK_INDEX = new WeakMap<object, number>();
 
 // the names of a constructor's fields, in order (as the template Luau copies such a table from, LOP_DUPTABLE)
-// (its parts are private, so a constant pool that freezes what it is given leaves the keys an ordinary array: reading a
-// frozen one is several times slower)
+// (its parts are private: they are tables' own storage, not what a constant holds, so they are not marked as one)
 export class RecordShape {
     readonly #keys: string[];
     readonly #index: Map<string, number>;

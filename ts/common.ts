@@ -250,6 +250,32 @@ export const ensureCanBind = (param: any, seen: Set<symbol> | undefined, syntaxC
     if (SPECIAL_FORMS.has(param)) throw new VMError(Msg.BadSyntax, [param]);
 }
 
+// What programs quote (%quote), and everything those objects hold: constants. Compiled code keeps them (across runs,
+// and across the instances that share code) and the optimizer reads them when compiling, so nothing may change one.
+// They are marked, not frozen (V8 reads a frozen array ten times slower than an ordinary one): whatever changes an
+// object in place refuses a constant. An array carries the mark as a property too (QUOTED), which generated code
+// tests for nothing, where looking a value up here costs a few nanoseconds
+const quoted = new WeakSet<object>();
+export const QUOTED: unique symbol = Symbol("quoted");
+
+// whether `value` is a constant a program quoted, or part of one: an object the host must not change
+export const isQuotedConstant = (value: unknown): boolean => typeof value === "object" && value !== null && quoted.has(value);
+
+const markQuoted = (root: unknown): void => {
+    const pending = [root];
+    while (pending.length > 0) {
+        const v = pending.pop();
+        if (typeof v !== "object" || v === null || quoted.has(v)) continue;
+        quoted.add(v);
+        if (Array.isArray(v)) {
+            if (Object.isExtensible(v)) Object.defineProperty(v, QUOTED, { value: true });
+            for (const x of v) pending.push(x);
+        } else {
+            for (const key of Object.keys(v)) pending.push((v as any)[key]);
+        }
+    }
+};
+
 /** A simple structure for registering constants */
 export class ConstPool {
     #known: Map<unknown, number>;
@@ -280,22 +306,14 @@ export class ConstPool {
         }
 
         // TODO: Deduplicate stuff later
-        return this.constants.push(this.#freezeObj(s)) - 1
+        markQuoted(s)
+        return this.constants.push(s) - 1
     }
 
     mutPush(s: unknown) {
         return this.constants.push(s) - 1
     }
 
-    #freezeObj(obj: any) {
-        if (typeof obj !== "object" || obj === null || isDatum(obj)) return obj;
-        Object.keys(obj).forEach(prop => {
-            if (typeof obj[prop] === 'object' && !Object.isFrozen(obj[prop])) {
-                this.#freezeObj(obj[prop]);
-            }
-        });
-        return Object.freeze(obj);
-    }
 }
 
 let n = 0

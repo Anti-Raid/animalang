@@ -1,4 +1,4 @@
-import { Env, ErrorObject, IProcedure, OpaqueValue, isDeepEqual, symGen } from "../common";
+import { Env, ErrorObject, IProcedure, OpaqueValue, QUOTED, isDeepEqual, isQuotedConstant, symGen } from "../common";
 import { Table } from "./table";
 import { ASTStringifier } from "./printer";
 import { add, div, exact, isExactInteger, isNum, modulo, mul, neg, quotient, remainder, requireNum, sameKind, sub, type Num } from "./numbers";
@@ -114,6 +114,13 @@ const requireTable = (name: string, val: any): Table => {
 const requireVector = (name: string, val: any): any[] => {
     if (!Array.isArray(val)) throw hostError(`${name} requires a vector`);
     return val;
+};
+
+// a vector to change in place: not one a program quoted (see isQuotedConstant)
+const requireMutableVector = (name: string, val: any): any[] => {
+    const vec = requireVector(name, val);
+    if (isQuotedConstant(vec)) throw hostError(`${name}: cannot change a constant vector`);
+    return vec;
 };
 
 const vectorIndex = (name: string, vec: any[], k: any): number => {
@@ -406,10 +413,10 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
         return vec[vectorIndex("vector-ref", vec, regs[start + 1])];
     }, (args, slow) => args.length !== 2 ? null : `(${vectorIndexOk(args[0], args[1])} ? ${args[0]}[${args[1]}] : ${slow})`),
     builtin("vector-set!", 3, 3, (regs, start) => {
-        const vec = requireVector("vector-set!", regs[start]);
+        const vec = requireMutableVector("vector-set!", regs[start]);
         vec[vectorIndex("vector-set!", vec, regs[start + 1])] = regs[start + 2];
         return undefined;
-    }, (args, slow) => args.length !== 3 ? null : `(${vectorIndexOk(args[0], args[1])} ? (${args[0]}[${args[1]}] = ${args[2]}, undefined) : ${slow})`),
+    }, (args, slow, _tmp, d) => args.length !== 3 ? null : `(${vectorIndexOk(args[0], args[1])} && ${args[0]}[${d.QUOTED}] !== true ? (${args[0]}[${args[1]}] = ${args[2]}, undefined) : ${slow})`),
     builtin("vector->list", 1, 1, (regs, start) => Cons.fromArray(requireVector("vector->list", regs[start]))),
     builtin("list->vector", 1, 1, (regs, start) => {
         const lst = regs[start];
@@ -418,7 +425,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
         throw hostError("list->vector requires a proper list");
     }),
     builtin("vector-fill!", 2, 2, (regs, start) => {
-        requireVector("vector-fill!", regs[start]).fill(regs[start + 1]);
+        requireMutableVector("vector-fill!", regs[start]).fill(regs[start + 1]);
         return undefined;
     }),
     builtin("vector-copy", 1, 1, (regs, start) => [...requireVector("vector-copy", regs[start])]),
@@ -523,7 +530,7 @@ export const SCHEME_TYPES: TypeSystem = {
 };
 
 // what the templates may refer to
-const INLINE_DEPS = { Cons, MCons, Table, IProcedure, ErrorObject, ContinuationMarkSet, MISSING: MISSING_KEY };
+const INLINE_DEPS = { Cons, MCons, Table, IProcedure, ErrorObject, ContinuationMarkSet, MISSING: MISSING_KEY, QUOTED };
 
 // (apply proc arg ... lst): the elements of lst, as the VM's %apply takes them
 const spreadList = (lst: any, into: any[] = []): any[] => {

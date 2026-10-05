@@ -1,4 +1,4 @@
-import { MissingVarError, Env, ErrorObject, OpaqueValue, TRY_CALL } from '../common';
+import { MissingVarError, Env, ErrorObject, OpaqueValue, TRY_CALL, isQuotedConstant } from '../common';
 import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createScheme } from '../scheme';
@@ -113,6 +113,22 @@ describe('Anima', () => {
             expect(() => run(`(vector-ref (vector 1) 0.5)`)).toThrow("vector-ref: index 0.5 out of bounds")
             expect(() => run(`(vector-set! '(1) 0 2)`)).toThrow("vector-set! requires a vector")
             expect(() => run(`(define (len v) (vector-length v)) (len 5)`)).toThrow("vector-length requires a vector")
+        })
+        it('a quoted constant is marked, not frozen, and is not changed in place', () => {
+            const value = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src))
+            // a quoted vector or list, and what it holds, but nothing a program makes
+            expect([`'#(1 2 3)`, `'(1 2)`, `(cadr '(1 #(2 3)))`, `(vector-ref '#(#(1)) 0)`].map(src => isQuotedConstant(value(src)))).toEqual([true, true, true, true])
+            expect([`(vector 1 2 3)`, `(list 1 2)`, `(vector-copy '#(1 2 3))`, `5`, `"s"`, `'sym`].map(src => isQuotedConstant(value(src)))).toEqual([false, false, false, false, false, false])
+            expect(Object.isFrozen(value(`'#(1 2 3)`))).toBe(false)
+            // compiled code refuses it, and so does the builtin called another way
+            run(`(define (lit) '#(1 2 3)) (define (put! v) (vector-set! v 0 9))`)
+            expect(() => run(`(put! (lit))`)).toThrow("vector-set!: cannot change a constant vector")
+            expect(() => run(`(apply vector-set! (list (lit) 0 9))`)).toThrow("vector-set!: cannot change a constant vector")
+            expect(() => run(`(vector-fill! (lit) 0)`)).toThrow("vector-fill!: cannot change a constant vector")
+            expect(() => run(`(vector-set! (cadr '(1 #(2 3))) 0 9)`)).toThrow("vector-set!: cannot change a constant vector")
+            expect(run(`(lit)`)).toBe("#(1 2 3)")
+            // a copy is the program's own
+            expect(run(`(let ((v (vector-copy (lit)))) (put! v) (list v (lit)))`)).toBe("(#(9 2 3) #(1 2 3))")
         })
 
         it('builtins in tail position are inlined with the same semantics', () => {
