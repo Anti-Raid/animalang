@@ -1,6 +1,6 @@
 // The VM's runtime values and state: frames, execution contexts, wind points, continuations, coroutines, catch tokens,
 // stack snapshots, and Suspend (how direct code hands control to heap frames)
-import { ErrorObject, IProcedure, Msg, MultipleValues, OpaqueValue, unpackValues, vmError } from "../common";
+import { ErrorObject, IProcedure, Msg, MultipleValues, OpaqueValue, VMError, unpackValues, vmError } from "../common";
 import type { Env, Formatter, SourcePos } from "../common";
 import { Caught, EXCEPTION_HANDLERS, Handlers, TAIL_TRAIL, markFirst, markOwn } from "../marks";
 import type { Marks, TailTrail } from "../marks";
@@ -572,6 +572,32 @@ export const frameInfos = (frame: Frame | null, level: number = 0): FrameInfo[] 
 
 export const formatTraceback = (frames: FrameInfo[], msg: string | undefined, fmt: Formatter): string =>
     [fmt(Msg.TracebackHeader, [msg], fmt, null), ...frames.map(f => fmt(Msg.TracebackFrame, [f.name, f.pos, f.tails], fmt, f.pos))].join("\n");
+
+// What a direct entry's catch does with `e`, thrown out of `closure`'s code: the Suspend to throw on (a stop leaves as
+// it is: no frame needs rebuilding, and no handler may see it). `regs` are the registers a heap frame resuming at `rip`
+// reads, or null when it was leaving by a tail call (`rip` -1; `tip`: that call's ip, or -1), which rebuilds no frame.
+// `dip`, `derr`: the ip an error was noted at, and that error (debug code notes the ip of everything it runs)
+export const unwind = (e: any, closure: Closure, regs: any[] | null, rip: number, tip: number, dip: number, derr: any, isite: number, ctx: ExecutionContext, marks: Marks, mframe: number): Suspend => {
+    if (e instanceof InterruptError) throw e;
+    const sig = e instanceof Suspend ? e : Suspend.error(e);
+    sig.entered = closure;
+    const code = closure.tmpl.code;
+    if (regs === null) {
+        // a tail call that failed to call (no frame is left to say where it was)
+        if (tip !== -1 && e instanceof VMError && e.at === null) e.at = code.positionAt(tip);
+        if (sig.innermost === null && sig.marks === undefined) {
+            sig.marks = marks;
+            sig.mframe = mframe;
+        }
+        return sig;
+    }
+    const f = new Frame(closure, regs, rip, null, ctx, marks, mframe);
+    if (code.debug ? !(e instanceof Suspend) : e === derr) f.posIp = dip;
+    f.isite = isite;
+    if (e instanceof VMError && e.at === null) e.at = errorPos(f);
+    sig.push(f);
+    return sig;
+};
 
 // where an error in `frame` happened
 export const errorPos = (frame: Frame | null): SourcePos | null => {

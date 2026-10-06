@@ -1,5 +1,5 @@
 // What the resume entry and the direct entry of a compiled function share (FunctionEmitter)
-import { windowRegs, type Liveness } from "./liveness";
+import { Liveness, windowRegs } from "./liveness";
 import { transfer, type Facts, type Aliases } from "./facts";
 import type { AotBlock, AotInst, AotTerm } from "./types";
 import type { Arity } from "../arity";
@@ -11,6 +11,17 @@ import type { Structure } from "./structure";
 import { CodeEmitter, inlineDeps } from "./code-emitter";
 import { CONTROL_AOT, type ControlAot } from "./control";
 
+
+// a constant as js source, when it has a literal (the others are read from the code's constants)
+const literal = (v: unknown): string | null => {
+    switch (typeof v) {
+        case "string": return JSON.stringify(v);
+        case "number": return Object.is(v, -0) ? "-0" : String(v);
+        case "bigint": return `${v}n`;
+        case "boolean": case "undefined": return String(v);
+    }
+    return v === null ? "null" : null;
+};
 
 // emits one entry point of a compiled function; subclasses decide how registers reach callees, how values come back and
 // how control leaves
@@ -41,19 +52,76 @@ export abstract class FunctionEmitter extends CodeEmitter {
     protected one = new Set<number>();
     #plain: Set<number> | null = null;
 
+    // Direct code (`substitutes`) does not move a constant, or another register, into a register there and then: where
+    // the register is read, the constant or the other register's variable is written in its place (`#atoms`). Its own
+    // variable is assigned only if a later block reads it, or before the variable it stands for is assigned. Heap code
+    // keeps every move: its registers are also read from the frame
+    protected readonly substitutes: boolean = false;
+    readonly #atoms = new Map<number, string>();
+
     protected startBlock(facts: Facts | undefined): void {
         this.facts = new Map(facts ?? []);
         this.aliases = new Map();
         this.one = new Set();
+        this.#atoms.clear();
+    }
+
+    // the js of register `reg` where it is read
+    protected use(reg: number): string {
+        return this.#atoms.get(reg) ?? `r${reg}`;
+    }
+
+    // the same, where a property of it is read or it goes into an intrinsic's template: a number is in parentheses
+    protected operand(reg: number): string {
+        const atom = this.#atoms.get(reg);
+        return atom === undefined ? `r${reg}` : /^[-\d]/.test(atom) ? `(${atom})` : atom;
+    }
+
+    // what `inst` moves into its register, when that is a constant or another register
+    #atomOf(inst: AotInst): string | null {
+        switch (inst.k) {
+            case "Move": return this.use(inst.src);
+            case "LoadInt": return literal(inst.value);
+            case "LoadConst": return literal(this.constants[inst.idx]) ?? `CONSTANTS[${inst.idx}]`;
+            default: return null;
+        }
+    }
+
+    // `reg` is about to change (its variable assigned, or itself made to stand for something): the registers that
+    // stand for its variable take its value first. So a register never stands for one that stands for something
+    #beforeWrite(reg: number): void {
+        for (const [other, atom] of [...this.#atoms]) if (atom === `r${reg}`) this.#materialise(other);
+    }
+
+    #materialise(reg: number): void {
+        const atom = this.#atoms.get(reg);
+        if (atom === undefined) return;
+        this.#atoms.delete(reg);
+        this.emit(`r${reg} = ${atom};`);
     }
 
     // a block's instructions. `fused` may emit some of them together itself, from `index` on: it says how many
     protected emitInsts(block: AotBlock): void {
         for (let i = 0; i < block.insts.length;) {
             const fused = this.fused(block, i);
-            if (fused === 0) this.emitInst(block.insts[i]);
+            if (fused === 0) {
+                const inst = block.insts[i];
+                const atom = this.substitutes ? this.#atomOf(inst) : null;
+                if (atom !== null) {
+                    const dst = (inst as { dst: number }).dst;
+                    this.#beforeWrite(dst);
+                    if (atom === `r${dst}`) this.#atoms.delete(dst);
+                    else this.#atoms.set(dst, atom);
+                } else {
+                    const defs = Liveness.defs(inst);
+                    for (const reg of defs) this.#beforeWrite(reg);
+                    this.emitInst(inst);
+                    for (const reg of defs) this.#atoms.delete(reg);
+                }
+            }
             for (const end = i + Math.max(fused, 1); i < end; i++) {
                 const inst = block.insts[i];
+                if (fused !== 0) for (const reg of Liveness.defs(inst)) this.#atoms.delete(reg);
                 transfer(inst, this.facts, this.table, this.constants, this.aliases);
                 for (const [reg, isOne] of this.#defines(inst, r => this.one.has(r))) {
                     if (isOne) this.one.add(reg);
@@ -61,6 +129,10 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 }
             }
         }
+        // what later blocks read is in its variable from here on; a self tail call moves registers about, so all are
+        const term = block.term;
+        const live = this.liveness.liveOut(term);
+        for (const reg of [...this.#atoms.keys()]) if (term.k === "MaybeSelfTailCall" || live.has(reg)) this.#materialise(reg);
     }
 
     // whether a call that asks for several values may get them in VB (see Code.entry)
@@ -122,7 +194,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
 
     // a branch's condition: a known boolean as it is
     protected truthy(reg: number): string {
-        return this.facts.get(reg) === "boolean" ? `r${reg}` : `(r${reg} !== false)`;
+        return this.facts.get(reg) === "boolean" ? this.use(reg) : `(${this.use(reg)} !== false)`;
     }
 
     // debug code only: statement recording the exact position of the op about to run
@@ -140,14 +212,20 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
     // the AOT code of a core control operation a HostCall calls, if it is one
+    // the test that what a host intrinsic returned is a request (`cls`: ControlRequest, or HostTail): only an object
+    // can be, and most results are not objects, which `typeof` tells without looking at a prototype chain
+    protected isRequest(v: string, cls: string): string {
+        return `typeof ${v} === "object" && ${v} !== null && ${v} instanceof ${cls}`;
+    }
+
     protected controlOf(term: Extract<AotTerm, { k: "HostCall" }>): ControlAot | undefined {
         return term.pos < CORE_COUNT ? CONTROL_AOT.get(this.table!.entries[term.pos].name) : undefined;
     }
 
     protected tailProcOf(term: AotTerm): string | undefined {
-        if (term.k === "HostCall" && term.isTail && this.controlOf(term)?.tailProc) return `r${term.start}`;
+        if (term.k === "HostCall" && term.isTail && this.controlOf(term)?.tailProc) return this.use(term.start);
         switch (term.k) {
-            case "TailCall": case "MaybeSelfTailCall": return `r${term.proc}`;
+            case "TailCall": case "MaybeSelfTailCall": return this.use(term.proc);
             default: return undefined;
         }
     }
@@ -197,7 +275,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected argList(start: number, nargs: number): string {
-        return windowRegs(start, nargs).map(r => `r${r}`).join(", ");
+        return windowRegs(start, nargs).map(r => this.use(r)).join(", ");
     }
 
     protected jump(target: number, next: number): string {
@@ -232,15 +310,15 @@ export abstract class FunctionEmitter extends CodeEmitter {
         if (this.debug) this.emit(this.debugHooks(inst));
         switch (inst.k) {
             case "LoadConst":
-                return this.emit(`r${inst.dst} = CONSTANTS[${inst.idx}];`);
+                return this.emit(`r${inst.dst} = ${literal(this.constants[inst.idx]) ?? `CONSTANTS[${inst.idx}]`};`);
             case "LoadInt":
                 return this.emit(`r${inst.dst} = ${inst.value};`);
             case "LoadUpvar":
                 return this.emit(`r${inst.dst} = ${this.upvarRef(inst.idx)}${inst.unbox ? ".val" : ""};`);
             case "SetUpvar":
-                return this.emit(`${this.setUpvarExpr(inst.idx, inst.box ? `new Box(r${inst.src})` : `r${inst.src}`)};`);
+                return this.emit(`${this.setUpvarExpr(inst.idx, inst.box ? `new Box(${this.use(inst.src)})` : this.use(inst.src))};`);
             case "FixUpvar":
-                return this.emit(`r${inst.clo}.upvars[${inst.idx}] = r${inst.src};`);
+                return this.emit(`${this.operand(inst.clo)}.upvars[${inst.idx}] = ${this.use(inst.src)};`);
             case "LoadGlobal":
                 return this.emit(`
                     {
@@ -267,27 +345,27 @@ export abstract class FunctionEmitter extends CodeEmitter {
                     }
                 `);
             case "SetGlobal":
-                return this.emit(`ctx.scope.set(CONSTANTS[${inst.sym}], r${inst.src});`);
+                return this.emit(`ctx.scope.set(CONSTANTS[${inst.sym}], ${this.use(inst.src)});`);
             case "Move":
-                return this.emit(`r${inst.dst} = r${inst.src};`);
+                return this.emit(`r${inst.dst} = ${this.use(inst.src)};`);
             case "Box":
-                return this.emit(`r${inst.dst} = new Box(r${inst.src});`);
+                return this.emit(`r${inst.dst} = new Box(${this.use(inst.src)});`);
             case "Unbox":
-                return this.emit(`r${inst.dst} = r${inst.src}.val;`);
+                return this.emit(`r${inst.dst} = ${this.operand(inst.src)}.val;`);
             case "SetBox":
-                return this.emit(`r${inst.dst}.val = r${inst.src};`);
+                return this.emit(`${this.operand(inst.dst)}.val = ${this.use(inst.src)};`);
             case "NewClosure": {
-                const captures = inst.captures.map(c => c.local ? `r${c.index}` : this.upvarRef(c.index)).join(", ");
+                const captures = inst.captures.map(c => c.local ? this.use(c.index) : this.upvarRef(c.index)).join(", ");
                 return this.emit(`r${inst.dst} = new Closure(CONSTANTS[${inst.tmpl}], [${captures}]);`);
             }
             case "MoveAcc":
                 return this.emit(`r${inst.dst} = ${inst.one ? this.accOne : this.accExpr};`);
             case "SetMark":
-                return this.emit(`${this.marksVar} = markSet(${this.marksVar}, ${this.mframeVar}, r${inst.key}, r${inst.val});`);
+                return this.emit(`${this.marksVar} = markSet(${this.marksVar}, ${this.mframeVar}, ${this.use(inst.key)}, ${this.use(inst.val)});`);
             case "MarkSave":
                 return this.emit(`r${inst.reg} = ${this.marksVar}; r${inst.reg + 1} = ${this.mframeVar}; ${this.mframeVar}++;`);
             case "MarkRestore":
-                return this.emit(`${this.marksVar} = r${inst.reg}; ${this.mframeVar} = r${inst.reg + 1};`);
+                return this.emit(`${this.marksVar} = ${this.use(inst.reg)}; ${this.mframeVar} = ${this.use(inst.reg + 1)};`);
             case "CurMarks":
                 return this.emit(`r${inst.dst} = new ContinuationMarkSet(${this.marksVar});`);
             case "SetSite":
@@ -297,12 +375,12 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 if (inst.flags === 0) {
                     const regs = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i}`);
                     // the call asked for them: they are in VB, or it is one value
-                    if (inst.many && this.buffered) return this.emit(`tmp = r${inst.src}; if (tmp === MULTI) { ${regs.map((r, i) => `${r} = VB[${i}];`).join(" ")} ${regs.map((_, i) => `VB[${i}] = `).join("")}undefined; } else { ${regs.map((r, i) => `${r} = ${i === 0 ? "tmp" : "undefined"};`).join(" ")} }`);
-                    return this.emit(`tmp = r${inst.src}; if (tmp?.constructor === MultipleValues) { tmp = tmp.values; ${regs.map((r, i) => `${r} = tmp[${i}];`).join(" ")} } else { ${regs.map((r, i) => `${r} = ${i === 0 ? "tmp" : "undefined"};`).join(" ")} }`);
+                    if (inst.many && this.buffered) return this.emit(`tmp = ${this.use(inst.src)}; if (tmp === MULTI) { ${regs.map((r, i) => `${r} = VB[${i}];`).join(" ")} ${regs.map((_, i) => `VB[${i}] = `).join("")}undefined; } else { ${regs.map((r, i) => `${r} = ${i === 0 ? "tmp" : "undefined"};`).join(" ")} }`);
+                    return this.emit(`tmp = ${this.use(inst.src)}; if (tmp?.constructor === MultipleValues) { tmp = tmp.values; ${regs.map((r, i) => `${r} = tmp[${i}];`).join(" ")} } else { ${regs.map((r, i) => `${r} = ${i === 0 ? "tmp" : "undefined"};`).join(" ")} }`);
                 }
                 const moves = Array.from({ length: inst.count }, (_, i) => `r${inst.start + i} = tmp[${i}];`);
                 if ((inst.flags & UNPACK_REST) !== 0) moves.push(`r${inst.start + inst.count} = restValues(tmp, ${inst.count});`);
-                return this.emit(`tmp = unpackForBinding(r${inst.src}, ${inst.count}, ${inst.flags}); ${moves.join(" ")}`);
+                return this.emit(`tmp = unpackForBinding(${this.use(inst.src)}, ${inst.count}, ${inst.flags}); ${moves.join(" ")}`);
             }
             case "IntCall":
                 // non-debug code does not record where each operation is: an error the intrinsic raises gets the position here
@@ -313,7 +391,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "IntApply": {
                 // an array alone is the argument array itself: intrinsics never write to or keep it
                 const entry = this.table!.entries[inst.pos];
-                const args = inst.nargs === 1 ? `arrayArg("%apply", r${inst.start})` : `applyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs})`;
+                const args = inst.nargs === 1 ? `arrayArg("%apply", ${this.use(inst.start)})` : `applyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs})`;
                 const call = `r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, ${args}, ctx, executor);`;
                 if (this.debug || inst.at === undefined) return this.emit(call);
                 return this.emit(`try { ${call} } catch (e) { ${this.errorSite(inst.at, "e")} throw e; }`);
@@ -343,7 +421,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
         const result = Intrinsics.resultKind(entry, known);
         const typedSlow = result === undefined ? slow : result === "boolean" ? `!!${slow}` : this.table?.types?.coerce?.(result, slow) ?? slow;
         const site = entry.site !== undefined && at !== undefined ? `SC${at}` : undefined;
-        const inlined = entry.inline(regs.map(r => `r${r}`), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known, site);
+        const inlined = entry.inline(regs.map(r => this.operand(r)), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known, site);
         return inlined ?? direct;
     }
 

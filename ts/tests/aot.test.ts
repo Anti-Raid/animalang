@@ -156,6 +156,27 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         expect(AotCompiler.generateSource(t2.code, t2)).toContain('typeof ');
     });
 
+    it("reads constants and moved registers in place, and leaves a failure to one helper", () => {
+        const anima = createScheme(impl);
+        const bc = anima.compileRaw(`(define (inc x) (+ x 1)) (define (name) "s")
+            (define (swap a b n) (if (= n 0) (list a b) (swap b a (- n 1))))
+            (define (rot a b c n) (if (= n 0) (list a b c) (let ((t a)) (rot b c t (- n 1)))))`) as Code;
+        const source = (name: string) => {
+            const fn = bc.constants.find((c: any) => c instanceof Closure && c.debugName === name)!;
+            const src = AotCompiler.generateSource(fn.tmpl.code, fn.tmpl);
+            return src.slice(src.indexOf("direct: function"));
+        };
+        // no move of x or of 1 into registers of their own; a string is a literal
+        expect(source("inc")).toMatch(/r\d+ = \(+r0 \+ \(1\)\)+;/);
+        expect(source("name")).toMatch(/return "s";|r\d+ = "s";/);
+        expect(source("inc")).toMatch(/throw unwind\(e, closure, /);
+        expect(source("inc")).not.toMatch(/new Frame/);
+        anima.evaluateRaw(bc);
+        const run = (src: string) => new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw(src)));
+        // arguments that are each other's registers are moved through their old values
+        expect([run("(swap 1 2 3)"), run("(swap 1 2 4)"), run("(rot 1 2 3 1)"), run("(rot 1 2 3 2)"), run("(inc 41)"), run("(name)")]).toEqual(["(2 1)", "(1 2)", "(2 3 1)", "(3 1 2)", "42", '"s"']);
+    });
+
     it("knows bigints too, through Scheme's kinds", () => {
         const anima = createScheme(impl);
         const bc = anima.compileRaw("(define (pow2 n) (let loop ((i 0n) (acc 1n)) (if (= i n) acc (loop (+ i 1n) (* acc 2n)))))") as Code;
@@ -163,8 +184,8 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         const src = AotCompiler.generateSource(fn.tmpl.code, fn.tmpl);
         const direct = src.slice(src.indexOf("direct: function"));
         // i and acc are known bigints: + and * on them are bare
-        expect(direct).toMatch(/r\d+ = \(\(r\d+ \+ r\d+\)\);/);
-        expect(direct).toMatch(/r\d+ = \(\(r\d+ \* r\d+\)\);/);
+        expect(direct).toMatch(/r\d+ = \(\(r\d+ \+ \(1n\)\)\);/);
+        expect(direct).toMatch(/r\d+ = \(\(r\d+ \* \(2n\)\)\);/);
         anima.evaluateRaw(bc);
         expect(new ASTStringifier().stringify(anima.evaluateRaw(anima.compileRaw("(pow2 70n)")))).toBe("1180591620717411303424");
     });

@@ -174,7 +174,7 @@ export class ResumeEmitter extends FunctionEmitter {
                     frame.ip = ${term.resume};
                     {
                         const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
-                        if (res instanceof ControlRequest) {
+                        if (${this.isRequest("res", "ControlRequest")}) {
                             ${term.isTail ? this.tailMark("res") : this.#spills(live.spillsFor(term.resume))}
                             return res.run(ctx, executor, frame, ${term.isTail});
                         }

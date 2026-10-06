@@ -38,7 +38,7 @@ export type IntrinsicOptions = {
     // never calls back into the VM (never returns a tail request): an IntCall, and not a call for the boxing analysis
     leaf?: boolean,
     // AOT template: (argument expressions, the direct call, a scratch variable, the deps' local names) => js expression,
-    // or null to make the direct call. Argument expressions are plain variables, so they may be repeated. Its code outside
+    // or null to make the direct call. Argument expressions are plain variables or constants (a number in parentheses), so they may be repeated. Its code outside
     // the direct call must not throw: errors are the function's (an expression that never makes the call needs no
     // handler for where they happened)
     inline?: InlineFn,

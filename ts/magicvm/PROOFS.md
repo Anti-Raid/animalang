@@ -324,6 +324,20 @@ Other exits do not resume this activation at an arbitrary ip:
 
 Direct code never resumes in the middle of a function. When it suspends, it rebuilds a frame at `rip`, which is a resume point, with every register (`allRegs`), so I1 holds there too. □
 
+### 4.5 Registers read in place (direct code)
+
+Direct code keeps registers in JS variables `ri`, and within a block does not emit `Move`, `LoadInt` or `LoadConst`: it records that the register *stands for* an atom, which is a literal, a constant's slot `CONSTANTS[k]`, or another register's variable `rj`, and writes the atom wherever the register is read (`use`, `operand`). The variable `ri` is assigned (*materialised*) only in two places.
+
+**Invariant.** *At every point of a block, for every register $i$: if $i$ stands for an atom $a$, the value of $a$ there is the value register $i$ has in the unchanged program; otherwise `ri` holds it. No register stands for the variable of a register that itself stands for something.*
+
+*Proof.* By induction over the block's instructions, all atoms being dropped where a block starts.
+1. **A literal or `CONSTANTS[k]`** never changes, so it keeps the value.
+2. **`rj` changes only where it is assigned,** which generated code does at an instruction that defines $j$, or where $j$ is materialised. Before either, and before $j$ is made to stand for something (which leaves `rj` as it is, but would break the second clause), every register standing for `rj` is materialised (`#beforeWrite`), taking the value `rj` still has. By the second clause none of those is itself stood for, so this assigns no variable another register stands for, and ends.
+3. **An instruction reads its operands through their atoms** before it assigns what it defines, and its own registers' atoms are dropped after, so `r5 = r5 + 1` with 5 standing for a literal reads the literal.
+4. **A `Move` from a register that stands for an atom** records that atom, not the register, so the second clause holds for the new entry.
+
+**Where a variable must hold the value.** A register read in a later block (in `liveOut` of the block's terminator, the union of its successors' `liveIn`, 4.4) is materialised before the terminator. That covers the frame a `Suspend` rebuilds: it reads the registers live at resume points, a resume point is a successor of the `Call` or `HostCall` that ends the block, and `rip` is set only there. An error thrown inside a block rebuilds a frame that is never resumed (4.4), so what its registers hold is not read. A self tail call assigns the parameters' variables from the argument registers one after another, so every register is materialised before it. A terminator otherwise only reads registers, through their atoms, before anything is assigned. Heap code keeps every move: its frame's `regs` are read by the calls it makes. □
+
 ---
 
 ## 5. Changes from this sweep

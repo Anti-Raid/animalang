@@ -23,6 +23,7 @@ export class DirectEmitter extends FunctionEmitter {
     protected readonly accExpr = "acc";
     protected readonly accOne = "acc";
     protected readonly buffered = true;
+    protected readonly substitutes = true;
     // how many values the calls of the entry being emitted want (Code.wanted; 0: all of them). Its tail calls ask the
     // same of what they call
     #want = 0;
@@ -176,25 +177,7 @@ export class DirectEmitter extends FunctionEmitter {
         }
         this.emit(`
                 } catch (e) {
-                    // a stop leaves as it is: no frame needs rebuilding, and no handler may see it
-                    if (e instanceof InterruptError) throw e;
-                    const sig = e instanceof Suspend ? e : Suspend.error(e);
-                    sig.entered = closure;
-                    if (rip === -1) {
-                        // a tail call that failed to call (no frame is left to say where it was)
-                        if (tip !== -1 && e instanceof VMError && e.at === null) e.at = closure.tmpl.code.positionAt(tip);
-                        if (sig.innermost === null && sig.marks === undefined) {
-                            sig.marks = marks;
-                            sig.mframe = mframe;
-                        }
-                    } else {
-                        const f = new Frame(closure, [${allRegs}], rip, null, ctx, marks, mframe);
-                        ${this.debug ? "if (!(e instanceof Suspend)) f.posIp = dip;" : "if (e === derr) f.posIp = dip;"}
-                        ${this.#hasSites ? "f.isite = isite;" : ""}
-                        if (e instanceof VMError && e.at === null) e.at = errorPos(f);
-                        sig.push(f);
-                    }
-                    throw sig;
+                    throw unwind(e, closure, rip === -1 ? null : [${allRegs}], rip, tip, dip, ${this.debug ? "undefined" : "derr"}, ${this.#hasSites ? "isite" : "-1"}, ctx, marks, mframe);
                 }
             }
         `);
@@ -341,8 +324,8 @@ export class DirectEmitter extends FunctionEmitter {
         const inst = block.insts[index];
         if (this.#want === 0 || inst.k !== "IntCall" || inst.pos !== VALUES_POS || inst.nargs === 1 || index !== block.insts.length - 1) return 0;
         const given = windowRegs(inst.start, Math.min(inst.nargs, this.#want));
-        const returns = given.length === 0 ? "return undefined;" : this.#want === 1 ? `return r${given[0]};`
-            : `${given.map((r, i) => `VB[${i}] = r${r};`).join(" ")} return MULTI;`;
+        const returns = given.length === 0 ? "return undefined;" : this.#want === 1 ? `return ${this.use(given[0])};`
+            : `${given.map((r, i) => `VB[${i}] = ${this.use(r)};`).join(" ")} return MULTI;`;
         if (block.term.k === "Return" && block.term.reg === inst.dst) {
             this.#valuesReturn = returns;
             return 1;
@@ -389,7 +372,7 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     #args(term: { start: number, nargs: number }): string[] {
-        return windowRegs(term.start, term.nargs).map(r => `r${r}`);
+        return windowRegs(term.start, term.nargs).map(r => this.use(r));
     }
 
     protected emitTerm(term: AotTerm, next: number): void {
@@ -405,7 +388,7 @@ export class DirectEmitter extends FunctionEmitter {
             case "Call":
                 return this.emit(`
                     {
-                        const proc = r${term.proc};
+                        const proc = ${this.use(term.proc)};
                         rip = ${term.resume};
                         ${this.#call({ args: this.#args(term), tail: false, site: term.at, want: term.one === true ? 1 : term.many ?? 0 })}
                     }
@@ -425,11 +408,11 @@ export class DirectEmitter extends FunctionEmitter {
                     {
                         rip = ${term.isTail ? -1 : term.resume};
                         const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
-                        if (res instanceof HostTail) {
+                        if (${this.isRequest("res", "HostTail")}) {
                             ${term.isTail ? this.tailMark("res") : ""}
                             const proc = res.proc, args = res.args;
                             ${this.#call({ args: null, tail: term.isTail })}
-                        } else if (res instanceof ControlRequest) {
+                        } else if (${this.isRequest("res", "ControlRequest")}) {
                             ${term.isTail ? this.tailMark("res") : ""}
                             ${term.isTail ? `return ${this.#returned(`res.direct(ctx, executor, closure, marks, mframe, true)`)};` : "acc = res.direct(ctx, executor, closure, marks, mframe, false);"}
                         } else {
@@ -440,11 +423,11 @@ export class DirectEmitter extends FunctionEmitter {
                 `);
             }
             case "TailCall":
-                return this.emit(`{ const proc = r${term.proc}; ${this.#call({ args: this.#args(term), tail: true, site: term.at })} }`);
+                return this.emit(`{ const proc = ${this.use(term.proc)}; ${this.#call({ args: this.#args(term), tail: true, site: term.at })} }`);
             case "MaybeSelfTailCall":
                 return this.emit(`
                     {
-                        const proc = r${term.proc};
+                        const proc = ${this.use(term.proc)};
                         if (proc === closure) {
                             ${this.selfMoves(term)}
                             ${this.#selfTailCount()}
@@ -460,7 +443,7 @@ export class DirectEmitter extends FunctionEmitter {
                 this.#valuesReturn = null;
                 if (made !== null) return this.emit(made);
                 // an entry for one value returns the first of several: nothing to do where the register holds one
-                const value = `r${term.reg}`;
+                const value = this.use(term.reg);
                 if (this.#want === 0 || this.holdsOne(term.reg, this.#params)) return this.emit(`return ${value};`);
                 if (this.#want === 1) return this.emit(`return ${this.oneOf(value)};`);
                 // multiple values made elsewhere: the first few are moved here (as manyValues does), without a call

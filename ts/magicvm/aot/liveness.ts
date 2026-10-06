@@ -31,6 +31,18 @@ export class Liveness {
         return [...regs].sort((a, b) => a - b);
     }
 
+    // the registers read after a block that ends in `term`, in the blocks it goes on to
+    liveOut(term: AotTerm): Set<number> {
+        const live = new Set<number>();
+        for (const succ of Liveness.#successors(term)) for (const r of this.liveIn.get(succ) ?? []) live.add(r);
+        return live;
+    }
+
+    // registers an instruction overwrites
+    static defs(inst: AotInst): number[] {
+        return Liveness.#instDefs(inst);
+    }
+
     static #resumePoint(term: AotTerm): number | null {
         switch (term.k) {
             case "Call": return term.resume;

@@ -14,7 +14,7 @@ import type { CallCache, Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { blockStarts, type Op } from "../ops";
-import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, MULTI, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, oneValue, restValues, tailName, unpackForBinding, VB, manyValues } from "../values";
+import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, MULTI, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, oneValue, restValues, tailName, unpackForBinding, unwind, VB, manyValues } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
     markSet,
@@ -34,6 +34,7 @@ export const JIT_DEPS = {
     MissingVarError,
     VMError,
     errorPos,
+    unwind,
     Closure,
     CaseLambda,
     WindPoint,
