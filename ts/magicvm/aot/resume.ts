@@ -88,7 +88,7 @@ export class ResumeEmitter extends FunctionEmitter {
     // A tail call from heap code: through the callee's direct entry when it has one (the js stack does not grow, since
     // this returns right after), else a heap frame replacing this one. A Suspend out of the direct callee rebuilds its
     // frames on top of this frame's caller, as the call is a tail call.
-    #tailCall(proc: string, args: string, nargs: string, heapCall: string): string {
+    #tailCall(proc: string, args: string, nargs: string, ip: number, heapCall: string): string {
         return `
             const fn = frame.code.tailSuspends < ${DIRECT_SUSPEND_LIMIT} ? executor.entry(${proc}, null, ${nargs}, 0) : null;
             if (fn !== null) {
@@ -98,6 +98,7 @@ export class ResumeEmitter extends FunctionEmitter {
                 } catch (e) {
                     if (!(e instanceof Suspend)) throw e;
                     frame.code.tailSuspends++;
+                    e.locate(frame.code.positionAt(${ip}));
                     if (frame.parent !== null) e.push(frame.parent);
                     return executor.resumeSuspend(ctx, e);
                 }
@@ -188,7 +189,7 @@ export class ResumeEmitter extends FunctionEmitter {
                 return this.emit(`
                     {
                         const proc = r${term.proc};
-                        ${this.#tailCall("proc", this.argList(term.start, term.nargs), `${term.nargs}`, `
+                        ${this.#tailCall("proc", this.argList(term.start, term.nargs), `${term.nargs}`, term.ip, `
                             frame.ip = ${term.ip};
                             ${this.#spills(windowRegs(term.start, term.nargs))}
                             return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, true);
@@ -204,7 +205,7 @@ export class ResumeEmitter extends FunctionEmitter {
                             ip = 0;
                             continue top;
                         }
-                        ${this.#tailCall("proc", this.argList(term.start, term.nargs), `${term.nargs}`, `
+                        ${this.#tailCall("proc", this.argList(term.start, term.nargs), `${term.nargs}`, term.ip, `
                             frame.ip = ${term.ip};
                             ${this.#spills(windowRegs(term.start, term.nargs))}
                             return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, true);

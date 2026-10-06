@@ -282,6 +282,8 @@ export class VMContinuation extends IProcedure {
 // a function whose direct calls keep ending in a control transfer (call/cc, a continuation, a yield, an escape) or an
 // error pays for it every time: after DIRECT_SUSPEND_LIMIT of them, calls to it use heap frames, where those are cheap
 export const countControlSuspend = (code: Code): void => {
+    // (the VM's own code stays direct: an error in it is placed by the frames it leaves through)
+    if (code.internal) return;
     if (++code.controlSuspends === DIRECT_SUSPEND_LIMIT) {
         code.direct = false;
     }
@@ -455,6 +457,12 @@ export class Suspend {
     // `control`: suspended for call/cc, invoking a continuation, a yield or a coroutine resume, rather than for depth or an error
     constructor(public readonly action: SuspendAction | null, public readonly error?: any, public readonly control: boolean = false) {}
 
+    // the error it carries happened at `pos`, if nothing has said where yet (a tail call into the VM's own code leaves
+    // no frame to say)
+    locate(pos: SourcePos | null): void {
+        if (this.error instanceof VMError && this.error.at === null) this.error.at = pos;
+    }
+
     push(frame: Frame) {
         if (this.pendingEscape !== null) {
             frame.escape = this.pendingEscape;
@@ -582,9 +590,11 @@ export const unwind = (e: any, closure: Closure, regs: any[] | null, rip: number
     const sig = e instanceof Suspend ? e : Suspend.error(e);
     sig.entered = closure;
     const code = closure.tmpl.code;
+    // the error it carries, which may have come through the VM's own code without getting a position
+    const err = e instanceof Suspend ? e.error : e;
     if (regs === null) {
-        // a tail call that failed to call (no frame is left to say where it was)
-        if (tip !== -1 && e instanceof VMError && e.at === null) e.at = code.positionAt(tip);
+        // a tail call that failed, or whose callee did: no frame is left to say where it was
+        if (tip !== -1 && err instanceof VMError && err.at === null) err.at = code.positionAt(tip);
         if (sig.innermost === null && sig.marks === undefined) {
             sig.marks = marks;
             sig.mframe = mframe;
@@ -594,7 +604,7 @@ export const unwind = (e: any, closure: Closure, regs: any[] | null, rip: number
     const f = new Frame(closure, regs, rip, null, ctx, marks, mframe);
     if (code.debug ? !(e instanceof Suspend) : e === derr) f.posIp = dip;
     f.isite = isite;
-    if (e instanceof VMError && e.at === null) e.at = errorPos(f);
+    if (err instanceof VMError && err.at === null) err.at = errorPos(f);
     sig.push(f);
     return sig;
 };

@@ -388,11 +388,11 @@ export class VMExecutor {
     }
 
     // calls `proc` with a new catch token as the innermost exception handler; its value, or a Caught, is returned to `frame`
-    public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, pre: any, guarded: boolean): Frame | null {
+    public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, pre: any, guarded: boolean, args: any[] = []): Frame | null {
         const tok = frame.escape = new CatchToken(ctx.id, ctx.wind, pre, guarded);
         const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
         try {
-            return this.invoke(ctx, proc, frame, [], 0, 0, false, marks, frame.mframe + 1);
+            return this.invoke(ctx, proc, frame, args, 0, args.length, false, marks, frame.mframe + 1);
         } catch (err) {
             if (err instanceof EscapedError || err instanceof InterruptError) throw err;
             ctx.acc = new Caught(caughtValue(err, this.vm));

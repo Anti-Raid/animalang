@@ -51,7 +51,6 @@ describe("Luau lowered", () => {
         expect(run("return {} .. 'x'".replace("{}", "true"))).toBe("error: t:1: attempt to concatenate boolean with string");
         expect(run("return -nil")).toBe("error: t:1: attempt to perform arithmetic (unm) on nil");
         expect(run("local x = 1 +", "chunk.luau")).toBe("error: chunk.luau:1: Expected identifier when parsing expression, got <eof>");
-        expect(run("for k in x do end")).toBe("error: t:1: for ... in is not supported yet");
     });
 });
 
@@ -152,6 +151,54 @@ describe("Luau lowered functions", () => {
         expect(run("local t = {} t[nil] = 1")).toBe("error: t:1: table index is nil");
         expect(run("local t = {} t[0/0] = 1")).toBe("error: t:1: table index is NaN");
         expect(run("return #5")).toBe("error: t:1: attempt to get length of a number value");
+    });
+
+    // the expected values are what Luau gives
+    it("iterates with for ... in: over tables, with pairs, ipairs and next, and with any function", () => {
+        const t = "local t = {10, 20, 30, x = 'a', y = 'b'} ";
+        expect(run(t + "local s, n, m = 0, 0, 0 for i, v in ipairs(t) do s = s + i * v end for k, v in pairs(t) do n = n + 1 end for k, v in t do m = m + 1 end return s, n, m")).toBe("140\t5\t5");
+        expect(run("local t = {5, 6, 7} local out = '' for i, v in next, t do out = out .. i .. '=' .. v .. ';' end return out")).toBe("1=5;2=6;3=7;");
+        // ipairs stops at the first nil; a third variable is nil; one variable takes the key
+        expect(run("local t = {1, 2, nil, 4} local n, m = 0, 0 for i, v in ipairs(t) do n = n + 1 end for k, v in pairs(t) do m = m + 1 end return n, m")).toBe("2\t3");
+        expect(run("local n = 0 for i, v, extra in ipairs({1, 2, 3}) do n = n + i if extra ~= nil then n = -100 end end return n")).toBe("6");
+        expect(run("local t = {1, 2, 3} local s = 0 for k in pairs(t) do s = s + k end for k in t do s = s + k end return s")).toBe("12");
+        // an entry may be assigned, or removed, while the table is traversed
+        expect(run("local t = {a = 1, b = 2, c = 3} for k, v in pairs(t) do t[k] = v * 2 end return t.a, t.b, t.c")).toBe("2\t4\t6");
+        expect(run("local t = {a = 1, b = 2, c = 3} for k, v in pairs(t) do t[k] = nil end return next(t)")).toBe("nil");
+        // a function is called with the state and the last first value until that is nil
+        expect(run("local function gen(s, c) if c < 3 then return c + 1, 'v' .. c end end local out = '' for a, b in gen, nil, 0 do out = out .. a .. b end return out")).toBe("1v02v13v2");
+        expect(run("local function range(n) local i = 0 return function() i = i + 1 if i <= n then return i, i * i end end end local s = 0 for a, b in range(4) do s = s + a + b end return s")).toBe("40");
+        // each iteration has its own variables, and break and continue leave and go on
+        expect(run("local fs = {} for i, v in ipairs({7, 8, 9}) do fs[i] = function() return v * 10 + i end end return fs[1](), fs[3]()")).toBe("71\t93");
+        expect(run("local s = 0 for i, v in ipairs({1, 2, 3, 4}) do if v == 2 then continue end if v == 4 then break end s = s + v end return s")).toBe("4");
+    });
+
+    it("has next, pairs and ipairs as Luau's library does", () => {
+        expect(run("return next({}), next({7})")).toBe("nil\t1\t7");
+        expect(run("local f, s, c = ipairs({9}) return f(s, c)")).toBe("1\t9");
+        expect(run("local f, s, c = ipairs({}) return f(s, c)")).toBe("");
+        expect(run("local f = ipairs({}) return f({1, 2}, 1), f({1, 2}, '1'), f({1, 2}, 1.9)")).toBe("2\t2\t2\t2");
+        // the function pairs returns is not the global next
+        expect(run("local f = pairs({}) return f == next, f({7})")).toBe("false\t1\t7");
+    });
+
+    it("reports Luau's errors for what cannot be iterated, where the loop or the call is", () => {
+        expect(run("for x in nil do end")).toBe("error: t:1: attempt to iterate over a nil value");
+        expect(run("local n = 5\nfor x in n do end")).toBe("error: t:2: attempt to iterate over a number value");
+        expect(run("for k, v in pairs(5) do end")).toBe("error: t:1: invalid argument #1 to 'pairs' (table expected, got number)");
+        expect(run("local a, b = ipairs() return a")).toBe("error: t:1: missing argument #1 to 'ipairs' (table expected)");
+        // in tail position too, and in a function called in tail position
+        expect(run("return pairs(nil)")).toBe("error: t:1: invalid argument #1 to 'pairs' (table expected, got nil)");
+        expect(run("local function f()\n  return pairs(nil)\nend\nreturn f()")).toBe("error: t:2: invalid argument #1 to 'pairs' (table expected, got nil)");
+        // the functions pairs and ipairs return have no name; an error of the table's has no position
+        expect(run("local f = ipairs({}) return f({1, 2})")).toBe("error: t:1: missing argument #2 (number expected)");
+        expect(run("local f = pairs({}) return f()")).toBe("error: t:1: missing argument #1 (table expected)");
+        expect(run("local x = next({}, 'nope') return x")).toBe("error: invalid key to 'next'");
+    });
+
+    it("builds a constructor's items that have no key into the array part, after one that has", () => {
+        expect(run("local u = {nil, [3] = 4, 6} return #u, u[1], u[2], u[3]")).toBe("3\tnil\t6\t4");
+        expect(run("local u = {nil, [5] = 5, [-1] = 3, [3] = 1, [2.5] = 5, 4} return #u, u[2], u[3]")).toBe("3\t4\t1");
     });
 
     it("gives a function's ... to it as values", () => {
@@ -424,6 +471,84 @@ describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
         expect(wrong.slice(0, 3)).toEqual([]);
         // enough of them run to the end
         expect(expected.filter(l => !l.startsWith("error: ")).length).toBeGreaterThan(programs.length / 4);
+    }, 60000);
+
+    it("iterates with for ... in as Luau does", () => {
+        let seed = 97;
+        const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return Math.floor(seed / 4096) % n; };
+        const pick = <T,>(xs: readonly T[]): T => xs[rand(xs.length)];
+        // the order of a traversal is Luau's only for the array part, so what a loop over the rest computes does not
+        // depend on the order: counts, sums, and the entries copied to another table
+        const defs = [
+            "local t, u, seen, a, b, n, s, out = {}, {}, {}, 0, 0, 0, 0, ''",
+            "local function range(k) local i = 0 return function() i = i + 1 if i <= k then return i, i * i, 'r' end end end",
+            "local function gen(st, c) if c < st then return c + 1, c * 2 end end",
+            "local function one(st, c) if c == nil then return 1 end end",
+        ].join("\n");
+        const tables = ["t", "u"];
+        const keys = ["1", "2", "3", "4", "5", "9", "'x'", "'y'", "'z'", "true", "2.5", "0", "-1"];
+        const num = () => String(rand(9) + 1);
+        const table = (): string => {
+            const items = Array.from({ length: rand(7) }, () => {
+                const r = rand(8);
+                return r < 4 ? num() : r === 4 ? "nil" : r === 5 ? `${pick(["x", "y", "z"])} = ${num()}` : `[${pick(keys)}] = ${num()}`;
+            });
+            return `{${items.join(", ")}}`;
+        };
+        const build = (): string => {
+            const o = pick(tables);
+            switch (rand(7)) {
+                case 0: case 1: return `${o} = ${table()}`;
+                case 2: return `${o}[${pick(keys)}] = ${pick([num(), num(), "nil"])}`;
+                case 3: return `for i = 1, ${1 + rand(12)} do ${o}[${pick(["i", "i", "i * 2", "i + 2"])}] = i end`;
+                case 4: return `${o}[#${o} + 1] = ${num()}`;
+                case 5: return `local w = {} for i = 1, ${1 + rand(10)} do w[i] = i * 3 end w[${1 + rand(12)}] = nil ${o} = w`;
+                default: return `${o}.${pick(["x", "y", "z"])} = ${num()}`;
+            }
+        };
+        const body = (k: string, v: string, o: string): string => pick([
+            `n = n + 1 s = s + ${v}`,
+            `n = n + 1 seen[${k}] = ${v}`,
+            `s = s + ${v} if ${k} == 'x' or ${k} == 2 then a = a + ${v} end`,
+            `if ${v} == 3 then continue end n = n + 1`,
+            `n = n + 1 if n >= ${1 + rand(4)} then break end`,
+            `${o}[${k}] = ${v} + 1 n = n + 1`,
+            `${o}[${k}] = nil n = n + 1`,
+            `local q = ${v} seen[${k}] = function() return q + ${k === "i" ? "i" : "1"} end n = n + 1`,
+        ]);
+        const loop = (): string => {
+            const o = pick(tables);
+            switch (rand(14)) {
+                case 0: case 1: return `for i, v in ipairs(${o}) do out = out .. i .. '=' .. v .. ' ' end`;
+                case 2: return `for i, v in ipairs(${o}) do ${body("i", "v", o)} end`;
+                case 3: case 4: return `for k, v in pairs(${o}) do ${body("k", "v", o)} end`;
+                case 5: return `for k, v in ${o} do ${body("k", "v", o)} end`;
+                case 6: return `for k, v in next, ${o} do ${body("k", "v", o)} end`;
+                case 7: return `for k in ${pick([`pairs(${o})`, o, `ipairs(${o})`])} do n = n + 1 if k == 1 then a = a + 1 end end`;
+                case 8: return `for k, v, w in ${pick([`pairs(${o})`, `ipairs(${o})`, "range(3)", o])} do n = n + 1 if w ~= nil then b = b + 1 end end`;
+                case 9: return `for x, y in ${pick(["range(4)", "gen, 3, 0", "one", "gen, 0, 0", "range(0)"])} do out = out .. x .. ',' .. (y or '-') .. ' ' end`;
+                case 10: return `for i, v in ipairs(${o}) do for k, w in pairs(${pick(tables)}) do n = n + 1 s = s + v end end`;
+                case 11: return pick([`local f, st, c = ipairs(${o}) local i, v = f(st, c) a = i b = v`, `local f, st, c = pairs(${o}) b = c a = f == next`, `a = next(${o}) ~= nil`, `a = next(${o}, 'q')`]);
+                case 12: return `for k, v in ${pick(["a", "nil", "'str'", `ipairs(a)`, `pairs(out)`, "5, 6", `next, a`, "gen"])} do n = n + 1 end`;
+                default: return `local fs = {} for i, v in ipairs(${o}) do fs[i] = function() return i * 100 + v end end if fs[1] then a = fs[1]() end if fs[2] then b = fs[2]() end`;
+            }
+        };
+        const programs = Array.from({ length: 1500 }, () => {
+            const lines = [...Array.from({ length: 1 + rand(4) }, build), ...Array.from({ length: 1 + rand(4) }, () => rand(4) === 0 ? build() : loop())];
+            const tail = "local c = 0 for k, v in pairs(seen) do c = c + 1 end local f1, f2 = seen[1], seen.x if f1 ~= nil and f1 ~= 1 and f1 ~= 2 and f1 == f1 then end";
+            return `${defs}\n${lines.join("\n")}\n${tail}\nreturn n, s, out, a, b, c, #t, #u, t[1], t[2], t.x, u[1], u.y, seen[2], seen.y, seen[true]`;
+        });
+        const quote = (s: string) => JSON.stringify(s);
+        const lua = programs.map(p => `do local f, err = loadstring(${quote(p)}, "=t") if not f then print("error: " .. err) else local r = table.pack(pcall(f)) if r[1] then local out = {} for i = 2, r.n do out[#out + 1] = tostring(r[i]) end print(table.concat(out, "\\t")) else print("error: " .. tostring(r[2])) end end end`);
+        const file = join(mkdtempSync(join(tmpdir(), "luau-")), "forin.luau");
+        writeFileSync(file, lua.join("\n"));
+        const plain = (l: string) => l.replace(/(function|table): (builtin: )?0x[0-9a-f]+/g, "$1");
+        const expected = execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26, timeout: 30000 }).split("\n").slice(0, programs.length).map(plain);
+        const actual = programs.map(p => plain(run(p)));
+        const wrong = actual.flatMap((a, i) => a === expected[i] ? [] : [`${programs[i]}\n--- ours:   ${a}\n--- Luau's: ${expected[i]}`]);
+        if (process.env.LUAU_WRONG) writeFileSync(process.env.LUAU_WRONG, `${wrong.length} wrong, ${expected.filter(l => !l.startsWith("error: ")).length} ran to the end\n` + wrong.join("\n=====\n"));
+        expect(wrong.slice(0, 3)).toEqual([]);
+        expect(expected.filter(l => !l.startsWith("error: ")).length).toBeGreaterThan(programs.length / 2);
     }, 60000);
 
     it("reads and assigns locals in Luau's order", () => {

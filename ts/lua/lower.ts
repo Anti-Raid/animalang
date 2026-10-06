@@ -1,6 +1,6 @@
 // Luau's tree (syntax/ast.ts) lowered to the VM's core forms. So far: locals, assignment, compound assignment, do, if,
-// while, repeat, numeric for, break, continue, return, functions, calls and method calls, several values and `...`,
-// tables, indexing, literals, and the operators; the rest is "not supported yet"
+// while, repeat, numeric for, for ... in, break, continue, return, functions, calls and method calls, several values
+// and `...`, tables, indexing, literals, and the operators; the rest is "not supported yet"
 import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LETREC, CORE_LET_STAR, CORE_LET_VALUES, CORE_LOOP, CORE_QUOTE, CORE_SET, MultipleValues, type SourcePos } from "../common";
 import { PAD, clause } from "../magicvm/lambda";
 import { predictShapes, type Shape } from "./shapes";
@@ -43,7 +43,7 @@ const intern = (s: string): string => Object.keys({ [s]: 0 })[0];
 
 // reading and storing an entry: by name where the key is a string constant (LOP_GETTABLEKS, LOP_SETTABLEKS)
 const getter = (key: C.Expr): string => typeof key === "string" ? "%luau-field" : "%luau-index";
-const setter = (key: C.Expr): string => typeof key === "string" ? "%luau-setfield" : "%luau-setindex";
+const setter = (key: C.Expr): string => typeof key === "string" && key !== "__mode" && key !== "__call" ? "%luau-setfield" : "%luau-setindex";
 
 // the number a table constructor's key is when Luau's compiler knows it: a literal, or arithmetic on literals (Luau
 // also follows locals that are never assigned; this does not)
@@ -259,7 +259,7 @@ class Lowering {
                 this.#checkUntil(repeat, locals, index, stat);
                 return [CORE_IF, pos, this.test(repeat[2]), [CORE_ESCAPE, pos, loop.brk], [CORE_ESCAPE, pos, loop.cont]];
             }
-            case L.FORIN: return this.unsupported(stat, "for ... in");
+            case L.FORIN: return this.forIn(stat as C.ForIn, pos);
             case L.CALL: case L.METHOD: return this.call(stat as C.Call | C.Method);
         }
         return this.unsupported(stat, "this statement");
@@ -400,6 +400,44 @@ class Lowering {
                         [CORE_ESCAPE, pos, loop.brk]]])]];
     }
 
+    // for v1, ..., vn in f, s, c: LOP_FORGPREP and LOP_FORGLOOP. What the loop does each time round is decided once
+    // (%luau-for-prep): over a table by ipairs it reads the array part at the next index; over a table by pairs or next,
+    // or a table itself, it moves to the next position that has an entry; otherwise it calls f(s, c), stops when the
+    // first value is nil, and that value is the next c. Each iteration binds fresh locals
+    forIn([, names, exprs, block]: C.ForIn, pos: SourcePos): any[] {
+        this.#declare(...names);
+        const [f, s, c, kind, table, at, v] = ["f", "s", "c", "kind", "table", "at", "v"].map(n => Symbol(n));
+        const temps = names.map(() => Symbol("v"));
+        const stop = (loop: Loop, value: any) => [CORE_IF, pos, intcall(pos, "%luau-nil?", value), [CORE_ESCAPE, pos, loop.brk]];
+        const set = (name: symbol, value: any) => [CORE_SET, pos, name, value];
+        const second = temps.length > 1 ? (value: any) => [set(temps[1], value)] : () => [];
+        const called = (loop: Loop): any => {
+            const got = names.map(() => Symbol("v"));
+            const each = [stop(loop, got[0]), set(c, got[0]), ...got.map((g, i) => set(temps[i], g))];
+            const call = [CORE_CALL, pos, f, s, c];
+            return got.length === 1 ? [CORE_LET, pos, [[got[0], intcall(pos, "%first-value", call, undefined)]], ...each]
+                : [CORE_LET_VALUES, pos, [[got, null, call]], ...each];
+        };
+        return this.bind(pos, [f, s, c], exprs, [
+            [CORE_LET, pos, [[kind, intcall(pos, "%luau-for-prep", f, s, c)]],
+                [CORE_LET, pos, [[table, intcall(pos, "%luau-for-table", f, s)], [at, 0], ...temps.map(t => [t, undefined])],
+                    this.loop(pos, loop => [CORE_LOOP, pos,
+                        [CORE_BEGIN, pos,
+                            [CORE_IF, pos,
+                                intcall(pos, "%luau-eq", kind, 1),
+                                [CORE_BEGIN, pos,
+                                    set(at, intcall(pos, "%luau-add", at, 1)),
+                                    [CORE_LET, pos, [[v, intcall(pos, "%luau-array-at", table, at)]], stop(loop, v), set(temps[0], at), ...second(v)]],
+                                intcall(pos, "%luau-eq", kind, 2),
+                                [CORE_BEGIN, pos,
+                                    set(at, intcall(pos, "%luau-next-pos", table, at)),
+                                    [CORE_IF, pos, intcall(pos, "%luau-eq", at, 0), [CORE_ESCAPE, pos, loop.brk]],
+                                    set(temps[0], intcall(pos, "%luau-key-at", table, at)),
+                                    ...second(intcall(pos, "%luau-value-at", table, at))],
+                                called(loop)],
+                            [CORE_LET, pos, names.map((name, i) => [name, temps[i]]), [CORE_BLOCK, pos, loop.cont, ...this.statements(block)]]]])]]]);
+    }
+
     // a padded closure, as Luau's functions take any number of arguments: missing ones are nil, extra ones dropped, or
     // are its `...`
     function(func: C.Func): any[] {
@@ -477,6 +515,25 @@ class Lowering {
                 made([CORE_CALL, pos, f, o, ...given, v])]];
     }
 
+    // `a{x}b` is ("a%*b"):format(x), as Luau compiles it: the pieces with their % doubled, %* for each expression (one
+    // value of it), and a string constant among the expressions written into the format
+    interp(e: C.Interp): any {
+        const pos = this.pos(e);
+        const escaped = (s: string) => s.replace(/%/g, "%%");
+        let format = "";
+        const bindings: any[][] = [];
+        (e.slice(1, -1) as (string | C.Expr)[]).forEach((part, i) => {
+            if (i % 2 === 0 || typeof part === "string") format += escaped(part as string);
+            else {
+                format += "%*";
+                bindings.push([Symbol("a"), this.expr(part as C.Expr)]);
+            }
+        });
+        const fmt = intern(format);
+        const call = [CORE_CALL, pos, intcall(pos, "%luau-method", fmt, "format"), fmt, ...bindings.map(b => b[0])];
+        return [CORE_LET, pos, bindings, intcall(pos, "%first-value", call, undefined)];
+    }
+
     // an operation on `operands`, which are evaluated in order, but a local of the function is its register, read when
     // the operation runs: after the operands that follow it
     #inOrder(pos: SourcePos, operands: C.Expr[], make: (forms: any[]) => any): any {
@@ -531,12 +588,12 @@ class Lowering {
             const item = items[i];
             if (keyed(item)) {
                 const at = this.pos(item);
-                if (item[0] === L.FIELD) steps.push(intcall(at, "%luau-setfield", t, intern(item[1]), this.expr(item[2])));
+                if (item[0] === L.FIELD) steps.push(intcall(at, setter(item[1]), t, intern(item[1]), this.expr(item[2])));
                 else steps.push(this.#inOrder(at, [item[1], item[2]], ([key, v]) => intcall(at, "%luau-setindex", t, key, v)));
             } else if (i === items.length - 1 && multi !== null) {
                 steps.push(intcall(pos, "%luau-setlist", t, index, multi[0] === L.VARARGS ? this.#varargs : intcall(pos, "%values->array", this.call(multi))));
             } else {
-                steps.push(intcall(pos, "%luau-setindex", t, index++, this.expr(item)));
+                steps.push(intcall(pos, "%luau-seti", t, index++, this.expr(item)));
             }
         }
         return [CORE_LET, pos, [[t, made]], ...steps, t];
@@ -612,7 +669,7 @@ class Lowering {
             case L.INDEX: return this.#inOrder(pos, [e[1], e[2]], ([o, k]) => intcall(pos, getter(e[2] as C.Expr), o, k));
             case L.FUNCTION: return this.function(e as C.Func);
             case L.TABLE: return this.table(e as C.Table);
-            case L.INTERP: return this.unsupported(e, "an interpolated string");
+            case L.INTERP: return this.interp(e as C.Interp);
         }
         return this.unsupported(e, "this expression");
     }

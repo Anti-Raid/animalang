@@ -154,23 +154,26 @@ export class EscapeRequest extends ControlRequest {
     }
 }
 
-// (%call-catching thunk [pre [guarded]]): what %catch compiles to
+// (%call-catching thunk [pre [guarded]]): what %catch compiles to. (%apply-catching proc array) calls proc with the
+// array's elements instead (the array is the call's own from then on)
 export class CatchRequest extends ControlRequest {
     proc: any = undefined;
     pre: any = null;
     guarded: boolean = false;
+    args: any[] | null = null;
 
     static readonly #reused = new CatchRequest();
-    static of(proc: any, pre: any, guarded: boolean): CatchRequest {
+    static of(proc: any, pre: any, guarded: boolean, args: any[] | null = null): CatchRequest {
         const r = CatchRequest.#reused;
         r.proc = proc;
         r.pre = pre;
         r.guarded = guarded;
+        r.args = args;
         return r;
     }
 
     run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
-        return executor.callCatch(ctx, this.proc, frame, this.pre, this.guarded);
+        return executor.callCatch(ctx, this.proc, frame, this.pre, this.guarded, this.args ?? []);
     }
 
     direct(): any {
@@ -492,6 +495,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     control("%call/cc", [1, 1], (regs, start) => CallCCRequest.of(regs[start]));
     control("%call/ec", [1, 1], (regs, start) => EscapeRequest.of(regs[start]), false);
     control("%call-catching", [1, 3], (regs, start, nargs) => CatchRequest.of(regs[start], nargs >= 2 ? regs[start + 1] : null, nargs === 3 ? catchGuard(regs[start + 2]) : false), false);
+    control("%apply-catching", [2, 2], (regs, start) => CatchRequest.of(regs[start], null, false, arrayArg("%apply-catching", regs[start + 1])), false);
     control("%coroutine-yield", [0, Infinity], (regs, start, nargs) => YieldRequest.of(nargs === 1 ? regs[start] : packValues(copyWindow(regs, start, start + nargs))), false);
     control("%coroutine-resume", [1, Infinity], (regs, start, nargs) => ResumeRequest.of(regs[start], copyWindow(regs, start + 1, start + nargs)));
     control("%coroutine-resume-array", [2, 2], (regs, start) => ResumeRequest.of(regs[start], arrayArg("%coroutine-resume-array", regs[start + 1]).slice()));

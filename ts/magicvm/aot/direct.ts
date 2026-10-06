@@ -177,6 +177,7 @@ export class DirectEmitter extends FunctionEmitter {
         }
         this.emit(`
                 } catch (e) {
+                    for (ic = 16; ic > 0; ic--);
                     throw unwind(e, closure, rip === -1 ? null : [${allRegs}], rip, tip, dip, ${this.debug ? "undefined" : "derr"}, ${this.#hasSites ? "isite" : "-1"}, ctx, marks, mframe);
                 }
             }

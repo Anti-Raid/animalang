@@ -65,6 +65,21 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
             }
         }`,
     }],
+    ["%apply-catching", {
+        heap: s => `return executor.callCatch(ctx, ${s.args[0]}, frame, null, false, arrayArg("%apply-catching", ${s.args[1]}));`,
+        direct: s => `{
+            const tok = new CatchToken(ctx.id, ctx.wind, null, false);
+            const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
+            try {
+                acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), depth + 1, handlers, mframe + 1);
+            } catch (e) {
+                const caught = catchHere(e, tok, ctx);
+                if (caught === null) throw executor.pushEscape(e, tok, handlers, mframe);
+                countControlSuspend(closure.tmpl.code);
+                acc = caught;
+            }
+        }`,
+    }],
     ["%coroutine-yield", { heap: s => `return executor.coYield(ctx, frame, ${valuesOf(s.args)});`, direct: s => `throw Suspend.yield(${valuesOf(s.args)});` }],
     ...["%coroutine-resume", "%coroutine-resume-array"].map((name): [string, ControlAot] => [name, {
         heap: s => `return executor.coResume(ctx, ${s.isTail ? "frame.parent" : "frame"}, ${s.args[0]}, ${resumeArgs(name, s.args)}, frame.marks, frame.mframe);`,

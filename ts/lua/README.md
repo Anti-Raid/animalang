@@ -1,16 +1,20 @@
 # Luau
 
 The Luau front end, in progress: the parser (`syntax/`, see its README), the lowering to the VM's core forms
-(`lower.ts`), the operators (`ops.ts`), Luau's table (`table.ts`), numbers as strings (`number.ts`), buffers
-(`buffer.ts`), vectors (`vector.ts`) and integers (`integer.ts`). `createLuau(options)` (`index.ts`) makes an instance
-whose language is Luau.
+(`lower.ts`), the operators (`ops.ts`), Luau's table (`table.ts`), the string library (`strlib.ts`, with `matcher.ts`,
+`pattern.ts`, `format.ts`), numbers as strings (`number.ts`), buffers (`buffer.ts`), vectors (`vector.ts`) and integers
+(`integer.ts`). `createLuau(options, host)` (`index.ts`) makes an instance
+whose language is Luau; `host.print` gets each line `print` writes (without it, `console.log` does). A Luau string is
+of bytes, one char each, there and in what a chunk returns: `luauText` reads one as UTF-8.
 
 ## Lowering
 So far: locals, assignment (to locals, globals and table entries, several at once), compound assignment, `do` blocks,
-`if`, `while`, `repeat`, numeric `for`, `break`, `continue`, `return`, functions (`function`, `local function`,
-`function a.b:c()`), calls and method calls, several values and `...`, table constructors, indexing, literals,
-if-expressions, and the operators (arithmetic, `..`, comparisons, `and`, `or`, `not`, `#`). Anything else (`for ... in`,
-interpolated strings) is a positioned "not supported yet" error. Metamethods and the standard library come later.
+`if`, `while`, `repeat`, numeric `for`, `for ... in`, `break`, `continue`, `return`, functions (`function`,
+`local function`, `function a.b:c()`), calls and method calls, several values and `...`, table constructors, indexing,
+literals, interpolated strings, if-expressions, and the operators (arithmetic, `..`, comparisons, `and`, `or`, `not`,
+`#`). Anything else is a positioned "not supported yet" error. Of the standard library there are `next`, `pairs`,
+`ipairs`, `tostring`, `tonumber`, `print`, `error`, `pcall` and `string` (but `pack`, `unpack` and `packsize`); the rest, and
+metamethods, come later.
 
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
@@ -51,14 +55,16 @@ interpolated strings) is a positioned "not supported yet" error. Metamethods and
   slot per positional item, a hash slot per keyed one; keys `[1]`, `[2]`, ... in order go to the array part when there
   are no other `[]` keys; a table of fields only has a slot per distinct name, as its `DUPTABLE` template has), then
   the items in order: a keyed one is stored as an assignment is, so it overwrites a positional one before it and is
-  overwritten by one after it, and the last item, when it is a call or `...`, gives all its values (`%luau-setlist`).
+  overwritten by one after it; a positional one after a keyed one goes into the array part, grown to hold it if a
+  keyed store shrank it (`%luau-seti`, Luau's `SETLIST`), and the last item, when it is a call or `...`, gives all its
+  values (`%luau-setlist`).
   An empty constructor bound to a local gets the sizes Luau predicts from the local's assignments (`shapes.ts`, Luau's
   `TableShape.cpp`): a hash slot per field name assigned, an array slot per `t[1]`, `t[2]`, ... in order, or the bound
   of a `for i = 1, k` (`k` up to 16) that assigns `t[i]`. Sizes decide when a table grows, and so `#t` of a table with
   holes.
 - `t[k]`, `#v` and stores are `%luau-index`, `%luau-len` and `%luau-setindex` (`luaV_gettable`, `luaV_dolen`,
-  `luaV_settable`, without metamethods so far): a table's entry, a string's entry in the string library (empty until
-  the library is there, so nil), a vector's component; `attempt to index nil with 'name'` and `attempt to get length
+  `luaV_settable`, without metamethods so far): a table's entry, a string's entry in the string library, a vector's
+  component; `attempt to index nil with 'name'` and `attempt to get length
   of a number value` otherwise. Their templates test for a table inline. The kinds are `number`, `integer`, `string`
   and `table`.
 - A key that is a string constant (`t.name`, `t["name"]`, a method's name) is Luau's `GETTABLEKS`, `SETTABLEKS` and
@@ -76,6 +82,37 @@ interpolated strings) is a positioned "not supported yet" error. Metamethods and
   targets, the objects and keys of indexed targets are evaluated first, and a local that is both assigned and indexed
   by the statement is assigned last. `t[k] op= v` evaluates the object and key once, reads the entry, evaluates `v`,
   then stores.
+- `for v1, ..., vn in f, s, c` is Luau's `FORGPREP` and `FORGLOOP`. Once, before the loop (`%luau-for-prep`), it is
+  decided how it goes on: when `f` is what `ipairs` returns, over a table from index 0, each round reads the array
+  part at the next index and stops at a nil (`LuaTable.arrayAt`); when `f` is `next` (or what `pairs` returns) over a
+  table from nil, or `f` is itself a table with no `__call`, each round moves to the next position that has an entry
+  (`nextPos`, `keyAt`, `valueAt`: the array part's indexes, then the hash part's slots, as Luau walks its nodes by
+  index); otherwise `f(s, c)` is called, asked for as many values as there are variables, the loop stops when the first
+  is nil, and that value is the next `c`. Anything else is `attempt to iterate over a number value`. One loop tests
+  which it is each round, so the body is there once, and each round binds fresh locals. What a traversal by position
+  does when the table gets new keys meanwhile is unspecified in Luau and is not Luau's here; assigning or removing
+  entries it has is.
+- `next`, `pairs` and `ipairs` are procedures over intrinsics (`%luau-fn-next` ...), made when the instance is
+  (`index.ts`): they take any arguments and check them as Luau's do (`invalid argument #1 to 'pairs' (table expected,
+  got nil)`, `missing argument #1 to 'ipairs' (table expected)`). Their code is marked as the VM's own, so such an error
+  is where the function was called, as Luau reports a C function's, and they are not in tracebacks. The functions
+  `pairs` and `ipairs` return are not the global `next` and have no name, as in Luau; `invalid key to 'next'` has no
+  position, as in Luau.
+- `` `a{x}b` `` is `("a%*b"):format(x)`, as Luau compiles it: `%` in the text doubled, `%*` for each expression (one
+  value of it), a string constant among the expressions written into the format. So it calls whatever `string.format`
+  is then.
+- `tostring`, `tonumber` and `print` are made the same way (`luaB_tostring`, `luaB_tonumber`, `luaB_print`, without
+  `__tostring` so far): `tonumber(v)` reads a number or a string as arithmetic does, `tonumber(s, base)` as C's
+  `strtoull` does (a number is read as it is written; `base out of range` outside 2 to 36), and `print` hands its line
+  (the values tab-separated) to the host.
+- `pcall` is a procedure whose body is the call under a catch (`%apply-catching`, so no closure is made for it):
+  `true` and the results, or `false` and the error
+  (an error of the VM or of the library is its message, with its position). `error` is `%raise`: a string or a number
+  at level 1 is raised as the library's own errors are, so it gets the position of the frame it leaves through, which
+  is none when `pcall` called `error` itself (`pcall(error, "x")` gives `x`), as in Luau; at level 0, and for any other
+  value, the value is raised as it is. A level further up reads the position from the stack (`%current-stack`), which
+  differs from Luau's in two ways: a call in tail position leaves no frame here (Luau makes no tail calls), and the
+  library's functions are not levels (Luau counts `pcall`, and gives no position at it).
 - Luau code is compiled as not re-entrant (`reentrant: false`): Luau has no continuations that run a frame twice
   (a coroutine resumes its one suspended frame), so an assigned local needs a box only when a closure captures it.
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
@@ -106,6 +143,13 @@ when it runs.
   when it has as many keys as slots; Luau's fills earlier when keys collide. `getfield` and `setfield` are `rawget`
   and `rawset` of a string key given a cache of the slot it was last in, and `LuaTable.record` makes a table over a
   shared `RecordShape`, copied when the table first adds a key.
+- **Short ways in**: reading or storing an index of the array part (`rawget`, `rawset`, `arrayAt`), a field at its
+  cached slot (`getfield`, `setfield`) and a step of a traversal (`nextPos`, `keyAt`, `valueAt`) are a few lines
+  each, small enough for V8 to inline, that fall through to the full operation for anything else. They look at the
+  array part and the keys through second references (`#fastArray`, `#fastKeys`, `#fastVals`) that are empty arrays
+  when the table's values (or, for the hash part's values, its keys) are weak, so a weak table takes the full
+  operation every time and an ordinary one never asks whether it is weak (asking on every read cost five times the
+  read). A weak mode set on a metatable that tables already have is taken up by each at its next full operation.
 - **Hash part**: slots in insertion order, with a `Map` from key to slot, instead of Luau's hashed nodes. Luau
   guarantees only that a traversal (`next`) visits keys `1..k` in order, up to the first nil; that order is Luau's,
   and the rest comes in insertion order rather than Luau's hash order.
@@ -124,6 +168,29 @@ when it runs.
 
 `tests/luau-table.test.ts` checks it against Luau's own results; with `LUAU` set to a Luau binary, it also compares
 lengths after every write and traversals (the guaranteed order, the rest as a set) for a thousand random programs.
+
+## Strings
+`strlib.ts` is Luau's string library (`lstrlib.cpp`) but `pack`, `unpack` and `packsize`: each function takes its
+arguments as an array, checked as `luaL_check*` do (`args.ts`: a number is a string where one is wanted, a numeric
+string a number; an integer is the number cut toward zero), and is an intrinsic (`%luau-string-<name>`) under a
+procedure in the `string` table, like `pairs`. What it gives is Luau's, the messages too; how it gets there is not:
+
+- A pattern is matched by a JS `RegExp` made of it once and kept (`matcher.ts`; it needs lookbehind, so Safari 16.4):
+  classes as explicit ranges of bytes, `-` as `*?`, `%f[set]` as a lookbehind and a lookahead, `%1` as `\1`, `()` as
+  an empty group whose position is asked for. A RegExp backtracks in the order Luau's matcher does, so it finds the
+  same match. `pattern.ts` is a port of Luau's matcher, used for what a RegExp cannot say or would say differently:
+  `%b`, a malformed pattern (Luau finds it so only when matching reaches the bad part), a reference to a capture that
+  is open or a position, and a pattern long enough that Luau might call it too complex.
+- `gsub` with a function calls it through the VM (`hostCall`) and goes on when it returns; with a string that has no
+  `%`, it is JS's `replace` (which goes on after an empty match as Luau does). `gmatch` gives a closure over where the
+  last match ended.
+- `format` (`format.ts`) writes numbers as C's `printf` does: exact digits, a tie rounded to even (JS's `toFixed`
+  rounds one up, so it is used only where there is no tie), `%d` of 64 bits, `inf` and `nan` (without a sign, as the
+  C library Luau is checked against writes it). A format is parsed once and kept.
+- `upper` and `lower` change the 26 letters only; `rep` refuses a result over 2^30 bytes.
+
+`tests/luau-string.test.ts` checks the RegExp against the port on 24,000 random cases; with `LUAU` set, it compares
+12,000 random calls (patterns, formats, argument checks) and the error cases with Luau's results.
 
 ## Numbers as strings
 `num2str` is Luau's `tostring` of a number (`lnumprint.cpp`): the shortest digits that read back, fixed notation when

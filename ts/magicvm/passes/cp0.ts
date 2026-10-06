@@ -104,11 +104,15 @@ const valuesOf = (e: any, mark: (x: any) => any = x => x, around: (form: any) =>
     return null;
 };
 
+// (a variable a (%set-box! x v) stores into is used there: its binding is the box)
 const usesIn = (es: readonly any[], sym: symbol): number => {
     let n = 0;
     const walk = (x: any) => {
         if (x === sym) n++;
-        else for (const y of children(x)) walk(y);
+        else {
+            if (Array.isArray(x) && x[2] === sym && Lconv.forms.get(x[0]) === "assign") n++;
+            for (const y of children(x)) walk(y);
+        }
     };
     es.forEach(walk);
     return n;

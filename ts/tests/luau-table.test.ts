@@ -190,6 +190,36 @@ describe("a table of fields", () => {
     });
 });
 
+describe("a table's short ways in", () => {
+    it("are not taken by a table whose values are weak, which never shows a reference", () => {
+        const o = new LuaTable(), cache = { slot: 0 };
+        const t = new LuaTable().set(1, o).set(2, 5).set("x", o);
+        const read = () => [t.arrayAt(1), t.valueAt(1), t.get(1), t.getfield("x", cache), t.valueAt(t.nextPos(2)), t.nextPos(0), t.keyAt(3)];
+        const strong = read();
+        t.metatable = new LuaTable().set("__mode", "v");
+        expect(read()).toEqual(strong);
+        expect(strong.slice(0, 5).every(v => v === o)).toBe(true);
+        // and stores into one are held weakly, as any other store into it
+        const p = new LuaTable();
+        t.setfield("x", p, cache);
+        t.set(1, p);
+        expect([t.getfield("x", cache), t.arrayAt(1), t.get("x")]).toEqual([p, p, p]);
+        t.metatable = null;
+        expect([t.getfield("x", cache), t.arrayAt(1), t.rawlen()]).toEqual([p, p, 2]);
+    });
+
+    it("leave an index that is not in the array part, and a read-only table, to the long way", () => {
+        const t = new LuaTable().set(1, "a").set(2, "b").set(2.5, "f").set(-1, "n").set(10, "j");
+        expect([t.get(1), t.get(2), t.get(2.5), t.get(-1), t.get(10), t.get(3), t.get(0), t.get(NaN), t.arrayAt(3), t.arrayAt(10)]).toEqual(["a", "b", "f", "n", "j", undefined, undefined, undefined, undefined, undefined]);
+        t.set(2, undefined);
+        expect([t.get(2), t.rawlen(), t.nextPos(1), t.arrayAt(2)]).toEqual([undefined, 1, 3, undefined]);
+        t.freeze();
+        expect(() => t.set(1, "z")).toThrow("attempt to modify a readonly table");
+        expect(() => t.setfield("q", 1, { slot: 0 })).toThrow("attempt to modify a readonly table");
+        expect(t.get(1)).toBe("a");
+    });
+});
+
 describe.skipIf(!process.env.LUAU)("Luau tables against Luau", () => {
     it("give Luau's lengths after every write and the traversal order Luau guarantees", () => {
         let seed = 7;

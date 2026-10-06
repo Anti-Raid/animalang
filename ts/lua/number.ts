@@ -8,6 +8,9 @@ export const num2str = (n: number): string => {
     if (n === Infinity) return "inf";
     if (n === -Infinity) return "-inf";
     if (n === 0) return Object.is(n, -0) ? "-0" : "0";
+    // (JS lays a number out the same way where neither uses an exponent)
+    const abs = n < 0 ? -n : n;
+    if (abs >= 1e-5 && abs < 1e21) return String(n);
     const sign = n < 0 ? "-" : "";
     const [mantissa, exp] = Math.abs(n).toExponential().split("e");
     const digits = mantissa.replace(".", "");
@@ -103,8 +106,14 @@ const trailingSpace = (s: string, i: number): boolean => {
     return i === s.length;
 };
 
+const DECIMAL = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/;
+const SHORT_HEX = /^0[xX][0-9a-fA-F]{1,13}$/;
+
 // luaO_str2d: the number `s` spells (surrounding space allowed), or undefined (nil)
 export const str2number = (s: string): number | undefined => {
+    // (JS reads a plain decimal as C does, and a short hex integer is exact)
+    if (DECIMAL.test(s)) return Number(s);
+    if (SHORT_HEX.test(s)) return parseInt(s, 16);
     s = cstring(s);
     const read = strtod(s, 0);
     return read !== undefined && trailingSpace(s, read[1]) ? read[0] : undefined;

@@ -2,6 +2,7 @@
 import { ErrorObject, IProcedure, Msg, formatPos, type Formatter, type SourcePos } from "../common";
 import { Coroutine } from "../magicvm/exec";
 import { LuaBuffer } from "./buffer";
+import { NOWHERE } from "./errors";
 import { num2str } from "./number";
 import { LuaTable } from "./table";
 import { LuaVector } from "./vector";
@@ -70,5 +71,5 @@ export const luauFormat: Formatter = (op, a, fmt, at) => {
         case Msg.TracebackFrame: return `${formatPos(a[1])} function ${a[0]}`;
     }
     const text = word(op, a, fmt, at);
-    return at === null ? text : `${at.file}:${at.line}: ${text}`;
+    return at === null || at === NOWHERE ? text : `${at.file}:${at.line}: ${text}`;
 };

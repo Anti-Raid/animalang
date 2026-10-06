@@ -104,6 +104,21 @@ describe('Anima', () => {
                         (let loop ((i 0) (s 0)) (if (= i 20) s (loop (+ i 1) (+ s (ce-cm)))))`)).toBe("140")
         })
 
+        it('%apply-catching calls a procedure with an array of arguments, giving its values or what it raised', () => {
+            const caught = (proc: string, args: string) => `(let ((r (%intcall %apply-catching ${proc} (%intcall %array ${args})))) (%if (%intcall %caught? r) (%call list 'caught (%intcall %caught-value r)) r))`
+            expect(nrun(caught("+", "1 2"))).toBe("3")
+            expect(nrun(caught("(lambda () 'none)", ""))).toBe("none")
+            expect(nrun(`(%call call-with-values (lambda () (%intcall %apply-catching values (%intcall %array 1 2))) list)`)).toBe("(1 2)")
+            expect(nrun(caught("(lambda (x) (%intcall %raise x))", "'boom"))).toBe("(caught boom)")
+            expect(nrun(`(%catch (lambda () ${caught("(lambda (x) (%intcall %raise x))", "'inner")}) (lambda (e) 'outer))`)).toBe("(caught inner)")
+            // an error that has a dynamic-wind to leave on the way
+            expect(nrun(`(define-global ac-log '()) ${caught("(lambda (x) (%call dynamic-wind (lambda () #f) (lambda () (%intcall %raise x)) (lambda () (%set! ac-log (%call cons x ac-log)))))", "'w")}`)).toBe("(caught w)")
+            expect(nrun("ac-log")).toBe("(w)")
+            // caught often enough, the function goes on in heap frames
+            expect(nrun(`(define-global (ac-run) (let loop ((i 0) (n 0)) (%if (%call = i 30) n (%call loop (%call + i 1) (%call + n (%intcall %caught-value (%intcall %apply-catching (lambda (a b) (%intcall %raise (%call + a b))) (%intcall %array i 1)))))))) (%call list (%call ac-run) (%call ac-run) (%call ac-run))`)).toBe("(465 465 465)")
+            expect(nrun(`(%catch (lambda () (%intcall %apply-catching + 5)) (lambda (e) 'not-an-array))`)).toBe("not-an-array")
+        })
+
         it('calls the %catch handler in tail position', () => {
             expect(nrun(`(define-global (ce-loop n) (%if (%call = n 0) 'ok (%catch (lambda () (%call raise n)) (lambda (e) (%call ce-loop (%call - e 1)))))) (%call ce-loop 100000)`)).toBe("ok")
         })
