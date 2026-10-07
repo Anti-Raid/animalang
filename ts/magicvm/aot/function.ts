@@ -39,6 +39,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
         readonly usedDeps: Set<string> = new Set(),
         // the code's constants, for the type facts of the ones it loads
         protected readonly constants: readonly any[] = [],
+        protected readonly reentrant: boolean = true,
     ) {
         super();
     }

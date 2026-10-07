@@ -9,7 +9,7 @@ import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
 import type { CallCache, DirectFn } from "./code";
 import type { VMHost } from "./code";
 import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, helperClosure, tracebackMessage } from "./coreops";
-import { Aborted, CatchToken, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
+import { Aborted, CatchToken, STACK_CATCH, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
@@ -147,7 +147,14 @@ export class VMExecutor {
         if (frame.isShared(ctx)) {
             frame = frame.thaw(ctx);
         }
-        if (frame.escape !== null) frame.escape = null;
+        if (frame.escape !== null) {
+            // its pending call was under a catch on the context's stack: that, and any left on it inside, are over
+            if (frame.catchAt !== -1) {
+                ctx.ncatch = frame.catchAt;
+                frame.catchAt = -1;
+            }
+            frame.escape = null;
+        }
         return frame;
     }
 
@@ -381,6 +388,18 @@ export class VMExecutor {
         return e;
     }
 
+    // the same of a catch on the context's stack (see ExecutionContext.catches)
+    public pushCatch(e: any, at: number, marks: Marks, mframe: number): any {
+        if (e instanceof Suspend) {
+            if (e.innermost === null && e.marks === undefined) {
+                e.marks = marks;
+                e.mframe = mframe + 1;
+            }
+            e.pendingCatch = at;
+        }
+        return e;
+    }
+
     // calls `proc` with a new escape continuation, which `frame` holds until it resumes
     public callEscape(ctx: ExecutionContext, proc: any, frame: Frame): Frame | null {
         const tok = frame.escape = new EscapeContinuation(ctx.id, ctx.wind);
@@ -393,6 +412,22 @@ export class VMExecutor {
         const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
         try {
             return this.invoke(ctx, proc, frame, args, 0, args.length, false, marks, frame.mframe + 1);
+        } catch (err) {
+            if (err instanceof EscapedError || err instanceof InterruptError) throw err;
+            ctx.acc = new Caught(caughtValue(err, this.vm));
+            return frame;
+        }
+    }
+
+    // callCatch for code that is not re-entrant, without a pre-unwind handler: the catch goes on the context's stack
+    public callCatchStack(ctx: ExecutionContext, proc: any, frame: Frame, args: any[] = []): Frame | null {
+        frame.escape = STACK_CATCH;
+        const at = frame.catchAt = ctx.ncatch;
+        ctx.catches[at] = markFirst(frame.marks, EXCEPTION_HANDLERS, null);
+        ctx.catches[at + 1] = ctx.wind;
+        ctx.ncatch = at + 2;
+        try {
+            return this.invoke(ctx, proc, frame, args, 0, args.length, false);
         } catch (err) {
             if (err instanceof EscapedError || err instanceof InterruptError) throw err;
             ctx.acc = new Caught(caughtValue(err, this.vm));
@@ -551,6 +586,14 @@ export class VMExecutor {
     public raise(ctx: ExecutionContext, frame: Frame | null, obj: any, continuable: boolean, marks: Marks = frame?.marks ?? null, mframe: number = frame?.mframe ?? 0): Frame | null {
         if (obj instanceof ErrorObject) this.vm.message(obj.error);
         const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
+        // a catch on the context's stack is innermost when no handler was installed inside it
+        const catches = ctx.catches, at = ctx.ncatch - 2;
+        if (at >= 0 && catches[at] === handlers) {
+            let target = frame;
+            while (target !== null && target.catchAt !== at) target = target.parent;
+            if (target === null) throw vmError(Msg.CatchOutsideExtent);
+            return this.#jumpTo(ctx, target, catches[at + 1], new Caught(obj));
+        }
         if (!(handlers instanceof Handlers)) return this.#unhandled(ctx, frame, obj);
         const handler = handlers.handler;
         const outer = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, handlers.outer);

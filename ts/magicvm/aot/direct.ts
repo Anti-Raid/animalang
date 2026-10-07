@@ -186,7 +186,7 @@ export class DirectEmitter extends FunctionEmitter {
 
     // direct-entry code never resumes mid-function, so compiled `if`s (If c else ... Else end, else: ... EndIf, end:) can be emitted as nested js if/else
     #structuredBody(seed: Facts | null = null): string | null {
-        const body = new DirectEmitter(this.blocks, this.structure, this.liveness, this.numReg, this.debug, this.table, this.usedDeps, this.constants);
+        const body = new DirectEmitter(this.blocks, this.structure, this.liveness, this.numReg, this.debug, this.table, this.usedDeps, this.constants, this.reentrant);
         body.#selfArity = this.#selfArity;
         body.#want = this.#want;
         body.#params = this.#params;
@@ -398,7 +398,7 @@ export class DirectEmitter extends FunctionEmitter {
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: this.#args(term), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume) };
+                    const site = { args: this.#args(term), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume), reentrant: this.reentrant };
                     return this.emit(`
                         ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}
                         ${control.direct(site, this.#call({ args: null, tail: term.isTail }), (args, marks) => this.#call({ args, tail: false, marks }))}

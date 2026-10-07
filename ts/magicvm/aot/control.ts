@@ -15,7 +15,8 @@ import { DIRECT_SUSPEND_LIMIT } from "../values";
 // `resume`: the ip after the call, which the emitter stores (frame.ip, rip) before the template unless `setsResume`;
 // `loopCount`: in direct code, the call is at a loop's back-edge (its next instruction is EndLoop), where a function can
 // count in its local `ic` (a loop there runs within one call of the function)
-export type ControlSite = { args: string[], isTail: boolean, resume: number, loopCount: boolean };
+// `reentrant`: whether the code may be re-entered by a continuation (Code.reentrant)
+export type ControlSite = { args: string[], isTail: boolean, resume: number, loopCount: boolean, reentrant: boolean };
 export type ControlAot = {
     heap: (s: ControlSite, spills: string) => string,
     direct: (s: ControlSite, callArray: string, call: (args: string[], marks: string) => string) => string,
@@ -29,6 +30,23 @@ export const resumeArgs = (name: string, args: string[]) => name === "%coroutine
 export const applyArgsOf = (name: string, args: string[]) => name === "%apply-fresh" ? `arrayArg("%apply", ${args[1]})` : `applyArgs([${args.slice(1).join(", ")}], 0, ${args.length - 1})`;
 // counting an interrupt check in the function's local `ic` (see %interrupt below)
 const LOOP_COUNT = "--ic < 0 && (ic = 255, (executor.interruptLeft -= 256) <= 0)";
+// a catch in direct code that is not re-entrant, around `call` (which leaves the value in acc): no token and no mark, its
+// place is on the context's stack (ExecutionContext.catches) while the call runs
+const stackCatch = (call: string) => `{
+    const at = ctx.ncatch;
+    ctx.catches[at] = marks === null ? null : markFirst(marks, EXCEPTION_HANDLERS, null);
+    ctx.catches[at + 1] = ctx.wind;
+    ctx.ncatch = at + 2;
+    try {
+        ${call}
+        ctx.ncatch = at;
+    } catch (e) {
+        const caught = caughtAt(e, at, ctx);
+        if (caught === null) throw executor.pushCatch(e, at, marks, mframe);
+        countControlSuspend(closure.tmpl.code);
+        acc = caught;
+    }
+}`;
 export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, ControlAot>([
     ["%call/cc", {
         heap: s => `return executor.callCC(ctx, ${s.args[0]}, frame, ${s.isTail});`,
@@ -50,8 +68,9 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
         }`,
     }],
     ["%call-catching", {
-        heap: s => `return executor.callCatch(ctx, ${s.args[0]}, frame, ${s.args[1] ?? "null"}, ${s.args.length === 3 ? `catchGuard(${s.args[2]})` : "false"});`,
-        direct: (s, callArray, call) => `{
+        heap: s => s.args.length === 1 && !s.reentrant ? `return executor.callCatchStack(ctx, ${s.args[0]}, frame);`
+            : `return executor.callCatch(ctx, ${s.args[0]}, frame, ${s.args[1] ?? "null"}, ${s.args.length === 3 ? `catchGuard(${s.args[2]})` : "false"});`,
+        direct: (s, callArray, call) => s.args.length === 1 && !s.reentrant ? stackCatch(`const proc = ${s.args[0]}; ${call([], "marks")}`) : `{
             const tok = new CatchToken(ctx.id, ctx.wind, ${s.args[1] ?? "null"}, ${s.args.length === 3 ? `catchGuard(${s.args[2]})` : "false"});
             const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
             try {
@@ -66,8 +85,9 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
         }`,
     }],
     ["%apply-catching", {
-        heap: s => `return executor.callCatch(ctx, ${s.args[0]}, frame, null, false, arrayArg("%apply-catching", ${s.args[1]}));`,
-        direct: s => `{
+        heap: s => s.reentrant ? `return executor.callCatch(ctx, ${s.args[0]}, frame, null, false, arrayArg("%apply-catching", ${s.args[1]}));`
+            : `return executor.callCatchStack(ctx, ${s.args[0]}, frame, arrayArg("%apply-catching", ${s.args[1]}));`,
+        direct: s => !s.reentrant ? stackCatch(`acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), depth + 1, marks, mframe + 1);`) : `{
             const tok = new CatchToken(ctx.id, ctx.wind, null, false);
             const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
             try {
@@ -92,7 +112,7 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
     }]),
     ["%raise", {
         heap: s => `return executor.raise(ctx, frame, ${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"});`,
-        direct: s => `throw Suspend.raise(${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"}, marks);`,
+        direct: s => `throw Suspend.raise(${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"}, marks, ctx);`,
     }],
     // An interrupt check: the count, and only when it runs out, the handler (see VMExecutor.interruptSlow). Heap code
     // counts every check. Direct code counts cheaply, as interrupts only have to come eventually:

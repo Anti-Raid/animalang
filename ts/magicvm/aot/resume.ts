@@ -163,7 +163,7 @@ export class ResumeEmitter extends FunctionEmitter {
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: false };
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: false, reentrant: this.reentrant };
                     return this.emit(`
                         ${control.setsResume ? "" : `frame.ip = ${term.resume};`}
                         ${term.isTail || control.continues ? "" : this.#spills(live.spillsFor(term.resume))}

@@ -14,7 +14,7 @@ import type { CallCache, Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { blockStarts, type Op } from "../ops";
-import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, MULTI, StackSnapshot, Suspend, WindPoint, catchHere, countControlSuspend, frameInfos, oneValue, restValues, tailName, unpackForBinding, unwind, VB, manyValues } from "../values";
+import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, MULTI, StackSnapshot, Suspend, WindPoint, catchHere, caughtAt, countControlSuspend, frameInfos, oneValue, restValues, tailName, unpackForBinding, unwind, VB, manyValues } from "../values";
 import type { ExecutionContext } from "../values";
 export const JIT_DEPS = {
     markSet,
@@ -62,6 +62,7 @@ export const JIT_DEPS = {
     CatchToken,
     Caught,
     catchHere,
+    caughtAt,
     markFirst,
     EXCEPTION_HANDLERS,
 };
@@ -192,12 +193,12 @@ export class AotCompiler {
         const usedDeps = new Set<string>();
         const structure = structureOf(code.ops);
         const resume = want !== 0 ? "null" : this.#step("resume", () => {
-            const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
+            const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
             out.emitFunction();
             return out.toString();
         });
         const direct = tmpl === undefined ? "null" : this.#step("direct", () => {
-            const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants);
+            const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
             out.emitFunction(tmpl.arity, want);
             return out.toString();
         });

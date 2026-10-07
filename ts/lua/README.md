@@ -105,7 +105,8 @@ metamethods, come later.
   `__tostring` so far): `tonumber(v)` reads a number or a string as arithmetic does, `tonumber(s, base)` as C's
   `strtoull` does (a number is read as it is written; `base out of range` outside 2 to 36), and `print` hands its line
   (the values tab-separated) to the host.
-- `pcall` is a procedure whose body is the call under a catch (`%apply-catching`, so no closure is made for it):
+- `pcall` is a procedure whose body is the call under a catch (`%apply-catching`, so no closure is made for it, and
+  as Luau code is not re-entrant, no token or mark either: the catch is two entries on the context's stack):
   `true` and the results, or `false` and the error
   (an error of the VM or of the library is its message, with its position). `error` is `%raise`: a string or a number
   at level 1 is raised as the library's own errors are, so it gets the position of the frame it leaves through, which
@@ -113,7 +114,8 @@ metamethods, come later.
   value, the value is raised as it is. A level further up reads the position from the stack (`%current-stack`), which
   differs from Luau's in two ways: a call in tail position leaves no frame here (Luau makes no tail calls), and the
   library's functions are not levels (Luau counts `pcall`, and gives no position at it).
-- Luau code is compiled as not re-entrant (`reentrant: false`): Luau has no continuations that run a frame twice
+- Luau code is compiled as not re-entrant (`reentrant: false`), which also means the VM gives it no continuations:
+  Luau has none
   (a coroutine resumes its one suspended frame), so an assigned local needs a box only when a closure captures it.
 - Errors are `LuauError`s (`errors.ts`, the VM's `Msg.Text`), so they get where they happened, and the formatter
   (`messages.ts`) words them as Luau does: `file:line: message`. Syntax errors are `LuauSyntaxError`s, worded alike.

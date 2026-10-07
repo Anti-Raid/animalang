@@ -40,6 +40,8 @@ export enum Msg {
     // a continuation ran a captured frame of code compiled as not re-entrant (AnimaOptions.reentrant) a second time;
     // args[0] is the frame's procedure
     NotReentrant,
+    // code compiled as not re-entrant asked for a continuation; args[0] is the operation's name
+    NoContinuations,
 }
 
 export type Formatter = (op: Msg, args: readonly any[], fmt: Formatter, at: SourcePos | null) => string;

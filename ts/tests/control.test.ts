@@ -130,6 +130,59 @@ describe('Anima', () => {
         })
     });
 
+    describe('Catches of code that is not re-entrant', () => {
+        // such code keeps its catches on the context's stack, not as tokens in the handler list: what it does is the same
+        const programs = [
+        `(call-with-values (lambda () (pcall + 1 2)) list)`,
+        `(call-with-values (lambda () (pcall raise 'x)) list)`,
+        `(call-with-values (lambda () (pcall (lambda () (pcall raise 'in) (raise 'out)))) list)`,
+        `(call-with-values (lambda () (pcall (lambda () (call-with-values (lambda () (pcall raise 'in)) list)))) list)`,
+        `(with-exception-handler (lambda (e) (+ e 1)) (lambda () (+ 10 (raise-continuable 5))))`,
+        `(call-with-values (lambda () (pcall (lambda () (with-exception-handler (lambda (e) (* e 2)) (lambda () (+ 1 (raise-continuable 20))))))) list)`,
+        `(call-with-values (lambda () (pcall (lambda () (with-exception-handler (lambda (e) (raise (list 'again e))) (lambda () (raise 'x)))))) list)`,
+        `(with-exception-handler (lambda (e) 99) (lambda () (call-with-values (lambda () (pcall (lambda () (+ 1 (raise-continuable 'y))))) list)))`,
+        `(call-with-values (lambda () (pcall (lambda () (with-exception-handler (lambda (e) 'ignored) (lambda () (raise 'x)))))) (lambda (ok e) (list ok (error-object? e))))`,
+        `(define log '()) (define r (call-with-values (lambda () (pcall (lambda () (dynamic-wind (lambda () (set! log (cons 'in log))) (lambda () (raise 'w)) (lambda () (set! log (cons 'out log))))))) list)) (list r log)`,
+        `(define log '()) (define r (call-with-values (lambda () (pcall (lambda () (dynamic-wind (lambda () #f) (lambda () (pcall raise 'inner) (raise 'w)) (lambda () (set! log (cons 'out log))))))) list)) (list r log)`,
+        `(define (deep n) (if (= n 0) (raise 'bottom) (+ 1 (deep (- n 1))))) (call-with-values (lambda () (pcall deep 5000)) list)`,
+        `(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1))))) (list (call-with-values (lambda () (pcall deep 5000)) list) (call-with-values (lambda () (pcall raise 'after)) list))`,
+        `(define (deep n) (if (= n 0) (call-with-values (lambda () (pcall raise 'in-deep)) list) (cons n (deep (- n 1))))) (length (deep 3000))`,
+        `(define (f i) (call-with-values (lambda () (pcall (lambda () (if (even? i) (raise i) i)))) list)) (let loop ((i 0) (acc '())) (if (= i 40) (length acc) (loop (+ i 1) (cons (f i) acc))))`,
+        `(call-with-values (lambda () (pcall vector-length 5)) (lambda (ok e) (list ok (error-message e))))`,
+        `(call-with-values (lambda () (pcall (lambda () (car 5)))) (lambda (ok e) ok))`,
+        `(call-with-values (lambda () (pcall (lambda () (pcall + 1 2) (raise 'second)))) list)`,
+        `(define co (coroutine-create (lambda () (call-with-values (lambda () (pcall (lambda () (coroutine-yield 1) (raise 'after-yield)))) list)))) (list (coroutine-resume co) (coroutine-resume co))`,
+        `(define co (coroutine-create (lambda () (coroutine-yield 1) (raise 'from-co)))) (coroutine-resume co) (call-with-values (lambda () (pcall coroutine-resume co)) list)`,
+        `(define co (coroutine-create (lambda () (pcall (lambda () (coroutine-yield 1))) (coroutine-yield 2) (raise 'late)))) (list (coroutine-resume co) (coroutine-resume co) (call-with-values (lambda () (pcall coroutine-resume co)) list))`,
+        `(pcall raise 'x) (raise 'unhandled)`,
+        `(define (f) (pcall raise 'x) 1) (f) (f) (car 7)`,
+        `(call-with-values (lambda () (pcall (lambda () (error "boom" 1 2)))) (lambda (ok e) (list ok (error-message e))))`,
+        `(call-with-values (lambda () (pcall (lambda () (with-exception-handler (lambda (e) (call-with-values (lambda () (pcall raise 'in-handler)) list)) (lambda () (raise-continuable 'c)))))) list)`,
+        ];
+        const outcome = (a: Anima, program: string) => { try { return s.stringify(a.evaluateRaw(a.compileRaw(program))); } catch (e: any) { return "error: " + e.message; } };
+
+        it('catch what the catches of re-entrant code catch', () => {
+            for (const options of [vmImpl, { ...vmImpl, debug: true, optimize: false }]) {
+                const wrong = programs.filter(p => outcome(createScheme({ ...options, reentrant: false }), p) !== outcome(createScheme(options), p));
+                expect(wrong).toEqual([]);
+            }
+            const a = createScheme({ ...vmImpl, reentrant: false });
+            expect(outcome(a, programs[1])).toBe("(#f x)");
+            expect(outcome(a, `(define log '()) (define r (call-with-values (lambda () (pcall (lambda () (dynamic-wind (lambda () #f) (lambda () (raise 'w)) (lambda () (set! log (cons 'out log))))))) list)) (list r log)`)).toBe("((#f w) (out))");
+            expect(outcome(a, `(pcall raise 'x) (raise 'unhandled)`)).toBe("error: unhandled");
+            // guard leaves through an escape continuation, which such code does not have
+            expect(outcome(a, `(guard (e (#t e)) (raise 'g))`)).toBe("error: %call/ec: no continuations in code compiled as not re-entrant");
+        })
+
+        it('are over once left: a later error is not theirs', () => {
+            const a = createScheme({ ...vmImpl, reentrant: false });
+            // left by returning or by an error, from direct code or (past the depth limit, after a yield) from heap frames
+            expect(outcome(a, `(define (deep n) (if (= n 0) (raise 'bottom) (+ 1 (deep (- n 1))))) (pcall deep 5000) (pcall (lambda () (pcall raise 1) (raise 2))) (raise 'later)`)).toBe("error: later");
+            expect(outcome(a, `(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1))))) (pcall deep 5000) (raise 'later)`)).toBe("error: later");
+            expect(outcome(a, `(define co (coroutine-create (lambda () (pcall (lambda () (coroutine-yield 1))) (raise 'in-co)))) (coroutine-resume co) (coroutine-resume co)`)).toBe("error: in-co");
+        })
+    });
+
     describe('The exception model (%raise / %catch)', () => {
         it('a guarded %catch catches errors in its pre too (xpcall)', () => {
             const xp = (thunk: string, pre: string, guarded = "#t") => `(%catch ${thunk} (lambda (r) (%call list 'handled r)) ${pre} ${guarded})`

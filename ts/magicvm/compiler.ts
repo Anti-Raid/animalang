@@ -29,6 +29,9 @@ type Closed = Unboxed & { captures: Captures }
 const assignmentsPass: Pass<Analyzed, Converted> = { name: "assignments", run: ({ ast, ascope }, ctx) => convertAssignments(ast, ascope.variables) }
 
 // only the boxes that are needed (see passes/unbox.ts)
+// the operations that make a continuation or leave through one
+const NO_CONTINUATIONS: ReadonlySet<symbol> = new Set(["%call/cc", "%call/ec", "%call/comp", "%call-with-prompt", "%abort"].map(n => Symbol.for(n)))
+
 const unboxPass: Pass<Converted, Unboxed> = { name: "unbox", run: ({ ast, boxes }, ctx) => removeBoxes(ast, boxes, ctx.intrinsics, ctx.reentrant) }
 
 // what each lambda captures (see passes/closures.ts)
@@ -255,6 +258,11 @@ export class Compiler {
                     this.#compileNormalCall(expr.slice(1), opts)
                     return
                 case CORE_INTCALL: {
+                    // code that is not re-entrant has no continuations: asking for one raises
+                    if (!this.reentrant && typeof expr[1] === "symbol" && NO_CONTINUATIONS.has(expr[1])) {
+                        this.#compileForm([CORE_INTCALL, Symbol.for("%no-continuations"), expr[1].description], opts)
+                        return
+                    }
                     const intrinsic = this.#intrinsicNamed("%intcall", expr)
                     const call = expr.slice(1)
                     // (%first-value (%call f arg ...) <#void>): a call that wants one value, which the callee gives

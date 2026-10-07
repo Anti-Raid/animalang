@@ -115,6 +115,13 @@ export class ExecutionContext {
     public epoch: number = 0;
     public wind: WindPoint | null = null;
     public pendingWind: PendingWindTransition | null = null;
+    // the catches of code that is not re-entrant its frames are under, outermost first, two entries each: the handler
+    // list (the EXCEPTION_HANDLERS mark) and the wind it was entered with. Such a catch has no token and sets no mark:
+    // an error is its to take when it is the last here and the handler list where the error was raised is the one it
+    // was entered with (a handler installed inside it would be on that list before). `ncatch` entries are in use (the
+    // array only grows: setting an array's length is slow)
+    public catches: any[] = [];
+    public ncatch: number = 0;
     public coroutine: Coroutine | null = null;
     // a throwaway resumer for nested resumes: control coming back here ends the nested driver loop
     public barrier: boolean = false;
@@ -350,6 +357,30 @@ export const catchHere = (e: any, tok: CatchToken, ctx: ExecutionContext): any =
     return handlers instanceof Handlers && handlers.handler === tok ? new Caught(caughtValue(e.error, ctx.vm)) : null;
 };
 
+// what the frame of a catch on its context's stack holds for `escape` (see Frame.catchAt)
+export const STACK_CATCH = new EscapeContinuation(0, null);
+
+// what a direct-mode catch on the context's stack at `at` takes from an exception passing through it (taking itself off
+// the stack), or null to let it go on: an error or a raise whose innermost handler it is, with no dynamic-wind to leave.
+// It is not the last there when a catch inside it let the exception go on, its frame rebuilt
+export const caughtAt = (e: any, at: number, ctx: ExecutionContext): any => {
+    const catches = ctx.catches;
+    if (ctx.ncatch !== at + 2 || ctx.wind !== catches[at + 1]) return null;
+    let caught;
+    if (!(e instanceof Suspend)) {
+        if (e instanceof EscapedError || e instanceof InterruptError) return null;
+        caught = new Caught(caughtValue(e, ctx.vm));
+    } else if (e.catchAt === at) caught = e.escapeVal;
+    else {
+        if (e.action !== null) return null;
+        const marks = e.marks !== undefined ? e.marks : e.innermost !== null ? e.innermost.marks : undefined;
+        if (marks === undefined || markFirst(marks, EXCEPTION_HANDLERS, null) !== catches[at]) return null;
+        caught = new Caught(caughtValue(e.error, ctx.vm));
+    }
+    ctx.ncatch = at;
+    return caught;
+};
+
 export class Frame {
     public code: Code;
     public upvars: any[];
@@ -363,6 +394,9 @@ export class Frame {
     public isite: number = -1;
     // the escape continuation or catch token of the %call/ec or %catch this frame's pending call is, cleared when it resumes
     public escape: EscapeContinuation | null = null;
+    // where in its context's `catches` the catch this frame's pending call is under is (-1: none; `escape` is
+    // STACK_CATCH then), taken off when it resumes
+    public catchAt: number = -1;
     // a captured frame that a copy has run from (see `resume`)
     public resumed: boolean = false;
 
@@ -450,6 +484,10 @@ export class Suspend {
     escapeVal: any = undefined;
     // for the next frame pushed: the token of the direct-mode %call/ec or %catch it was left through
     pendingEscape: EscapeContinuation | null = null;
+    // the same of a catch on the context's stack (where in `catches`, -1: none); and for a raise, the catch there it
+    // goes to, which a direct-mode catch on the way out takes it at (with `escapeVal`)
+    pendingCatch: number = -1;
+    catchAt: number = -1;
     // the marks where it was thrown, when that was a tail call (which rebuilds no frame): errors are raised with them
     marks: Marks | undefined = undefined;
     mframe: number = 0;
@@ -467,6 +505,11 @@ export class Suspend {
         if (this.pendingEscape !== null) {
             frame.escape = this.pendingEscape;
             this.pendingEscape = null;
+        }
+        if (this.pendingCatch !== -1) {
+            frame.escape = STACK_CATCH;
+            frame.catchAt = this.pendingCatch;
+            this.pendingCatch = -1;
         }
         if (this.outermost === null) {
             this.innermost = frame;
@@ -488,10 +531,13 @@ export class Suspend {
 
     // raising from direct code: an escape when the innermost handler is a plain catch token (which a direct %catch
     // further out can take), else delivered from heap frames
-    static raise(obj: any, continuable: boolean, marks: Marks) {
+    static raise(obj: any, continuable: boolean, marks: Marks, ctx?: ExecutionContext) {
         const sig = new Suspend((ctx, executor, caller) => executor.raise(ctx, caller, obj, continuable), undefined, true);
         const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
-        if (handlers instanceof Handlers && handlers.handler instanceof CatchToken && handlers.handler.pre === null) {
+        if (ctx !== undefined && ctx.ncatch !== 0 && ctx.catches[ctx.ncatch - 2] === handlers) {
+            sig.catchAt = ctx.ncatch - 2;
+            sig.escapeVal = new Caught(obj);
+        } else if (handlers instanceof Handlers && handlers.handler instanceof CatchToken && handlers.handler.pre === null) {
             sig.escape = handlers.handler;
             sig.escapeVal = new Caught(obj);
         }
@@ -520,8 +566,8 @@ export class Suspend {
         return new Suspend((ctx, executor, caller) => executor.callEscape(ctx, proc, caller), undefined, true);
     }
 
-    static catching(proc: any, pre: any, guarded: boolean) {
-        return new Suspend((ctx, executor, caller) => executor.callCatch(ctx, proc, caller, pre, guarded), undefined, true);
+    static catching(proc: any, pre: any, guarded: boolean, args: any[] = []) {
+        return new Suspend((ctx, executor, caller) => executor.callCatch(ctx, proc, caller, pre, guarded, args), undefined, true);
     }
 
     static callCC(proc: any) {

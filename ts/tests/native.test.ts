@@ -135,7 +135,7 @@ describe("native-scheme", () => {
         expect([run2(`(%intcall %coroutine-resume co)`), run2(`(%intcall %coroutine-resume co 10)`), run2(`(%intcall %coroutine-resume co 20)`)]).toEqual([1, 2, 30]);
     });
 
-    it("refuses to run a captured frame of code that is not re-entrant a second time", () => {
+    it("gives code that is not re-entrant no continuations", () => {
         const program = `(define-global saved #void) (define-global count 0)
             (define-global (f) (let ((n 0)) (%set! n (%intcall %+ n (%intcall %call/cc (lambda (k) (%set! saved k) 1)))) n))
             (define-global first (%call f))
@@ -144,10 +144,19 @@ describe("native-scheme", () => {
         const run2 = (a: Anima) => showValue(a.evaluateRaw(a.compileRaw(program, "t.ns")));
         // re-entrant (the default): the continuation runs f's frame again, each time from its captured state
         expect(run2(make())).toBe("(10)");
-        expect(() => run2(make({ ...impl, reentrant: false }))).toThrow("cannot re-enter a continuation through f: its code was compiled as not re-entrant");
-        // escaping through a continuation once is no re-entry
+        expect(() => run2(make({ ...impl, reentrant: false }))).toThrow("%call/cc: no continuations in code compiled as not re-entrant");
+        // none of the operations that make one or leave through one, when they run
         const a = make({ ...impl, reentrant: false });
-        expect(showValue(a.evaluateRaw(a.compileRaw(`(define-global (g k) (%call k 5) 6) (%intcall %+ 1 (%intcall %call/cc (lambda (k) (%call g k))))`, "t.ns")))).toBe("6");
+        const one = (src: string) => showValue(a.evaluateRaw(a.compileRaw(src, "t.ns")));
+        for (const use of ["(%intcall %call/ec (lambda (k) (%set! saved k) 1))", "(%intcall %call/comp (lambda (k) 1) 'tag)", "(%intcall %call-with-prompt 'tag (lambda () 1) (lambda (v) v))", "(%intcall %abort 'tag (%intcall %array 1))"]) {
+            expect(() => one(`(define-global saved #void) ${use}`)).toThrow(`${use.slice(10, use.indexOf(" ", 10))}: no continuations in code compiled as not re-entrant`);
+        }
+        // one that only leaves its own procedure is a block and a jump, which is no continuation
+        expect(one(`(%intcall %+ 1 (%intcall %call/ec (lambda (k) (%if #t (%call k 5) 6))))`)).toBe("6");
+        expect(one(`(define-global (unused) (%intcall %call/cc (lambda (k) 1))) 5`)).toBe("5");
+        // errors are caught and coroutines run as before
+        expect(one(`(%catch (lambda () (%intcall %raise 'x)) (lambda (e) (%intcall %push '() e)))`)).toBe("(x)");
+        expect(one(`(%catch (lambda () (%intcall %call/ec (lambda (k) (%set! saved k) 1))) (lambda (e) 'refused))`)).toBe("refused");
     });
 
     it("binds the values of an inlined procedure without making multiple values", () => {

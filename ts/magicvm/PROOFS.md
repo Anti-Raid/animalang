@@ -214,7 +214,7 @@ Only three things can make a register and the location it stands for disagree:
 
   None of these leaves two live copies that can each be written.
 
-**Code that is not re-entrant** (`AnimaOptions.reentrant: false`) gives up the boxes of (D2), and the VM gives up (D2) for it: a captured frame is run through a copy, by `Frame.thaw` (the frame going on, an escape to it, or a continuation called) or by `#compose`, and both call `Frame.resume`, which lets a frame of such code be copied once and raises `Msg.NotReentrant` the second time. So of a captured frame of that code at most one copy ever runs: there are never two live copies that can each be written, and its unboxed assigned variables behave as locations (Theorem 4 with the premise `liveAcrossCall(x)` replaced by this). Frames of re-entrant code in the same continuation are copied as before.
+**Code that is not re-entrant** (`AnimaOptions.reentrant: false`) gives up the boxes of (D2), and the VM gives up (D2) for it: a captured frame is run through a copy, by `Frame.thaw` (the frame going on, an escape to it, or a continuation called) or by `#compose`, and both call `Frame.resume`, which lets a frame of such code be copied once and raises `Msg.NotReentrant` the second time. Such code makes no continuation itself (its `%call/cc`, `%call/ec`, `%call/comp`, `%call-with-prompt` and `%abort` raise `Msg.NoContinuations`), so in an instance whose code is all of this kind no frame is ever captured, and the check is for a continuation made by other code. So of a captured frame of that code at most one copy ever runs: there are never two live copies that can each be written, and its unboxed assigned variables behave as locations (Theorem 4 with the premise `liveAcrossCall(x)` replaced by this). Frames of re-entrant code in the same continuation are copied as before.
 
 A capture point is always a pending **non-leaf call** of the frame, because leaf intrinsics never call back into the VM. For frames further out, it is their own pending call, which is also a call.
 
@@ -319,7 +319,7 @@ Every later entry at `R` reads `regs` in the state I2 guarantees. That is true w
 Other exits do not resume this activation at an arbitrary ip:
 
 - A return or tail call never resumes it.
-- An exception spills `written` and raises without continuing: host errors are never continuable, and a catch token resumes only a frame whose `escape` is set, meaning one waiting in its pending call at a resume point.
+- An exception spills `written` and raises without continuing: host errors are never continuable, and a catch (a token, or one on the context's stack in code that is not re-entrant, found by `Frame.catchAt`) resumes only a frame whose `escape` is set, meaning one waiting in its pending call at a resume point.
 - A tail call's `frame.ip = term.ip` is used only for error positions, for the same reason.
 
 Direct code never resumes in the middle of a function. When it suspends, it rebuilds a frame at `rip`, which is a resume point, with every register (`allRegs`), so I1 holds there too. □

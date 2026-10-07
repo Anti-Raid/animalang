@@ -177,7 +177,7 @@ export class CatchRequest extends ControlRequest {
     }
 
     direct(): any {
-        throw Suspend.catching(this.proc, this.pre, this.guarded);
+        throw Suspend.catching(this.proc, this.pre, this.guarded, this.args ?? []);
     }
 }
 
@@ -470,6 +470,8 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         const level = typeof args[0] === "number" ? args[0] : 0;
         return formatTraceback(frames.slice(level), tracebackMessage(msg, v => ctx!.vm.print(v)), ctx!.vm.intrinsics.format);
     }, { context: true });
+    // what a continuation operation is in code compiled as not re-entrant: (%no-continuations name) raises
+    core("%no-continuations", [1, 1], (regs, start) => { throw vmError(Msg.NoContinuations, regs[start]); });
     // Lua's truncation of multiple values to one: the first value, or `missing` for none
     core("%first-value", [2, 2], (regs, start) => {
         const val = regs[start];
