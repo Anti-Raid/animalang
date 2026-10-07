@@ -6,4 +6,5 @@ export { impl, type AnimaOptions } from "./magicvm/meta";
 export { IProcedure } from "./common";
 export { ASTStringifier } from "./scheme/printer";
 export { hostTailFrom, type Code } from "./magicvm/exec";
+export { compileNative } from "./native";
 export type { Anima } from "./anima";

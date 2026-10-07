@@ -5,7 +5,7 @@ import { BARRIER, Caught, EXCEPTION_HANDLERS, Handlers, MarkEntry, markFirst, ma
 import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
 import { bindArgs, checkArity } from "./arity";
-import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
+import { Code, CaseLambda, Closure, ClosureTemplate, NO_TEMPLATE, createRegs } from "./code";
 import type { CallCache, DirectFn } from "./code";
 import type { VMHost } from "./code";
 import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, helperClosure, tracebackMessage } from "./coreops";
@@ -239,8 +239,22 @@ export class VMExecutor {
         if (want !== 0 && code.direct && code.wanted[want] === undefined) AotCompiler.compileWant(code, proc.tmpl, want);
         const fn = code.entry(nargs, want);
         if (fn !== null && cache !== null) {
-            cache.tmpl = proc.tmpl;
-            cache.fn = fn;
+            if (cache.t0 === NO_TEMPLATE || cache.t0 === proc.tmpl) {
+                cache.t0 = proc.tmpl; cache.f0 = fn;
+            } else if (cache.t1 === NO_TEMPLATE || cache.t1 === proc.tmpl) {
+                cache.t1 = proc.tmpl; cache.f1 = fn;
+            } else if (cache.t2 === NO_TEMPLATE || cache.t2 === proc.tmpl) {
+                cache.t2 = proc.tmpl; cache.f2 = fn;
+            } else if (cache.t3 === NO_TEMPLATE || cache.t3 === proc.tmpl) {
+                cache.t3 = proc.tmpl; cache.f3 = fn;
+            } else {
+                const slot = cache.next;
+                if (slot === 0) { cache.t0 = proc.tmpl; cache.f0 = fn; }
+                else if (slot === 1) { cache.t1 = proc.tmpl; cache.f1 = fn; }
+                else if (slot === 2) { cache.t2 = proc.tmpl; cache.f2 = fn; }
+                else { cache.t3 = proc.tmpl; cache.f3 = fn; }
+                cache.next = (slot + 1) & 3;
+            }
         }
         return fn;
     }

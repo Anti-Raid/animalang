@@ -16,8 +16,17 @@ export type ResumeFn = (ctx: ExecutionContext, frame: Frame, executor: VMExecuto
 // `depth` counts nested direct calls on the js stack; past MAX_JS_DEPTH calls go through heap frames instead. `marks` is
 // the continuation's mark list and `mframe` the logical frame the function runs in (a tail call keeps its caller's)
 export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExecutor, depth: number, marks: any, mframe: number, ...args: any[]) => any;
-// what a call site keeps of its last callee: its template, and the entry for the site's argument count (Code.entry)
-export type CallCache = { tmpl: ClosureTemplate, fn: DirectFn | null };
+// what a call site's cache holds before its first call: no value's template, and never directly callable
+export const NO_TEMPLATE = { code: { direct: false } } as unknown as ClosureTemplate;
+
+// what a call site keeps of its callees: a 4-slot polymorphic inline cache (PIC)
+export type CallCache = {
+    t0: ClosureTemplate, f0: DirectFn | null,
+    t1: ClosureTemplate, f1: DirectFn | null,
+    t2: ClosureTemplate, f2: DirectFn | null,
+    t3: ClosureTemplate, f3: DirectFn | null,
+    next: number,
+};
 
 // an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
 export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };

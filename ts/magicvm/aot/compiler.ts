@@ -9,7 +9,7 @@ import { Liveness } from "./liveness";
 import { structureOf } from "./structure";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
-import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS } from "../code";
+import { CaseLambda, Closure, ClosureTemplate, NO_TEMPLATE, SHARED_OPS } from "../code";
 import type { CallCache, Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
@@ -67,10 +67,6 @@ export const JIT_DEPS = {
     EXCEPTION_HANDLERS,
 };
 
-// what a call site's cache holds before its first call: no value's template, and never directly callable. A site tests
-// `proc?.tmpl === cache.tmpl` alone (only a Closure has a template for its `tmpl`): `proc instanceof Closure` there costs
-// several times the call, as V8 does not know the class the generated code is given to be a constant
-const NO_TEMPLATE = { code: { direct: false } } as unknown as ClosureTemplate;
 
 export class AotCompiler {
     public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
@@ -171,7 +167,15 @@ export class AotCompiler {
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
         const callCache: Record<number, CallCache> = {};
-        for (const ip of this.#callSites(code)) callCache[ip] = { tmpl: NO_TEMPLATE, fn: null };
+        for (const ip of this.#callSites(code)) {
+            callCache[ip] = {
+                t0: NO_TEMPLATE, f0: null,
+                t1: NO_TEMPLATE, f1: null,
+                t2: NO_TEMPLATE, f2: null,
+                t3: NO_TEMPLATE, f3: null,
+                next: 0,
+            };
+        }
         const siteCache: Record<number, object> = {};
         for (const { ip, pos } of this.#intrinsicSites(code)) siteCache[ip] = code.table!.entries[pos].site!();
         return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, siteCache, code.table?.fns ?? [], code.table?.deps ?? []);

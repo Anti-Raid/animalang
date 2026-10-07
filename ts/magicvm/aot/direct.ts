@@ -362,8 +362,14 @@ export class DirectEmitter extends FunctionEmitter {
             ${tail ? `rip = -1;${site !== undefined ? ` tip = ${site};` : ""}` : ""}
             ${!tail && args.length === this.#selfArity && want === this.#want ? `if (proc === closure && depth < MAX_JS_DEPTH) {
                 acc = direct$(ctx, proc, ${rest});
-            } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.tmpl && ${cache}.tmpl.code.direct && depth < MAX_JS_DEPTH) {
-                ${use} ${cache}.fn(ctx, proc, ${rest});
+            } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.t0 && ${cache}.t0.code.direct && depth < MAX_JS_DEPTH) {
+                ${use} ${cache}.f0(ctx, proc, ${rest});
+            } else if (proc?.tmpl === ${cache}.t1 && ${cache}.t1.code.direct && depth < MAX_JS_DEPTH) {
+                ${use} ${cache}.f1(ctx, proc, ${rest});
+            } else if (proc?.tmpl === ${cache}.t2 && ${cache}.t2.code.direct && depth < MAX_JS_DEPTH) {
+                ${use} ${cache}.f2(ctx, proc, ${rest});
+            } else if (proc?.tmpl === ${cache}.t3 && ${cache}.t3.code.direct && depth < MAX_JS_DEPTH) {
+                ${use} ${cache}.f3(ctx, proc, ${rest});
             } else ` : ""}{
                 const callee = proc?.constructor === CaseLambda ? proc.select(${args.length}) : proc;
                 const fn = executor.entry(callee, ${cache}, ${args.length}, depth${want !== 0 ? `, ${want}` : ""});
