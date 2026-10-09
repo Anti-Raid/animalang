@@ -263,7 +263,7 @@ export const QUOTED: unique symbol = Symbol("quoted");
 // whether `value` is a constant a program quoted, or part of one: an object the host must not change
 export const isQuotedConstant = (value: unknown): boolean => typeof value === "object" && value !== null && quoted.has(value);
 
-const markQuoted = (root: unknown): void => {
+export const markQuoted = (root: unknown): void => {
     const pending = [root];
     while (pending.length > 0) {
         const v = pending.pop();

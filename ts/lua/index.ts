@@ -8,7 +8,9 @@ import { LuauSyntaxError, lowerLuau } from "./lower";
 import { luauFormat } from "./messages";
 import { LUAU_TYPES, registerLuauOps, type LuauLibrary } from "./ops";
 import { STRING_LIBRARY } from "./strlib";
-import { LuaTable } from "./table";
+import { LuaTable, RecordShape } from "./table";
+import { registerDatumSerializer } from "../magicvm/aot/serializer";
+import { registerDatumDeserializer } from "../magicvm/loader";
 import { parseLuau } from "./syntax/parser";
 import type { ParseResult } from "./syntax/ast";
 
@@ -21,6 +23,10 @@ export const luauText = (s: string): string => /[\x80-\xff]/.test(s) ? decoder.d
 
 // what the host gives a Luau instance. `print` gets each line print writes (a Luau string, without its newline)
 export type LuauHost = { readonly print?: (line: string) => void };
+
+// what Luau's compiled code holds besides plain values, for pre-compiled execution units: a record constructor's keys
+registerDatumSerializer("luau-record-shape", v => v instanceof RecordShape, v => ({ keys: v.keys }));
+registerDatumDeserializer("luau-record-shape", d => new RecordShape(d.keys));
 
 // what the front end reads: a parsed chunk, or (for the library's own functions) core forms as they are
 type Read = { parsed: ParseResult, file: string, source: string } | { core: any };

@@ -8,6 +8,12 @@ import { loadPrelude } from "./prelude";
 import { OP_LAMBDA } from "./symbols";
 import { MacroEvaluator } from "./transformer/macro";
 import { registerCoreSyntax } from "./transformer/syntax";
+import { registerDatumSerializer } from "../magicvm/aot/serializer";
+import { registerDatumDeserializer } from "../magicvm/loader";
+
+// Register Scheme's datum codecs for pre-compiled execution units
+registerDatumSerializer("cons", v => v instanceof Cons, (v, rec) => ({ car: rec(v.car), cdr: rec(v.cdr) }));
+registerDatumDeserializer("cons", (d, rec) => new Cons(rec(d.car), rec(d.cdr)));
 
 // A new instance running Scheme: its intrinsics (registered first, always in the same order), reserved names, reader,
 // macro expander and the prelude's procedures. The intrinsics stay open: register more before compiling code that uses them

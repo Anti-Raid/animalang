@@ -9,63 +9,16 @@ import { Liveness } from "./liveness";
 import { structureOf } from "./structure";
 import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
 import { fitsArity } from "../arity";
-import { CaseLambda, Closure, ClosureTemplate, NO_TEMPLATE, SHARED_OPS } from "../code";
+import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS, newCallCache } from "../code";
 import type { CallCache, Code, DirectFn, ResumeFn } from "../code";
 import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
 import type { VMExecutor } from "../executor";
 import { blockStarts, type Op } from "../ops";
 import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, MULTI, StackSnapshot, Suspend, WindPoint, catchHere, caughtAt, countControlSuspend, frameInfos, oneValue, restValues, tailName, unpackForBinding, unwind, VB, manyValues } from "../values";
 import type { ExecutionContext } from "../values";
-export const JIT_DEPS = {
-    markSet,
-    recordTailMark,
-    tailName,
-    ContinuationMarkSet,
-    MultipleValues,
-    unpackForBinding,
-    restValues,
-    oneValue,
-    MULTI,
-    VB,
-    manyValues,
-    IProcedure,
-    ErrorObject,
-    Box,
-    MissingVarError,
-    VMError,
-    errorPos,
-    unwind,
-    Closure,
-    CaseLambda,
-    WindPoint,
-    applyArgs,
-    arrayArg,
-    raiseContinuable,
-    catchGuard,
-    stackSkip,
-    packValues,
-    Handlers,
-    MISSING,
-    MAX_JS_DEPTH,
-    MAX_NESTED_RESUMES,
-    Env,
-    Frame,
-    Suspend,
-    InterruptError,
-    EscapeContinuation,
-    countControlSuspend,
-    StackSnapshot,
-    frameInfos,
-    HostTail,
-    ControlRequest,
-    applyIntrinsic,
-    CatchToken,
-    Caught,
-    catchHere,
-    caughtAt,
-    markFirst,
-    EXCEPTION_HANDLERS,
-};
+import { JIT_DEPS } from "../jit-deps";
+export { JIT_DEPS } from "../jit-deps";
+import { UnitLoader } from "../loader";
 
 
 export class AotCompiler {
@@ -167,15 +120,7 @@ export class AotCompiler {
         const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
         for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
         const callCache: Record<number, CallCache> = {};
-        for (const ip of this.#callSites(code)) {
-            callCache[ip] = {
-                t0: NO_TEMPLATE, f0: null,
-                t1: NO_TEMPLATE, f1: null,
-                t2: NO_TEMPLATE, f2: null,
-                t3: NO_TEMPLATE, f3: null,
-                next: 0,
-            };
-        }
+        for (const ip of this.#callSites(code)) callCache[ip] = newCallCache();
         const siteCache: Record<number, object> = {};
         for (const { ip, pos } of this.#intrinsicSites(code)) siteCache[ip] = code.table!.entries[pos].site!();
         return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, siteCache, code.table?.fns ?? [], code.table?.deps ?? []);
@@ -190,17 +135,56 @@ export class AotCompiler {
         return output;
     }
 
-    public static generateSource(code: Code, tmpl?: ClosureTemplate, want: number = 0): string {
+    public static emitCodeSources(code: Code, tmpl?: ClosureTemplate): {
+        resumeSource: string;
+        directSource: string | null;
+        globalLoads: number[];
+        callSites: number[];
+        intrinsicSites: { ip: number; pos: number }[];
+        usedDeps: string[];
+    } {
         if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
         const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
         const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
         const usedDeps = new Set<string>();
         const structure = structureOf(code.ops);
-        const resume = want !== 0 ? "null" : this.#step("resume", () => {
+        const resume = this.#step("resume", () => {
             const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
             out.emitFunction();
             return out.toString();
         });
+        const direct = tmpl === undefined ? null : this.#step("direct", () => {
+            const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
+            out.emitFunction(tmpl.arity, 0);
+            return out.toString();
+        });
+        return {
+            resumeSource: resume,
+            directSource: direct,
+            globalLoads: this.#globalLoads(code),
+            callSites: this.#callSites(code),
+            intrinsicSites: this.#intrinsicSites(code),
+            usedDeps: [...usedDeps],
+        };
+    }
+
+    public static generateSource(code: Code, tmpl?: ClosureTemplate, want: number = 0): string {
+        if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
+        if (want === 0) {
+            const emitted = this.emitCodeSources(code, tmpl);
+            const caches = emitted.globalLoads.map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
+            const callCaches = emitted.callSites.map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("")
+                + emitted.intrinsicSites.map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
+            const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
+            const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
+            const deps = emitted.usedDeps.map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
+            return `${caches}${callCaches}${fns}${deps}return {\nresume: ${emitted.resumeSource},\ndirect: ${emitted.directSource ?? "null"}\n};`;
+        }
+        const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
+        const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
+        const usedDeps = new Set<string>();
+        const structure = structureOf(code.ops);
+        const resume = "null";
         const direct = tmpl === undefined ? "null" : this.#step("direct", () => {
             const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
             out.emitFunction(tmpl.arity, want);
@@ -208,7 +192,7 @@ export class AotCompiler {
         });
         const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
         const callCaches = this.#callSites(code).map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("")
-            + this.#intrinsicSites(code).map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
+                + this.#intrinsicSites(code).map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
         // positions never change once registered, so each intrinsic's function and deps are read once, into locals
         const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
         const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
@@ -284,3 +268,6 @@ export class AotCompiler {
         return blocks;
     }
 }
+
+UnitLoader.fallbackCompiler = AotCompiler;
+

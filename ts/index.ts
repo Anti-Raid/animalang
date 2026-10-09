@@ -15,3 +15,9 @@ export { ASTStringifier } from './scheme/printer';
 export * as common from './common'
 export { ErrorObject, TRY_CALL, isQuotedConstant, type SourcePos, type TryCall } from './common'
 export { posOf, isPosSlot } from './magicvm/forms'
+import { UnitSerializer, registerDatumSerializer } from './magicvm/aot/serializer';
+import { UnitLoader, registerDatumDeserializer } from './magicvm/loader';
+
+export { UnitSerializer, registerDatumSerializer };
+export { UnitLoader, registerDatumDeserializer };
+export type { AnimaExecutionUnit, UnitMeta, UnitArity, UnitConstant, UnitSites, UnitSources, UnitTemplate, UnitIntrinsic } from './magicvm/unit-types';

@@ -19,14 +19,18 @@ export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExe
 // what a call site's cache holds before its first call: no value's template, and never directly callable
 export const NO_TEMPLATE = { code: { direct: false } } as unknown as ClosureTemplate;
 
-// what a call site keeps of its callees: a 4-slot polymorphic inline cache (PIC)
+// what a call site keeps of its callees: the templates of up to four, each with its entry for the site's argument
+// count (Code.entry). A slot is taken by the first callee that finds it free, or holding a template whose code no
+// longer runs directly; once all four hold live templates, other callees go the slow way each time (a site that kept
+// replacing them would spend more on that than it saves)
 export type CallCache = {
     t0: ClosureTemplate, f0: DirectFn | null,
     t1: ClosureTemplate, f1: DirectFn | null,
     t2: ClosureTemplate, f2: DirectFn | null,
     t3: ClosureTemplate, f3: DirectFn | null,
-    next: number,
 };
+// (every cache is made here, so all have one shape)
+export const newCallCache = (): CallCache => ({ t0: NO_TEMPLATE, f0: null, t1: NO_TEMPLATE, f1: null, t2: NO_TEMPLATE, f2: null, t3: NO_TEMPLATE, f3: null });
 
 // an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
 export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };

@@ -4,6 +4,9 @@ import { Intrinsics } from "./intrinsics";
 import { newIntrinsics } from "./core";
 import { CaseLambda } from "./code";
 
+import { UnitLoader } from "./loader";
+import type { AnimaExecutionUnit, UnitMeta } from "./unit-types";
+
 export {
     CodeEmitter,
     AotCompiler,
@@ -12,8 +15,10 @@ export {
     VMContinuation,
     VMExecutor,
     Code,
-    Coroutine
+    Coroutine,
+    UnitLoader
 };
+export type { AnimaExecutionUnit, UnitMeta };
 
 export class AnimaVM {
     readonly executor: VMExecutor;
@@ -40,6 +45,15 @@ export class AnimaVM {
         const ctx = new ExecutionContext(this, scope);
         const topClosure = new Closure(new ClosureTemplate([], null, code, []), [], "top-level");
         return this.#run(ctx, this.executor.newFrame(ctx, topClosure, createRegs(code.numReg), null));
+    }
+
+    public loadUnit(json: string | AnimaExecutionUnit): { code: Code; meta: UnitMeta; template: ClosureTemplate } {
+        return UnitLoader.load(json, this.intrinsics);
+    }
+
+    public evaluateUnit(json: string | AnimaExecutionUnit, scope: Env): any {
+        const unit = this.loadUnit(json);
+        return this.evaluateRaw(unit.code, scope);
     }
 
     public evaluateClosure(code: Closure | CaseLambda, scope: Env, args: any[]): any {

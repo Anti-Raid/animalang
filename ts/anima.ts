@@ -4,8 +4,10 @@ import type { CaseLambda } from "./magicvm/code"
 import { newIntrinsics } from "./magicvm/core"
 import { Compiler } from "./magicvm/compiler"
 import { AnimaVM } from "./magicvm/vm"
-import type { Code, Closure } from "./magicvm/exec"
+import type { Code, Closure, ClosureTemplate } from "./magicvm/exec"
 import type { AnimaOptions } from "./magicvm/meta"
+import { UnitLoader } from "./magicvm/loader"
+import type { AnimaExecutionUnit, UnitMeta } from "./magicvm/unit-types"
 
 // A language on top of the core: reads source into its syntax tree and lowers that to the core forms (each carrying
 // where it comes from, see magicvm/forms.ts)
@@ -88,6 +90,14 @@ export class Anima {
 
     public evaluateRaw(code: Code): any {
         return this.#vm.evaluateRaw(code, this.#scope)
+    }
+
+    public loadUnit(json: string | AnimaExecutionUnit): { code: Code, meta: UnitMeta, template: ClosureTemplate } {
+        return this.#vm.loadUnit(json)
+    }
+
+    public evaluateUnit(json: string | AnimaExecutionUnit): any {
+        return this.#vm.evaluateUnit(json, this.#scope)
     }
 
     public evaluateClosure(code: Closure | CaseLambda, args: any[]): any {
