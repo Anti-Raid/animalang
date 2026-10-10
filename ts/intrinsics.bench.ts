@@ -7,10 +7,9 @@ import type * as Lib from "./bench-entry";
 const BUNDLE = "../.bench/anima.js";
 const bundle = await import(/* @vite-ignore */ BUNDLE);
 
-const { createScheme, impl, implAot, ASTStringifier, IProcedure, hostTailFrom, dumpFull, readFull } = bundle as unknown as typeof Lib;
-type Anima = Lib.Anima;
+const { createScheme, impl, ASTStringifier, IProcedure, hostTailFrom, compileNative } = bundle as unknown as typeof Lib;
 type AnimaOptions = Lib.AnimaOptions;
-type ByteCode = Lib.ByteCode;
+type Code = Lib.Code;
 
 // --- the only part that follows the intrinsics API as it changes ---
 const makeInstance = (vmImpl: AnimaOptions) => {
@@ -22,9 +21,16 @@ const makeInstance = (vmImpl: AnimaOptions) => {
     });
     anima.registerIntrinsic("%bench-add-call", (regs, s) => regs[s] + regs[s + 1], { args: [2, 2], leaf: true });
     anima.registerIntrinsic("%bench-call-or", (regs, s, n) => regs[s] instanceof IProcedure ? hostTailFrom(regs[s], regs, s + 1, n - 1) : regs[s], { args: [1, Infinity] });
+    anima.evaluateRaw(compileNative(anima, `
+        (define-intrinsic bench-add %bench-add)
+        (define-intrinsic bench-add-call %bench-add-call)
+        (define-global bench-call-or
+            (case-lambda
+                ((a) (%intcall %bench-call-or a))
+                ((a b) (%intcall %bench-call-or a b))))
+    `));
     return anima;
 };
-const loadSetup = (anima: Anima, dumped: Uint32Array) => readFull(dumped, anima.intrinsics);
 // -------------------------------------------------------------------
 
 const SETUP = `
@@ -50,10 +56,10 @@ const SETUP = `
 (define (fold f acc l) (if (null? l) acc (fold f (f acc (car l)) (cdr l))))
 (define (count-by cmp x l) (let loop ((l l) (n 0)) (if (null? l) n (loop (cdr l) (if (cmp (car l) x) (+ n 1) n)))))
 
-(define (host-inline n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (%bench-add acc i)))))
-(define (host-call n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (%bench-add-call acc i)))))
-(define (host-value n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (%bench-call-or i))))))
-(define (host-tail n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (%bench-call-or (lambda (x) x) i))))))
+(define (host-inline n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (bench-add acc i)))))
+(define (host-call n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (bench-add-call acc i)))))
+(define (host-value n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (bench-call-or i))))))
+(define (host-tail n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (bench-call-or (lambda (x) x) i))))))
 
 (define (callcc-bench n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (call/cc (lambda (k) (k i))))))))
 (define (wind-bench n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (dynamic-wind (lambda () #f) (lambda () i) (lambda () #f)))))))
@@ -68,6 +74,31 @@ const SETUP = `
 (define (coroutine-create-bench n)
   (let loop ((i 0) (acc 0))
     (if (= i n) acc (loop (+ i 1) (if (eq? (coroutine-status (coroutine-create (lambda () i))) 'suspended) (+ acc 1) acc)))))
+(define (fn-a x) (+ x 1))
+(define (fn-b x) (+ x 2))
+(define (fn-c x) (+ x 3))
+(define (fn-d x) (+ x 4))
+(define (poly-bench-1 n)
+  (let loop ((i 0) (acc 0))
+    (if (= i n) acc
+        (loop (+ i 1) (fn-a acc)))))
+(define (poly-bench-2 n)
+  (let loop ((i 0) (acc 0))
+    (if (= i n) acc
+        (let ((f (if (= (remainder i 2) 0) fn-a fn-b)))
+          (loop (+ i 1) (f acc))))))
+(define (poly-bench-3 n)
+  (let loop ((i 0) (acc 0))
+    (if (= i n) acc
+        (let ((m (remainder i 3)))
+          (let ((f (if (= m 0) fn-a (if (= m 1) fn-b fn-c))))
+            (loop (+ i 1) (f acc)))))))
+(define (poly-bench-4 n)
+  (let loop ((i 0) (acc 0))
+    (if (= i n) acc
+        (let ((m (remainder i 4)))
+          (let ((f (if (= m 0) fn-a (if (= m 1) fn-b (if (= m 2) fn-c fn-d)))))
+            (loop (+ i 1) (f acc)))))))
 `;
 
 const GROUPS: [group: string, calls: Record<string, string>][] = [
@@ -81,6 +112,12 @@ const GROUPS: [group: string, calls: Record<string, string>][] = [
     ["calls between functions", {
         "helper call 100k": "(sum-squares 100000)",
         "mutual tail calls 100k": "(my-even? 100000)",
+    }],
+    ["polymorphic call sites", {
+        "monomorphic 100k": "(poly-bench-1 100000)",
+        "2-way polymorphic 100k": "(poly-bench-2 100000)",
+        "3-way polymorphic 100k": "(poly-bench-3 100000)",
+        "4-way polymorphic 100k": "(poly-bench-4 100000)",
     }],
     ["tables and vectors", {
         "table set/ref 10k": "(table-bench 10000)",
@@ -107,12 +144,12 @@ const GROUPS: [group: string, calls: Record<string, string>][] = [
     }],
 ];
 
-const MODES: [mode: string, vmImpl: AnimaOptions][] = [["interp", impl], ["aot", implAot]];
+const MODES: [mode: string, vmImpl: AnimaOptions][] = [["aot", impl]];
 
 const printer = new ASTStringifier();
 const stringify = (v: any): string => printer.stringify(v);
 
-// every workload is run once per mode up front; the modes must agree, so a broken workload fails loudly
+// every workload is run once up front, so a broken one fails before timing
 const prepared = MODES.map(([mode, vmImpl]) => {
     const anima = makeInstance(vmImpl);
     anima.evaluateRaw(anima.compileRaw(SETUP));
@@ -122,30 +159,20 @@ const prepared = MODES.map(([mode, vmImpl]) => {
     })] as const);
     return { mode, vmImpl, anima, groups };
 });
-for (const { mode, groups } of prepared.slice(1)) {
-    groups.forEach(([group, runs], g) => runs.forEach((run, i) => {
-        const expected = prepared[0].groups[g][1][i].result;
-        if (run.result !== expected) throw new Error(`${group} / ${run.name}: ${mode} gave ${run.result}, interp gave ${expected}`);
-    }));
-}
 
 const OPTS = { time: 1000, warmupTime: 300 };
 
 for (const { mode, anima, groups } of prepared) {
     for (const [group, runs] of groups) {
         describe(`${mode}: ${group}`, () => {
-            for (const { name, bc } of runs) bench(name, () => { anima.evaluateRaw(bc as ByteCode); }, OPTS);
+            for (const { name, bc } of runs) bench(name, () => { anima.evaluateRaw(bc as Code); }, OPTS);
         });
     }
 }
 
 for (const { mode, vmImpl, anima } of prepared) {
-    describe(`${mode}: startup, compile, load`, () => {
-        const compiled = anima.compileRaw(SETUP) as ByteCode;
-        const dumped = dumpFull(compiled);
+    describe(`${mode}: startup, compile`, () => {
         bench("new instance", () => { createScheme(vmImpl); }, OPTS);
         bench("compile setup program", () => { anima.compileRaw(SETUP); }, OPTS);
-        bench("dump + load setup program", () => { loadSetup(anima, dumpFull(compiled)); }, OPTS);
-        bench("load setup program", () => { loadSetup(anima, dumped); }, OPTS);
     });
 }

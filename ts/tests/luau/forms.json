@@ -1,0 +1,15 @@
+{
+  "attrib.luau": "97398e90f4fed654540c3b089f9cf92dc2418d51",
+  "basic.luau": "5ec47d65b5a448af1024ec7439c354914808d222",
+  "calls.luau": "14a9dec67e8a43743e400beddc8ea0204bd2516a",
+  "closure.luau": "c6d391ea2d1216bbf470a65558eb0bb174207209",
+  "constructs.luau": "1f1bf03eef70dbecb9c815ff1cc4f1c85d1f84ae",
+  "explicit_type_instantiations.luau": "25dcbac46df55798e24e79f8ba8cf94e171ee289",
+  "ifelseexpr.luau": "4beb59e353f9116a66297e566fd9e79124021b7f",
+  "literals.luau": "e89db9f3d78a2ac14f8e3f03a7d661abb847c999",
+  "locals.luau": "b25af5e3b29a923557b36c37bb4e29824f996fa1",
+  "stringinterp.luau": "a157e35a83ee8ba4fe4197d0d6b201d866951f4d",
+  "tpack.luau": "86576d8bd6838fe1b399ad2d6d1fc6bfcf86c810",
+  "types.luau": "76ecc78c588c38b74e5edbb0df8d24c09dc9112b",
+  "vararg.luau": "96b6eafc6037e53c261c548f4a6b7d8f594baa5b"
+}

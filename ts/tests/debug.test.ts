@@ -1,14 +1,15 @@
-import { ASTStringifier } from '../common';
+import { ASTStringifier } from '../scheme/printer';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Cons } from '../list';
+import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
-import { ByteCode } from '../bytecode-rvm/vm';
+import { Code } from '../magicvm/vm';
 import { Anima } from '../anima';
-import { impl, implAot, implDebug, implAotDebug } from '../bytecode-rvm/meta';
+import { impl, implDebug } from '../magicvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Anima', () => {
     let evaluator: Anima
     let s = new ASTStringifier()
@@ -121,12 +122,13 @@ describe('Anima', () => {
             expect(runFile(`(define fresh-co (coroutine-create (lambda () 1))) (debug-traceback fresh-co)`)).toBe("stack traceback:");
         });
 
-        it("%at overrides positions for transpiled code", () => {
-            const err = errorOf(`(define (lua-fn t)
-  (%at "game.luau" 12 5 (car t)))
-(list (lua-fn '()))`);
+        it("takes positions from the core forms a transpiler builds, and has no %at of its own", () => {
+            const S = Symbol.for;
+            const call = [S("%intcall"), { file: "game.luau", line: 12, col: 5 }, S("%car"), S("t")];
+            evaluator.evaluateRaw(evaluator.compiler.compile([S("%define-global"), null, S("lua-fn"), [S("%lambda"), null, [[], [S("t")], null, call]]]));
+            const err = errorOf(`(list (lua-fn '()))`);
             expect(err.animaTraceback).toContain("game.luau:12:5 in lua-fn");
-            expect(() => runFile(`(%at "x" 1 (car '(1)))`)).toThrow("%at must be in format");
+            expect(() => runFile(`(%at "x" 1 2 (car '(1)))`)).toThrow("Variable '%at' is not defined");
         });
 
         it("continuations stay multi-shot after a traceback", () => {
@@ -141,7 +143,8 @@ describe('Anima', () => {
 })
 })
 
-describe.each([["interp", implDebug], ["aot", implAotDebug]] as const)("debug %s", (_mode, vmImpl) => {
+describe("debug", () => {
+    const vmImpl = implDebug
     let evaluator: Anima;
     beforeEach(() => { evaluator = createScheme(vmImpl) });
     const runFile = (src: string) => evaluator.evaluateRaw(evaluator.compileRaw(src, "t.anima"));

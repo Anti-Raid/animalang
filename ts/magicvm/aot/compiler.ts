@@ -1,0 +1,236 @@
+// The AOT compiler: splits a function's instructions into basic blocks, generates a function's JS source (resume.ts, direct.ts) and builds it,
+// sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
+import { Intrinsics, type TypeSystem } from "../intrinsics";
+import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, VMError, packValues } from "../../common";
+import { newGlobalCache, type GlobalCache } from "../../env";
+import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
+import { DirectEmitter } from "./direct";
+import { ResumeEmitter } from "./resume";
+import { Liveness } from "./liveness";
+import { structureOf } from "./structure";
+import type { AotBlock, AotInst, AotTerm, SourceUse } from "./types";
+import { fitsArity } from "../arity";
+import { CaseLambda, Closure, ClosureTemplate, SHARED_OPS, newCallCache } from "../code";
+import type { CallCache, Code, DirectFn, ResumeFn } from "../code";
+import { ControlRequest, HostTail, applyArgs, applyIntrinsic, arrayArg, catchGuard, raiseContinuable, stackSkip } from "../coreops";
+import type { VMExecutor } from "../executor";
+import { blockStarts, type Op } from "../ops";
+import { Box, CatchToken, EscapeContinuation, EscapedError, Frame, errorPos, InterruptError, MAX_JS_DEPTH, MAX_NESTED_RESUMES, MISSING, MULTI, StackSnapshot, Suspend, WindPoint, catchHere, caughtAt, countControlSuspend, frameInfos, oneValue, restValues, tailName, unpackForBinding, unwind, VB, manyValues } from "../values";
+import type { ExecutionContext } from "../values";
+import { JIT_DEPS } from "../jit-deps";
+export { JIT_DEPS } from "../jit-deps";
+import { UnitLoader } from "../loader";
+
+
+export class AotCompiler {
+    public static run(ctx: ExecutionContext, initialFrame: Frame, executor: VMExecutor): any {
+        let frame: Frame | null = initialFrame;
+
+        // one try around the loop: any error ends the run
+        try {
+            if (frame.ip === 0 && frame.code.direct && frame.code.arity!.params === 0 && frame.code.arity!.rest === "none" && !frame.code.internal && !frame.isShared(frame.ctx)) frame = this.#runDirect(frame, executor);
+            while (frame !== null) {
+                const frameCtx: ExecutionContext = frame.ctx;
+                frame = executor.enter(frameCtx, frame);
+                const resumeFn = frame.code.resumeFn ?? this.compile(frame.code, frame.closure.tmpl);
+                frame = resumeFn(frameCtx, frame, executor);
+            }
+        } catch (err) {
+            throw err instanceof EscapedError ? err.error : err;
+        }
+
+        return ctx.acc;
+    }
+
+    // a fresh zero-argument frame (top-level code) runs through its direct entry, falling back to heap frames on a Suspend
+    static #runDirect(frame: Frame, executor: VMExecutor): Frame | null {
+        const ctx = frame.ctx;
+        let val;
+        try {
+            val = frame.code.directFn!(ctx, frame.closure, executor, 1, frame.marks, frame.mframe);
+        } catch (e) {
+            if (!(e instanceof Suspend)) throw e;
+            if (frame.parent !== null) e.push(frame.parent);
+            return executor.resumeSuspend(ctx, e);
+        }
+        return executor.setRetVal(ctx, frame.parent, val);
+    }
+
+    public static compileAll(code: Code, tmpl?: ClosureTemplate): void {
+        if (code.resumeFn === null) {
+            this.compile(code, tmpl);
+        }
+        for (const c of code.constants) {
+            if (c instanceof ClosureTemplate) {
+                this.compileAll(c.code, c);
+            } else if (c instanceof Closure) {
+                this.compileAll(c.tmpl.code, c.tmpl);
+            }
+        }
+    }
+
+    public static compile(code: Code, tmpl?: ClosureTemplate): ResumeFn {
+        const { resume, direct } = this.generateFunction(code, tmpl);
+        code.resumeFn = resume;
+        if (direct !== null && tmpl !== undefined) {
+            code.directFn = direct;
+            code.arity = tmpl.arity;
+            code.direct = true;
+        }
+        return resume;
+    }
+
+    // the compiled source of shared instruction lists: copies of a Code (Code.fresh) only build their own functions.
+    // Source that calls intrinsics also depends on what they generate: their positions, inline templates and deps' locals.
+    // Instances that register the same intrinsics the same way (e.g. from the same front end) share it
+    static readonly #sources = new WeakMap<readonly Op[], { uses: readonly SourceUse[], types: TypeSystem | null, want: number, factory: Function }[]>();
+
+    static #sameUses(a: readonly SourceUse[], b: readonly SourceUse[]): boolean {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            const x = a[i], y = b[i];
+            // name and bounds are written into the source of IntApply
+            // and the type facts rules, which the source relies on
+            if (x.pos !== y.pos || x.inline !== y.inline || (x.site === undefined) !== (y.site === undefined) || x.name !== y.name || x.min !== y.min || x.max !== y.max || !Intrinsics.sameFacts(x, y)) return false;
+            const dx = Object.entries(x.deps), dy = y.deps;
+            if (dx.length !== Object.keys(dy).length || dx.some(([k, v]) => dy[k] !== v)) return false;
+        }
+        return true;
+    }
+
+    // the direct entry of `code` for a call that wants `want` values (Code.wanted), compiled when a call first asks
+    // for it: most procedures are only ever called one way
+    public static compileWant(code: Code, tmpl: ClosureTemplate, want: number): void {
+        code.wanted[want] = this.generateFunction(code, tmpl, want).direct!;
+    }
+
+    // `want`: only the direct entry, for that many values
+    public static generateFunction(code: Code, tmpl?: ClosureTemplate, want: number = 0): { resume: ResumeFn, direct: DirectFn | null } {
+        const uses: SourceUse[] = code.intrinsics.map(({ pos }) => { const { inline, site, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch } = code.table!.entries[pos]; return { pos, inline, site, deps, name, min, max, returns, wants, refineArgs, branchNarrow, invertBranch }; });
+        let variants = this.#sources.get(code.ops);
+        const types = code.table?.types ?? null;
+        let factory = variants?.find(v => v.types === types && v.want === want && this.#sameUses(v.uses, uses))?.factory;
+        if (factory === undefined) {
+            // parsing the source is most of the cost, so copies share the factory and only call it for their own functions
+            factory = new Function(...Object.keys(JIT_DEPS), "CONSTANTS", "GLOBAL_CACHE", "CALL_CACHE", "SITE_CACHE", "RT", "DEPS", this.generateSource(code, tmpl, want));
+            if (SHARED_OPS.has(code.ops)) {
+                if (variants === undefined) this.#sources.set(code.ops, variants = []);
+                variants.push({ uses, types, want, factory });
+            }
+        }
+        const globalCache: Record<number, GlobalCache> = {};
+        for (const ip of this.#globalLoads(code)) globalCache[ip] = newGlobalCache();
+        const callCache: Record<number, CallCache> = {};
+        for (const ip of this.#callSites(code)) callCache[ip] = newCallCache();
+        const siteCache: Record<number, object> = {};
+        for (const { ip, pos } of this.#intrinsicSites(code)) siteCache[ip] = code.table!.entries[pos].site!();
+        return factory(...Object.values(JIT_DEPS), code.constants, globalCache, callCache, siteCache, code.table?.fns ?? [], code.table?.deps ?? []);
+    }
+
+    // called with each step's output when generating source: the blocks, their liveness, the resume and direct entries
+    static trace?: (step: string, output: unknown) => void;
+
+    static #step<T>(name: string, run: () => T): T {
+        const output = run();
+        this.trace?.(name, output);
+        return output;
+    }
+
+    // the source of `code`'s entries and what it reads from outside itself: its sites' caches, by ip, and the deps'
+    // locals its inline templates use. `want`: only the direct entry, for that many values (no resume entry then)
+    public static emitCodeSources(code: Code, tmpl?: ClosureTemplate, want: number = 0): {
+        resumeSource: string | null;
+        directSource: string | null;
+        globalLoads: number[];
+        callSites: number[];
+        intrinsicSites: { ip: number; pos: number }[];
+        usedDeps: string[];
+    } {
+        if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
+        const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
+        const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg, code.constants));
+        const usedDeps = new Set<string>();
+        const structure = structureOf(code.ops);
+        const resume = want !== 0 ? null : this.#step("resume", () => {
+            const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
+            out.emitFunction();
+            return out.toString();
+        });
+        const direct = tmpl === undefined ? null : this.#step("direct", () => {
+            const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
+            return out.emitFunction(tmpl.arity, want) ? out.toString() : null;
+        });
+        return {
+            resumeSource: resume,
+            directSource: direct,
+            globalLoads: this.#globalLoads(code),
+            callSites: this.#callSites(code),
+            intrinsicSites: this.#intrinsicSites(code),
+            usedDeps: [...usedDeps],
+        };
+    }
+
+    public static generateSource(code: Code, tmpl?: ClosureTemplate, want: number = 0): string {
+        const emitted = this.emitCodeSources(code, tmpl, want);
+        const caches = emitted.globalLoads.map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
+        const callCaches = emitted.callSites.map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("")
+            + emitted.intrinsicSites.map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
+        // positions never change once registered, so each intrinsic's function and deps are read once, into locals
+        const fns = code.intrinsics.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
+        const deps = emitted.usedDeps.map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
+        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${emitted.resumeSource ?? "null"},\ndirect: ${emitted.directSource ?? "null"}\n};`;
+    }
+
+    static #globalLoads(code: Code): number[] {
+        return code.ops.filter(op => op.k === "LoadGlobal").map(op => op.ip);
+    }
+
+    // the calls of leaf intrinsics that keep state of their own where they are called (IntrinsicOptions.site)
+    static #intrinsicSites(code: Code): { ip: number, pos: number }[] {
+        return code.ops.flatMap(op => op.k === "IntCall" && code.table!.entries[op.pos].site !== undefined ? [{ ip: op.ip, pos: op.pos }] : []);
+    }
+
+    static #callSites(code: Code): number[] {
+        return code.ops.filter(op => op.k === "Call" || op.k === "HostCall").map(op => op.ip);
+    }
+
+    public static buildAot(code: Code, tmpl?: ClosureTemplate): AotBlock[] {
+        const starts = blockStarts(code.ops);
+        const blocks: AotBlock[] = [];
+        let o = 0;
+        for (let b = 0; b < starts.length; b++) {
+            const end = b + 1 < starts.length ? starts[b + 1] : code.ops.length;
+            const insts: AotInst[] = [];
+            let term: AotTerm | null = null;
+            let ip = starts[b];
+            while (o < code.ops.length && code.ops[o].ip < ip) o++;
+            while (ip < end && term === null) {
+                const op = code.ops[o++];
+                const at = op.ip;
+                ip = at + 1;
+                switch (op.k) {
+                    case "If": term = { k: "Branch", cond: op.cond, then: ip, else: op.else, elseif: op.elseif, at }; break;
+                    case "Else": term = { k: "Jump", target: op.end, at }; break;
+                    case "EndIf": term = { k: "Jump", target: ip, at }; break;
+                    case "Block": case "Loop": term = { k: op.k, body: ip, end: op.end, at }; break;
+                    case "EndLoop": term = { k: "Jump", target: op.head, loopBack: true, at }; break;
+                    case "Jump": term = { k: "Jump", target: op.target, escape: true, at }; break;
+                    case "Call":
+                        term = !op.tail ? { k: "Call", proc: op.proc, start: op.start, nargs: op.nargs, resume: ip, one: op.one, many: op.many, at }
+                            : tmpl !== undefined && fitsArity(tmpl.arity, op.nargs)
+                            ? { k: "MaybeSelfTailCall", proc: op.proc, start: op.start, nargs: op.nargs, ip, arity: tmpl.arity, restPos: tmpl.code.restPos, at }
+                            : { k: "TailCall", proc: op.proc, start: op.start, nargs: op.nargs, ip, at };
+                        break;
+                    case "HostCall": term = { k: "HostCall", pos: op.pos, start: op.start, nargs: op.nargs, isTail: op.tail, resume: ip, at }; break;
+                    case "Return": term = { k: "Return", reg: op.src, at }; break;
+                    default: insts.push(op);
+                }
+            }
+            blocks.push({ start: starts[b], insts, term: term ?? { k: "Jump", target: ip } });
+        }
+        return blocks;
+    }
+}
+
+UnitLoader.fallbackCompiler = AotCompiler;
+

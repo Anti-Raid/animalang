@@ -2,8 +2,9 @@
 // it ships: one module, rather than the per-module code vitest runs the sources as, where every access to an import costs
 // extra (see intrinsics.bench.ts)
 export { createScheme } from "./scheme";
-export { impl, implAot, type AnimaOptions } from "./bytecode-rvm/meta";
-export { ASTStringifier, IProcedure } from "./common";
-export { hostTailFrom, type ByteCode } from "./bytecode-rvm/exec";
-export { dumpFull, readFull } from "./bytecode-rvm/utils";
+export { impl, type AnimaOptions } from "./magicvm/meta";
+export { IProcedure } from "./common";
+export { ASTStringifier } from "./scheme/printer";
+export { hostTailFrom, type Code } from "./magicvm/exec";
+export { compileNative } from "./native";
 export type { Anima } from "./anima";
