@@ -42,7 +42,25 @@ const WITH_MARK = Symbol.for("%with-mark");
 const APPLY = Symbol.for("%apply");
 const VALUES = Symbol.for("%values");
 const ARRAY = Symbol.for("%array");
-type Env = ReadonlyMap<symbol, Info>;
+// what the walk knows of the variables bound where it is: a scope's own over those of the scopes around it (each
+// scope a copy of the one around it would cost a function its locals times its binders)
+class Env {
+    readonly #own = new Map<symbol, Info>();
+
+    constructor(readonly around: Env | null = null) {}
+
+    get(sym: symbol): Info | undefined {
+        for (let scope: Env | null = this; scope !== null; scope = scope.around) {
+            const info = scope.#own.get(sym);
+            if (info !== undefined) return info;
+        }
+        return undefined;
+    }
+
+    set(sym: symbol, info: Info): void {
+        this.#own.set(sym, info);
+    }
+}
 // what the walk knows where it is: the variables bound to what it can use, the lambdas not to inline there (their own
 // %letrec group, and those being inlined), whether it is in the tail position of the procedure it is in (a lambda's,
 // or one inlined), and the same of each %block around it
@@ -118,6 +136,20 @@ const usesIn = (es: readonly any[], sym: symbol): number => {
     return n;
 };
 
+// the variables usesIn finds a use of in `es`
+const usedIn = (es: readonly any[]): Set<symbol> => {
+    const used = new Set<symbol>();
+    const walk = (x: any) => {
+        if (typeof x === "symbol") used.add(x);
+        else {
+            if (Array.isArray(x) && typeof x[2] === "symbol" && Lconv.forms.get(x[0]) === "assign") used.add(x[2]);
+            for (const y of children(x)) walk(y);
+        }
+    };
+    es.forEach(walk);
+    return used;
+};
+
 // whether every use of `sym` in `es` is as the operator of a call
 const onlyCalledIn = (es: readonly any[], sym: symbol): boolean => {
     const walk = (x: any): boolean => x !== sym && children(x).every((y, i) => i === 0 && y === sym && x[0] === CORE_CALL ? true : walk(y));
@@ -164,6 +196,54 @@ const freeIn = (e: any, bound: ReadonlySet<symbol>, out: Set<symbol>): Set<symbo
     return out;
 };
 
+// What a program does with each of its variables (a name is one variable, so its uses are those of its scope): what
+// usesIn, onlyCalledIn, boxedInPlace and usedOnceStraight find in a binding's scope, found for every variable in one walk.
+// Asking those of each binding in turn costs a function with many locals its length squared. Null for a program with
+// a form that is not laid out as it should be (which those walk as far as they can)
+type Uses = { uses: number, straight: number, nested: boolean, other: boolean, boxed: boolean };
+const usesOfAll = (ast: any): Map<symbol, Uses> | null => {
+    const all = new Map<symbol, Uses>();
+    // how many lambdas and loops a variable's binder is inside
+    const bound = new Map<symbol, number>();
+    const of = (sym: symbol): Uses => {
+        let u = all.get(sym);
+        if (u === undefined) all.set(sym, u = { uses: 0, straight: 0, nested: false, other: false, boxed: false });
+        return u;
+    };
+    let wellFormed = true;
+    const visit = (x: any[], depth: number): void => {
+        const shape = Lconv.forms.get(x[0]);
+        if (x.length === 0 || shape === "quote") return;
+        if (shape === undefined || malformed(Lconv, x) !== null) {
+            wellFormed = false;
+            return;
+        }
+        if (x[0] === BOX_IN_PLACE && typeof x[2] === "symbol") of(x[2]).boxed = true;
+        if (shape === "assign" && typeof x[2] === "symbol") of(x[2]).uses++;
+        const inner = x[0] === CORE_LAMBDA || x[0] === CORE_LOOP ? depth + 1 : depth;
+        const exprs = parts(Lconv, x).exprs;
+        // (a variable nothing uses is known too: as one with no uses)
+        for (const [, names] of exprs) {
+            for (const name of names) {
+                if (bound.has(name)) continue;
+                bound.set(name, inner);
+                of(name);
+            }
+        }
+        exprs.forEach(([y], i) => {
+            if (typeof y === "symbol") {
+                const u = of(y);
+                u.uses++;
+                u.straight++;
+                if (inner > (bound.get(y) ?? inner)) u.nested = true;
+                if (!(i === 0 && x[0] === CORE_CALL)) u.other = true;
+            } else if (Array.isArray(y)) visit(y, inner);
+        });
+    };
+    if (Array.isArray(ast)) visit(ast, 0);
+    return wellFormed ? all : null;
+};
+
 // `boxes`: the variables boxes were made of in what was inlined (for the unbox pass)
 export type Optimized = { ast: any, assumed: ReadonlySet<number>, boxes: ReadonlySet<symbol> };
 
@@ -172,6 +252,8 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     const assumed = new Set<number>();
     const locals = new Set<symbol>();
     const copy = renamer(intrinsics);
+    // (a variable made by inlining is not among them: its scope is looked through)
+    const known = usesOfAll(ast);
     let budget = INLINE_BUDGET;
     const boxes = new Set<symbol>();
 
@@ -232,14 +314,18 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
 
     // what binding `name` to `init` (simplified) tells the walk of `scope`: a constant or a copy takes its place (the
     // binding goes), a lambda may be inlined
-    const learn = (env: Map<symbol, Info>, name: symbol, init: any, scope: readonly any[]): boolean => {
+    const learn = (env: Env, name: symbol, init: any, scope: () => readonly any[]): boolean => {
+        const u = known?.get(name);
         // boxed in place, it holds its box from then on: not the value it was bound to
-        if (boxedInPlace(scope, name)) return false;
+        if (u !== undefined ? u.boxed : boxedInPlace(scope(), name)) return false;
         if (isConst(init)) env.set(name, { k: "const", e: init });
         else if (typeof init === "symbol" && locals.has(init)) env.set(name, { k: "alias", sym: init });
-        else if (sequenceOf(init) !== null && usedOnceStraight(scope, name)) env.set(name, { k: "seq", e: init });
+        else if (sequenceOf(init) !== null && (u !== undefined ? u.straight === 1 && !u.nested : usedOnceStraight(scope(), name))) env.set(name, { k: "seq", e: init });
         else {
-            if (inlinable(init)) env.set(name, { k: "lambda", lambda: init, once: usesIn(scope, name) === 1 && onlyCalledIn(scope, name), name: String(name.description) });
+            if (inlinable(init)) {
+                const once = u !== undefined ? u.uses === 1 && !u.other : usesIn(scope(), name) === 1 && onlyCalledIn(scope(), name);
+                env.set(name, { k: "lambda", lambda: init, once, name: String(name.description) });
+            }
             return false;
         }
         return true;
@@ -266,8 +352,11 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     // uses (so procedures that only call each other go when nothing else uses them)
     const needed = (bindings: any[][], items: readonly any[]): any[][] => {
         const kept = new Set(bindings.filter(([, init]) => !effectFree(unwrapBoxed(init))).map(b => b[0]));
+        if (kept.size === bindings.length) return bindings;
         for (let reach = [...items, ...bindings.filter(b => kept.has(b[0])).map(b => b[1])]; reach.length > 0;) {
-            const found = bindings.filter(b => !kept.has(b[0]) && usesIn(reach, b[0]) > 0);
+            // (what `reach` uses, found in one walk of it: asking usesIn of each binding walks it once for each)
+            const used = usedIn(reach);
+            const found = bindings.filter(b => !kept.has(b[0]) && used.has(b[0]));
             for (const b of found) kept.add(b[0]);
             reach = found.map(b => b[1]);
         }
@@ -302,12 +391,12 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 const bindings: any[][] = e[2];
                 if (!validBinders(bindings.map(b => b[0]))) return e;
                 const items = e.slice(3);
-                const inner = new Map(k.env);
+                const inner = new Env(k.env);
                 const kept: any[][] = [];
                 for (const [name, init] of bindings) {
                     const v = value(init);
                     locals.add(name);
-                    if (!learn(inner, name, v, items)) kept.push([name, v]);
+                    if (!learn(inner, name, v, () => items)) kept.push([name, v]);
                 }
                 const done = body(items, ctx, { ...k, env: inner });
                 const rest = needed(kept, done);
@@ -316,12 +405,12 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
             case "let*": {
                 const bindings: any[][] = e[2];
                 if (!bindings.every(b => canBind(b[0]))) return e;
-                const inner = new Map(k.env);
+                const inner = new Env(k.env);
                 const kept: any[][] = [];
                 bindings.forEach(([name, init], i) => {
                     const v = value(init, inner);
                     locals.add(name);
-                    if (!learn(inner, name, v, [...bindings.slice(i + 1).map(b => b[1]), ...e.slice(3)])) kept.push([name, v]);
+                    if (!learn(inner, name, v, () => [...bindings.slice(i + 1).map(b => b[1]), ...e.slice(3)])) kept.push([name, v]);
                 });
                 const done = body(e.slice(3), ctx, { ...k, env: inner });
                 const rest = needed(kept, done);
@@ -333,13 +422,17 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 if (!validBinders(names)) return e;
                 for (const n of names) locals.add(n);
                 const items = e.slice(3);
-                const inner = new Map(k.env);
+                const inner = new Env(k.env);
                 // a %letrec's lambdas are not inlined into each other, so recursion stays recursion
                 const group = new Set([...k.own, ...names]);
                 const lambda = (init: any) => isLetrecLambda(init) && init === unwrapBoxed(init) && inlinable(init);
                 const scopeOf = (name: symbol) => [...bindings.filter(b => b[0] !== name).map(b => b[1]), ...items];
                 for (const [name, init] of bindings) {
-                    if (lambda(init)) inner.set(name, { k: "lambda", lambda: init, once: usesIn([init], name) === 0 && usesIn(scopeOf(name), name) === 1 && onlyCalledIn(scopeOf(name), name), name: String(name.description) });
+                    if (!lambda(init)) continue;
+                    // (its uses are those of its own init and of its scope: none in the first, so all of them in the second)
+                    const u = known?.get(name);
+                    const once = usesIn([init], name) === 0 && (u !== undefined ? u.uses === 1 && !u.other : usesIn(scopeOf(name), name) === 1 && onlyCalledIn(scopeOf(name), name));
+                    inner.set(name, { k: "lambda", lambda: init, once, name: String(name.description) });
                 }
                 const inits = bindings.map(([name, init]) => {
                     const inside = unwrapBoxed(init);
@@ -360,11 +453,11 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 const found = rest === null && validBinders(names) ? valuesOf(init) : null;
                 if (found !== null && (op !== CORE_LET_VALUES_STRICT || found.exprs.length === names.length)) {
                     const items = e.slice(3);
-                    const inner = new Map(k.env);
+                    const inner = new Env(k.env);
                     const kept: any[][] = [];
                     names.forEach((name: symbol, i: number) => {
                         const v = i < found.exprs.length ? found.mark(found.exprs[i]) : VOID;
-                        if (!learn(inner, name, v, items)) kept.push([name, v]);
+                        if (!learn(inner, name, v, () => items)) kept.push([name, v]);
                     });
                     for (const x of found.exprs.slice(names.length)) kept.push([Symbol("_"), found.mark(x)]);
                     const done = body(items, ctx, { ...k, env: inner });
@@ -530,5 +623,5 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         return info?.k === "lambda" || (!locals.has(x) && intrinsics.known.has(x));
     };
 
-    return { ast: walk(ast, "value", { env: new Map(), own: new Set(), tail: true, blocks: new Map() }), assumed, boxes };
+    return { ast: walk(ast, "value", { env: new Env(), own: new Set(), tail: true, blocks: new Map() }), assumed, boxes };
 };

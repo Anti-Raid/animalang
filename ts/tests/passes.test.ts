@@ -55,14 +55,70 @@ describe("The compiler's passes", () => {
         const seen: string[] = [];
         anima.compiler.trace = (name, output) => {
             seen.push(name);
-            if (name === "rename" || name === "block-escapes" || name === "split-case-lambdas" || name === "lift-lambdas") check(Lsrc, output);
+            if (name === "flatten-lets" || name === "rename" || name === "block-escapes" || name === "split-case-lambdas" || name === "merge-loops" || name === "lift-lambdas") check(Lsrc, output);
             if (name === "assignments" || name === "cp0") check(Lconv, (output as any).ast);
         };
         anima.compileRaw(`
             (define (f . xs) (let* ((a 1) (b (+ a 1))) (set! a (lambda () b)) (call/cc (lambda (k) (if (null? xs) (k b) a)))))
             (define (g n) (define h (case-lambda ((x) x) ((x y) (+ x y)))) (letrec ((loop (lambda (i) (if (= i n) (h i) (loop (+ i 1)))))) (loop 0)))
             (let-values (((a . b) (values 1 2))) (g 3))`);
-        expect(seen).toEqual(["rename", "block-escapes", "split-case-lambdas", "lift-lambdas", "resolve", "assignments", "cp0", "unbox", "closures", "generate", "interrupts", "lower"]);
+        expect(seen).toEqual(["flatten-lets", "rename", "block-escapes", "split-case-lambdas", "merge-loops", "lift-lambdas", "resolve", "assignments", "cp0", "unbox", "closures", "generate", "interrupts", "lower"]);
+    });
+});
+
+describe("Merging mutually recursive procedures", () => {
+    const s = new ASTStringifier();
+    const outcome = (src: string, optimize: boolean): string => {
+        const a = createScheme({ debug: false, optimize });
+        try { return s.stringify(a.evaluateRaw(a.compileRaw(src, "t.anima"))); } catch (e: any) { return "error: " + e.message; }
+    };
+    // the names of the procedures the pass made of several, in `src`
+    const merged = (src: string, options = impl): string[] => {
+        const a = createScheme(options);
+        const found: string[] = [];
+        const walk = (e: any): void => {
+            if (typeof e === "symbol" && e.description?.includes("+") && e.description.length > 1 && !found.includes(e.description)) found.push(e.description);
+            if (Array.isArray(e)) e.forEach(walk);
+        };
+        a.compiler.trace = (name, output) => { if (name === "merge-loops") walk(output); };
+        a.compileRaw(src, "t.anima");
+        return found.filter(n => /[a-z?]\+[a-z?]/.test(n));
+    };
+    const evenOdd = `(letrec ((ev? (lambda (n) (if (= n 0) #t (od? (- n 1))))) (od? (lambda (n) (if (= n 0) #f (ev? (- n 1))))))`;
+
+    it("makes one procedure of those that call one another in tail position", () => {
+        expect(merged(`${evenOdd} (ev? 10))`)).toEqual(["ev?+od?"]);
+        expect(merged(`(define (run) (define (a n acc) (if (= n 0) acc (b (- n 1) (+ acc 1)))) (define (b n acc) (if (= n 0) acc (c (- n 1)))) (define (c n) (a n 100)) (a 9 0))`)).toEqual(["a+b+c"]);
+        // one that calls itself is a loop already; a call that is not in tail position makes no loop
+        expect(merged(`(letrec ((loop (lambda (n) (if (= n 0) 'done (loop (- n 1)))))) (loop 5))`)).toEqual([]);
+        expect(merged(`(letrec ((f (lambda (n) (if (= n 0) 0 (+ 1 (g (- n 1)))))) (g (lambda (n) (if (= n 0) 0 (+ 1 (f (- n 1))))))) (f 5))`)).toEqual([]);
+        // a name that is assigned is not known to be the procedure, and debug code keeps its procedures apart
+        expect(merged(`${evenOdd} (set! od? (lambda (n) 'changed)) (ev? 3))`)).toEqual([]);
+        expect(merged(`${evenOdd} (ev? 10))`, { debug: true, optimize: false })).toEqual([]);
+    });
+
+    it("gives what the procedures gave apart", () => {
+        const programs = [
+            `${evenOdd} (list (ev? 10) (ev? 7) (od? 7) (od? 0)))`,
+            `${evenOdd} (ev? 1000000))`,
+            // different counts of parameters, three in a cycle
+            `(define (run) (define (a n acc) (if (= n 0) acc (b (- n 1) (+ acc 1)))) (define (b n acc) (if (= n 0) (list 'b acc) (c (- n 1)))) (define (c n) (a n 100)) (list (a 9 0) (b 4 1) (c 0))) (run)`,
+            // used as values, and called with a count they do not take
+            `${evenOdd} (list (map ev? '(1 2 3 4)) (procedure? od?) (call-with-values (lambda () (pcall ev? 1 2)) (lambda (ok e) ok))))`,
+            // calls of one another that are not tail calls, beside ones that are
+            `(letrec ((f (lambda (n) (if (= n 0) 0 (if (even? n) (g (- n 1)) (+ 1 (g (- n 1))))))) (g (lambda (n) (if (= n 0) 0 (f (- n 1)))))) (list (f 10) (g 10) (f 7)))`,
+            // each round has its own parameters: what a closure made in one captured, and a parameter that is assigned
+            `(letrec ((a (lambda (n acc) (if (= n 0) (map (lambda (k) (k)) acc) (b (- n 1) (cons (lambda () n) acc))))) (b (lambda (n acc) (a n (cons (lambda () (* n 10)) acc))))) (a 3 '()))`,
+            `(letrec ((a (lambda (n) (set! n (- n 1)) (if (< n 0) 'done (b n)))) (b (lambda (m) (a m)))) (list (a 5) (b 2)))`,
+            // an error in one of them, and one raised through them
+            `(letrec ((a (lambda (n) (if (= n 0) (car n) (b (- n 1))))) (b (lambda (n) (a n)))) (a 3))`,
+            `(letrec ((a (lambda (n) (if (= n 0) (raise 'bottom) (b (- n 1))))) (b (lambda (n) (a n)))) (call-with-values (lambda () (pcall a 5)) list))`,
+            // nine of them: more than are merged at once
+            `(letrec (${Array.from({ length: 9 }, (_, i) => `(s${i} (lambda (n) (if (= n 0) ${i} (s${(i + 1) % 9} (- n 1)))))`).join(" ")}) (list (s0 4) (s0 20) (s5 3)))`,
+        ];
+        expect(programs.filter(p => outcome(p, true) !== outcome(p, false))).toEqual([]);
+        expect(outcome(programs[0], true)).toBe("(#t #f #t #f)");
+        expect(outcome(programs[2], true)).toBe("((b 101) (b 101) 100)");
     });
 });
 

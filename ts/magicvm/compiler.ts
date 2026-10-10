@@ -2,7 +2,10 @@ import { Msg, VMError, ensureCanBind, normalizeExpr, CORE_CALL, CORE_INTCALL, CO
 import { AstAnalysis, isSpreadOf } from "./analysis";
 import { AnalysisScope, CompilerScope } from "./scope";
 import { IR, type Node, JumpLabel, ClosureTemplateIR } from "./ir";
-import { blockEscapes, liftLambdas, splitCaseLambdas } from "./lift";
+import { UNPACK_REST, UNPACK_STRICT } from "./ops";
+import { blockEscapes, liftLambdas, splitCaseLambdas } from "./passes/lift";
+import { mergeLoops } from "./passes/merge"
+import { flattenLets } from "./passes/flatten"
 import { PAD, bodyOf, clausesOf, isBoxedInit, isLetrecLambda, isPadded, optionsOf, paramsOf, restOf, unwrapBoxed } from "./lambda";
 import { corePos, type Code } from "./exec";
 import { runPass, type Pass, type PassContext } from "./passes/pass";
@@ -37,10 +40,14 @@ const unboxPass: Pass<Converted, Unboxed> = { name: "unbox", run: ({ ast, boxes 
 // what each lambda captures (see passes/closures.ts)
 const closuresPass: Pass<Unboxed, Closed> = { name: "closures", run: (unboxed, ctx) => ({ ...unboxed, captures: closureCaptures(unboxed.ast, ctx.intrinsics) }) }
 
-// the core forms to core forms (see lift.ts)
+// the core forms to core forms (see passes/lift.ts)
 const escapesPass: Pass<any, any> = { name: "block-escapes", run: ast => blockEscapes(ast) }
 const caseLambdasPass: Pass<any, any> = { name: "split-case-lambdas", run: ast => splitCaseLambdas(ast) }
 const liftPass: Pass<any, any> = { name: "lift-lambdas", run: ast => liftLambdas(ast) }
+// long chains of nested %lets made one %let*, so that no pass goes as deep as a function has locals (see passes/flatten.ts)
+const flattenPass: Pass<any, any> = { name: "flatten-lets", run: ast => flattenLets(ast) }
+// procedures that call one another in tail position made one, whose calls of itself are loops (see passes/merge.ts)
+const mergePass: Pass<any, any> = { name: "merge-loops", run: ast => mergeLoops(ast) }
 
 // the variables of each scope: which are assigned, captured, rest parameters (see AstAnalysis)
 const resolvePass: Pass<any, Analyzed> = {
@@ -109,10 +116,10 @@ export class Compiler {
     compile(trExpr: any, debug: boolean = this.debug, optimize: boolean = this.optimize): Code {
         const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, reentrant: this.reentrant, assumed: new Set(), trace: this.trace }
         try {
-            const renamed = runPass(renamePass, trExpr, ctx)
+            const renamed = runPass(renamePass, runPass(flattenPass, trExpr, ctx), ctx)
             const escaped = runPass(escapesPass, renamed, ctx)
             const split = runPass(caseLambdasPass, escaped, ctx)
-            const lifted = runPass(liftPass, split, ctx)
+            const lifted = runPass(liftPass, ctx.optimize ? runPass(mergePass, split, ctx) : split, ctx)
             const converted = runPass(assignmentsPass, runPass(resolvePass, lifted, ctx), ctx)
             const unboxed = runPass(unboxPass, ctx.optimize ? runPass(cp0Pass, converted, ctx) : converted, ctx)
             const closed = runPass(closuresPass, unboxed, ctx)
@@ -133,7 +140,7 @@ export class Compiler {
             const retReg = scope.allocTemp()
             this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, forwards, captures })
             if (!this.#nodesEndsInRet(nodes)) {
-                nodes.push({ t: "Return", reg: retReg })
+                nodes.push({ k: "Return", src: retReg })
             }
             return { nodes, numRegs: scope.numRegs }
         },
@@ -147,11 +154,11 @@ export class Compiler {
             return
         } else if (expr === null) {
             if (opts.destReg === undefined) return 
-            opts.nodes.push({t: "LoadValue", constant: null, destReg: opts.destReg})
+            opts.nodes.push({ k: "LoadValue", constant: null, dst: opts.destReg })
             return
         } else if (!Array.isArray(expr)) { // a literal (string, number, boolean, undefined, etc.)
             if (opts.destReg === undefined) return  
-            opts.nodes.push({t: "LoadValue", constant: expr, destReg: opts.destReg})
+            opts.nodes.push({ k: "LoadValue", constant: expr, dst: opts.destReg })
             return
         }
         if (expr.length === 0) throw new VMError(Msg.EmptyForm, [])
@@ -160,14 +167,14 @@ export class Compiler {
         const pos = expr[1]
         const form = [expr[0], ...expr.slice(2)]
         if (pos !== null && pos !== opts.pos) {
-            opts.nodes.push({ t: "Pos", pos })
+            opts.nodes.push({ k: "Pos", pos })
             try {
                 this.#compileForm(form, { ...opts, pos })
             } catch (err) {
                 if (err instanceof VMError) err.at ??= pos
                 throw err
             }
-            if (opts.pos !== undefined) opts.nodes.push({ t: "Pos", pos: opts.pos })
+            if (opts.pos !== undefined) opts.nodes.push({ k: "Pos", pos: opts.pos })
             return
         }
         this.#compileForm(form, opts)
@@ -221,7 +228,7 @@ export class Compiler {
                     this.#compileWithMark(expr, opts)
                     return
                 case OP_CURRENT_MARKS:
-                    if (opts.destReg !== undefined) opts.nodes.push({ t: "CurrentMarks", destReg: opts.destReg })
+                    if (opts.destReg !== undefined) opts.nodes.push({ k: "CurMarks", dst: opts.destReg })
                     return
                 case CORE_CATCH:
                     this.#compileCatch(expr, opts)
@@ -243,9 +250,9 @@ export class Compiler {
                     return
                 case INLINED:
                 case TAIL_INLINED:
-                    opts.nodes.push({ t: "InlineEnter", name: expr[1].description, at: opts.pos ?? null, tail: operator === TAIL_INLINED })
+                    opts.nodes.push({ k: "InlineEnter", name: expr[1].description, at: opts.pos ?? null, tail: operator === TAIL_INLINED })
                     this.#compileBody(expr.slice(2), opts)
-                    opts.nodes.push({ t: "InlineExit" })
+                    opts.nodes.push({ k: "InlineExit" })
                     return
                 case OP_APPLY:
                     this.#compileApply(expr, opts)
@@ -273,13 +280,13 @@ export class Compiler {
                     }
                     if (intrinsic.leaf) {
                         this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
-                            this.#withDest(opts, dest, destReg => opts.nodes.push({ t: "IntCall", pos: intrinsic.pos, destReg, startReg: start, nargs }))
+                            this.#withDest(opts, dest, destReg => opts.nodes.push({ k: "IntCall", pos: intrinsic.pos, dst: destReg, start, nargs }))
                         })
                         return
                     }
                     this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
                         // an intrinsic whose value is that of the call itself (see `tail`) is a call and then a return
-                        opts.nodes.push({ t: "HostCall", pos: intrinsic.pos, startReg: start, nargs, isTail: opts.isTail && intrinsic.tail, destReg: dest })
+                        opts.nodes.push({ k: "HostCall", pos: intrinsic.pos, start, nargs, tail: opts.isTail && intrinsic.tail, dst: dest })
                     })
                     return
                 }
@@ -310,7 +317,7 @@ export class Compiler {
     #compileBody(body: any[], opts: CmpOpts) {
         if (body.length === 0) {
             if (opts.destReg === undefined) return 
-            opts.nodes.push({t: "LoadValue", constant: undefined, destReg: opts.destReg})
+            opts.nodes.push({ k: "LoadValue", constant: undefined, dst: opts.destReg })
             return
         }
         body.forEach((e, i) => {
@@ -332,15 +339,15 @@ export class Compiler {
             const condReg = opts.scope.allocTemp()
             this.#compile(args[i], { ...opts, destReg: condReg, isTail: false })
             const nextLabel = new JumpLabel()
-            opts.nodes.push({ t: i === 0 ? "If" : "ElseIf", reg: condReg, elseLabel: nextLabel })
+            opts.nodes.push({ k: "If", cond: condReg, else: nextLabel, elseif: i !== 0 })
             opts.scope.freeTemp(condReg)
             this.#compile(args[i + 1], opts)
-            opts.nodes.push({ t: "Else", endLabel })
-            opts.nodes.push({ t: "Label", label: nextLabel })
+            opts.nodes.push({ k: "Else", end: endLabel })
+            opts.nodes.push({ k: "Label", label: nextLabel })
         }
         this.#compile(args.length % 2 === 1 ? args[args.length - 1] : undefined, opts)
-        opts.nodes.push({ t: "EndIf" })
-        opts.nodes.push({ t: "Label", label: endLabel })
+        opts.nodes.push({ k: "EndIf" })
+        opts.nodes.push({ k: "Label", label: endLabel })
     }
 
     #compileQuote(expr: any[], opts: CmpOpts) {
@@ -348,7 +355,7 @@ export class Compiler {
             throw new VMError(Msg.QuoteArgs, [expr.length - 1])
         }
         if (opts.destReg === undefined) return
-        opts.nodes.push({t: "LoadValue", constant: normalizeExpr(expr[1]), destReg: opts.destReg})
+        opts.nodes.push({ k: "LoadValue", constant: normalizeExpr(expr[1]), dst: opts.destReg })
     }
 
     // note that the syntax transformer alr handles defines inside a lambda so
@@ -360,10 +367,10 @@ export class Compiler {
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
         this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description });
-        opts.nodes.push({t: "SetGlobal", srcReg: valReg, sym})
+        opts.nodes.push({ k: "SetGlobal", src: valReg, sym })
         opts.scope.freeTemp(valReg)
         if (opts.destReg !== undefined) {
-            opts.nodes.push({t: "LoadValue", destReg: opts.destReg, constant: undefined})
+            opts.nodes.push({ k: "LoadValue", dst: opts.destReg, constant: undefined })
         }
     }
 
@@ -379,7 +386,7 @@ export class Compiler {
         if(res) opts.nodes.push(...res)
         opts.scope.freeTemp(valReg)
         if (opts.destReg !== undefined) {
-            opts.nodes.push({t: "LoadValue", destReg: opts.destReg, constant: undefined})
+            opts.nodes.push({ k: "LoadValue", dst: opts.destReg, constant: undefined })
         }
     }
 
@@ -397,7 +404,7 @@ export class Compiler {
         if (clauses.length === 1) return this.#compileClause(clauses[0], opts, name)
         const startReg = opts.scope.regAlloc.allocBlock(clauses.length)
         clauses.forEach((c, i) => this.#compileClause(c, { ...opts, destReg: opts.destReg === undefined ? undefined : startReg + i, isTail: false }, name))
-        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntCall", pos: corePos("%make-case-lambda"), destReg, startReg, nargs: clauses.length }))
+        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ k: "IntCall", pos: corePos("%make-case-lambda"), dst: destReg, start: startReg, nargs: clauses.length }))
         opts.scope.regAlloc.freeBlock(startReg, clauses.length)
     }
 
@@ -413,7 +420,7 @@ export class Compiler {
         for (const p of params) this.#ensureNotIntrinsic(p, "lambda")
         this.#ensureNotIntrinsic(remParams, "lambda")
         const lambdaNodes: Node[] = []
-        if (opts.pos !== undefined) lambdaNodes.push({ t: "Pos", pos: opts.pos })
+        if (opts.pos !== undefined) lambdaNodes.push({ k: "Pos", pos: opts.pos })
 
         for (const p of params) lambdaScope.addLocal(p)
         if (remParams !== null) lambdaScope.addLocal(remParams)
@@ -423,15 +430,15 @@ export class Compiler {
 
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
-        lambdaNodes.push({ t: "FunctionEntry" })
+        lambdaNodes.push({ k: "FunctionEntry" })
         this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, fnDepth: (opts.fnDepth ?? 0) + 1 })
         if (!this.#nodesEndsInRet(lambdaNodes)) {
-            lambdaNodes.push({t: "Return", reg: retReg})
+            lambdaNodes.push({ k: "Return", src: retReg })
         }
         const displayName = name ?? (opts.pos !== undefined ? `lambda@${opts.pos.file}:${opts.pos.line}` : "lambda")
         const rest = remParams === null || opts.forwards.has(remParams) || this.intrinsics.pack === undefined ? "array" : "packed"
         const template = new ClosureTemplateIR(params, remParams, lambdaNodes, lambdaScope.numRegs, lambdaScope.upvars, displayName, rest, isPadded(clause));
-        opts.nodes.push({t: "NewClosure", template: template, destReg: opts.destReg})
+        opts.nodes.push({ k: "NewClosure", template, dst: opts.destReg })
     }
 
     // (%let-values ((formals expr) ...) body ...): every expr is evaluated and spread into registers (Unpack), then
@@ -449,11 +456,11 @@ export class Compiler {
             this.#compile(init, { ...opts, destReg: valReg, isTail: false, ...(many ? { many: names.length } : {}) })
             const size = names.length + (rest !== null ? 1 : 0)
             const start = opts.scope.regAlloc.allocBlock(size)
-            opts.nodes.push({ t: "Unpack", srcReg: valReg, startReg: start, count: names.length, rest: rest !== null, strict, many })
+            opts.nodes.push({ k: "Unpack", src: valReg, start, count: names.length, flags: (rest !== null ? UNPACK_REST : 0) | (strict ? UNPACK_STRICT : 0), many })
             const pack = this.intrinsics.pack
             if (rest !== null && pack !== undefined) {
                 const reg = start + names.length
-                opts.nodes.push({ t: "IntApply", pos: pack.pos, destReg: reg, startReg: reg, nargs: 1 })
+                opts.nodes.push({ k: "IntApply", pos: pack.pos, dst: reg, start: reg, nargs: 1 })
             }
             opts.scope.freeTemp(valReg)
             names.forEach((sym, i) => bound.push({ sym, reg: start + i }))
@@ -467,7 +474,7 @@ export class Compiler {
             ensureCanBind(sym, seen, "let-values")
             this.#ensureNotIntrinsic(sym, "let-values")
             const destReg = opts.scope.addLocal(sym)
-            opts.nodes.push({ t: "Move", srcReg: reg, destReg })
+            opts.nodes.push({ k: "Move", src: reg, dst: destReg })
         }
         this.#compileBody(expr.slice(2), opts)
         opts.scope.exitBlock()
@@ -482,9 +489,9 @@ export class Compiler {
             name: expr[1], end, destReg: opts.destReg, isTail: opts.isTail, fnDepth: opts.fnDepth ?? 0,
             markDepth: opts.markRegions?.length ?? 0, parent: opts.blocks,
         }
-        opts.nodes.push({ t: "Block", end })
+        opts.nodes.push({ k: "Block", end })
         this.#compileBody(expr.slice(2), { ...opts, blocks: target })
-        opts.nodes.push({ t: "Label", label: end })
+        opts.nodes.push({ k: "Label", label: end })
     }
 
     #compileEscape(expr: any[], opts: CmpOpts) {
@@ -501,8 +508,8 @@ export class Compiler {
         if (expr.length > 2) this.#compile(expr[2], valueOpts)
         else this.#compile(undefined, valueOpts)
         const regions = opts.markRegions ?? []
-        if (regions.length > target.markDepth) opts.nodes.push({ t: "MarkRestore", reg: regions[target.markDepth] })
-        opts.nodes.push({ t: "Jump", label: target.end })
+        if (regions.length > target.markDepth) opts.nodes.push({ k: "MarkRestore", reg: regions[target.markDepth] })
+        opts.nodes.push({ k: "Jump", target: target.end })
     }
 
     // (%with-mark key value body): in tail position the mark goes on the current frame (replacing its value for the key)
@@ -510,18 +517,18 @@ export class Compiler {
     #compileWithMark(expr: any[], opts: CmpOpts) {
         const [, key, value, body] = expr
         const saved = opts.isTail ? -1 : opts.scope.regAlloc.allocBlock(2)
-        if (!opts.isTail) opts.nodes.push({ t: "MarkSave", reg: saved })
+        if (!opts.isTail) opts.nodes.push({ k: "MarkSave", reg: saved })
         const kv = opts.scope.regAlloc.allocBlock(2)
         this.#compile(key, { ...opts, destReg: kv, isTail: false })
         this.#compile(value, { ...opts, destReg: kv + 1, isTail: false })
-        opts.nodes.push({ t: "SetMark", keyReg: kv, valReg: kv + 1 })
+        opts.nodes.push({ k: "SetMark", key: kv, val: kv + 1 })
         opts.scope.regAlloc.freeBlock(kv, 2)
         if (opts.isTail) {
             this.#compile(body, opts)
             return
         }
         this.#compile(body, { ...opts, markRegions: [...(opts.markRegions ?? []), saved] })
-        opts.nodes.push({ t: "MarkRestore", reg: saved })
+        opts.nodes.push({ k: "MarkRestore", reg: saved })
         opts.scope.regAlloc.freeBlock(saved, 2)
     }
 
@@ -529,22 +536,22 @@ export class Compiler {
     #compileLoop(expr: any[], opts: CmpOpts) {
         const head = new JumpLabel()
         const end = new JumpLabel()
-        opts.nodes.push({ t: "Loop", end })
-        opts.nodes.push({ t: "Label", label: head })
+        opts.nodes.push({ k: "Loop", end })
+        opts.nodes.push({ k: "Label", label: head })
         for (const e of expr.slice(1)) this.#compile(e, { ...opts, destReg: undefined, isTail: false })
-        opts.nodes.push({ t: "EndLoop", head })
-        opts.nodes.push({ t: "Label", label: end })
+        opts.nodes.push({ k: "EndLoop", head })
+        opts.nodes.push({ k: "Label", label: end })
     }
 
     #nodesEndsInRet(nodes: Node[]) {
         let last = nodes.length - 1
-        while (last >= 0 && nodes[last].t === "Pos") last--
+        while (last >= 0 && nodes[last].k === "Pos") last--
         if (last < 0) return false // we need a return if there is no code
         const lastNode = nodes[last]
         if (
-            lastNode.t === "TailCall" ||
-            lastNode.t === "Return" ||
-            (lastNode.t === "HostCall" && lastNode.isTail)
+            (lastNode.k === "Call" && lastNode.tail) ||
+            lastNode.k === "Return" ||
+            (lastNode.k === "HostCall" && lastNode.tail)
         ) {
             return true // all of these ops alr return
         }
@@ -563,28 +570,28 @@ export class Compiler {
         const resReg = opts.scope.allocTemp();
         const startReg = opts.scope.regAlloc.allocBlock(args.length);
         args.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + i, isTail: false }));
-        opts.nodes.push({ t: "HostCall", pos: corePos("%call-catching"), startReg, nargs: args.length, isTail: false, destReg: resReg });
+        opts.nodes.push({ k: "HostCall", pos: corePos("%call-catching"), start: startReg, nargs: args.length, tail: false, dst: resReg });
         opts.scope.regAlloc.freeBlock(startReg, args.length);
 
         const condReg = opts.scope.allocTemp();
-        opts.nodes.push({ t: "IntCall", pos: corePos("%caught?"), destReg: condReg, startReg: resReg, nargs: 1 });
+        opts.nodes.push({ k: "IntCall", pos: corePos("%caught?"), dst: condReg, start: resReg, nargs: 1 });
         const elseLabel = new JumpLabel();
         const endLabel = new JumpLabel();
-        opts.nodes.push({ t: "If", reg: condReg, elseLabel });
+        opts.nodes.push({ k: "If", cond: condReg, else: elseLabel, elseif: false });
         opts.scope.freeTemp(condReg);
 
         const call = opts.scope.regAlloc.allocBlock(2);
         this.#compile(expr[2], { ...opts, destReg: call, isTail: false });
-        opts.nodes.push({ t: "IntCall", pos: corePos("%caught-value"), destReg: call + 1, startReg: resReg, nargs: 1 });
-        if (opts.isTail) opts.nodes.push({ t: "TailCall", procReg: call, startReg: call + 1, nargs: 1 });
-        else opts.nodes.push({ t: "Call", procReg: call, destReg: opts.destReg, startReg: call + 1, nargs: 1 });
+        opts.nodes.push({ k: "IntCall", pos: corePos("%caught-value"), dst: call + 1, start: resReg, nargs: 1 });
+        if (opts.isTail) opts.nodes.push({ k: "Call", proc: call, start: call + 1, nargs: 1, tail: true });
+        else opts.nodes.push({ k: "Call", proc: call, dst: opts.destReg, start: call + 1, nargs: 1, tail: false });
         opts.scope.regAlloc.freeBlock(call, 2);
 
-        opts.nodes.push({ t: "Else", endLabel });
-        opts.nodes.push({ t: "Label", label: elseLabel });
-        if (opts.destReg !== undefined) opts.nodes.push({ t: "Move", destReg: opts.destReg, srcReg: resReg });
-        opts.nodes.push({ t: "EndIf" });
-        opts.nodes.push({ t: "Label", label: endLabel });
+        opts.nodes.push({ k: "Else", end: endLabel });
+        opts.nodes.push({ k: "Label", label: elseLabel });
+        if (opts.destReg !== undefined) opts.nodes.push({ k: "Move", dst: opts.destReg, src: resReg });
+        opts.nodes.push({ k: "EndIf" });
+        opts.nodes.push({ k: "Label", label: endLabel });
         opts.scope.freeTemp(resReg);
     }
 
@@ -599,7 +606,7 @@ export class Compiler {
 
     #withRtResult(opts: CmpOpts, op: string, startReg: number, nargs: number, use: (reg: number) => void) {
         const reg = opts.scope.allocTemp()
-        opts.nodes.push({ t: "IntCall", pos: corePos(op), destReg: reg, startReg, nargs })
+        opts.nodes.push({ k: "IntCall", pos: corePos(op), dst: reg, start: startReg, nargs })
         use(reg)
         opts.scope.freeTemp(reg)
     }
@@ -668,7 +675,7 @@ export class Compiler {
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
         this.#compile(procExpr, { ...opts, destReg: startReg, isTail: false });
         argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + 1 + i, isTail: false }));
-        opts.nodes.push({ t: "HostCall", pos: corePos(op), startReg, nargs, isTail: opts.isTail, destReg: opts.destReg });
+        opts.nodes.push({ k: "HostCall", pos: corePos(op), start: startReg, nargs, tail: opts.isTail, dst: opts.destReg });
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
@@ -678,7 +685,7 @@ export class Compiler {
         const nargs = argExprs.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
         argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + i, isTail: false }));
-        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ t: "IntApply", pos: intrinsic.pos, destReg, startReg, nargs }));
+        this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ k: "IntApply", pos: intrinsic.pos, dst: destReg, start: startReg, nargs }));
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
@@ -702,9 +709,9 @@ export class Compiler {
         for (let i = 0; i < nargs; i++) this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false });
 
         if (opts.isTail) {
-            opts.nodes.push({t: "TailCall", nargs, procReg, startReg})
+            opts.nodes.push({ k: "Call", nargs, proc: procReg, start: startReg, tail: true })
         } else {
-            opts.nodes.push({t: "Call", destReg: opts.destReg, nargs, procReg, startReg, one, many})
+            opts.nodes.push({ k: "Call", dst: opts.destReg, nargs, proc: procReg, start: startReg, one, many, tail: false })
         }
 
         opts.scope.regAlloc.freeBlock(startReg, nargs)
@@ -724,7 +731,7 @@ export class Compiler {
             const reg = opts.scope.allocTemp()
             const boxed = this.#compileInit(init, { ...opts, destReg: reg, isTail: false, name: sym.description })
             const destReg = opts.scope.addLocal(sym)
-            opts.nodes.push({ t: boxed ? "Box" : "Move", srcReg: reg, destReg })
+            opts.nodes.push({ k: boxed ? "Box" : "Move", src: reg, dst: destReg })
             opts.scope.freeTemp(reg)
         }
         this.#compileBody(expr.slice(2), opts)
@@ -749,7 +756,7 @@ export class Compiler {
             ensureCanBind(sym, seen, "let")
             this.#ensureNotIntrinsic(sym, "let")
             const destReg = opts.scope.addLocal(sym)
-            opts.nodes.push({ t: boxed[i] ? "Box" : "Move", srcReg: initRegs[i], destReg })
+            opts.nodes.push({ k: boxed[i] ? "Box" : "Move", src: initRegs[i], dst: destReg })
         }
         this.#compileBody(expr.slice(2), opts)
         opts.scope.exitBlock()
@@ -775,8 +782,8 @@ export class Compiler {
             this.#ensureNotIntrinsic(sym, "letrec")
             const reg = opts.scope.addLocal(sym)
             regs.push(reg)
-            if (boxed[i] || !isLambda[i]) opts.nodes.push({ t: "LoadValue", constant: undefined, destReg: reg })
-            if (boxed[i]) opts.nodes.push({ t: "Box", srcReg: reg, destReg: reg })
+            if (boxed[i] || !isLambda[i]) opts.nodes.push({ k: "LoadValue", constant: undefined, dst: reg })
+            if (boxed[i]) opts.nodes.push({ k: "Box", src: reg, dst: reg })
         }
 
         // every closure made here, with what it captured, so a name can be filled into them once its value exists
@@ -785,7 +792,7 @@ export class Compiler {
         const fillIn = (reg: number) => {
             for (const closure of made) {
                 closure.captures.forEach((c, j) => {
-                    if (c.local && c.index === reg) opts.nodes.push({ t: "FixUpvar", closureReg: closure.reg, upvarIdx: j, srcReg: reg })
+                    if (c.local && c.index === reg) opts.nodes.push({ k: "FixUpvar", clo: closure.reg, idx: j, src: reg })
                 })
             }
         }
@@ -794,14 +801,14 @@ export class Compiler {
             if (boxed[i]) temps.push(dest)
             const before = opts.nodes.length
             this.#compile(unwrapBoxed(bindings[i][1]), { ...opts, destReg: dest, isTail: false, name: bindings[i][0].description })
-            if (boxed[i]) opts.nodes.push({ t: "SetBox", destReg: regs[i], srcReg: dest })
-            return { dest, closure: opts.nodes.slice(before).reverse().find(n => n.t === "NewClosure") }
+            if (boxed[i]) opts.nodes.push({ k: "SetBox", dst: regs[i], src: dest })
+            return { dest, closure: opts.nodes.slice(before).reverse().find(n => n.k === "NewClosure") }
         }
 
         for (let i = 0; i < bindings.length; i++) {
             if (!isLambda[i]) continue
             const { dest, closure } = compileInit(i)
-            made.push({ reg: dest, captures: closure?.t === "NewClosure" ? closure.template.upvarLocs : [] })
+            made.push({ reg: dest, captures: closure?.k === "NewClosure" ? closure.template.upvarLocs : [] })
         }
         for (let i = 0; i < bindings.length; i++) if (isLambda[i] && !boxed[i]) fillIn(regs[i])
         for (let i = 0; i < bindings.length; i++) {
@@ -817,19 +824,19 @@ export class Compiler {
 
     #getVar(varname: symbol, opts: CmpOpts, destReg?: number): Node[] {
         const resolved = opts.scope.resolve(varname)
-        if (resolved.type === "Local") return destReg !== undefined && resolved.index !== destReg ? [{ t: "Move", srcReg: resolved.index, destReg }] : []
-        if (resolved.type === "Upvar") return destReg !== undefined ? [{ t: "LoadUpvar", upvarIdx: resolved.index, destReg, andUnbox: false }] : []
-        if (destReg !== undefined) return [{ t: "LoadGlobal", sym: varname, destReg }]
+        if (resolved.type === "Local") return destReg !== undefined && resolved.index !== destReg ? [{ k: "Move", src: resolved.index, dst: destReg }] : []
+        if (resolved.type === "Upvar") return destReg !== undefined ? [{ k: "LoadUpvar", idx: resolved.index, dst: destReg, unbox: false }] : []
+        if (destReg !== undefined) return [{ k: "LoadGlobal", sym: varname, dst: destReg }]
         const tmpReg = opts.scope.allocTemp()
         opts.scope.freeTemp(tmpReg)
-        return [{ t: "LoadGlobal", sym: varname, destReg: tmpReg }]
+        return [{ k: "LoadGlobal", sym: varname, dst: tmpReg }]
     }
 
     #setVar(varname: symbol, opts: CmpOpts, srcReg: number): Node[] {
         const resolved = opts.scope.resolve(varname)
-        if (resolved.type === "Local") return srcReg !== resolved.index ? [{ t: "Move", srcReg, destReg: resolved.index }] : []
-        if (resolved.type === "Upvar") return [{ t: "SetUpvar", srcReg, upvarIdx: resolved.index, andBox: false }]
-        return [{ t: "SetGlobal", sym: varname, srcReg }]
+        if (resolved.type === "Local") return srcReg !== resolved.index ? [{ k: "Move", src: srcReg, dst: resolved.index }] : []
+        if (resolved.type === "Upvar") return [{ k: "SetUpvar", src: srcReg, idx: resolved.index, box: false }]
+        return [{ k: "SetGlobal", sym: varname, src: srcReg }]
     }
 
     // a %let or %let* init: (%box e) is e, which the binding boxes (whether it did is the result)
@@ -842,15 +849,15 @@ export class Compiler {
     // (%box e): a new box holding e's value
     #compileBox(expr: any[], opts: CmpOpts) {
         this.#compile(expr[1], { ...opts, isTail: false })
-        if (opts.destReg !== undefined) opts.nodes.push({ t: "Box", srcReg: opts.destReg, destReg: opts.destReg })
+        if (opts.destReg !== undefined) opts.nodes.push({ k: "Box", src: opts.destReg, dst: opts.destReg })
     }
 
     // (%unbox x): the value in the box x holds
     #compileUnbox(expr: any[], opts: CmpOpts) {
         const resolved = opts.scope.resolve(expr[1])
         if (opts.destReg === undefined) return
-        if (resolved.type === "Local") opts.nodes.push({ t: "Unbox", srcReg: resolved.index, destReg: opts.destReg })
-        else if (resolved.type === "Upvar") opts.nodes.push({ t: "LoadUpvar", upvarIdx: resolved.index, destReg: opts.destReg, andUnbox: true })
+        if (resolved.type === "Local") opts.nodes.push({ k: "Unbox", src: resolved.index, dst: opts.destReg })
+        else if (resolved.type === "Upvar") opts.nodes.push({ k: "LoadUpvar", idx: resolved.index, dst: opts.destReg, unbox: true })
         else throw new Error(`internal error: unboxing ${String(expr[1]?.description)}, which is not a local variable`)
     }
 
@@ -858,7 +865,7 @@ export class Compiler {
     #compileBoxInPlace(expr: any[], opts: CmpOpts) {
         const resolved = opts.scope.resolve(expr[1])
         if (resolved.type !== "Local") throw new Error(`internal error: boxing ${String(expr[1]?.description)} in place, which is not a local of this function`)
-        opts.nodes.push({ t: "Box", srcReg: resolved.index, destReg: resolved.index })
+        opts.nodes.push({ k: "Box", src: resolved.index, dst: resolved.index })
     }
 
     // (%set-box! x v): the box x holds now holds v; the value is <#void>
@@ -868,15 +875,15 @@ export class Compiler {
         this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description })
         const resolved = opts.scope.resolve(sym)
         if (resolved.type === "Local") {
-            opts.nodes.push({ t: "SetBox", srcReg: valReg, destReg: resolved.index })
+            opts.nodes.push({ k: "SetBox", src: valReg, dst: resolved.index })
         } else if (resolved.type === "Upvar") {
             const tmpReg = opts.scope.allocTemp()
-            opts.nodes.push({ t: "LoadUpvar", andUnbox: false, destReg: tmpReg, upvarIdx: resolved.index }, { t: "SetBox", destReg: tmpReg, srcReg: valReg })
+            opts.nodes.push({ k: "LoadUpvar", unbox: false, dst: tmpReg, idx: resolved.index }, { k: "SetBox", dst: tmpReg, src: valReg })
             opts.scope.freeTemp(tmpReg)
         } else {
             throw new Error(`internal error: setting the box of ${String(sym?.description)}, which is not a local variable`)
         }
         opts.scope.freeTemp(valReg)
-        if (opts.destReg !== undefined) opts.nodes.push({ t: "LoadValue", destReg: opts.destReg, constant: undefined })
+        if (opts.destReg !== undefined) opts.nodes.push({ k: "LoadValue", dst: opts.destReg, constant: undefined })
     }
 }

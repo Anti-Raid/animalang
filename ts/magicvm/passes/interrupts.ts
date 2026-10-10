@@ -7,18 +7,18 @@ import type { Pass } from "./pass";
 
 export type FunctionIR = { nodes: Node[], numRegs: number };
 
-const check = (): Node => ({ t: "HostCall", pos: corePos("%interrupt"), startReg: 0, nargs: 0, isTail: false, destReg: undefined });
+const check = (): Node => ({ k: "HostCall", pos: corePos("%interrupt"), start: 0, nargs: 0, tail: false });
 
 const calls = (nodes: Node[]): boolean =>
-    nodes.some(n => n.t === "Call" || n.t === "TailCall" || (n.t === "HostCall" && n.pos !== corePos("%interrupt")));
+    nodes.some(n => n.k === "Call" || (n.k === "HostCall" && n.pos !== corePos("%interrupt")));
 
 const withChecks = (nodes: Node[]): Node[] => {
     const entryCheck = calls(nodes);
     const out: Node[] = [];
     for (const n of nodes) {
-        if (n.t === "EndLoop") out.push(check());
-        if (n.t === "FunctionEntry" && entryCheck) out.push(check());
-        if (n.t === "NewClosure") {
+        if (n.k === "EndLoop") out.push(check());
+        if (n.k === "FunctionEntry" && entryCheck) out.push(check());
+        if (n.k === "NewClosure") {
             const t = n.template;
             out.push({ ...n, template: new ClosureTemplateIR(t.params, t.remParams, withChecks(t.code), t.numRegs, t.upvarLocs, t.name, t.rest, t.pad) });
             continue;

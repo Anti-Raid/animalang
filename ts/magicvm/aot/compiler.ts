@@ -2,6 +2,7 @@
 // sharing the built source between copies of the same code; JIT_DEPS are the names generated code can use
 import { Intrinsics, type TypeSystem } from "../intrinsics";
 import { Env, ErrorObject, IProcedure, MissingVarError, MultipleValues, VMError, packValues } from "../../common";
+import { newGlobalCache, type GlobalCache } from "../../env";
 import { Caught, ContinuationMarkSet, EXCEPTION_HANDLERS, Handlers, markFirst, markSet, recordTailMark } from "../../marks";
 import { DirectEmitter } from "./direct";
 import { ResumeEmitter } from "./resume";
@@ -117,8 +118,8 @@ export class AotCompiler {
                 variants.push({ uses, types, want, factory });
             }
         }
-        const globalCache: Record<number, { scope: Env | null, version: number, value: any }> = {};
-        for (const ip of this.#globalLoads(code)) globalCache[ip] = { scope: null, version: -1, value: undefined };
+        const globalCache: Record<number, GlobalCache> = {};
+        for (const ip of this.#globalLoads(code)) globalCache[ip] = newGlobalCache();
         const callCache: Record<number, CallCache> = {};
         for (const ip of this.#callSites(code)) callCache[ip] = newCallCache();
         const siteCache: Record<number, object> = {};
@@ -147,7 +148,7 @@ export class AotCompiler {
     } {
         if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
         const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
-        const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
+        const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg, code.constants));
         const usedDeps = new Set<string>();
         const structure = structureOf(code.ops);
         const resume = want !== 0 ? null : this.#step("resume", () => {
@@ -157,8 +158,7 @@ export class AotCompiler {
         });
         const direct = tmpl === undefined ? null : this.#step("direct", () => {
             const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
-            out.emitFunction(tmpl.arity, want);
-            return out.toString();
+            return out.emitFunction(tmpl.arity, want) ? out.toString() : null;
         });
         return {
             resumeSource: resume,
@@ -209,22 +209,6 @@ export class AotCompiler {
                 const at = op.ip;
                 ip = at + 1;
                 switch (op.k) {
-                    case "LoadConst": insts.push({ k: "LoadConst", dst: op.dst, idx: op.idx, at }); break;
-                    case "LoadInt": insts.push({ k: "LoadInt", dst: op.dst, value: op.value, at }); break;
-                    case "LoadUpvar": insts.push({ k: "LoadUpvar", dst: op.dst, idx: op.idx, unbox: op.unbox, at }); break;
-                    case "SetUpvar": insts.push({ k: "SetUpvar", src: op.src, idx: op.idx, box: op.box, at }); break;
-                    case "FixUpvar": insts.push({ k: "FixUpvar", clo: op.clo, idx: op.idx, src: op.src, at }); break;
-                    case "LoadGlobal": insts.push({ k: "LoadGlobal", dst: op.dst, sym: op.sym, ip: at, at }); break;
-                    case "SetGlobal": insts.push({ k: "SetGlobal", src: op.src, sym: op.sym, at }); break;
-                    case "Move": case "Box": case "Unbox": case "SetBox": insts.push({ k: op.k, dst: op.dst, src: op.src, at }); break;
-                    case "NewClosure": insts.push({ k: "NewClosure", dst: op.dst, tmpl: op.tmpl, captures: (code.constants[op.tmpl] as ClosureTemplate).upvarLocs, at }); break;
-                    case "MoveAcc": insts.push({ k: "MoveAcc", dst: op.dst, one: op.one, at }); break;
-                    case "Unpack": insts.push({ k: "Unpack", src: op.src, start: op.start, count: op.count, flags: op.flags, many: op.many, at }); break;
-                    case "SetMark": insts.push({ k: "SetMark", key: op.key, val: op.val, at }); break;
-                    case "MarkSave": case "MarkRestore": insts.push({ k: op.k, reg: op.reg, at }); break;
-                    case "CurMarks": insts.push({ k: "CurMarks", dst: op.dst, at }); break;
-                    case "InlineSite": insts.push({ k: "SetSite", site: op.site, at }); break;
-                    case "IntCall": case "IntApply": insts.push({ k: op.k, pos: op.pos, dst: op.dst, start: op.start, nargs: op.nargs, at }); break;
                     case "If": term = { k: "Branch", cond: op.cond, then: ip, else: op.else, elseif: op.elseif, at }; break;
                     case "Else": term = { k: "Jump", target: op.end, at }; break;
                     case "EndIf": term = { k: "Jump", target: ip, at }; break;
@@ -239,9 +223,7 @@ export class AotCompiler {
                         break;
                     case "HostCall": term = { k: "HostCall", pos: op.pos, start: op.start, nargs: op.nargs, isTail: op.tail, resume: ip, at }; break;
                     case "Return": term = { k: "Return", reg: op.src, at }; break;
-                    default: {
-                        const _: never = op;
-                    }
+                    default: insts.push(op);
                 }
             }
             blocks.push({ start: starts[b], insts, term: term ?? { k: "Jump", target: ip } });

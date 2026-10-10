@@ -44,12 +44,30 @@ export class ResumeEmitter extends FunctionEmitter {
     #blocksByStart: Map<number, AotBlock> | null = null;
     readonly #threaded = new Map<number, number>();
 
-    protected jump(target: number, next: number): string {
-        return super.jump(this.#thread(target), next);
+    // going on at `target` from a block that `next` follows: nothing when it is the next case, else through the switch
+    #jump(target: number, next: number): string {
+        target = this.#thread(target);
+        if (target === next && target < this.structure.size) return "";
+        if (target >= this.structure.size) return this.endOfCode;
+        return `ip = ${target}; continue top;`;
     }
 
-    protected branch(term: Extract<AotTerm, { k: "Branch" }>, next: number): string {
-        return super.branch({ ...term, then: this.#thread(term.then), else: this.#thread(term.else) }, next);
+    #branch(term: Extract<AotTerm, { k: "Branch" }>, next: number): string {
+        const then = this.#thread(term.then), other = this.#thread(term.else);
+        if (then === next) return `if (!${this.truthy(term.cond)}) { ${this.#jump(other, -1)} }`;
+        return `ip = ${this.truthy(term.cond)} ? ${then} : ${other}; continue top;`;
+    }
+
+    // each block is a case of the switch the function resumes through
+    #emitSwitchBody(): void {
+        for (let i = 0; i < this.blocks.length; i++) {
+            const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.structure.size;
+            this.emit(`case ${this.blocks[i].start}: {`);
+            this.startBlock(undefined);
+            this.emitInsts(this.blocks[i]);
+            this.#emitTerm(this.blocks[i].term, next);
+            this.emit(`}`);
+        }
     }
 
     protected recordIp(ip: number): string {
@@ -120,7 +138,7 @@ export class ResumeEmitter extends FunctionEmitter {
                     top: while (true) {
                         switch (ip) {
         `);
-        this.emitSwitchBody();
+        this.#emitSwitchBody();
         this.emit(`
                             default:
                                 return null;
@@ -134,17 +152,17 @@ export class ResumeEmitter extends FunctionEmitter {
         `);
     }
 
-    protected emitTerm(term: AotTerm, next: number): void {
+    #emitTerm(term: AotTerm, next: number): void {
         const live = this.liveness;
-        if (this.debug) this.emit(this.debugHooks(term, this.tailProcOf(term)));
+        if (this.debug) this.emit(this.debugHooks(term.at, this.tailProcOf(term)));
         switch (term.k) {
             case "Jump":
-                return this.emit(this.jump(term.target, next));
+                return this.emit(this.#jump(term.target, next));
             case "Branch":
-                return this.emit(this.branch(term, next));
+                return this.emit(this.#branch(term, next));
             case "Block":
             case "Loop":
-                return this.emit(this.jump(term.body, next));
+                return this.emit(this.#jump(term.body, next));
             case "Call":
                 return this.emit(`
                     {
@@ -158,17 +176,17 @@ export class ResumeEmitter extends FunctionEmitter {
                             return executor.invoke(ctx, proc, frame, regs, ${term.start}, ${term.nargs}, false);
                         }
                     }
-                    ${this.jump(term.resume, next)}
+                    ${this.#jump(term.resume, next)}
                 `);
             case "HostCall": {
                 const control = this.controlOf(term);
                 if (control !== undefined) {
-                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: false, reentrant: this.reentrant };
+                    const site = { args: windowRegs(term.start, term.nargs).map(r => `r${r}`), isTail: term.isTail, resume: term.resume, loopCount: false, reentrant: this.reentrant, deeper: "1" };
                     return this.emit(`
                         ${control.setsResume ? "" : `frame.ip = ${term.resume};`}
                         ${term.isTail || control.continues ? "" : this.#spills(live.spillsFor(term.resume))}
                         ${control.heap(site, this.#spills(live.spillsFor(term.resume)))}
-                        ${control.continues ? this.jump(term.resume, next) : ""}
+                        ${control.continues ? this.#jump(term.resume, next) : ""}
                     `);
                 }
                 return this.emit(`
@@ -182,7 +200,7 @@ export class ResumeEmitter extends FunctionEmitter {
                         ctx.acc = res;
                         ${term.isTail ? "return executor.setRetVal(ctx, frame.parent, res);" : ""}
                     }
-                    ${term.isTail ? "" : this.jump(term.resume, next)}
+                    ${term.isTail ? "" : this.#jump(term.resume, next)}
                 `);
             }
             case "TailCall":

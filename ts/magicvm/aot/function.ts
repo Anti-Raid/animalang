@@ -1,7 +1,7 @@
 // What the resume entry and the direct entry of a compiled function share (FunctionEmitter)
 import { Liveness, windowRegs } from "./liveness";
 import { transfer, type Facts, type Aliases } from "./facts";
-import type { AotBlock, AotInst, AotTerm } from "./types";
+import { capturesOf, type AotBlock, type AotInst, type AotTerm } from "./types";
 import type { Arity } from "../arity";
 import { CORE_COUNT } from "../coreops";
 import { Intrinsics } from "../intrinsics";
@@ -201,9 +201,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // debug code only: statement recording the exact position of the op about to run
     protected abstract debugPos(ip: number): string;
 
-    protected debugHooks(x: { at?: number }, tailProc?: string): string {
-        if (!this.debug || x.at === undefined) return "";
-        return `${this.debugPos(x.at + 1)}${tailProc !== undefined ? ` ${this.marksVar} = recordTailMark(${this.marksVar}, ${this.mframeVar}, tailName(${tailProc}));` : ""}`;
+    protected debugHooks(at: number | undefined, tailProc?: string): string {
+        if (!this.debug || at === undefined) return "";
+        return `${this.debugPos(at + 1)}${tailProc !== undefined ? ` ${this.marksVar} = recordTailMark(${this.marksVar}, ${this.mframeVar}, tailName(${tailProc}));` : ""}`;
     }
 
     // debug code only: records a control request made in tail position as the tail call, as debugHooks does for a call
@@ -232,8 +232,6 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
     abstract emitFunction(arity: Arity): void;
-
-    protected abstract emitTerm(term: AotTerm, next: number): void;
 
     // a (regs, start, nargs)-style call of `fn` over the register window; runtime functions also take (ctx, executor) first
     // a call of `fn` over the register window (followed by ctx and executor for an intrinsic that takes the context)
@@ -264,30 +262,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
     protected abstract readonly marksVar: string;
     protected abstract readonly mframeVar: string;
 
-    protected emitSwitchBody(): void {
-        for (let i = 0; i < this.blocks.length; i++) {
-            const next = i + 1 < this.blocks.length ? this.blocks[i + 1].start : this.structure.size;
-            this.emit(`case ${this.blocks[i].start}: {`);
-            this.startBlock(undefined);
-            this.emitInsts(this.blocks[i]);
-            this.emitTerm(this.blocks[i].term, next);
-            this.emit(`}`);
-        }
-    }
-
     protected argList(start: number, nargs: number): string {
         return windowRegs(start, nargs).map(r => this.use(r)).join(", ");
-    }
-
-    protected jump(target: number, next: number): string {
-        if (target === next && target < this.structure.size) return "";
-        if (target >= this.structure.size) return this.endOfCode;
-        return `ip = ${target}; continue top;`;
-    }
-
-    protected branch(term: Extract<AotTerm, { k: "Branch" }>, next: number): string {
-        if (term.then === next) return `if (!${this.truthy(term.cond)}) { ${this.jump(term.else, -1)} }`;
-        return `ip = ${this.truthy(term.cond)} ? ${term.then} : ${term.else}; continue top;`;
     }
 
 
@@ -308,7 +284,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
     }
 
     protected emitInst(inst: AotInst): void {
-        if (this.debug) this.emit(this.debugHooks(inst));
+        if (this.debug) this.emit(this.debugHooks(inst.ip));
         switch (inst.k) {
             case "LoadConst":
                 return this.emit(`r${inst.dst} = ${literal(this.constants[inst.idx]) ?? `CONSTANTS[${inst.idx}]`};`);
@@ -327,21 +303,15 @@ export abstract class FunctionEmitter extends CodeEmitter {
                         if (cache.scope === ctx.scope && cache.version === Env.globalsVersion) {
                             r${inst.dst} = cache.value;
                         } else {
-                            let val = ctx.scope.lookup(CONSTANTS[${inst.sym}], MISSING);
-                            if (val === MISSING) {
-                                if (ctx.scope.unbound === Env.ERROR) {
-                                    ${this.recordIp(inst.ip)}
-                                    const err = new MissingVarError(CONSTANTS[${inst.sym}]);
-                                    ${this.debug ? "" : this.errorSite(inst.ip, "err")}
-                                    throw err;
-                                }
-                                val = ctx.scope.unbound;
+                            const cell = ctx.scope.cell(CONSTANTS[${inst.sym}], ctx.scope.unbound);
+                            if (cell.v === Env.ERROR) {
+                                ${this.recordIp(inst.ip)}
+                                const err = new MissingVarError(CONSTANTS[${inst.sym}]);
+                                ${this.debug ? "" : this.errorSite(inst.ip, "err")}
+                                throw err;
                             }
                             ctx.scope.watch();
-                            cache.scope = ctx.scope;
-                            cache.version = Env.globalsVersion;
-                            cache.value = val;
-                            r${inst.dst} = val;
+                            r${inst.dst} = Env.remember(cache, ctx.scope, cell);
                         }
                     }
                 `);
@@ -356,7 +326,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "SetBox":
                 return this.emit(`${this.operand(inst.dst)}.val = ${this.use(inst.src)};`);
             case "NewClosure": {
-                const captures = inst.captures.map(c => c.local ? this.use(c.index) : this.upvarRef(c.index)).join(", ");
+                const captures = capturesOf(inst, this.constants).map(c => c.local ? this.use(c.index) : this.upvarRef(c.index)).join(", ");
                 return this.emit(`r${inst.dst} = new Closure(CONSTANTS[${inst.tmpl}], [${captures}]);`);
             }
             case "MoveAcc":
@@ -369,7 +339,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`${this.marksVar} = ${this.use(inst.reg)}; ${this.mframeVar} = ${this.use(inst.reg + 1)};`);
             case "CurMarks":
                 return this.emit(`r${inst.dst} = new ContinuationMarkSet(${this.marksVar});`);
-            case "SetSite":
+            case "InlineSite":
                 return this.emit(`${this.siteVar} = ${inst.site};`);
             case "Unpack": {
                 // (%let-values of formals with no rest, not strict: one value, or the values of several, with no call)
@@ -386,16 +356,16 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "IntCall":
                 // non-debug code does not record where each operation is: an error the intrinsic raises gets the position here
                 // (an inlined template that never calls the intrinsic cannot raise its errors, so needs none)
-                const call = this.intrinsicCall(inst.pos, inst.start, inst.nargs, inst.at);
-                if (this.debug || inst.at === undefined || !this.#callsIntrinsic(inst.pos, call)) return this.emit(`r${inst.dst} = ${call};`);
-                return this.emit(`try { r${inst.dst} = ${call}; } catch (e) { ${this.errorSite(inst.at, "e")} throw e; }`);
+                const call = this.intrinsicCall(inst.pos, inst.start, inst.nargs, inst.ip);
+                if (this.debug || !this.#callsIntrinsic(inst.pos, call)) return this.emit(`r${inst.dst} = ${call};`);
+                return this.emit(`try { r${inst.dst} = ${call}; } catch (e) { ${this.errorSite(inst.ip, "e")} throw e; }`);
             case "IntApply": {
                 // an array alone is the argument array itself: intrinsics never write to or keep it
                 const entry = this.table!.entries[inst.pos];
                 const args = inst.nargs === 1 ? `arrayArg("%apply", ${this.use(inst.start)})` : `applyArgs([${this.argList(inst.start, inst.nargs)}], 0, ${inst.nargs})`;
                 const call = `r${inst.dst} = applyIntrinsic(I${inst.pos}, ${JSON.stringify(entry.name)}, ${entry.min}, ${entry.max}, ${args}, ctx, executor);`;
-                if (this.debug || inst.at === undefined) return this.emit(call);
-                return this.emit(`try { ${call} } catch (e) { ${this.errorSite(inst.at, "e")} throw e; }`);
+                if (this.debug) return this.emit(call);
+                return this.emit(`try { ${call} } catch (e) { ${this.errorSite(inst.ip, "e")} throw e; }`);
             }
             default: {
                 const _: never = inst;

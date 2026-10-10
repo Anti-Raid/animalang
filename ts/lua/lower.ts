@@ -133,17 +133,27 @@ class Lowering {
             else if (stat[0] === L.LOCALFN) this.#declare((stat as C.LocalFunction)[1]);
         }
         let rest: any[] = tail();
+        // the statements lowered since the last local, last first (put before `rest` one at a time, a long block
+        // would be copied once for each of its statements)
+        let run: any[] = [];
+        const after = (): any[] => {
+            if (run.length > 0) {
+                rest = run.reverse().concat(rest);
+                run = [];
+            }
+            return rest;
+        };
         for (let i = block.length - 2; i >= 1; i--) {
             const stat = block[i] as C.Stat;
             onEach?.(i);
-            if (stat[0] === L.LOCAL) rest = [this.local(stat as C.LocalStat, rest)];
+            if (stat[0] === L.LOCAL) rest = [this.local(stat as C.LocalStat, after())];
             else if (stat[0] === L.LOCALFN) {
                 const [, name, func] = stat as C.LocalFunction;
-                rest = [[CORE_LETREC, this.pos(stat), [[name, this.function(func)]], ...rest]];
+                rest = [[CORE_LETREC, this.pos(stat), [[name, this.function(func)]], ...after()]];
             }
-            else rest = [this.statement(stat), ...rest];
+            else run.push(this.statement(stat));
         }
-        return rest;
+        return after();
     }
 
     #declare(...names: symbol[]): void {

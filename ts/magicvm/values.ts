@@ -437,6 +437,8 @@ export class Frame {
     }
 }
 
+// how deep direct calls go before a call goes on in heap frames: in calls of functions with few registers (one with
+// many counts as several, see DirectEmitter)
 export const MAX_JS_DEPTH = 1000;
 
 export const MAX_NESTED_RESUMES = 16;

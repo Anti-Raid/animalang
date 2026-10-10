@@ -16,7 +16,8 @@ import { DIRECT_SUSPEND_LIMIT } from "../values";
 // `loopCount`: in direct code, the call is at a loop's back-edge (its next instruction is EndLoop), where a function can
 // count in its local `ic` (a loop there runs within one call of the function)
 // `reentrant`: whether the code may be re-entered by a continuation (Code.reentrant)
-export type ControlSite = { args: string[], isTail: boolean, resume: number, loopCount: boolean, reentrant: boolean };
+// `deeper`: in direct code, the depth a call from the site passes (see DirectEmitter)
+export type ControlSite = { args: string[], isTail: boolean, resume: number, loopCount: boolean, reentrant: boolean, deeper: string };
 export type ControlAot = {
     heap: (s: ControlSite, spills: string) => string,
     direct: (s: ControlSite, callArray: string, call: (args: string[], marks: string) => string) => string,
@@ -87,11 +88,11 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
     ["%apply-catching", {
         heap: s => s.reentrant ? `return executor.callCatch(ctx, ${s.args[0]}, frame, null, false, arrayArg("%apply-catching", ${s.args[1]}));`
             : `return executor.callCatchStack(ctx, ${s.args[0]}, frame, arrayArg("%apply-catching", ${s.args[1]}));`,
-        direct: s => !s.reentrant ? stackCatch(`acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), depth + 1, marks, mframe + 1);`) : `{
+        direct: s => !s.reentrant ? stackCatch(`acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), ${s.deeper}, marks, mframe + 1);`) : `{
             const tok = new CatchToken(ctx.id, ctx.wind, null, false);
             const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
             try {
-                acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), depth + 1, handlers, mframe + 1);
+                acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), ${s.deeper}, handlers, mframe + 1);
             } catch (e) {
                 const caught = catchHere(e, tok, ctx);
                 if (caught === null) throw executor.pushEscape(e, tok, handlers, mframe);

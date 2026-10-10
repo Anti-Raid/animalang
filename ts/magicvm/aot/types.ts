@@ -1,27 +1,13 @@
 // The AOT compiler's decoded instructions and block terminators
 import type { Arity } from "../arity";
-import type { UpVarLoc } from "../code";
+import type { ClosureTemplate, UpVarLoc } from "../code";
+import type { Op } from "../ops";
 import type { Intrinsic } from "../intrinsics";
 
-// `at` is the ip of the instruction an op or terminator was decoded from
-export type AotInst = { at?: number } & (
-    | { k: "LoadConst"; dst: number; idx: number }
-    | { k: "LoadInt"; dst: number; value: number }
-    | { k: "LoadUpvar"; dst: number; idx: number; unbox: boolean }
-    | { k: "SetUpvar"; src: number; idx: number; box: boolean }
-    | { k: "FixUpvar"; clo: number; idx: number; src: number }
-    | { k: "LoadGlobal"; dst: number; sym: number; ip: number }
-    | { k: "SetGlobal"; src: number; sym: number }
-    | { k: "Move" | "Box" | "Unbox" | "SetBox"; dst: number; src: number }
-    | { k: "NewClosure"; dst: number; tmpl: number; captures: UpVarLoc[] }
-    | { k: "MoveAcc"; dst: number; one?: true }
-    | { k: "IntCall" | "IntApply"; pos: number; dst: number; start: number; nargs: number }
-    | { k: "Unpack"; src: number; start: number; count: number; flags: number; many?: true }
-    | { k: "SetMark"; key: number; val: number }
-    | { k: "MarkSave" | "MarkRestore"; reg: number }
-    | { k: "CurMarks"; dst: number }
-    | { k: "SetSite"; site: number });
+// an instruction that does not end a basic block: the compiler's own (ops.ts), at its `ip`
+export type AotInst = Exclude<Op, { k: "If" | "Else" | "EndIf" | "Block" | "Loop" | "EndLoop" | "Jump" | "Call" | "HostCall" | "Return" }>;
 
+// how a block ends, decoded from the instruction at `at`
 export type AotTerm = { at?: number } & (
     // `escape` jumps leave a %block early; `loopBack` jumps close a %loop
     | { k: "Jump"; target: number; escape?: boolean; loopBack?: boolean }
@@ -41,3 +27,7 @@ export const MAX_STRUCTURED_NESTING = 250;
 
 // what generated source depends on in an intrinsic it calls (not its function, so a cached source keeps none alive)
 export type SourceUse = Pick<Intrinsic, "pos" | "inline" | "site" | "deps" | "name" | "min" | "max" | "returns" | "wants" | "refineArgs" | "branchNarrow" | "invertBranch">;
+
+// the variables a NewClosure captures: its template's, among the code's constants
+export const capturesOf = (inst: Extract<AotInst, { k: "NewClosure" }>, constants: readonly any[]): readonly UpVarLoc[] =>
+    (constants[inst.tmpl] as ClosureTemplate).upvarLocs;

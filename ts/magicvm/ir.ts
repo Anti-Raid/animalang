@@ -2,7 +2,7 @@ import { ConstPool, type SourcePos } from "../common";
 import { Code, Closure, ClosureTemplate, type InlineSite, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import type { RestKind } from "./arity";
-import { UNPACK_REST, UNPACK_STRICT, returnedFrom, type DistributiveOmit, type Op } from "./ops";
+import { returnedFrom, type DistributiveOmit, type Op } from "./ops";
 
 let nextLabelId = 0;
 
@@ -10,179 +10,42 @@ export class JumpLabel {
     public id: number = ++nextLabelId;
 }
 
-export type JumpCond = "True" | "False"
-
-export type Node = {
-    t: "LoadValue",
-    destReg: number,
-    constant: any // will later on become a LoadConst or a LoadInt
-} | {
-    t: "Move",
-    destReg: number,
-    srcReg: number,
-} | {
-    t: "LoadUpvar",
-    destReg: number,
-    upvarIdx: number,
-    andUnbox: boolean
-} | {
-    t: "SetUpvar",
-    srcReg: number,
-    upvarIdx: number,
-    andBox: boolean
-} | {
-    // reg[closureReg].upvars[upvarIdx] = reg[srcReg]
-    t: "FixUpvar",
-    closureReg: number,
-    upvarIdx: number,
-    srcReg: number
-} | {
-    t: "LoadGlobal",
-    destReg: number,
-    sym: symbol
-} | {
-    t: "SetGlobal",
-    srcReg: number,
-    sym: symbol
-} | {
-    t: "Label",
-    label: JumpLabel
-} | {
-    t: "If",
-    reg: number,
-    elseLabel: JumpLabel,
-} | {
-    // the next condition of an %if chain (like If, but continuing the chain an If started)
-    t: "ElseIf",
-    reg: number,
-    elseLabel: JumpLabel,
-} | {
-    t: "Else",
-    endLabel: JumpLabel,
-} | {
-    t: "EndIf",
-} | {
-    t: "Call",
-    procReg: number,
-    destReg?: number,
-    startReg: number,
-    nargs: number,
-    // the call wants one value: the first the procedure returns, or <#void>
-    one?: boolean,
-    // its values are bound at once to this many names
-    many?: number,
-} | {
-    t: "TailCall",
-    procReg: number,
-    // does not return to caller so no ret value needed
-    startReg: number,
-    nargs: number,
-} | {
-    t: "Return",
-    reg: number
-} | {
-    t: "NewClosure",
-    destReg: number,
-    template: ClosureTemplateIR
-} | {
-    // reg[destReg] = [reg[srcReg]]
-    t: "Box",
-    destReg: number,
-    srcReg: number
-} | {
-    // reg[destReg] = reg[srcReg][0]
-    t: "Unbox",
-    destReg: number,
-    srcReg: number
-} | {
-    // reg[destReg][0] = reg[srcReg]
-    t: "SetBox",
-    destReg: number,
-    srcReg: number
-} | {
-    // start of a %block whose escapes jump to `end`
-    t: "Block",
-    end: JumpLabel
-} | {
-    // start of a %loop ending at `end`; its head is the label right after
-    t: "Loop",
-    end: JumpLabel
-} | {
-    // back edge of a %loop
-    t: "EndLoop",
-    head: JumpLabel
-} | {
-    // spread the multiple values in srcReg over [startReg, startReg + count), plus a rest list after them
-    t: "Unpack",
-    srcReg: number,
-    startReg: number,
-    count: number,
-    rest: boolean,
-    strict: boolean,
-    many?: boolean
-} | {
-    // set a continuation mark on the current frame
-    t: "SetMark",
-    keyReg: number,
-    valReg: number
-} | {
-    // save the marks into reg and reg + 1, then start a new logical frame
-    t: "MarkSave",
-    reg: number
-} | {
-    // put back marks saved by MarkSave
-    t: "MarkRestore",
-    reg: number
-} | {
-    t: "CurrentMarks",
-    destReg: number
-} | {
-    // an intrinsic that is not a leaf: may return a tail request
-    t: "HostCall",
-    pos: number,
-    startReg: number,
-    nargs: number,
-    isTail: boolean,
-    destReg?: number
-} | {
-    // (%apply %intrinsic arg ... array) of a leaf intrinsic
-    t: "IntApply",
-    pos: number,
-    destReg: number,
-    startReg: number,
-    nargs: number
-} | {
-    // a leaf intrinsic
-    t: "IntCall",
-    pos: number,
-    destReg: number,
-    startReg: number,
-    nargs: number
-} | {
-    // an %escape: jump to the end of a %block
-    t: "Jump",
-    label: JumpLabel
-} | {
-    // reg[destReg] = the accumulator (the result of the call the code was entered from; VM helper code only)
-    t: "MoveAcc",
-    destReg: number
-} | {
+// What compiler.ts writes for a function: the instructions of ops.ts before their places are known (so with no `ip`
+// or `where`), in order. An instruction that needs nothing more is written as it is. The others:
+//  - a jump names a label, which a Label entry places
+//  - a constant is its value (LoadValue), a global its symbol, a closure's template still its IR: lowering makes the
+//    constant pool
+//  - a call that is not a tail call may say where its value goes (`dst`), which is the MoveAcc after it
+// and some entries are no instruction at all (Label, Pos, FunctionEntry, InlineEnter, InlineExit)
+type Unplaced<K extends Op["k"]> = DistributiveOmit<Extract<Op, { k: K }>, "ip" | "where">;
+export type Node =
+    | Unplaced<"LoadUpvar" | "SetUpvar" | "FixUpvar" | "EndIf" | "Return" | "Move" | "Box" | "Unbox" | "SetBox" | "MoveAcc" | "SetMark" | "MarkSave" | "MarkRestore" | "CurMarks" | "IntCall" | "IntApply">
+    | { k: "LoadValue"; dst: number; constant: any }
+    | { k: "LoadGlobal"; dst: number; sym: symbol }
+    | { k: "SetGlobal"; src: number; sym: symbol }
+    | { k: "NewClosure"; dst: number; template: ClosureTemplateIR }
+    // `elseif`: the next condition of an %if chain (like an If, but continuing the chain one started)
+    | { k: "If"; cond: number; else: JumpLabel; elseif: boolean }
+    | { k: "Else"; end: JumpLabel }
+    // a %block whose escapes jump to `end`, a %loop ending there (its head is the label right after), its back edge
+    | { k: "Block" | "Loop"; end: JumpLabel }
+    | { k: "EndLoop"; head: JumpLabel }
+    | { k: "Jump"; target: JumpLabel }
+    // `one`: the call wants one value, the first the procedure returns (or <#void>); `many`: its values are bound at
+    // once to that many names
+    | { k: "Call"; proc: number; start: number; nargs: number; tail: boolean; one?: boolean; many?: number; dst?: number }
+    // a call of an intrinsic that is not a leaf (it may return a request)
+    | { k: "HostCall"; pos: number; start: number; nargs: number; tail: boolean; dst?: number }
+    | { k: "Unpack"; src: number; start: number; count: number; flags: number; many?: boolean }
+    | { k: "Label"; label: JumpLabel }
     // the code up to the matching InlineExit is the body of `name`, inlined at `at` (in tail position if `tail`):
-    // tracebacks show it as that procedure's frame (emits nothing; see Code.inlines)
-    t: "InlineEnter",
-    name: string,
-    at: SourcePos | null,
-    tail: boolean
-} | {
-    t: "InlineExit"
-} | {
-    // where a function's body starts, after its parameters are set up (emits nothing; see passes/interrupts.ts)
-    t: "FunctionEntry"
-} | {
-    // marks where the following code came from (goes into the line table, emits nothing)
-    t: "Pos",
-    pos: SourcePos
-}
+    // tracebacks show it as that procedure's frame (see Code.inlines)
+    | { k: "InlineEnter"; name: string; at: SourcePos | null; tail: boolean }
+    | { k: "InlineExit" }
+    // where a function's body starts, after its parameters are set up (see passes/interrupts.ts)
+    | { k: "FunctionEntry" }
+    // where the code that follows came from: its instructions' `where`
+    | { k: "Pos"; pos: SourcePos };
 
 // a function's code from its IR nodes (see Op)
 export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, lowerTemplate: (t: ClosureTemplateIR) => ClosureTemplate) => {
@@ -211,28 +74,26 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
     const open: number[] = []
     // code that runs inlined procedures starts (and a self tail call restarts it) outside any: its first instruction,
     // after the positions it starts at
-    let reset = nodes.some(n => n.t === "InlineEnter")
+    let reset = nodes.some(n => n.k === "InlineEnter")
     const fixups: [op: any, field: string, label: JumpLabel][] = []
     const jump = (op: Op, field: string, label: JumpLabel) => fixups.push([op, field, label])
     for (const node of nodes) {
-        if (reset && node.t !== "Pos") {
+        if (reset && node.k !== "Pos") {
             push({ k: "InlineSite", site: -1 })
             reset = false
         }
-        switch (node.t) {
+        switch (node.k) {
             case "LoadValue": {
                 const v = node.constant
-                if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) push({ k: "LoadInt", dst: node.destReg, value: v })
-                else push({ k: "LoadConst", dst: node.destReg, idx: cpool.push(v) })
+                if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF && !Object.is(v, -0)) push({ k: "LoadInt", dst: node.dst, value: v })
+                else push({ k: "LoadConst", dst: node.dst, idx: cpool.push(v) })
                 break
             }
-            case "LoadUpvar": push({ k: "LoadUpvar", dst: node.destReg, idx: node.upvarIdx, unbox: node.andUnbox }); break
-            case "SetUpvar": push({ k: "SetUpvar", src: node.srcReg, idx: node.upvarIdx, box: node.andBox }); break
-            case "FixUpvar": push({ k: "FixUpvar", clo: node.closureReg, idx: node.upvarIdx, src: node.srcReg }); break
-            case "LoadGlobal": push({ k: "LoadGlobal", dst: node.destReg, sym: cpool.push(node.sym) }); break
-            case "SetGlobal": push({ k: "SetGlobal", src: node.srcReg, sym: cpool.push(node.sym) }); break
+            case "LoadGlobal": push({ k: "LoadGlobal", dst: node.dst, sym: cpool.push(node.sym) }); break
+            case "SetGlobal": push({ k: "SetGlobal", src: node.src, sym: cpool.push(node.sym) }); break
             case "Label": labels.set(node.label, ip); break
             case "FunctionEntry": break
+            case "Pos": where = node.pos; break
             case "InlineEnter": {
                 const site = inlines.push({ start: ip, end: ip, name: node.name, at: node.at, tail: node.tail, parent: open.length > 0 ? open[open.length - 1] : -1 }) - 1
                 open.push(site)
@@ -245,40 +106,33 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
                 push({ k: "InlineSite", site: returnedFrom(site) })
                 break
             }
-            case "If": case "ElseIf": jump(push({ k: "If", cond: node.reg, else: -1, elseif: node.t === "ElseIf" }), "else", node.elseLabel); break
-            case "Else": jump(push({ k: "Else", end: -1 }), "end", node.endLabel); break
-            case "EndIf": push({ k: "EndIf" }); break
-            case "SetMark": push({ k: "SetMark", key: node.keyReg, val: node.valReg }); break
-            case "MarkSave": push({ k: "MarkSave", reg: node.reg }); break
-            case "MarkRestore": push({ k: "MarkRestore", reg: node.reg }); break
-            case "CurrentMarks": push({ k: "CurMarks", dst: node.destReg }); break
-            case "HostCall":
-                push({ k: "HostCall", pos: use(node.pos), start: node.startReg, nargs: node.nargs, tail: node.isTail })
-                if (!node.isTail && node.destReg !== undefined) push({ k: "MoveAcc", dst: node.destReg })
-                break
-            case "MoveAcc": push({ k: "MoveAcc", dst: node.destReg }); break
-            case "IntCall": push({ k: "IntCall", pos: use(node.pos), dst: node.destReg, start: node.startReg, nargs: node.nargs }); break
-            case "IntApply": push({ k: "IntApply", pos: use(node.pos), dst: node.destReg, start: node.startReg, nargs: node.nargs }); break
-            case "Unpack": push({ k: "Unpack", src: node.srcReg, start: node.startReg, count: node.count, flags: (node.rest ? UNPACK_REST : 0) | (node.strict ? UNPACK_STRICT : 0), ...(node.many ? { many: true as const } : {}) }); break
-            case "Block": case "Loop": jump(push({ k: node.t, end: -1 }), "end", node.end); break
+            case "If": jump(push({ k: "If", cond: node.cond, else: -1, elseif: node.elseif }), "else", node.else); break
+            case "Else": jump(push({ k: "Else", end: -1 }), "end", node.end); break
+            case "Block": case "Loop": jump(push({ k: node.k, end: -1 }), "end", node.end); break
             case "EndLoop": jump(push({ k: "EndLoop", head: -1 }), "head", node.head); break
-            case "Jump": jump(push({ k: "Jump", target: -1 }), "target", node.label); break
-            case "Call":
-                push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: false, ...(node.one ? { one: true as const } : {}), ...(node.many !== undefined ? { many: node.many } : {}) })
-                if (node.destReg !== undefined) push({ k: "MoveAcc", dst: node.destReg, ...(node.one ? { one: true as const } : {}) })
+            case "Jump": jump(push({ k: "Jump", target: -1 }), "target", node.target); break
+            case "HostCall":
+                push({ k: "HostCall", pos: use(node.pos), start: node.start, nargs: node.nargs, tail: node.tail })
+                if (!node.tail && node.dst !== undefined) push({ k: "MoveAcc", dst: node.dst })
                 break
-            case "TailCall": push({ k: "Call", proc: node.procReg, start: node.startReg, nargs: node.nargs, tail: true }); break
-            case "Return": push({ k: "Return", src: node.reg }); break
+            case "Call":
+                if (node.tail) push({ k: "Call", proc: node.proc, start: node.start, nargs: node.nargs, tail: true })
+                else {
+                    push({ k: "Call", proc: node.proc, start: node.start, nargs: node.nargs, tail: false, ...(node.one ? { one: true as const } : {}), ...(node.many !== undefined ? { many: node.many } : {}) })
+                    if (node.dst !== undefined) push({ k: "MoveAcc", dst: node.dst, ...(node.one ? { one: true as const } : {}) })
+                }
+                break
+            case "Unpack": push({ k: "Unpack", src: node.src, start: node.start, count: node.count, flags: node.flags, ...(node.many ? { many: true as const } : {}) }); break
             case "NewClosure": {
                 const ct = lowerTemplate(node.template)
                 // a closure that captures nothing is made once, as a constant
-                if (ct.upvarLocs.length === 0) push({ k: "LoadConst", dst: node.destReg, idx: cpool.mutPush(Closure.fromTemplate(ct)) })
-                else push({ k: "NewClosure", dst: node.destReg, tmpl: cpool.mutPush(ct) })
+                if (ct.upvarLocs.length === 0) push({ k: "LoadConst", dst: node.dst, idx: cpool.mutPush(Closure.fromTemplate(ct)) })
+                else push({ k: "NewClosure", dst: node.dst, tmpl: cpool.mutPush(ct) })
                 break
             }
-            case "Box": case "SetBox": case "Unbox": case "Move": push({ k: node.t, dst: node.destReg, src: node.srcReg }); break
-            case "Pos": where = node.pos; break
-            default: { const _: never = node }
+            case "IntCall": case "IntApply": push({ ...node, pos: use(node.pos) }); break
+            // an instruction as it is
+            default: push({ ...node })
         }
     }
     for (const [op, field, label] of fixups) {

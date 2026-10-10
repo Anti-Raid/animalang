@@ -298,6 +298,80 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
         expect(anima.evaluateClosure(fnClosure, [300])).toBe(305);
     });
 
+    it("gives a function nested too deeply for structured js no direct entry", () => {
+        const nested = (depth: number) => `(define (deep${depth} x) (let ((r 0)) ${"(if (> x 0) ".repeat(depth)}(set! r (+ x 1))${" #f)".repeat(depth)} r)) (list (deep${depth} 5) (deep${depth} 0))`;
+        const anima = createScheme(impl);
+        const s = new ASTStringifier();
+        const direct = (depth: number) => {
+            expect(s.stringify(anima.evaluateRaw(anima.compileRaw(nested(depth))))).toBe("(6 0)");
+            return (anima.evaluateRaw(anima.compileRaw(`deep${depth}`)) as Closure).tmpl.code;
+        };
+        const shallow = direct(100), deep = direct(300);
+        expect([shallow.direct, shallow.directFn !== null]).toEqual([true, true]);
+        // it runs on heap frames, through its resume entry
+        expect([deep.direct, deep.directFn, deep.resumeFn !== null]).toEqual([false, null, true]);
+        // and is still what it was when called again, or for one value
+        expect(s.stringify(anima.evaluateRaw(anima.compileRaw(`(let loop ((i 0) (n 0)) (if (= i 50) n (loop (+ i 1) (+ n (deep300 i)))))`)))).toBe(String(49 * 50 / 2 + 49));
+    });
+
+    it("recurses deeply through a function with many registers", () => {
+        const anima = createScheme(impl);
+        const s = new ASTStringifier();
+        const locals = Array.from({ length: 120 }, (_, i) => `(a${i} (+ n ${i}))`).join(" ");
+        expect(s.stringify(anima.evaluateRaw(anima.compileRaw(`(define (deep n) (let (${locals}) (if (= n 0) a119 (+ (- a0 n) (deep (- n 1)))))) (deep 5000)`)))).toBe("119");
+    });
+
+    it("compiles a function whose lets nest thousands deep", () => {
+        const anima = createScheme(impl);
+        const [LET, INTCALL, ARRAY] = ["%let", "%intcall", "%array"].map(n => Symbol.for(n));
+        // (%let ((a0 (%array))) 0 (%let ((a1 (%array a0))) 0 ... (%array a0 aLast))): core forms, as a front end that
+        // binds each local around the rest of its block gives them
+        const nested = (n: number, shadow: boolean): any => {
+            const names = Array.from({ length: n }, (_, i) => shadow ? Symbol.for("x") : Symbol(`a${i}`));
+            let form: any = [INTCALL, null, ARRAY, names[0], names[n - 1]];
+            for (let i = n - 1; i >= 0; i--) form = [LET, null, [[names[i], i === 0 ? [INTCALL, null, ARRAY] : [INTCALL, null, ARRAY, names[i - 1]]]], 0, form];
+            return form;
+        };
+        const depth = (v: any): number => { let d = 0; while (Array.isArray(v) && v.length === 1) { v = v[0]; d++; } return d; };
+        const [first, last] = anima.evaluateRaw(anima.compiler.compile(nested(3000, false)));
+        expect([depth(first), depth(last)]).toEqual([0, 2999]);
+        // each name is bound for what follows it alone
+        const [inner, same] = anima.evaluateRaw(anima.compiler.compile(nested(3000, true)));
+        expect([depth(inner), inner === same]).toEqual([2999, true]);
+        // a short chain is left as it is
+        const seen: string[] = [];
+        anima.compiler.trace = (name, output) => { if (name === "flatten-lets") seen.push(String((output as any)[0].description)); };
+        anima.compiler.compile(nested(150, false));
+        anima.compiler.compile(nested(300, false));
+        expect(seen).toEqual(["%let", "%let*"]);
+        anima.compiler.trace = undefined;
+        // procedures bound one inside the other, as a front end gives local functions: each sees itself and those before it
+        const [LETREC, LAMBDA, CALL, IF] = ["%letrec", "%lambda", "%call", "%if"].map(n => Symbol.for(n));
+        const procedures = (n: number): any => {
+            const names = Array.from({ length: n }, (_, i) => Symbol(`f${i}`));
+            const x = Symbol("x");
+            let form: any = [CALL, null, names[n - 1], true];
+            for (let i = n - 1; i >= 0; i--) {
+                const before = i === 0 ? [INTCALL, null, ARRAY] : [INTCALL, null, ARRAY, [CALL, null, names[i - 1], true]];
+                form = [LETREC, null, [[names[i], [LAMBDA, null, [[], [x], null, [IF, null, x, before, [CALL, null, names[i], true]]]]]], 0, form];
+            }
+            return form;
+        };
+        expect(depth(anima.evaluateRaw(anima.compiler.compile(procedures(2500))))).toBe(2499);
+    });
+
+    it("gives a read of a global its value after the global is set, by code or by the host", () => {
+        const anima = createScheme(impl);
+        const s = new ASTStringifier();
+        const run = (src: string) => s.stringify(anima.evaluateRaw(anima.compileRaw(src)));
+        expect(run(`(define g 1) (define (read) g) (define (write! v) (set! g v)) (list (read) (begin (write! 2) (read)) (begin (write! 'three) (read)))`)).toBe("(1 2 three)");
+        expect(run(`(define c 0) (define (bump!) (set! c (+ c 1))) (let loop ((i 0)) (if (< i 1000) (begin (bump!) (loop (+ i 1))) (list c (read))))`)).toBe("(1000 three)");
+        anima.scope.set(Symbol.for("g"), 44);
+        expect(run(`(read)`)).toBe("44");
+        // a name defined later is found, and one redefined is the new one
+        expect(run(`(define (late) later) (define later 5) (define first (late)) (define later 6) (list first (late))`)).toBe("(5 6)");
+    });
+
     it("narrows on a branch only while the tested arguments are unchanged", () => {
         const table = new Intrinsics();
         const lt = table.register("%lt", (regs, s) => regs[s] < regs[s + 1], { args: [2, 2], leaf: true, branchNarrow: () => ({ then: ["number", "number"] }) });
@@ -305,7 +379,7 @@ describe("JIT Compiler Runtime Compilation & Execution", () => {
             const blocks: AotBlock[] = [
                 {
                     start: 0,
-                    insts: [{ k: "IntCall", pos: lt.pos, dst: 2, start: 0, nargs: 2 }, ...(overwrite ? [{ k: "MoveAcc" as const, dst: 1 }] : [])],
+                    insts: [{ k: "IntCall", pos: lt.pos, dst: 2, start: 0, nargs: 2, ip: 0 }, ...(overwrite ? [{ k: "MoveAcc" as const, dst: 1, ip: 1 }] : [])],
                     term: { k: "Branch", cond: 2, then: 10, else: 20, elseif: false },
                 },
                 { start: 10, insts: [], term: { k: "Return", reg: 0 } },

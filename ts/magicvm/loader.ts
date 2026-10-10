@@ -1,7 +1,7 @@
 // Standalone Loader for MagicVM pre-compiled execution units (.animau)
 import { closureArity, type RestKind } from "./arity";
 import { MultipleValues, markQuoted } from "../common";
-import type { Env } from "../env";
+import { newGlobalCache, type GlobalCache } from "../env";
 import {
     Closure,
     ClosureTemplate,
@@ -85,7 +85,7 @@ export const deserializeConstant = (
 
 type UnitCacheData = {
     constants: any[];
-    globalCache: Record<number, { scope: Env | null; version: number; value: any }>;
+    globalCache: Record<number, GlobalCache>;
     callCache: Record<number, CallCache>;
     siteCache: Record<number, object>;
 };
@@ -203,8 +203,8 @@ export class UnitLoader {
         // 6. Fast Single-Batch Hydration
         if (!needsRecompile && unit.sources) {
             const makeCacheData = (constants: any[], sites: UnitSites): UnitCacheData => {
-                const globalCache: Record<number, { scope: Env | null; version: number; value: any }> = {};
-                for (const ip of sites.globals) globalCache[ip] = { scope: null, version: -1, value: undefined };
+                const globalCache: Record<number, GlobalCache> = {};
+                for (const ip of sites.globals) globalCache[ip] = newGlobalCache();
                 const callCache: Record<number, CallCache> = {};
                 for (const ip of sites.calls) callCache[ip] = newCallCache();
                 const siteCache: Record<number, object> = {};

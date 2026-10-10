@@ -105,7 +105,7 @@ export const transfer = (
         case "LoadUpvar": case "LoadGlobal": case "Box": case "Unbox": case "NewClosure": case "MoveAcc": case "CurMarks":
             removeAlias(aliases, inst.dst);
             return void facts.delete(inst.dst);
-        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "SetBox": case "SetMark": case "MarkRestore": case "SetSite":
+        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "SetBox": case "SetMark": case "MarkRestore": case "InlineSite":
             return;
         default: {
             const _: never = inst;
@@ -139,7 +139,7 @@ const written = (inst: AotInst): number[] => {
         case "LoadInt": case "LoadConst": case "Move": case "IntCall": case "IntApply": case "LoadUpvar": case "LoadGlobal":
         case "Box": case "Unbox": case "NewClosure": case "MoveAcc": case "CurMarks":
             return [inst.dst];
-        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "SetBox": case "SetMark": case "MarkRestore": case "SetSite":
+        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "SetBox": case "SetMark": case "MarkRestore": case "InlineSite":
             return [];
     }
 };
