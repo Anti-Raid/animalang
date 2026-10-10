@@ -1,9 +1,9 @@
 // The AOT code of the core control operations (CONTROL_AOT)
 import { DIRECT_SUSPEND_LIMIT } from "../values";
 
-// AOT code for the core control operations: what carrying out their requests does (see ControlRequest), written out at
-// the call so there is no request to make and dispatch on, which shows in tight coroutine and call/cc loops. The
-// other requests carry themselves out (ControlRequest.run). `args` are the arguments' registers (as js expressions): the count
+// AOT code for the core control operations, written out at the call, so there is no request to make and dispatch on
+// (which shows in tight coroutine and call/cc loops): these operations have no function of their own (`generated` in
+// coreops.ts). The other control operations return a request that carries itself out (ControlRequest.run). `args` are the arguments' registers (as js expressions): the count
 // was checked when compiling.
 //  - heap: resume code, after frame.ip is set (and, unless in tail position or `continues`, the live registers are
 //    spilled): statements that return the frame to run next, or with `continues`, set ctx.acc and carry on. `spills`

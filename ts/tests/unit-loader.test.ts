@@ -411,6 +411,14 @@ describe("Execution Unit (.animau) Serializer & Loader", () => {
         expect(() => UnitLoader.load(unit, createScheme(impl).intrinsics)).toThrow(/uses intrinsic '%ta', which is not registered/);
     });
 
+    it("is refused by an instance whose code is of the other kind", () => {
+        const plain = createScheme(impl), strict = createScheme({ ...impl, reentrant: false });
+        const unit = UnitSerializer.serialize(strict.compileRaw("(+ 1 2)") as Code, meta);
+        expect(stringify(createScheme({ ...impl, reentrant: false }).evaluateUnit(unit))).toBe("3");
+        expect(() => plain.loadUnit(unit)).toThrow("this code was compiled as not re-entrant, and the instance's code is re-entrant");
+        expect(() => plain.evaluateUnit(unit)).toThrow("not re-entrant");
+    });
+
     it("refuses a constant it could not give back as it was", () => {
         class Opaque { x = 1; }
         const a = createScheme(impl);

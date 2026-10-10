@@ -89,15 +89,27 @@ export class Anima {
     }
 
     public evaluateRaw(code: Code): any {
-        return this.#vm.evaluateRaw(code, this.#scope)
+        return this.#vm.evaluateRaw(this.#ownKind(code), this.#scope)
     }
 
     public loadUnit(json: string | AnimaExecutionUnit): { code: Code, meta: UnitMeta, template: ClosureTemplate } {
-        return this.#vm.loadUnit(json)
+        const unit = this.#vm.loadUnit(json)
+        this.#ownKind(unit.code)
+        return unit
     }
 
     public evaluateUnit(json: string | AnimaExecutionUnit): any {
-        return this.#vm.evaluateUnit(json, this.#scope)
+        return this.evaluateRaw(this.loadUnit(json).code)
+    }
+
+    // An instance runs code of its own kind alone (AnimaOptions.reentrant): code that is not re-entrant relies on no
+    // continuation ever holding one of its frames, which re-entrant code beside it could make
+    #ownKind(code: Code): Code {
+        const reentrant = this.#options.reentrant ?? true
+        if (code.reentrant !== reentrant) {
+            throw new Error(`this code was compiled as ${code.reentrant ? "re-entrant" : "not re-entrant"}, and the instance's code is ${reentrant ? "re-entrant" : "not re-entrant"}`)
+        }
+        return code
     }
 
     public evaluateClosure(code: Closure | CaseLambda, args: any[]): any {

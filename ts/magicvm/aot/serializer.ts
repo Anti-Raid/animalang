@@ -117,10 +117,7 @@ export class UnitSerializer {
                 code.arity ? code.arity.pad : false
             );
 
-        // 1. Compile all procedures recursively
-        AotCompiler.compileAll(code, effectiveTmpl);
-
-        // 2. Discover and assign IDs to all closure templates
+        // 1. Discover and assign IDs to all closure templates
         const templates: ClosureTemplate[] = [];
         const templateMap = new Map<ClosureTemplate, number>();
         const uniques = new Map<symbol, number>();
@@ -144,12 +141,11 @@ export class UnitSerializer {
 
         for (const c of code.constants) scan(c);
 
-        // 3. Emit AOT JS sources for root
+        // 2. Emit AOT JS sources for root (the code itself is left as it was: running it compiles it as usual)
         const rootEmitted = AotCompiler.emitCodeSources(code, effectiveTmpl);
 
-        // 4. Emit AOT JS sources for each child template
+        // 3. Emit AOT JS sources for each child template
         const serializedTemplates: UnitTemplate[] = templates.map((t, id) => {
-            AotCompiler.compileAll(t.code, t);
             const emitted = AotCompiler.emitCodeSources(t.code, t);
             const tmplArity: UnitArity = {
                 params: t.arity.params,
@@ -177,7 +173,7 @@ export class UnitSerializer {
                 ops: [...t.code.ops],
                 sources: {
                     direct: emitted.directSource,
-                    resume: emitted.resumeSource,
+                    resume: emitted.resumeSource!,
                 },
             };
         });
@@ -211,7 +207,7 @@ export class UnitSerializer {
             ops: [...code.ops],
             sources: {
                 direct: rootEmitted.directSource,
-                resume: rootEmitted.resumeSource,
+                resume: rootEmitted.resumeSource!,
             },
             name: effectiveTmpl.name,
             params: effectiveTmpl.params.map(p => p.description ?? ""),

@@ -397,8 +397,6 @@ export class Frame {
     // where in its context's `catches` the catch this frame's pending call is under is (-1: none; `escape` is
     // STACK_CATCH then), taken off when it resumes
     public catchAt: number = -1;
-    // a captured frame that a copy has run from (see `resume`)
-    public resumed: boolean = false;
 
     // `marks`: the continuation marks visible in this frame; `mframe`: its logical frame (a tail call keeps its caller's)
     constructor(
@@ -419,15 +417,9 @@ export class Frame {
         return this.closure.debugName ?? "lambda";
     }
 
-    // a captured frame is about to run (as a copy): code that is not re-entrant keeps its assigned variables in the
-    // registers, so a second copy would not see what the first assigned
-    resume(): void {
-        if (this.resumed && !this.code.reentrant) throw vmError(Msg.NotReentrant, this.debugName);
-        this.resumed = true;
-    }
-
+    // a captured frame is about to run, as a copy (only ever a frame of re-entrant code: code that is not makes no
+    // continuation, and an instance runs code of its own kind alone, see Anima.evaluateRaw)
     thaw(ctx: ExecutionContext): Frame {
-        this.resume();
         const copy = new Frame(this.closure, this.regs.slice(), this.ip, this.parent, ctx, this.marks, this.mframe);
         copy.isite = this.isite;
         copy.winds = this.winds;
@@ -560,14 +552,6 @@ export class Suspend {
 
     static abort(tag: any, values: any[]) {
         return new Suspend((ctx, executor, caller) => executor.abort(ctx, caller, tag, values), undefined, true);
-    }
-
-    static escape(proc: any) {
-        return new Suspend((ctx, executor, caller) => executor.callEscape(ctx, proc, caller), undefined, true);
-    }
-
-    static catching(proc: any, pre: any, guarded: boolean, args: any[] = []) {
-        return new Suspend((ctx, executor, caller) => executor.callCatch(ctx, proc, caller, pre, guarded, args), undefined, true);
     }
 
     static callCC(proc: any) {

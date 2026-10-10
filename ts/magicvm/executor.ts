@@ -71,12 +71,8 @@ export class VMExecutor {
 
     // --- interrupts ---
 
-    // an interrupt check: nothing, or what the handler asked for (a yield or a stop)
-    public interrupt(ctx: ExecutionContext): ControlRequest | undefined {
-        return --this.interruptLeft > 0 ? undefined : this.interruptSlow(ctx);
-    }
-
-    // the count ran out: it starts again, and the handler is called
+    // an interrupt check whose count ran out (generated code counts): it starts again, and the handler is called, which
+    // gives nothing, or what it asked for (a yield or a stop)
     public interruptSlow(ctx: ExecutionContext): ControlRequest | undefined {
         this.interruptLeft = INTERRUPT_INTERVAL;
         // a pause the handler asked for while an intrinsic ran (see checkInterrupt) happens now, if the code can pause
@@ -512,7 +508,6 @@ export class VMExecutor {
         let parent = returnTo;
         for (let i = k.frames.length - 1; i >= 0; i--) {
             const f = k.frames[i];
-            f.resume();
             const copy = new Frame(f.closure, f.regs.slice(), f.ip, parent, ctx, move(f.marks), f.mframe + shift);
             copy.escape = f.escape;
             copy.posIp = f.posIp;

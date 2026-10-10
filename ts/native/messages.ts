@@ -88,7 +88,6 @@ export const nativeFormat: Formatter = (op, args, fmt, at) => {
         case Msg.UnknownIntrinsic: return `${a[0]}: ${name(a[1])} is not an intrinsic`;
         case Msg.ApplyNonLeaf: return `%intapply: ${a[0]} is not a leaf intrinsic, so it cannot be applied`;
         case Msg.Text: return a[0];
-        case Msg.NotReentrant: return `cannot re-enter a continuation through ${a[0]}: its code was compiled as not re-entrant`;
         case Msg.NoContinuations: return `${a[0]}: no continuations in code compiled as not re-entrant`;
         default: {
             const unworded: never = op;

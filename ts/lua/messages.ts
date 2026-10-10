@@ -54,7 +54,6 @@ const errorText = (x: any): string => x instanceof Error ? x.message : x instanc
 const word = (op: Msg, a: readonly any[], fmt: Formatter, at: SourcePos | null): string => {
     switch (op) {
         case Msg.Text: return a[0];
-        case Msg.NotReentrant: return `cannot re-enter a continuation through function ${a[0]}`;
         case Msg.MissingVar: return `unbound global '${String(a[0].description ?? a[0])}'`;
         case Msg.NonProcedure: case Msg.NonProcedureWind: return `attempt to call a ${typeName(a[0])} value`;
         case Msg.ErrorInHandler: return `error in error handling: ${errorText(a[0])}`;

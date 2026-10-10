@@ -135,8 +135,10 @@ export class AotCompiler {
         return output;
     }
 
-    public static emitCodeSources(code: Code, tmpl?: ClosureTemplate): {
-        resumeSource: string;
+    // the source of `code`'s entries and what it reads from outside itself: its sites' caches, by ip, and the deps'
+    // locals its inline templates use. `want`: only the direct entry, for that many values (no resume entry then)
+    public static emitCodeSources(code: Code, tmpl?: ClosureTemplate, want: number = 0): {
+        resumeSource: string | null;
         directSource: string | null;
         globalLoads: number[];
         callSites: number[];
@@ -148,14 +150,14 @@ export class AotCompiler {
         const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
         const usedDeps = new Set<string>();
         const structure = structureOf(code.ops);
-        const resume = this.#step("resume", () => {
+        const resume = want !== 0 ? null : this.#step("resume", () => {
             const out = new ResumeEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
             out.emitFunction();
             return out.toString();
         });
         const direct = tmpl === undefined ? null : this.#step("direct", () => {
             const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
-            out.emitFunction(tmpl.arity, 0);
+            out.emitFunction(tmpl.arity, want);
             return out.toString();
         });
         return {
@@ -169,35 +171,14 @@ export class AotCompiler {
     }
 
     public static generateSource(code: Code, tmpl?: ClosureTemplate, want: number = 0): string {
-        if (code.intrinsics.length > 0 && code.table === null) throw new Error("internal error: compiling code that uses intrinsics without a table");
-        if (want === 0) {
-            const emitted = this.emitCodeSources(code, tmpl);
-            const caches = emitted.globalLoads.map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
-            const callCaches = emitted.callSites.map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("")
-                + emitted.intrinsicSites.map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
-            const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
-            const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
-            const deps = emitted.usedDeps.map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
-            return `${caches}${callCaches}${fns}${deps}return {\nresume: ${emitted.resumeSource},\ndirect: ${emitted.directSource ?? "null"}\n};`;
-        }
-        const blocks = this.#step("blocks", () => this.buildAot(code, tmpl));
-        const liveness = this.#step("liveness", () => new Liveness(blocks, code.numReg));
-        const usedDeps = new Set<string>();
-        const structure = structureOf(code.ops);
-        const resume = "null";
-        const direct = tmpl === undefined ? "null" : this.#step("direct", () => {
-            const out = new DirectEmitter(blocks, structure, liveness, code.numReg, code.debug, code.table, usedDeps, code.constants, code.reentrant);
-            out.emitFunction(tmpl.arity, want);
-            return out.toString();
-        });
-        const caches = this.#globalLoads(code).map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
-        const callCaches = this.#callSites(code).map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("")
-                + this.#intrinsicSites(code).map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
+        const emitted = this.emitCodeSources(code, tmpl, want);
+        const caches = emitted.globalLoads.map(ip => `const GC${ip} = GLOBAL_CACHE[${ip}];\n`).join("");
+        const callCaches = emitted.callSites.map(ip => `const CC${ip} = CALL_CACHE[${ip}];\n`).join("")
+            + emitted.intrinsicSites.map(({ ip }) => `const SC${ip} = SITE_CACHE[${ip}];\n`).join("");
         // positions never change once registered, so each intrinsic's function and deps are read once, into locals
-        const used = code.intrinsics.map(({ pos }) => code.table!.entries[pos]);
-        const fns = used.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
-        const deps = [...usedDeps].map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
-        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${resume},\ndirect: ${direct}\n};`;
+        const fns = code.intrinsics.map(({ pos }) => `const I${pos} = RT[${pos}];\n`).join("");
+        const deps = emitted.usedDeps.map(d => `const ${d} = DEPS[${d.slice(1)}];\n`).join("");
+        return `${caches}${callCaches}${fns}${deps}return {\nresume: ${emitted.resumeSource ?? "null"},\ndirect: ${emitted.directSource ?? "null"}\n};`;
     }
 
     static #globalLoads(code: Code): number[] {

@@ -38,9 +38,10 @@ export const markSetArg = (who: string, set: any): Marks => {
 // What an intrinsic that is not a leaf may return instead of a value: a transfer of control the VM carries out where the
 // intrinsic was called (HostCall), as if the call site were that operation. The VM carries it out at once, reading its
 // fields before running anything else, so the core operations reuse one request of each kind (`of`) rather than
-// allocating one per call, which shows in tight coroutine loops. This is how the VM's control operations
-// (%call/cc, %raise, the coroutine operations, applying a procedure) are intrinsics rather than instructions, and how host
-// intrinsics call back into the VM (HostTail)
+// allocating one per call. This is how host intrinsics call back into the VM (HostTail, hostYield), and how the core
+// control operations that have no code of their own in generated code are carried out (the prompt operations,
+// %coroutine-raise). The others are written out where they are called (CONTROL_AOT in aot/control.ts) and make no
+// request: see `generated` below
 export abstract class ControlRequest {
     // for a request made in tail position, what debug code records as the tail call (see recordTailMark)
     get tailProc(): any {
@@ -109,77 +110,6 @@ export const hostTailFrom = (proc: any, regs: readonly any[], from: number, coun
     for (let i = 0; i < count; i++) args[i] = regs[from + i];
     return new HostTail(proc, args);
 };
-
-// (%call/cc proc)
-export class CallCCRequest extends ControlRequest {
-    proc: any = undefined;
-
-    static readonly #reused = new CallCCRequest();
-    static of(proc: any): CallCCRequest {
-        const r = CallCCRequest.#reused;
-        r.proc = proc;
-        return r;
-    }
-
-    get tailProc(): any {
-        return this.proc;
-    }
-
-    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
-        return executor.callCC(ctx, this.proc, frame, isTail);
-    }
-
-    direct(): any {
-        throw Suspend.callCC(this.proc);
-    }
-}
-
-// (%call/ec proc)
-export class EscapeRequest extends ControlRequest {
-    proc: any = undefined;
-
-    static readonly #reused = new EscapeRequest();
-    static of(proc: any): EscapeRequest {
-        const r = EscapeRequest.#reused;
-        r.proc = proc;
-        return r;
-    }
-
-    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
-        return executor.callEscape(ctx, this.proc, frame);
-    }
-
-    direct(): any {
-        throw Suspend.escape(this.proc);
-    }
-}
-
-// (%call-catching thunk [pre [guarded]]): what %catch compiles to. (%apply-catching proc array) calls proc with the
-// array's elements instead (the array is the call's own from then on)
-export class CatchRequest extends ControlRequest {
-    proc: any = undefined;
-    pre: any = null;
-    guarded: boolean = false;
-    args: any[] | null = null;
-
-    static readonly #reused = new CatchRequest();
-    static of(proc: any, pre: any, guarded: boolean, args: any[] | null = null): CatchRequest {
-        const r = CatchRequest.#reused;
-        r.proc = proc;
-        r.pre = pre;
-        r.guarded = guarded;
-        r.args = args;
-        return r;
-    }
-
-    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
-        return executor.callCatch(ctx, this.proc, frame, this.pre, this.guarded, this.args ?? []);
-    }
-
-    direct(): any {
-        throw Suspend.catching(this.proc, this.pre, this.guarded, this.args ?? []);
-    }
-}
 
 // (%call-with-prompt tag thunk handler)
 export class PromptRequest extends ControlRequest {
@@ -253,17 +183,9 @@ export class AbortRequest extends ControlRequest {
     }
 }
 
-// (%coroutine-yield v ...), or hostYield: the values it is resumed with are the value of the call. The core operation is
-// never in tail position; a host intrinsic's can be, and then they are its caller's
+// hostYield: the values the coroutine is resumed with are the value of the call (its caller's, in tail position)
 export class YieldRequest extends ControlRequest {
     val: any = undefined;
-
-    static readonly #reused = new YieldRequest();
-    static of(val: any): YieldRequest {
-        const r = YieldRequest.#reused;
-        r.val = val;
-        return r;
-    }
 
     run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame, isTail: boolean): Frame | null {
         return isTail ? executor.coYield(ctx, frame.parent, this.val, frame.marks, frame.mframe) : executor.coYield(ctx, frame, this.val);
@@ -300,7 +222,7 @@ export class InterruptRequest extends ControlRequest {
 
 export const hostInterruptError = (value: any): InterruptRequest => new InterruptRequest(value);
 
-// (%coroutine-resume co v ...), or with `raising`, (%coroutine-raise co obj): args is [obj], raised by the pending yield
+// (%coroutine-raise co obj): a resume with `raising`, args being [obj], which the pending yield raises
 export class ResumeRequest extends ControlRequest {
     co: any = undefined;
     args: any[] = [];
@@ -329,48 +251,6 @@ export class ResumeRequest extends ControlRequest {
             throw Suspend.resume(this.co, this.args, marks, mframe, this.raising);
         }
         return executor.coResumeNested(ctx, this.co, this.args, this.raising);
-    }
-}
-
-// (%raise obj [continuable]): never in tail position (a continuable raise returns where it was raised)
-export class RaiseRequest extends ControlRequest {
-    obj: any = undefined;
-    continuable: boolean = false;
-
-    static readonly #reused = new RaiseRequest();
-    static of(obj: any, continuable: boolean): RaiseRequest {
-        const r = RaiseRequest.#reused;
-        r.obj = obj; r.continuable = continuable;
-        return r;
-    }
-
-    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
-        return executor.raise(ctx, frame, this.obj, this.continuable);
-    }
-
-    direct(ctx: ExecutionContext, executor: VMExecutor, closure: Closure, marks: Marks): any {
-        throw Suspend.raise(this.obj, this.continuable, marks);
-    }
-}
-
-// (%current-stack [skip]): never in tail position (the frames it describes are those of the call)
-export class StackRequest extends ControlRequest {
-    skip: number = 0;
-
-    static readonly #reused = new StackRequest();
-    static of(skip: number): StackRequest {
-        const r = StackRequest.#reused;
-        r.skip = skip;
-        return r;
-    }
-
-    run(ctx: ExecutionContext, executor: VMExecutor, frame: Frame): Frame | null {
-        ctx.acc = new StackSnapshot(frameInfos(frame, this.skip));
-        return frame;
-    }
-
-    direct(): any {
-        throw Suspend.stack(this.skip);
     }
 }
 
@@ -417,6 +297,10 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     const deps = { MultipleValues, WindPoint, Caught, EXCEPTION_HANDLERS, Handlers, BARRIER };
     const core = (name: string, args: [number, number], fn: IntrinsicFn, options: Omit<IntrinsicOptions, "args" | "deps"> = {}) =>
         table.register(name, fn, { args, leaf: true, ...options, deps: options.inline === undefined ? undefined : deps });
+    // A control operation that generated code carries out itself, where it is called (its entry in CONTROL_AOT, for
+    // heap and for direct code): compiled code never calls a function for it, so it has none to call
+    const generated = (name: string, args: [number, number], tail: boolean = true, context: boolean = false) =>
+        core(name, args, () => { throw new Error(`internal error: ${name} is carried out by generated code and has no function to call`); }, { leaf: false, tail, context });
     // (%coroutine-create proc [finally]): finally is a thunk run when the coroutine, once started, is left for good
     core("%coroutine-create", [1, 2], (regs, start, nargs, ctx, executor) => executor.coCreate(ctx, regs[start], nargs === 2 ? regs[start + 1] : null), { context: true });
     core("%current-coroutine", [1, 1], (regs, start, nargs, ctx) => ctx!.coroutine ?? regs[start], {
@@ -435,7 +319,7 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         context: true, inline: () => `(ctx.wind !== null && (ctx.wind = ctx.wind.parent), undefined)`,
     });
     // (%dynamic-wind before thunk after): a call of the VM's helper that runs them (see raiseHelpers in executor.ts)
-    core("%dynamic-wind", [3, 3], (regs, start, nargs, ctx, executor) => new HostTail(executor.dynamicWind, [regs[start], regs[start + 2], regs[start + 1]]), { context: true, leaf: false });
+    generated("%dynamic-wind", [3, 3], true, true);
     core("%caught?", [1, 1], (regs, start) => regs[start] instanceof Caught, { inline: unaryInline((v, d) => `${v} instanceof ${d.Caught}`) });
     core("%caught-value", [1, 1], (regs, start) => regs[start].error, { inline: unaryInline(v => `${v}.error`) });
     core("%make-caught", [1, 1], (regs, start) => new Caught(regs[start]), { inline: unaryInline((v, d) => `new ${d.Caught}(${v})`) });
@@ -488,22 +372,20 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     // Control operations: not leaves, they return a ControlRequest the VM carries out at the call. Those whose value is
     // that of the call itself (`tail: false`) are never compiled as tail calls
     const control = (name: string, args: [number, number], fn: IntrinsicFn, tail: boolean = true) => core(name, args, fn, { leaf: false, tail });
-    // regs[from .. to) as a new array: a loop, as slicing a frame's registers is several times slower on these windows
-    const copyWindow = (regs: any[], from: number, to: number): any[] => {
-        const out: any[] = [];
-        for (let i = from; i < to; i++) out.push(regs[i]);
-        return out;
-    };
-    control("%call/cc", [1, 1], (regs, start) => CallCCRequest.of(regs[start]));
-    control("%call/ec", [1, 1], (regs, start) => EscapeRequest.of(regs[start]), false);
-    control("%call-catching", [1, 3], (regs, start, nargs) => CatchRequest.of(regs[start], nargs >= 2 ? regs[start + 1] : null, nargs === 3 ? catchGuard(regs[start + 2]) : false), false);
-    control("%apply-catching", [2, 2], (regs, start) => CatchRequest.of(regs[start], null, false, arrayArg("%apply-catching", regs[start + 1])), false);
-    control("%coroutine-yield", [0, Infinity], (regs, start, nargs) => YieldRequest.of(nargs === 1 ? regs[start] : packValues(copyWindow(regs, start, start + nargs))), false);
-    control("%coroutine-resume", [1, Infinity], (regs, start, nargs) => ResumeRequest.of(regs[start], copyWindow(regs, start + 1, start + nargs)));
-    control("%coroutine-resume-array", [2, 2], (regs, start) => ResumeRequest.of(regs[start], arrayArg("%coroutine-resume-array", regs[start + 1]).slice()));
+    generated("%call/cc", [1, 1]);
+    generated("%call/ec", [1, 1], false);
+    // (%call-catching thunk [pre [guarded]]): what %catch compiles to. (%apply-catching proc array) calls proc with the
+    // array's elements instead (the array is the call's own from then on)
+    generated("%call-catching", [1, 3], false);
+    generated("%apply-catching", [2, 2], false);
+    generated("%coroutine-yield", [0, Infinity], false);
+    generated("%coroutine-resume", [1, Infinity]);
+    generated("%coroutine-resume-array", [2, 2]);
     control("%coroutine-raise", [2, 2], (regs, start) => ResumeRequest.of(regs[start], [regs[start + 1]], true));
-    control("%raise", [1, 2], (regs, start, nargs) => RaiseRequest.of(regs[start], nargs === 2 ? raiseContinuable(regs[start + 1]) : false), false);
-    control("%current-stack", [0, 1], (regs, start, nargs) => StackRequest.of(nargs === 1 ? stackSkip(regs[start]) : 0), false);
+    // (%raise obj [continuable]) and (%current-stack [skip]) are never in tail position: a continuable raise returns
+    // where it was raised, and the frames a snapshot describes are those of the call
+    generated("%raise", [1, 2], false);
+    generated("%current-stack", [0, 1], false);
     // delimited continuations: a prompt's body gives its value to %prompt-finish, or an abort to it an Aborted, whose
     // values its handler is then called with
     control("%call-with-prompt", [3, 3], (regs, start) => PromptRequest.of(regs[start], regs[start + 1], regs[start + 2]));
@@ -514,10 +396,10 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
         return res instanceof Aborted ? new HostTail(regs[start], res.values) : res;
     }, { leaf: false });
     // an interrupt check (see Intrinsics.setInterruptHandler), which the compiler puts in code itself; AOT code inlines the count
-    core("%interrupt", [0, 0], (regs, start, nargs, ctx, executor) => executor.interrupt(ctx), { context: true, leaf: false, tail: false });
+    generated("%interrupt", [0, 0], false, true);
     // (%apply proc arg ... array) compiles to these: %apply-fresh when the array is a new one nothing else holds
-    control("%apply-array", [2, Infinity], (regs, start, nargs) => new HostTail(regs[start], applyArgs(regs, start + 1, nargs - 1)));
-    control("%apply-fresh", [2, 2], (regs, start) => new HostTail(regs[start], arrayArg("%apply", regs[start + 1])));
+    generated("%apply-array", [2, Infinity]);
+    generated("%apply-fresh", [2, 2]);
     control("%host-then", [2, 2], (regs, start) => regs[start](regs[start + 1]));
     return table.freeze();
 })();

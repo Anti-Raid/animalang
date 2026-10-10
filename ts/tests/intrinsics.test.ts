@@ -7,6 +7,7 @@ import { createScheme } from '../scheme';
 import { Code, AotCompiler } from '../magicvm/vm';
 import { Closure, CORE_COUNT, CORE_INTRINSICS, corePos, listing } from '../magicvm/exec';
 import { Compiler } from '../magicvm/compiler';
+import { CONTROL_AOT } from '../magicvm/aot/control';
 import { Intrinsics } from '../magicvm/intrinsics';
 import { Anima } from '../anima';
 import { impl } from '../magicvm/meta';
@@ -377,6 +378,17 @@ describe("Argument binding", () => {
     })
 })
 describe("Compiler intrinsics", () => {
+    it("have no function to call where generated code carries the operation out itself", () => {
+        const generated = (name: string) => {
+            try { CORE_INTRINSICS.byName(name)!.fn([], 0, 0); } catch (e: any) { return /is carried out by generated code/.test(e.message); }
+            return false;
+        };
+        // every operation with code of its own for both entries, and no other
+        expect([...CONTROL_AOT.keys()].filter(name => !generated(name))).toEqual([]);
+        expect(CORE_INTRINSICS.entries.map(e => e.name).filter(name => generated(name) && !CONTROL_AOT.has(name))).toEqual([]);
+        expect([...CONTROL_AOT.values()].every(t => typeof t.heap === "function" && typeof t.direct === "function")).toBe(true);
+    });
+
     it("are all documented in the compiler's README", () => {
         const readme = readFileSync(new URL("../magicvm/README.md", import.meta.url), "utf8");
         const documented = (name: string) => new RegExp("[`(]" + name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&") + "[`\\s)]").test(readme);

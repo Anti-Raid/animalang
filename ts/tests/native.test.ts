@@ -154,6 +154,10 @@ describe("native-scheme", () => {
         // one that only leaves its own procedure is a block and a jump, which is no continuation
         expect(one(`(%intcall %+ 1 (%intcall %call/ec (lambda (k) (%if #t (%call k 5) 6))))`)).toBe("6");
         expect(one(`(define-global (unused) (%intcall %call/cc (lambda (k) 1))) 5`)).toBe("5");
+        // an instance runs code of its own kind alone, so no re-entrant code beside it can capture its frames
+        const other = make();
+        expect(() => other.evaluateRaw(a.compileRaw(`1`, "t.ns"))).toThrow("this code was compiled as not re-entrant, and the instance's code is re-entrant");
+        expect(() => a.evaluateRaw(other.compileRaw(`1`, "t.ns"))).toThrow("this code was compiled as re-entrant, and the instance's code is not re-entrant");
         // errors are caught and coroutines run as before
         expect(one(`(%catch (lambda () (%intcall %raise 'x)) (lambda (e) (%intcall %push '() e)))`)).toBe("(x)");
         expect(one(`(%catch (lambda () (%intcall %call/ec (lambda (k) (%set! saved k) 1))) (lambda (e) 'refused))`)).toBe("refused");

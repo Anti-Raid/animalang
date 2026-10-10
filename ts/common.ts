@@ -37,9 +37,6 @@ export enum Msg {
     // a front end's own message, args[0] its text, raised by its intrinsics so that it gets where it happened (`at`) and
     // is worded by the formatter (e.g. prefixed with that position)
     Text,
-    // a continuation ran a captured frame of code compiled as not re-entrant (AnimaOptions.reentrant) a second time;
-    // args[0] is the frame's procedure
-    NotReentrant,
     // code compiled as not re-entrant asked for a continuation; args[0] is the operation's name
     NoContinuations,
 }
