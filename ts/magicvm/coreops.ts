@@ -374,10 +374,10 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     const control = (name: string, args: [number, number], fn: IntrinsicFn, tail: boolean = true) => core(name, args, fn, { leaf: false, tail });
     generated("%call/cc", [1, 1]);
     generated("%call/ec", [1, 1], false);
-    // (%call-catching thunk [pre [guarded]]): what %catch compiles to. (%apply-catching proc array) calls proc with the
-    // array's elements instead (the array is the call's own from then on)
+    // (%call-catching thunk [pre [guarded]]): what %catch compiles to. (%apply-catching proc array [pre [guarded]]) calls
+    // proc with the array's elements instead (the array is the call's own from then on)
     generated("%call-catching", [1, 3], false);
-    generated("%apply-catching", [2, 2], false);
+    generated("%apply-catching", [2, 4], false);
     generated("%coroutine-yield", [0, Infinity], false);
     generated("%coroutine-resume", [1, Infinity]);
     generated("%coroutine-resume-array", [2, 2]);

@@ -393,6 +393,16 @@ export class VMExecutor {
         return e;
     }
 
+    // the same of a %catch's token, for one with a pre-unwind handler (which runs in heap code): an error raised by the
+    // catch's own call before any frame of the callee (what it was to call is no procedure) is one for the token too,
+    // worded as it is there (the catch's frame is not one it leaves through)
+    public pushToken(e: any, tok: CatchToken, marks: Marks, mframe: number): any {
+        // (an error that comes to the catch with no position, through the VM's own code alone, is worded so too)
+        if (e instanceof Suspend && e.error instanceof VMError && e.error.at === null) this.vm.message(e.error);
+        const sig = e instanceof Suspend || e instanceof EscapedError || e instanceof InterruptError ? e : Suspend.error(caughtValue(e, this.vm));
+        return this.pushEscape(sig, tok, marks, mframe);
+    }
+
     // the same of a catch on the context's stack (see ExecutionContext.catches)
     public pushCatch(e: any, at: number, marks: Marks, mframe: number): any {
         if (e instanceof Suspend) {

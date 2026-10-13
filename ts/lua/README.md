@@ -13,8 +13,9 @@ So far: locals, assignment (to locals, globals and table entries, several at onc
 `local function`, `function a.b:c()`), calls and method calls, several values and `...`, table constructors, indexing,
 literals, interpolated strings, if-expressions, and the operators (arithmetic, `..`, comparisons, `and`, `or`, `not`,
 `#`). Anything else is a positioned "not supported yet" error. Of the standard library there are `next`, `pairs`,
-`ipairs`, `tostring`, `tonumber`, `print`, `error`, `pcall` and `string` (but `pack`, `unpack` and `packsize`); the rest, and
-metamethods, come later.
+`ipairs`, `tostring`, `tonumber`, `print`, `type`, `select`, `assert`, `setmetatable`, `error`, `pcall`, `xpcall`,
+`debug.traceback` and `string` (but `pack`, `unpack` and `packsize`); the rest, and metamethods (but `__call`, `__mode` and
+`__metatable`), come later.
 
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
@@ -114,6 +115,21 @@ metamethods, come later.
   value, the value is raised as it is. A level further up reads the position from the stack (`%current-stack`), which
   differs from Luau's in two ways: a call in tail position leaves no frame here (Luau makes no tail calls), and the
   library's functions are not levels (Luau counts `pcall`, and gives no position at it).
+- `type`, `select`, `assert` and `setmetatable` are `luaB_type`, `luaB_select`, `luaB_assert` and `luaB_setmetatable`:
+  their argument errors are Luau's, `assert` raises its message (a string or a number, else an argument error) as
+  the library's own errors are raised, and `setmetatable` refuses a table whose metatable has a `__metatable` field
+  (`cannot change a protected metatable`) or that is frozen. A metatable's `__call` and `__mode` are what act so far.
+- `xpcall` is `pcall` with the catch's handler before anything unwinds (`%apply-catching` with a `pre`, see the VM's
+  README): the handler (a function, `luaL_checktype`) is called with the error where it was raised, so a traceback it
+  takes shows the frames of the error, and its first value is what `xpcall` returns after `false`; a handler that
+  fails gives `error in error handling`. Such a catch is a token (one object per call), not the two stack entries
+  `pcall`'s is.
+- `debug.traceback([thread,] [message [, level]])` is `luaL_traceback`: the message and a line, then a line for each
+  frame from the function that called it (level 1) out, `file:line`, and ` function name` for a function a function
+  statement named (`function f`, `local function f`, the last name of `function a.b:c`); a function expression has
+  no name, whatever it is assigned to (its `%lambda` clause has the `unnamed` option). The levels differ from Luau's as
+  `error`'s do: a call in tail position leaves no frame, and the library's functions (`pcall`, `xpcall`) are not
+  levels, though Luau counts them (and shows none of them either).
 - Luau code is compiled as not re-entrant (`reentrant: false`), which also means the VM gives it no continuations:
   Luau has none
   (a coroutine resumes its one suspended frame), so an assigned local needs a box only when a closure captures it.

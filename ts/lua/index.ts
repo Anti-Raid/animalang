@@ -1,6 +1,6 @@
 // Luau: an instance whose language is Luau (syntax/ parses it, lower.ts lowers it to core forms, ops.ts has its operators)
 import { Anima } from "../anima";
-import { CORE_IF, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LETREC, Env } from "../common";
+import { CORE_CALL, CORE_IF, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LETREC, Env } from "../common";
 import { ClosureTemplate, type Closure, type Code } from "../magicvm/code";
 import { PAD, clause } from "../magicvm/lambda";
 import type { AnimaOptions } from "../magicvm/meta";
@@ -78,7 +78,7 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
     iterators.inext = library("ipairs", "%luau-fn-inext");
     define("pairs", library("pairs", "%luau-fn-pairs"));
     define("ipairs", library("ipairs", "%luau-fn-ipairs"));
-    for (const name of ["tostring", "tonumber", "print"]) define(name, library(name, `%luau-fn-${name}`));
+    for (const name of ["tostring", "tonumber", "print", "type", "assert", "select", "setmetatable"]) define(name, library(name, `%luau-fn-${name}`));
     for (const name of Object.keys(STRING_LIBRARY)) iterators.string.set(name, library(name, `%luau-string-${name}`));
     // gmatch gives a function that goes on from where the last match ended
     const [rest, state] = [Symbol("..."), Symbol("state")];
@@ -98,5 +98,21 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
             [CORE_IF, null, call("%caught?", r),
                 call("%values", false, call("%luau-caught", call("%caught-value", r))),
                 call("%values-cons", true, r)]]])]));
+    // xpcall is pcall whose handler runs where the error is raised, before anything unwinds (the catch's `pre`), and
+    // gives what xpcall returns after false: its first value; a handler that fails is "error in error handling"
+    const [h, e] = [Symbol("handler"), Symbol("e")];
+    define("xpcall", procedure("xpcall", [CORE_LAMBDA, null, clause([PAD], [], rest, [
+        call("%luau-xpcall-check", rest),
+        [CORE_LET, null, [[h, call("%luau-arg", rest, 1)]],
+            [CORE_LET, null, [[r, call("%apply-catching", call("%luau-arg", rest, 0), call("%luau-xpcall-args", rest),
+                [CORE_LAMBDA, null, clause([], [e], null, [call("%first-value", [CORE_CALL, null, h, call("%luau-caught", e)], undefined)])], true)]],
+                [CORE_IF, null, call("%caught?", r),
+                    call("%values", false, call("%luau-xpcall-caught", call("%caught-value", r))),
+                    call("%values-cons", true, r)]]]])]));
+    // debug.traceback: the frames from the function that called it out (or a thread's), as Luau lists them
+    const debug = new LuaTable();
+    debug.set("traceback", procedure("traceback", [CORE_LAMBDA, null, clause([PAD], [], rest, [
+        call("%luau-fn-traceback", rest, call("%debug-frames", call("%current-stack"), call("%luau-traceback-thread", rest), undefined))])]));
+    define("debug", debug);
     return anima;
 };

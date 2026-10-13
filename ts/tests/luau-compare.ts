@@ -5,11 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Anima } from '../anima';
 import { MultipleValues } from '../common';
-import { toString } from '../lua';
+import { toString, typeName } from '../lua';
 
 // a value on one line: a string with what is not a letter, a digit or a space as \ddd
 const escaped = (s: string) => s.replace(/[^A-Za-z0-9 ]/g, c => "\\" + String(c.charCodeAt(0)).padStart(3, "0"));
-const show = (v: any) => typeof v === "string" ? `<${escaped(v)}>` : typeof v === "object" && v !== null ? "table" : toString(v).replace(/^function: .*/, "function");
+const show = (v: any) => typeof v === "string" ? `<${escaped(v)}>` : typeName(v) === "function" ? "function" : typeof v === "object" && v !== null ? "table" : toString(v);
 
 const header = [
     "local function esc(s) return (s:gsub('[^%w ]', function(c) return string.format('\\\\%03d', c:byte()) end)) end",
@@ -21,7 +21,9 @@ const theirs = (programs: string[]): string[] => {
     const lua = [...header, ...programs.map(p => `do local f, err = loadstring(${JSON.stringify(p)}, "=t") if not f then print("error: " .. esc(err)) else local r = table.pack(pcall(f)) if r[1] then local out = {} for i = 2, r.n do out[#out + 1] = shown(r[i]) end print(table.concat(out, " ")) else print("error: " .. esc(tostring(r[2]))) end end end`)];
     const file = join(mkdtempSync(join(tmpdir(), "luau-")), "programs.luau");
     writeFileSync(file, lua.join("\n"));
-    return execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26, timeout: 60000 }).split("\n").slice(0, programs.length);
+    // (a traceback taken in a program goes on into the frames of this file's code, which are no part of the program)
+    const frame = new RegExp(`${escaped(file).replace(/\\/g, "\\\\")}\\\\058\\d+\\\\010`, "g");
+    return execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26, timeout: 60000 }).split("\n").slice(0, programs.length).map(line => line.replace(frame, ""));
 };
 
 // a Luau string literal of `s`

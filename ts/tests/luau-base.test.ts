@@ -103,8 +103,107 @@ describe("Luau's error and pcall", () => {
     });
 });
 
+describe("Luau's type, select, assert, setmetatable, xpcall and debug.traceback", () => {
+    it("names a value's type, picks arguments, and checks a condition", () => {
+        expect(run("return type(1), type('s'), type(nil), type({}), type(print), type(1 == 1)")).toBe("number\tstring\tnil\ttable\tfunction\tboolean");
+        expect(run("return type()")).toBe("error: t:1: missing argument #1");
+        expect(run("return select('#'), select('#', 1, nil, 3), select(2, 'a', 'b', 'c')")).toBe("0\t3\tb\tc");
+        expect(run("return select(-1, 'a', 'b', 'c')")).toBe("c");
+        expect(run("return select(5, 'a', 'b')")).toBe("");
+        expect(run("return pcall(select, 0, 1)")).toBe("false\tinvalid argument #1 to 'select' (index out of range)");
+        expect(run("return pcall(select, {}, 1)")).toBe("false\tinvalid argument #1 to 'select' (number expected, got table)");
+        expect(run("return assert(1, 'm', 3)")).toBe("1\tm\t3");
+        expect(run("local function f()\n  assert(1 == 2)\nend\nreturn pcall(f)")).toBe("false\tt:2: assertion failed!");
+        expect(run("return pcall(assert, nil, 'gone')")).toBe("false\tgone");
+        expect(run("return pcall(assert, false, {})")).toBe("false\tinvalid argument #2 to 'assert' (string expected, got table)");
+        expect(run("return pcall(assert)")).toBe("false\tmissing argument #1");
+    });
+
+    it("sets a table's metatable, unless the one it has is protected", () => {
+        expect(run("local t = {} return setmetatable(t, {}) == t, setmetatable(t, nil) == t")).toBe("true\ttrue");
+        expect(run("local t = setmetatable({}, { __call = function(self, a) return a + 1 end }) return t(41)")).toBe("42");
+        expect(run("return pcall(setmetatable, {})")).toBe("false\tmissing argument #2 to 'setmetatable' (nil or table expected)");
+        expect(run("return pcall(setmetatable, 1, {})")).toBe("false\tinvalid argument #1 to 'setmetatable' (table expected, got number)");
+        expect(run("local t = setmetatable({}, { __metatable = false }) return pcall(setmetatable, t, {})")).toBe("false\tcannot change a protected metatable");
+    });
+
+    it("calls a handler where an error is raised, and gives what it returns", () => {
+        expect(run("return xpcall(function(a, b) return a + b, a end, tostring, 1, 2)")).toBe("true\t3\t1");
+        expect(run("return xpcall(function() error('boom') end, function(e) return 'handled: ' .. e, 'dropped' end)")).toBe("false\thandled: t:1: boom");
+        expect(run("return xpcall(function() error('a') end, function(e) error('b') end)")).toBe("false\terror in error handling");
+        expect(run("return xpcall(nil, function(e) return 'h: ' .. e end)")).toBe("false\th: attempt to call a nil value");
+        expect(run("return pcall(xpcall, tostring)")).toBe("false\tmissing argument #2 to 'xpcall' (function expected)");
+        expect(run("return pcall(xpcall, tostring, 1)")).toBe("false\tinvalid argument #2 to 'xpcall' (function expected, got number)");
+        expect(run("local n = 0 for i = 1, 200 do local ok, v = xpcall(function() if i % 2 == 0 then error('x') end return 1 end, function(e) return 0 end) n = n + v end return n")).toBe("100");
+        // the handler sees the frames of the error, which are gone once xpcall returns
+        expect(run("local function f()\n  error('deep')\nend\nlocal function g()\n  f()\nend\nlocal ok, s = xpcall(g, debug.traceback)\nreturn s")).toBe("t:2: deep\nt:2 function f\nt:5 function g\nt:7\n");
+    });
+
+    it("lists the frames from the function that asked, a function statement's by its name", () => {
+        expect(run("local function f()\n  local s = debug.traceback('msg')\n  return s\nend\nlocal s = f()\nreturn s")).toBe("msg\nt:2 function f\nt:5\n");
+        expect(run("local t = {}\nfunction t.a() local s = debug.traceback() return s end\nfunction t:b() local s = debug.traceback() return s end\nlocal x, y = t.a(), t:b()\nreturn x .. y")).toBe("t:2 function a\nt:4\nt:3 function b\nt:4\n");
+        expect(run("local f = function() local s = debug.traceback() return s end\nlocal s = f()\nreturn s")).toBe("t:1\nt:2\n");
+        expect(run("local function a() local s = debug.traceback('x', 2) return s end\nlocal function b() local s = a() return s end\nlocal s = b()\nreturn s")).toBe("x\nt:2 function b\nt:3\n");
+        expect(run("return pcall(debug.traceback, 'm', -1)")).toBe("false\tinvalid argument #2 to 'traceback' (level can't be negative)");
+        expect(run("return pcall(debug.traceback, {})")).toBe("false\tinvalid argument #1 to 'traceback' (string expected, got table)");
+    });
+});
+
 describe.skipIf(!process.env.LUAU)("Luau's tostring and tonumber against Luau", () => {
     const compare = comparer(luau);
+
+    it("does what Luau's type, select, assert and setmetatable do", () => {
+        const args = ["1", "'s'", "nil", "true", "false", "{}", "print", "-1", "0", "2", "3", "'#'", "'#x'", "'2'", "1.9", "-2.5", "'x'", "1e10", "-1e10"];
+        const list = (n: number) => Array.from({ length: n }, () => pick(args)).join(", ");
+        const programs = Array.from({ length: 3000 }, () => {
+            switch (rand(6)) {
+                case 0: return `return pcall(select, ${list(rand(6))})`;
+                case 1: return `local function f(...) return select(${pick(args)}, ...) end return pcall(f, ${list(rand(5))})`;
+                case 2: return `return pcall(assert, ${list(rand(4))})`;
+                case 3: return `return pcall(type, ${list(rand(3))})`;
+                case 4: return `local t, mt = {}, { __metatable = ${pick(["nil", "nil", "false", "1"])} } return pcall(setmetatable, ${pick(["t", "t", "mt", "setmetatable(t, mt)", "1", "nil"])}${pick(["", ", nil", ", mt", ", {}", ", 1", ", 's'"])})`;
+                default: return `local function f(a)\n  ${pick(["assert(a, 'bad ' .. tostring(a))", "assert(a)", "assert(a, 7)", "return (select(2, a, a))"])}\n  return type(a)\nend\nreturn pcall(f, ${pick(args)})`;
+            }
+        });
+        expect(compare(programs).slice(0, 4)).toEqual([]);
+    }, 120000);
+
+    it("catches with a handler as Luau's xpcall does", () => {
+        // (a level past the caller is counted in frames, which Luau counts xpcall's own among: see the README)
+        const raise = () => pick(["error('msg')", "error('msg', 0)", "error(true)", "error()", "error(42)", "local x = nil\n  x = x.y", "local t = {} + 1", "tostring()", "nothere()"]);
+        const handler = () => pick(["function(e) return e end", "function(e) return 'h:' .. tostring(e) end", "function(e) return e, 'more' end", "function(e) end", "function(e) error('in handler') end",
+            "function(e) local s = debug.traceback(tostring(e)) return s end", "debug.traceback", "tostring", "function(e) return tostring(e ~= nil) end", "function(e) local x = nil return x.y end"]);
+        const programs = Array.from({ length: 2500 }, () => {
+            const depth = 1 + rand(3);
+            const lines = [`local function f1(a)\n  ${rand(3) === 0 ? "local r = a" : raise()}\n  return a, 'second'\nend`];
+            for (let d = 2; d <= depth; d++) lines.push(`local function f${d}(a)\n  local r, s = f${d - 1}(a)\n  return r, s\nend`);
+            const f = pick([`f${depth}`, `f${depth}`, "nil", "error", "pcall"]), h = pick([handler(), handler(), handler(), "nil", "1"]);
+            const call = `xpcall(${f}, ${h}${pick(["", ", 1", ", 'arg', 0", ", nil"])})`;
+            lines.push(pick([`local ok, v, w = ${call}\nreturn ok, v, w`, `local ok, v = pcall(function()\n  local a, b = ${call}\n  return a, b\nend)\nreturn ok, v`,
+                `local ok, v = xpcall(function()\n  local a, b = ${call}\n  error(tostring(b))\nend, ${handler()})\nreturn ok, v`]));
+            return lines.join("\n");
+        });
+        expect(compare(programs).slice(0, 4)).toEqual([]);
+    }, 120000);
+
+    it("writes tracebacks as Luau does", () => {
+        // (no call in tail position: Luau keeps its frame, see the README)
+        const programs = Array.from({ length: 1500 }, () => {
+            const depth = 1 + rand(4), where = pick(["debug.traceback()", "debug.traceback('m')", `debug.traceback('m', ${rand(6)})`, `debug.traceback(nil, ${rand(4)})`, "debug.traceback(7)"]);
+            const lines = ["local t = {}", `${pick(["local function f1()", "function t.f1()", "function t:f1()", "function f1()", "local f1 = function()"])}\n  local s = ${where}\n  return s\nend`];
+            const name = (d: number, how: string) => how.startsWith("function t.") ? `t.f${d}` : how.startsWith("function t:") ? `t:f${d}` : `f${d}`;
+            let last = name(1, lines[1]);
+            for (let d = 2; d <= depth; d++) {
+                const how = pick([`local function f${d}()`, `function t.f${d}()`, `function t:f${d}()`, `local f${d} = function()`, `local f${d} f${d} = function()`]);
+                // (a level is counted in frames, which Luau counts pcall's own among: only the default one goes through pcall)
+                lines.push(`${how}\n  local s = ${!where.includes(", ") && rand(5) === 0 ? `select(2, pcall(${last.replace(":", ".")}))` : `${last}()`}\n  return s\nend`);
+                last = name(d, how);
+            }
+            lines.push(`local s = ${last}()\nreturn s`);
+            return lines.join("\n");
+        });
+        expect(compare(programs).slice(0, 4)).toEqual([]);
+    }, 120000);
 
     it("raises and catches errors as Luau does", () => {
         const value = () => pick(["'msg'", "'msg'", "42", "nil", "true", "{}", "'a' .. 1"]);

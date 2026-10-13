@@ -1,8 +1,9 @@
 // Luau's operators (VM/src/lvmutils.cpp), as intrinsics: numbers, strings that read as numbers, vectors, and (a
 // deviation from Luau) integers with integers
-import { ErrorObject, IProcedure, MultipleValues, TRY_CALL } from "../common";
+import { ErrorObject, IProcedure, Msg, MultipleValues, TRY_CALL, VMError } from "../common";
+import { Coroutine } from "../magicvm/exec";
 import { severalValues } from "../magicvm/coreops";
-import { argError, argInvalid, optInteger, stringArg, tableArg, type Args } from "./args";
+import { argError, argInvalid, integerArg, optInteger, stringArg, tableArg, type Args } from "./args";
 import { NOWHERE, luauError } from "./errors";
 import type { ArgKinds, InlineFn, Intrinsics, Returns, TypeSystem } from "../magicvm/intrinsics";
 import { integer, ipow } from "./integer";
@@ -11,6 +12,9 @@ import { cstring, num2str, str2integer, str2number } from "./number";
 import { STRING_LIBRARY, gmatchNext, gmatchState } from "./strlib";
 import { LuaTable, type SlotCache } from "./table";
 import { LuaVector, vadd, vdiv, vidiv, vmul, vsub, vunm } from "./vector";
+
+// a function's name in a traceback (a proto's debugname): none for a chunk or a function nothing names
+const functionName = (name: any): string | null => typeof name !== "string" || name === "lambda" || name === "top-level" || name.startsWith("lambda@") ? null : name;
 
 export type ArithOp = "add" | "sub" | "mul" | "div" | "idiv" | "mod" | "pow" | "unm";
 
@@ -362,6 +366,62 @@ export const registerLuauOps = (table: Intrinsics, library: LuauLibrary): void =
         const e = regs[s] instanceof ErrorObject ? regs[s].error : regs[s];
         return e instanceof Error ? e.message : e;
     }, { args: [1, 1], leaf: true, oneValue: true });
+    // xpcall (luaB_xpcally): its handler is a function; what it calls the function with; and what its handler gave
+    // for the error, "error in error handling" if the handler failed itself
+    table.register("%luau-xpcall-check", (regs, s) => {
+        if (!(regs[s][1] instanceof IProcedure)) throw argError(regs[s], 2, "xpcall", "function");
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-xpcall-args", (regs, s) => regs[s].slice(2), { args: [1, 1], leaf: true, oneValue: true, fresh: true, effectFree: true });
+    table.register("%luau-xpcall-caught", (regs, s) => {
+        const v = regs[s];
+        if (!(v instanceof ErrorObject)) return v;
+        if (v.error instanceof VMError && v.error.op === Msg.ErrorInHandler) return "error in error handling";
+        return v.error instanceof Error ? v.error.message : v.error;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    // luaB_type, luaB_assert, luaB_select, luaB_setmetatable
+    table.register("%luau-fn-type", (regs, s) => {
+        if (regs[s].length < 1) throw luauError("missing argument #1");
+        return typeName(regs[s][0]);
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-fn-assert", (regs, s) => {
+        const a: Args = regs[s];
+        if (a.length < 1) throw luauError("missing argument #1");
+        if (a[0] === false || a[0] === undefined) throw luauError(a[1] === undefined ? "assertion failed!" : stringArg(a, 2, "assert"));
+        return a.length === 1 ? a[0] : new MultipleValues(a.slice());
+    }, { args: [1, 1], leaf: true });
+    table.register("%luau-fn-select", (regs, s) => {
+        const a: Args = regs[s], n = a.length;
+        if (typeof a[0] === "string" && a[0].charCodeAt(0) === 35) return n - 1;
+        let i = integerArg(a, 1, "select");
+        if (i < 0) i = n + i;
+        else if (i > n) i = n;
+        if (i < 1) throw argInvalid(1, "select", "index out of range");
+        return n - i === 1 ? a[i] : new MultipleValues(a.slice(i));
+    }, { args: [1, 1], leaf: true });
+    table.register("%luau-fn-setmetatable", (regs, s) => {
+        const a: Args = regs[s], t = tableArg(a, 1, "setmetatable"), mt = a[1];
+        if (a.length < 2 || (mt !== undefined && !(mt instanceof LuaTable))) throw argError(a, 2, "setmetatable", "nil or table");
+        if (t.metatable !== null && t.metatable.rawget("__metatable") !== undefined) throw luauError("cannot change a protected metatable");
+        if (t.frozen) throw luauError("attempt to modify a readonly table");
+        t.metatable = mt ?? null;
+        return t;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    // debug.traceback (db_traceback, luaL_traceback): the thread it is given as the array %debug-frames takes one in,
+    // and the traceback of those frames (each #(name file line col), the innermost first: the function that called
+    // debug.traceback, which Luau counts as level 1, or the frame a thread it is given is at, level 0)
+    table.register("%luau-traceback-thread", (regs, s) => regs[s][0] instanceof Coroutine ? [regs[s][0]] : [], { args: [1, 1], leaf: true, oneValue: true, fresh: true });
+    table.register("%luau-fn-traceback", (regs, s) => {
+        const a: Args = regs[s], frames: any[][] = regs[s + 1], at = a[0] instanceof Coroutine ? 1 : 0;
+        const msg = a[at] === undefined ? null : stringArg(a, at + 1, "traceback");
+        const level = optInteger(a, at + 2, "traceback", 1 - at);
+        if (level < 0) throw argInvalid(at + 2, "traceback", "level can't be negative");
+        let out = msg === null ? "" : msg + "\n";
+        for (let i = at === 1 ? level : Math.max(level - 1, 0); i < frames.length; i++) {
+            const [name, file, line] = frames[i];
+            out += `${file ?? ""}${line > 0 ? ":" + line : ""}${functionName(name) === null ? "" : " function " + functionName(name)}\n`;
+        }
+        return out;
+    }, { args: [2, 2], leaf: true, oneValue: true });
     table.register("%luau-fn-tostring", (regs, s) => {
         if (regs[s].length < 1) throw luauError("missing argument #1");
         return toString(regs[s][0]);

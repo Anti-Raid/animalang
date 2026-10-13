@@ -2,7 +2,7 @@
 // while, repeat, numeric for, for ... in, break, continue, return, functions, calls and method calls, several values
 // and `...`, tables, indexing, literals, and the operators; the rest is "not supported yet"
 import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LETREC, CORE_LET_STAR, CORE_LET_VALUES, CORE_LOOP, CORE_QUOTE, CORE_SET, MultipleValues, type SourcePos } from "../common";
-import { PAD, clause } from "../magicvm/lambda";
+import { PAD, UNNAMED, clause } from "../magicvm/lambda";
 import { predictShapes, type Shape } from "./shapes";
 import { RecordShape } from "./table";
 import { L, isForm, offsetOf, type ParseResult } from "./syntax/ast";
@@ -230,7 +230,7 @@ class Lowering {
                 const [, targets, exprs] = stat as C.Assign;
                 if (targets.length !== 1 || exprs.length !== 1) return (yield this.assign(pos, targets, exprs));
                 const target = targets[0];
-                if (!isIndex(target)) return [CORE_SET, pos, this.variable(target), (yield this.expr(exprs[0]))];
+                if (!isIndex(target)) return [CORE_SET, pos, this.variable(target), (yield this.#named(exprs[0]))];
                 return (yield this.#inOrder(pos, [target[1], target[2], exprs[0]], ([o, k, v]) => intcall(pos, setter(target[2]), o, k, v)));
             }
             case L.OPSET: {
@@ -494,6 +494,11 @@ class Lowering {
                             [CORE_LET, pos, names.map((name, i) => [name, temps[i]]), [CORE_BLOCK, pos, loop.cont, ...(yield self.statements(block))]]]]; })]]]));
     }
 
+    // the value assigned to a variable: a function statement's function is named by the assignment itself
+    *#named(e: C.Expr): Task<any> {
+        return Array.isArray(e) && e[0] === L.FUNCTION ? (yield this.function(e as C.Func)) : (yield this.expr(e));
+    }
+
     // a padded closure, as Luau's functions take any number of arguments: missing ones are nil, extra ones dropped, or
     // are its `...`
     *function(func: C.Func): Task<any[]> {
@@ -506,7 +511,8 @@ class Lowering {
         this.#varargs = rest;
         this.#declare(...params);
         try {
-            return [CORE_LAMBDA, pos, clause([PAD], params, rest, [(yield this.functionBody(pos, block))])];
+            // (only a function statement names its function: the name the parser gives it. Any other is nameless)
+            return [CORE_LAMBDA, pos, clause(func[4] === null ? [PAD, UNNAMED] : [PAD], params, rest, [(yield this.functionBody(pos, block))])];
         } finally {
             this.#loops = outer.loops;
             this.#ret = outer.ret;
@@ -754,7 +760,13 @@ class Lowering {
             case L.VARARGS: return intcall(pos, "%luau-arg", this.#varargs, 0);
             case L.CALL: case L.METHOD: return (yield this.call(e as C.Call | C.Method, true));
             case L.INDEX: return (yield this.#inOrder(pos, [e[1], e[2]], ([o, k]) => intcall(pos, getter(e[2] as C.Expr), o, k)));
-            case L.FUNCTION: return (yield this.function(e as C.Func));
+            case L.FUNCTION: {
+                // a function statement's function that is not bound to its name where it is made (a method, a field's)
+                const name = (e as C.Func)[4], made = (yield this.function(e as C.Func));
+                if (name === null) return made;
+                const bound = Symbol(name);
+                return [CORE_LETREC, this.pos(e), [[bound, made]], bound];
+            }
             case L.TABLE: return (yield this.table(e as C.Table));
             case L.INTERP: return (yield this.interp(e as C.Interp));
         }

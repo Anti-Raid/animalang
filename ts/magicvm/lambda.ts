@@ -7,6 +7,10 @@ export type Clause = any[];
 // a clause whose missing arguments are <#void> and whose extra ones are dropped (or go to its rest parameter): it
 // takes any count
 export const PAD = Symbol.for("pad");
+// a lambda with no name of its own: it is not named after what it is bound to (as a language's function expression is
+// not, where only a function's declaration names it)
+export const UNNAMED = Symbol.for("unnamed");
+export const isUnnamed = (lambda: any[]): boolean => lambda.length > 2 && Array.isArray(lambda[2]) && Array.isArray(lambda[2][0]) && lambda[2][0].includes(UNNAMED);
 
 export const isLambda = (e: any): e is any[] => Array.isArray(e) && e[0] === CORE_LAMBDA;
 

@@ -79,23 +79,23 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
                 ${call([], "handlers")}
             } catch (e) {
                 const caught = catchHere(e, tok, ctx);
-                if (caught === null) throw executor.pushEscape(e, tok, handlers, mframe);
+                if (caught === null) throw executor.pushToken(e, tok, handlers, mframe);
                 countControlSuspend(closure.tmpl.code);
                 acc = caught;
             }
         }`,
     }],
     ["%apply-catching", {
-        heap: s => s.reentrant ? `return executor.callCatch(ctx, ${s.args[0]}, frame, null, false, arrayArg("%apply-catching", ${s.args[1]}));`
-            : `return executor.callCatchStack(ctx, ${s.args[0]}, frame, arrayArg("%apply-catching", ${s.args[1]}));`,
-        direct: s => !s.reentrant ? stackCatch(`acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), ${s.deeper}, marks, mframe + 1);`) : `{
-            const tok = new CatchToken(ctx.id, ctx.wind, null, false);
+        heap: s => s.args.length === 2 && !s.reentrant ? `return executor.callCatchStack(ctx, ${s.args[0]}, frame, arrayArg("%apply-catching", ${s.args[1]}));`
+            : `return executor.callCatch(ctx, ${s.args[0]}, frame, ${s.args[2] ?? "null"}, ${s.args.length === 4 ? `catchGuard(${s.args[3]})` : "false"}, arrayArg("%apply-catching", ${s.args[1]}));`,
+        direct: s => s.args.length === 2 && !s.reentrant ? stackCatch(`acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), ${s.deeper}, marks, mframe + 1);`) : `{
+            const tok = new CatchToken(ctx.id, ctx.wind, ${s.args[2] ?? "null"}, ${s.args.length === 4 ? `catchGuard(${s.args[3]})` : "false"});
             const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
             try {
                 acc = executor.callArray(ctx, ${s.args[0]}, arrayArg("%apply-catching", ${s.args[1]}), ${s.deeper}, handlers, mframe + 1);
             } catch (e) {
                 const caught = catchHere(e, tok, ctx);
-                if (caught === null) throw executor.pushEscape(e, tok, handlers, mframe);
+                if (caught === null) throw executor.pushToken(e, tok, handlers, mframe);
                 countControlSuspend(closure.tmpl.code);
                 acc = caught;
             }

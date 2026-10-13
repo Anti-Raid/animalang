@@ -377,14 +377,14 @@ export class DirectEmitter extends FunctionEmitter {
                 if (control !== undefined) {
                     const site = { args: this.#args(term), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume), reentrant: this.reentrant, deeper: this.#deeper };
                     return this.emit(`
-                        ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}
+                        ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}${term.isTail ? ` tip = ${term.resume};` : ""}
                         ${control.direct(site, this.#call({ args: null, tail: term.isTail }), (args, marks) => this.#call({ args, tail: false, marks }))}
                         ${term.isTail ? "" : this.#afterCall(term.resume, next)}
                     `);
                 }
                 return this.emit(`
                     {
-                        rip = ${term.isTail ? -1 : term.resume};
+                        rip = ${term.isTail ? `-1; tip = ${term.resume}` : term.resume};
                         const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
                         if (${this.isRequest("res", "HostTail")}) {
                             ${term.isTail ? this.tailMark("res") : ""}

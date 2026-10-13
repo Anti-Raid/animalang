@@ -15,7 +15,7 @@
 import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_VALUES_STRICT, CORE_LOOP, CORE_QUOTE, SPECIAL_FORMS } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
-import { BOXED, isLetrecLambda, isPadded, unwrapBoxed } from "../lambda";
+import { BOXED, isLetrecLambda, isPadded, isUnnamed, unwrapBoxed } from "../lambda";
 import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX, boxesIn, convertAssignments } from "./assignments";
 import { AstAnalysis } from "../analysis";
 import { malformed, parts, rebuild, subExprs, type Shape } from "./lang";
@@ -86,6 +86,8 @@ const lambdaName = (lambda: any): string => {
     const pos = posOf(lambda);
     return pos !== null ? `lambda@${pos.file}:${pos.line}` : "lambda";
 };
+// the name of a lambda bound to `bound`: the variable's, unless the lambda takes no name (see UNNAMED)
+const boundName = (lambda: any, bound: symbol): string => isUnnamed(unwrapBoxed(lambda)) ? lambdaName(unwrapBoxed(lambda)) : String(bound.description);
 
 // how often `sym` is used in the expressions `es`
 const escapesTo = (e: any, label: symbol): boolean => {
@@ -408,7 +410,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         else {
             if (inlinable(init)) {
                 const once = u !== undefined ? u.uses === 1 && !u.other : usesIn(scope(), name) === 1 && onlyCalledIn(scope(), name);
-                env.set(name, { k: "lambda", lambda: init, once, name: String(name.description) });
+                env.set(name, { k: "lambda", lambda: init, once, name: boundName(init, name) });
             }
             return false;
         }
@@ -542,7 +544,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                     // (its uses are those of its own init and of its scope: none in the first, so all of them in the second)
                     const u = known?.get(name);
                     const once = usesIn([init], name) === 0 && (u !== undefined ? u.uses === 1 && !u.other : usesIn(scopeOf(name), name) === 1 && onlyCalledIn(scopeOf(name), name));
-                    inner.set(name, { k: "lambda", lambda: init, once, name: String(name.description) });
+                    inner.set(name, { k: "lambda", lambda: init, once, name: boundName(init, name) });
                 }
                 const inits: any[] = [];
                 for (const [name, init] of bindings) {

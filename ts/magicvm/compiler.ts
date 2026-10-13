@@ -6,7 +6,7 @@ import { UNPACK_REST, UNPACK_STRICT } from "./ops";
 import { blockEscapes, liftLambdas, splitCaseLambdas } from "./passes/lift";
 import { mergeLoops } from "./passes/merge"
 import { flattenLets } from "./passes/flatten"
-import { PAD, bodyOf, clausesOf, isBoxedInit, isLetrecLambda, isPadded, optionsOf, paramsOf, restOf, unwrapBoxed } from "./lambda";
+import { PAD, UNNAMED, bodyOf, clausesOf, isBoxedInit, isLetrecLambda, isPadded, optionsOf, paramsOf, restOf, unwrapBoxed } from "./lambda";
 import { corePos, type Code } from "./exec";
 import { runPass, type Pass, type PassContext } from "./passes/pass";
 import { interruptsPass, type FunctionIR } from "./passes/interrupts";
@@ -416,7 +416,8 @@ export class Compiler {
         const wellFormed = (c: any) => Array.isArray(c) && Array.isArray(c[0]) && c[0].every((o: any) => typeof o === "symbol")
             && Array.isArray(c[1]) && (c[2] === null || typeof c[2] === "symbol")
         if (clauses.length === 0 || !clauses.every(wellFormed)) throw new VMError(Msg.LambdaForm, [])
-        for (const c of clauses) for (const o of optionsOf(c)) if (o !== PAD) throw new VMError(Msg.LambdaOption, [o])
+        for (const c of clauses) for (const o of optionsOf(c)) if (o !== PAD && o !== UNNAMED) throw new VMError(Msg.LambdaOption, [o])
+        if (clauses.some(c => optionsOf(c).includes(UNNAMED))) name = undefined
         // a padded clause takes any count, so none after it would ever run
         const padded = clauses.findIndex(isPadded)
         if (padded !== -1 && padded < clauses.length - 1) throw new VMError(Msg.UnreachableClause, [])
