@@ -9,6 +9,7 @@ import type {
     UnitTemplate,
 } from "../unit-types";
 import { AotCompiler } from "./compiler";
+import { Worklist } from "../visitor";
 
 export type DatumSerializer = (val: any, recurse: (c: any) => UnitConstant) => any;
 export const DATUM_SERIALIZERS = new Map<string, { test: (v: any) => boolean; serialize: DatumSerializer }>();
@@ -122,24 +123,24 @@ export class UnitSerializer {
         const templateMap = new Map<ClosureTemplate, number>();
         const uniques = new Map<symbol, number>();
 
-        const scan = (c: any) => {
+        const todo = new Worklist();
+        todo.addAll(code.constants);
+        todo.run((c: any) => {
             if (c instanceof ClosureTemplate) {
                 if (!templateMap.has(c)) {
                     const id = templates.length;
                     templateMap.set(c, id);
                     templates.push(c);
-                    for (const nested of c.code.constants) scan(nested);
+                    todo.addAll(c.code.constants);
                 }
             } else if (c instanceof Closure) {
-                scan(c.tmpl);
+                todo.add(c.tmpl);
             } else if (Array.isArray(c)) {
-                for (const item of c) scan(item);
+                todo.addAll(c);
             } else if (typeof c === "object" && c !== null) {
-                for (const key of Object.keys(c)) scan((c as any)[key]);
+                for (const key of Object.keys(c)) todo.add((c as any)[key]);
             }
-        };
-
-        for (const c of code.constants) scan(c);
+        });
 
         // 2. Emit AOT JS sources for root (the code itself is left as it was: running it compiles it as usual)
         const rootEmitted = AotCompiler.emitCodeSources(code, effectiveTmpl);

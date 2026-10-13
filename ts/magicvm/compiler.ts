@@ -19,6 +19,7 @@ import { optimize } from "./passes/cp0";
 import { hasCore, isCoreForm, newIntrinsics } from "./core";
 import { Intrinsics, type Intrinsic } from "./intrinsics";
 import { VALUES_MAX } from "./values";
+import { ascend, descend, run, start, type Task } from "./visitor";
 
 // a body as one expression
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, null, ...body]
@@ -138,7 +139,7 @@ export class Compiler {
             const scope = new CompilerScope(null)
             const nodes: Node[] = []
             const retReg = scope.allocTemp()
-            this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, forwards, captures })
+            run(this.#compile(ast, { destReg: retReg, isTail: true, nodes, scope, forwards, captures }))
             if (!this.#nodesEndsInRet(nodes)) {
                 nodes.push({ k: "Return", src: retReg })
             }
@@ -146,7 +147,8 @@ export class Compiler {
         },
     }
 
-    #compile(expr: any, opts: CmpOpts) {
+    // (a walk, as every method here that compiles what is inside a form: see visitor.ts)
+    #compile(expr: any, opts: CmpOpts): void | Task<void> {
         // Raw values
         if (typeof expr === 'symbol') {
             const res = this.#getVar(expr, opts, opts.destReg)
@@ -166,21 +168,46 @@ export class Compiler {
         // the form's own position, and its operands for the compile methods (which index them from 1)
         const pos = expr[1]
         const form = [expr[0], ...expr.slice(2)]
-        if (pos !== null && pos !== opts.pos) {
+        // (as deep on the js stack as compiling may go: what is inside is left for a walk of its own)
+        if (!descend()) return this.#compileLater(expr, opts)
+        try {
+            if (pos === null || pos === opts.pos) {
+                const walk = this.#compileForm(form, opts)
+                return walk === undefined ? undefined : start(walk)
+            }
             opts.nodes.push({ k: "Pos", pos })
+            let walk: void | Task<void>
             try {
-                this.#compileForm(form, { ...opts, pos })
+                walk = this.#compileForm(form, { ...opts, pos })
+                if (walk !== undefined) walk = start(walk)
             } catch (err) {
                 if (err instanceof VMError) err.at ??= pos
                 throw err
             }
+            if (walk !== undefined) return this.#compileAt(walk, opts, pos)
             if (opts.pos !== undefined) opts.nodes.push({ k: "Pos", pos: opts.pos })
-            return
+        } finally {
+            ascend()
         }
-        this.#compileForm(form, opts)
     }
 
-    #compileForm(expr: any[], opts: CmpOpts) {
+    *#compileLater(expr: any, opts: CmpOpts): Task<void> {
+        const walk = this.#compile(expr, opts)
+        if (walk !== undefined) yield walk
+    }
+
+    // the rest of a form with a position of its own, when compiling it is a walk
+    *#compileAt(walk: Task<void>, opts: CmpOpts, pos: SourcePos): Task<void> {
+        try {
+            yield walk
+        } catch (err) {
+            if (err instanceof VMError) err.at ??= pos
+            throw err
+        }
+        if (opts.pos !== undefined) opts.nodes.push({ k: "Pos", pos: opts.pos })
+    }
+
+    #compileForm(expr: any[], opts: CmpOpts): void | Task<void> {
         const name = opts.name
         if (name !== undefined) opts = { ...opts, name: undefined }
         const operator = expr[0];
@@ -188,111 +215,88 @@ export class Compiler {
         if (typeof operator === "symbol") {
             switch (operator) {
                 case CORE_BEGIN:
-                    this.#compileBegin(expr, opts)
-                    return
+                    return this.#compileBegin(expr, opts)
                 case CORE_IF:
-                    this.#compileIfCall(expr, opts)
-                    return
+                    return this.#compileIfCall(expr, opts)
                 case CORE_QUOTE:
-                    this.#compileQuote(expr, opts)
-                    return
+                    return this.#compileQuote(expr, opts)
                 case CORE_SET:
-                    this.#compileSet(expr, opts)
-                    return
+                    return this.#compileSet(expr, opts)
                 case CORE_LAMBDA:
-                    this.#compileLambda(expr, opts, name)
-                    return
+                    return this.#compileLambda(expr, opts, name)
                 case CORE_LETREC:
-                    this.#compileLetrec(expr, opts)
-                    return
+                    return this.#compileLetrec(expr, opts)
                 case CORE_LET_STAR:
-                    this.#compileLetStar(expr, opts)
-                    return
+                    return this.#compileLetStar(expr, opts)
                 case CORE_LET:
-                    this.#compileLet(expr, opts)
-                    return
+                    return this.#compileLet(expr, opts)
                 case CORE_LET_VALUES:
                 case CORE_LET_VALUES_STRICT:
-                    this.#compileLetValues(expr, opts, operator === CORE_LET_VALUES_STRICT)
-                    return
+                    return this.#compileLetValues(expr, opts, operator === CORE_LET_VALUES_STRICT)
                 case CORE_BLOCK:
-                    this.#compileBlock(expr, opts)
-                    return
+                    return this.#compileBlock(expr, opts)
                 case CORE_ESCAPE:
-                    this.#compileEscape(expr, opts)
-                    return
+                    return this.#compileEscape(expr, opts)
                 case CORE_LOOP:
-                    this.#compileLoop(expr, opts)
-                    return
+                    return this.#compileLoop(expr, opts)
                 case CORE_WITH_MARK:
-                    this.#compileWithMark(expr, opts)
-                    return
+                    return this.#compileWithMark(expr, opts)
                 case OP_CURRENT_MARKS:
                     if (opts.destReg !== undefined) opts.nodes.push({ k: "CurMarks", dst: opts.destReg })
                     return
                 case CORE_CATCH:
-                    this.#compileCatch(expr, opts)
-                    return
+                    return this.#compileCatch(expr, opts)
                 case OP_DEFINE_GLOBAL:
-                    this.#compileDefine(expr, opts)
-                    return
+                    return this.#compileDefine(expr, opts)
                 case BOX:
-                    this.#compileBox(expr, opts)
-                    return
+                    return this.#compileBox(expr, opts)
                 case UNBOX:
-                    this.#compileUnbox(expr, opts)
-                    return
+                    return this.#compileUnbox(expr, opts)
                 case BOX_IN_PLACE:
-                    this.#compileBoxInPlace(expr, opts)
-                    return
+                    return this.#compileBoxInPlace(expr, opts)
                 case SET_BOX:
-                    this.#compileSetBox(expr, opts)
-                    return
+                    return this.#compileSetBox(expr, opts)
                 case INLINED:
                 case TAIL_INLINED:
-                    opts.nodes.push({ k: "InlineEnter", name: expr[1].description, at: opts.pos ?? null, tail: operator === TAIL_INLINED })
-                    this.#compileBody(expr.slice(2), opts)
-                    opts.nodes.push({ k: "InlineExit" })
-                    return
+                    return this.#compileInlined(expr, opts, operator === TAIL_INLINED)
                 case OP_APPLY:
-                    this.#compileApply(expr, opts)
-                    return
+                    return this.#compileApply(expr, opts)
                 case CORE_INTAPPLY:
-                    this.#compileIntApply(expr, opts)
-                    return
+                    return this.#compileIntApply(expr, opts)
                 case CORE_CALL:
                     if (expr.length < 2) throw new VMError(Msg.FormArgs, ["%call", "a procedure", 0])
-                    this.#compileNormalCall(expr.slice(1), opts)
-                    return
+                    return this.#compileNormalCall(expr.slice(1), opts)
                 case CORE_INTCALL: {
                     // code that is not re-entrant has no continuations: asking for one raises
                     if (!this.reentrant && typeof expr[1] === "symbol" && NO_CONTINUATIONS.has(expr[1])) {
-                        this.#compileForm([CORE_INTCALL, Symbol.for("%no-continuations"), expr[1].description], opts)
-                        return
+                        return this.#compileForm([CORE_INTCALL, Symbol.for("%no-continuations"), expr[1].description], opts)
                     }
                     const intrinsic = this.#intrinsicNamed("%intcall", expr)
                     const call = expr.slice(1)
                     // (%first-value (%call f arg ...) <#void>): a call that wants one value, which the callee gives
                     // itself when it is entered for one (see Code.wanted), with nothing to check after it
                     if (intrinsic.pos === corePos("%first-value") && call.length === 3 && call[2] === undefined && Array.isArray(call[1]) && call[1][0] === CORE_CALL && call[1].length >= 3) {
-                        this.#compile(call[1], { ...opts, isTail: false, one: true })
-                        return
+                        return this.#compile(call[1], { ...opts, isTail: false, one: true })
                     }
                     if (intrinsic.leaf) {
-                        this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                        return this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
                             this.#withDest(opts, dest, destReg => opts.nodes.push({ k: "IntCall", pos: intrinsic.pos, dst: destReg, start, nargs }))
                         })
-                        return
                     }
-                    this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
+                    return this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
                         // an intrinsic whose value is that of the call itself (see `tail`) is a call and then a return
                         opts.nodes.push({ k: "HostCall", pos: intrinsic.pos, start, nargs, tail: opts.isTail && intrinsic.tail, dst: dest })
                     })
-                    return
                 }
             }
         }
         throw new VMError(Msg.BareCall, [operator])
+    }
+
+    *#compileInlined(expr: any[], opts: CmpOpts, tail: boolean): Task<void> {
+        opts.nodes.push({ k: "InlineEnter", name: expr[1].description, at: opts.pos ?? null, tail })
+        { const t = this.#compileBody(expr.slice(2), opts); if (t !== undefined) yield t }
+        opts.nodes.push({ k: "InlineExit" })
     }
 
     #bindingsOf(form: string, expr: any[]): [symbol, any][] {
@@ -309,27 +313,41 @@ export class Compiler {
         return intrinsic
     }
 
-    #compileBegin(expr: any[], opts: CmpOpts) {
-        this.#compileBody(expr.slice(1), opts)
+    #compileBegin(expr: any[], opts: CmpOpts): void | Task<void> {
+        return this.#compileBody(expr.slice(1), opts)
     }
 
     // expressions in order, the last one giving the value (<#void> if there are none)
-    #compileBody(body: any[], opts: CmpOpts) {
+    // (compiled here as far as it goes without a walk: from the first expression that is one, the rest is a walk too)
+    #compileBody(body: any[], opts: CmpOpts): void | Task<void> {
         if (body.length === 0) {
-            if (opts.destReg === undefined) return 
+            if (opts.destReg === undefined) return
             opts.nodes.push({ k: "LoadValue", constant: undefined, dst: opts.destReg })
             return
         }
-        body.forEach((e, i) => {
-            const isLastChild = i === body.length - 1;
-            this.#compile(e, { ...opts, destReg: isLastChild ? opts.destReg : undefined, isTail: isLastChild && opts.isTail });
-        });
+        for (let i = 0; i < body.length; i++) {
+            const walk = this.#compileBodyItem(body, i, opts)
+            if (walk !== undefined) return this.#compileBodyFrom(body, opts, i + 1, walk)
+        }
+    }
+
+    #compileBodyItem(body: any[], i: number, opts: CmpOpts): void | Task<void> {
+        const isLastChild = i === body.length - 1;
+        return this.#compile(body[i], { ...opts, destReg: isLastChild ? opts.destReg : undefined, isTail: isLastChild && opts.isTail });
+    }
+
+    *#compileBodyFrom(body: any[], opts: CmpOpts, next: number, walk: Task<void>): Task<void> {
+        yield walk
+        for (let i = next; i < body.length; i++) {
+            const t = this.#compileBodyItem(body, i, opts)
+            if (t !== undefined) yield t
+        }
     }
 
     // compiles both if calls as well as code that is converted into if calls
     // (%if c1 e1 c2 e2 ... [else]): the first ei whose ci is true, else `else` (or <#void>). One chain whatever the number
     // of clauses: If c1 L1; e1; Else end; L1: <c2>; If (elseif) c2 L2; e2; Else end; L2: ...; else; EndIf; end:
-    #compileIfCall(expr: any[], opts: CmpOpts) {
+    *#compileIfCall(expr: any[], opts: CmpOpts): Task<void> {
         const args = expr.slice(1)
         if (args.length < 2) {
             throw new VMError(Msg.IfArgs, [args.length])
@@ -337,15 +355,15 @@ export class Compiler {
         const endLabel = new JumpLabel()
         for (let i = 0; i + 1 < args.length; i += 2) {
             const condReg = opts.scope.allocTemp()
-            this.#compile(args[i], { ...opts, destReg: condReg, isTail: false })
+            { const t = this.#compile(args[i], { ...opts, destReg: condReg, isTail: false }); if (t !== undefined) yield t }
             const nextLabel = new JumpLabel()
             opts.nodes.push({ k: "If", cond: condReg, else: nextLabel, elseif: i !== 0 })
             opts.scope.freeTemp(condReg)
-            this.#compile(args[i + 1], opts)
+            { const t = this.#compile(args[i + 1], opts); if (t !== undefined) yield t }
             opts.nodes.push({ k: "Else", end: endLabel })
             opts.nodes.push({ k: "Label", label: nextLabel })
         }
-        this.#compile(args.length % 2 === 1 ? args[args.length - 1] : undefined, opts)
+        { const t = this.#compile(args.length % 2 === 1 ? args[args.length - 1] : undefined, opts); if (t !== undefined) yield t }
         opts.nodes.push({ k: "EndIf" })
         opts.nodes.push({ k: "Label", label: endLabel })
     }
@@ -359,14 +377,14 @@ export class Compiler {
     }
 
     // note that the syntax transformer alr handles defines inside a lambda so
-    #compileDefine(expr: any[], opts: CmpOpts) {
+    *#compileDefine(expr: any[], opts: CmpOpts): Task<void> {
         const [, sym, val] = expr;
         if (typeof sym !== "symbol") throw new Error("internal error: complex defines should be transformed by AnimaTransform prior to reaching here")
         this.#ensureNotIntrinsic(sym, "define")
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
-        this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description });
+        { const t = this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "SetGlobal", src: valReg, sym })
         opts.scope.freeTemp(valReg)
         if (opts.destReg !== undefined) {
@@ -374,14 +392,14 @@ export class Compiler {
         }
     }
 
-    #compileSet(expr: any[], opts: CmpOpts) {
+    *#compileSet(expr: any[], opts: CmpOpts): Task<void> {
         const [, sym, val] = expr;
         if (typeof sym !== "symbol") throw new VMError(Msg.SetTarget, [sym])
         this.#ensureNotIntrinsic(sym, "set!")
 
         // We need to compile the second arg first and leave it on a temp reg
         const valReg = opts.scope.allocTemp();
-        this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description });
+        { const t = this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description }); if (t !== undefined) yield t }
         const res = this.#setVar(sym, opts, valReg)
         if(res) opts.nodes.push(...res)
         opts.scope.freeTemp(valReg)
@@ -392,7 +410,7 @@ export class Compiler {
 
     // [%lambda, clause ...]: one clause is a closure; several are their closures, made in a block, then one procedure
     // that runs the first taking the call's count (%make-case-lambda)
-    #compileLambda(expr: any[], opts: CmpOpts, name?: string) {
+    *#compileLambda(expr: any[], opts: CmpOpts, name?: string): Task<void> {
         const clauses = expr.slice(1)
         const wellFormed = (c: any) => Array.isArray(c) && Array.isArray(c[0]) && c[0].every((o: any) => typeof o === "symbol")
             && Array.isArray(c[1]) && (c[2] === null || typeof c[2] === "symbol")
@@ -401,15 +419,18 @@ export class Compiler {
         // a padded clause takes any count, so none after it would ever run
         const padded = clauses.findIndex(isPadded)
         if (padded !== -1 && padded < clauses.length - 1) throw new VMError(Msg.UnreachableClause, [])
-        if (clauses.length === 1) return this.#compileClause(clauses[0], opts, name)
+        if (clauses.length === 1) {
+            yield this.#compileClause(clauses[0], opts, name)
+            return
+        }
         const startReg = opts.scope.regAlloc.allocBlock(clauses.length)
-        clauses.forEach((c, i) => this.#compileClause(c, { ...opts, destReg: opts.destReg === undefined ? undefined : startReg + i, isTail: false }, name))
+        for (let i = 0; i < clauses.length; i++) yield this.#compileClause(clauses[i], { ...opts, destReg: opts.destReg === undefined ? undefined : startReg + i, isTail: false }, name)
         this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ k: "IntCall", pos: corePos("%make-case-lambda"), dst: destReg, start: startReg, nargs: clauses.length }))
         opts.scope.regAlloc.freeBlock(startReg, clauses.length)
     }
 
     // [options, params, rest, body ...]: params an array of symbols, rest a symbol or null
-    #compileClause(clause: any[], opts: CmpOpts, name?: string) {
+    *#compileClause(clause: any[], opts: CmpOpts, name?: string): Task<void> {
         const lambdaScope = new CompilerScope(opts.scope, opts.captures.get(clause) ?? [])
 
         const params: symbol[] = paramsOf(clause)
@@ -431,7 +452,7 @@ export class Compiler {
         // Compile lambda body
         const retReg = lambdaScope.allocTemp() // no need to free the temp reg as we return?
         lambdaNodes.push({ k: "FunctionEntry" })
-        this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, fnDepth: (opts.fnDepth ?? 0) + 1 })
+        { const t = this.#compile(bodyExpr(bodyOf(clause)), {...opts, destReg: retReg, isTail: true, nodes: lambdaNodes, scope: lambdaScope, fnDepth: (opts.fnDepth ?? 0) + 1 }); if (t !== undefined) yield t }
         if (!this.#nodesEndsInRet(lambdaNodes)) {
             lambdaNodes.push({ k: "Return", src: retReg })
         }
@@ -444,7 +465,7 @@ export class Compiler {
     // (%let-values ((formals expr) ...) body ...): every expr is evaluated and spread into registers (Unpack), then
     // all the variables are bound in a block, as in %let
     // clauses are [params, rest, init]
-    #compileLetValues(expr: any[], opts: CmpOpts, strict: boolean) {
+    *#compileLetValues(expr: any[], opts: CmpOpts, strict: boolean): Task<void> {
         const clauses: [symbol[], symbol | null, any][] = expr[1]
 
         const bound: { sym: symbol, reg: number }[] = []
@@ -453,7 +474,7 @@ export class Compiler {
             const valReg = opts.scope.allocTemp()
             // names bound to the values of a call, any missing <#void>: the call asks for that many (see Code.entry)
             const many = !strict && rest === null && names.length >= 2 && names.length <= VALUES_MAX && Array.isArray(init) && init[0] === CORE_CALL && init.length >= 3
-            this.#compile(init, { ...opts, destReg: valReg, isTail: false, ...(many ? { many: names.length } : {}) })
+            { const t = this.#compile(init, { ...opts, destReg: valReg, isTail: false, ...(many ? { many: names.length } : {}) }); if (t !== undefined) yield t }
             const size = names.length + (rest !== null ? 1 : 0)
             const start = opts.scope.regAlloc.allocBlock(size)
             opts.nodes.push({ k: "Unpack", src: valReg, start, count: names.length, flags: (rest !== null ? UNPACK_REST : 0) | (strict ? UNPACK_STRICT : 0), many })
@@ -476,13 +497,13 @@ export class Compiler {
             const destReg = opts.scope.addLocal(sym)
             opts.nodes.push({ k: "Move", src: reg, dst: destReg })
         }
-        this.#compileBody(expr.slice(2), opts)
+        { const t = this.#compileBody(expr.slice(2), opts); if (t !== undefined) yield t }
         opts.scope.exitBlock()
         for (const { start, size } of blocks) opts.scope.regAlloc.freeBlock(start, size)
     }
 
     // (%block name body ...): the value of the body, or of an (%escape name value) jumping to its end
-    #compileBlock(expr: any[], opts: CmpOpts) {
+    *#compileBlock(expr: any[], opts: CmpOpts): Task<void> {
         if (typeof expr[1] !== "symbol") throw new VMError(Msg.FormArgs, ["%block", "a block name symbol", expr.length - 1])
         const end = new JumpLabel()
         const target: BlockTarget = {
@@ -490,11 +511,11 @@ export class Compiler {
             markDepth: opts.markRegions?.length ?? 0, parent: opts.blocks,
         }
         opts.nodes.push({ k: "Block", end })
-        this.#compileBody(expr.slice(2), { ...opts, blocks: target })
+        { const t = this.#compileBody(expr.slice(2), { ...opts, blocks: target }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "Label", label: end })
     }
 
-    #compileEscape(expr: any[], opts: CmpOpts) {
+    *#compileEscape(expr: any[], opts: CmpOpts): Task<void> {
         if (typeof expr[1] !== "symbol" || expr.length > 3) throw new VMError(Msg.FormArgs, ["%escape", "a block name symbol and at most a value", expr.length - 1])
         const name: symbol = expr[1]
         let target = opts.blocks
@@ -505,8 +526,8 @@ export class Compiler {
         }
         // the value is computed as if it were the block's own value: into its register, in its tail position
         const valueOpts = { ...opts, destReg: target.destReg, isTail: target.isTail }
-        if (expr.length > 2) this.#compile(expr[2], valueOpts)
-        else this.#compile(undefined, valueOpts)
+        if (expr.length > 2) { const t = this.#compile(expr[2], valueOpts); if (t !== undefined) yield t }
+        else { const t = this.#compile(undefined, valueOpts); if (t !== undefined) yield t }
         const regions = opts.markRegions ?? []
         if (regions.length > target.markDepth) opts.nodes.push({ k: "MarkRestore", reg: regions[target.markDepth] })
         opts.nodes.push({ k: "Jump", target: target.end })
@@ -514,31 +535,31 @@ export class Compiler {
 
     // (%with-mark key value body): in tail position the mark goes on the current frame (replacing its value for the key)
     // and stays until the frame returns; otherwise the body runs as a new frame, so the marks are saved and put back after
-    #compileWithMark(expr: any[], opts: CmpOpts) {
+    *#compileWithMark(expr: any[], opts: CmpOpts): Task<void> {
         const [, key, value, body] = expr
         const saved = opts.isTail ? -1 : opts.scope.regAlloc.allocBlock(2)
         if (!opts.isTail) opts.nodes.push({ k: "MarkSave", reg: saved })
         const kv = opts.scope.regAlloc.allocBlock(2)
-        this.#compile(key, { ...opts, destReg: kv, isTail: false })
-        this.#compile(value, { ...opts, destReg: kv + 1, isTail: false })
+        { const t = this.#compile(key, { ...opts, destReg: kv, isTail: false }); if (t !== undefined) yield t }
+        { const t = this.#compile(value, { ...opts, destReg: kv + 1, isTail: false }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "SetMark", key: kv, val: kv + 1 })
         opts.scope.regAlloc.freeBlock(kv, 2)
         if (opts.isTail) {
-            this.#compile(body, opts)
+            { const t = this.#compile(body, opts); if (t !== undefined) yield t }
             return
         }
-        this.#compile(body, { ...opts, markRegions: [...(opts.markRegions ?? []), saved] })
+        { const t = this.#compile(body, { ...opts, markRegions: [...(opts.markRegions ?? []), saved] }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "MarkRestore", reg: saved })
         opts.scope.regAlloc.freeBlock(saved, 2)
     }
 
     // (%loop body ...): repeats forever; only an %escape leaves it
-    #compileLoop(expr: any[], opts: CmpOpts) {
+    *#compileLoop(expr: any[], opts: CmpOpts): Task<void> {
         const head = new JumpLabel()
         const end = new JumpLabel()
         opts.nodes.push({ k: "Loop", end })
         opts.nodes.push({ k: "Label", label: head })
-        for (const e of expr.slice(1)) this.#compile(e, { ...opts, destReg: undefined, isTail: false })
+        for (const e of expr.slice(1)) { const t = this.#compile(e, { ...opts, destReg: undefined, isTail: false }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "EndLoop", head })
         opts.nodes.push({ k: "Label", label: end })
     }
@@ -561,7 +582,7 @@ export class Compiler {
     // (%catch thunk handler [pre]): %call-catching gives the value of (thunk), or a Caught when it raised, after which the
     // handler expression is evaluated and called with the error (in tail position if the %catch is); pre is evaluated
     // first, and runs on the error before unwinding
-    #compileCatch(expr: any[], opts: CmpOpts) {
+    *#compileCatch(expr: any[], opts: CmpOpts): Task<void> {
         if (expr.length < 3 || expr.length > 5) {
             throw new VMError(Msg.FormArgs, ["%catch", "2 to 4 arguments (thunk, handler, pre, guarded)", expr.length - 1]);
         }
@@ -569,7 +590,7 @@ export class Compiler {
         const args = expr[4] === true ? [expr[1], expr[3], true] : expr.length >= 4 ? [expr[1], expr[3]] : [expr[1]];
         const resReg = opts.scope.allocTemp();
         const startReg = opts.scope.regAlloc.allocBlock(args.length);
-        args.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + i, isTail: false }));
+        for (let i = 0; i < args.length; i++) { const t = this.#compile(args[i], { ...opts, destReg: startReg + i, isTail: false }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "HostCall", pos: corePos("%call-catching"), start: startReg, nargs: args.length, tail: false, dst: resReg });
         opts.scope.regAlloc.freeBlock(startReg, args.length);
 
@@ -581,7 +602,7 @@ export class Compiler {
         opts.scope.freeTemp(condReg);
 
         const call = opts.scope.regAlloc.allocBlock(2);
-        this.#compile(expr[2], { ...opts, destReg: call, isTail: false });
+        { const t = this.#compile(expr[2], { ...opts, destReg: call, isTail: false }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "IntCall", pos: corePos("%caught-value"), dst: call + 1, start: resReg, nargs: 1 });
         if (opts.isTail) opts.nodes.push({ k: "Call", proc: call, start: call + 1, nargs: 1, tail: true });
         else opts.nodes.push({ k: "Call", proc: call, dst: opts.destReg, start: call + 1, nargs: 1, tail: false });
@@ -595,11 +616,22 @@ export class Compiler {
         opts.scope.freeTemp(resReg);
     }
 
-    #compileRuntimeOp(expr: any[], opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void) {
+    #compileRuntimeOp(expr: any[], opts: CmpOpts, minArgs: number, maxArgs: number, emit: (startReg: number, nargs: number, destReg: number | undefined) => void): void | Task<void> {
         const nargs = expr.length - 1
         if (nargs < minArgs || nargs > maxArgs) throw new VMError(Msg.Arity, [String(expr[0].description), minArgs, maxArgs, nargs])
         const startReg = opts.scope.regAlloc.allocBlock(nargs)
-        for (let i = 0; i < nargs; i++) this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false })
+        for (let i = 0; i < nargs; i++) {
+            const walk = this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false })
+            if (walk !== undefined) return this.#compileRuntimeOpFrom(expr, opts, emit, startReg, i + 1, walk)
+        }
+        emit(startReg, nargs, opts.destReg)
+        opts.scope.regAlloc.freeBlock(startReg, nargs)
+    }
+
+    *#compileRuntimeOpFrom(expr: any[], opts: CmpOpts, emit: (startReg: number, nargs: number, destReg: number | undefined) => void, startReg: number, next: number, walk: Task<void>): Task<void> {
+        const nargs = expr.length - 1
+        yield walk
+        for (let i = next; i < nargs; i++) { const t = this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false }); if (t !== undefined) yield t }
         emit(startReg, nargs, opts.destReg)
         opts.scope.regAlloc.freeBlock(startReg, nargs)
     }
@@ -631,33 +663,25 @@ export class Compiler {
         if (this.#isIntrinsic(sym)) throw new VMError(Msg.CannotBindIntrinsic, [syntaxCtx, sym])
     }
 
-    #resolveProcReg(procExpr: any, opts: CmpOpts): { procReg: number; isTemp: boolean } {
-        if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
-            throw new VMError(Msg.IntrinsicAsValue, [procExpr]);
-        }
-        const procReg = opts.scope.allocTemp();
-        this.#compile(procExpr, { ...opts, destReg: procReg, isTail: false });
-        return { procReg, isTemp: true };
-    }
 
-    #compileApply(expr: any[], opts: CmpOpts) {
+    *#compileApply(expr: any[], opts: CmpOpts): Task<void> {
         if (expr.length < 3) {
             throw new VMError(Msg.FormArgs, ["%apply", "at least 2 arguments (proc, ...args, array)", expr.length - 1]);
         }
         const procExpr = expr[1];
         const argExprs = expr.slice(2);
         argExprs[argExprs.length - 1] = this.#forwarded(argExprs[argExprs.length - 1], opts);
-        this.#compileApplyCall(procExpr, argExprs, opts, argExprs.length === 1 && this.#isFresh(argExprs[0]) ? "%apply-fresh" : "%apply-array");
+        yield this.#compileApplyCall(procExpr, argExprs, opts, argExprs.length === 1 && this.#isFresh(argExprs[0]) ? "%apply-fresh" : "%apply-array");
     }
 
-    #compileIntApply(expr: any[], opts: CmpOpts) {
+    *#compileIntApply(expr: any[], opts: CmpOpts): Task<void> {
         if (expr.length < 3) {
             throw new VMError(Msg.FormArgs, ["%intapply", "at least 2 arguments (intrinsic, ...args, array)", expr.length - 1]);
         }
         const intrinsic = this.#intrinsicNamed("%intapply", expr);
         const argExprs = expr.slice(2);
         argExprs[argExprs.length - 1] = this.#forwarded(argExprs[argExprs.length - 1], opts);
-        this.#compileApplyIntrinsic(intrinsic, argExprs, opts);
+        yield this.#compileApplyIntrinsic(intrinsic, argExprs, opts);
     }
 
     // a call of an intrinsic that returns a new array, or an %intapply of one
@@ -667,24 +691,24 @@ export class Compiler {
     }
 
     // applying a procedure is a call of the core operation %apply-array (or %apply-fresh) over [proc, arg ..., array]
-    #compileApplyCall(procExpr: any, argExprs: any[], opts: CmpOpts, op: string) {
+    *#compileApplyCall(procExpr: any, argExprs: any[], opts: CmpOpts, op: string): Task<void> {
         if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
             throw new VMError(Msg.IntrinsicAsValue, [procExpr]);
         }
         const nargs = 1 + argExprs.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        this.#compile(procExpr, { ...opts, destReg: startReg, isTail: false });
-        argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + 1 + i, isTail: false }));
+        { const t = this.#compile(procExpr, { ...opts, destReg: startReg, isTail: false }); if (t !== undefined) yield t }
+        for (let i = 0; i < argExprs.length; i++) { const t = this.#compile(argExprs[i], { ...opts, destReg: startReg + 1 + i, isTail: false }); if (t !== undefined) yield t }
         opts.nodes.push({ k: "HostCall", pos: corePos(op), start: startReg, nargs, tail: opts.isTail, dst: opts.destReg });
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
 
     // (%intapply %intrinsic arg ... lst): the argument count is only known at run time, so IntApply checks it there
-    #compileApplyIntrinsic(intrinsic: Intrinsic, argExprs: any[], opts: CmpOpts) {
+    *#compileApplyIntrinsic(intrinsic: Intrinsic, argExprs: any[], opts: CmpOpts): Task<void> {
         if (!intrinsic.leaf) throw new VMError(Msg.ApplyNonLeaf, [intrinsic.name]);
         const nargs = argExprs.length;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        argExprs.forEach((arg, i) => this.#compile(arg, { ...opts, destReg: startReg + i, isTail: false }));
+        for (let i = 0; i < argExprs.length; i++) { const t = this.#compile(argExprs[i], { ...opts, destReg: startReg + i, isTail: false }); if (t !== undefined) yield t }
         this.#withDest(opts, opts.destReg, destReg => opts.nodes.push({ k: "IntApply", pos: intrinsic.pos, dst: destReg, start: startReg, nargs }));
         opts.scope.regAlloc.freeBlock(startReg, nargs);
     }
@@ -697,17 +721,38 @@ export class Compiler {
     }
 
     // a normal call
-    #compileNormalCall(expr: any[], opts: CmpOpts) {
+    #compileNormalCall(expr: any[], opts: CmpOpts): void | Task<void> {
         const one = opts.one === true, many = opts.many
         if (one || many !== undefined) opts = { ...opts, one: false, many: undefined }
         // We need to compile the proc and place it on its own tempval
-        const { procReg, isTemp } = this.#resolveProcReg(expr[0], opts);
+        const procExpr = expr[0]
+        if (typeof procExpr === "symbol" && this.#isIntrinsic(procExpr)) {
+            throw new VMError(Msg.IntrinsicAsValue, [procExpr]);
+        }
+        const procReg = opts.scope.allocTemp();
+        const walk = this.#compile(procExpr, { ...opts, destReg: procReg, isTail: false })
+        if (walk !== undefined) return this.#compileNormalCallFrom(expr, opts, one, many, procReg, -1, 0, walk)
 
         // Push all arguments to a contiguous reg block
         const nargs = expr.length - 1;
         const startReg = opts.scope.regAlloc.allocBlock(nargs);
-        for (let i = 0; i < nargs; i++) this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false });
+        for (let i = 0; i < nargs; i++) {
+            const walk = this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false })
+            if (walk !== undefined) return this.#compileNormalCallFrom(expr, opts, one, many, procReg, startReg, i + 1, walk)
+        }
+        this.#emitCall(opts, one, many, procReg, startReg, nargs)
+    }
 
+    // (`startReg` -1: the walk is the procedure's, and the arguments' block is yet to be taken)
+    *#compileNormalCallFrom(expr: any[], opts: CmpOpts, one: boolean, many: number | undefined, procReg: number, startReg: number, next: number, walk: Task<void>): Task<void> {
+        const nargs = expr.length - 1;
+        yield walk
+        if (startReg === -1) startReg = opts.scope.regAlloc.allocBlock(nargs);
+        for (let i = next; i < nargs; i++) { const t = this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false }); if (t !== undefined) yield t }
+        this.#emitCall(opts, one, many, procReg, startReg, nargs)
+    }
+
+    #emitCall(opts: CmpOpts, one: boolean, many: number | undefined, procReg: number, startReg: number, nargs: number) {
         if (opts.isTail) {
             opts.nodes.push({ k: "Call", nargs, proc: procReg, start: startReg, tail: true })
         } else {
@@ -715,13 +760,13 @@ export class Compiler {
         }
 
         opts.scope.regAlloc.freeBlock(startReg, nargs)
-        if (isTemp) opts.scope.freeTemp(procReg)
+        opts.scope.freeTemp(procReg)
     }
 
     // (%let ((x init) ...) body ...): inits are evaluated in the outer scope, then bound in a block of this function
     // (%let* ((name init) ...) body ...): each init runs with the names before it bound, then its name is bound; all in
     // one block of the current function, as nested %lets would be, without the nesting
-    #compileLetStar(expr: any[], opts: CmpOpts) {
+    *#compileLetStar(expr: any[], opts: CmpOpts): Task<void> {
         const bindings: [symbol, any][] = this.#bindingsOf("%let*", expr)
         opts.scope.enterBlock()
         for (const binding of bindings) {
@@ -729,23 +774,23 @@ export class Compiler {
             ensureCanBind(sym, undefined, "let*")
             this.#ensureNotIntrinsic(sym, "let*")
             const reg = opts.scope.allocTemp()
-            const boxed = this.#compileInit(init, { ...opts, destReg: reg, isTail: false, name: sym.description })
+            const boxed = (yield this.#compileInit(init, { ...opts, destReg: reg, isTail: false, name: sym.description }))
             const destReg = opts.scope.addLocal(sym)
             opts.nodes.push({ k: boxed ? "Box" : "Move", src: reg, dst: destReg })
             opts.scope.freeTemp(reg)
         }
-        this.#compileBody(expr.slice(2), opts)
+        { const t = this.#compileBody(expr.slice(2), opts); if (t !== undefined) yield t }
         opts.scope.exitBlock()
     }
 
-    #compileLet(expr: any[], opts: CmpOpts) {
+    *#compileLet(expr: any[], opts: CmpOpts): Task<void> {
         const bindings: [symbol, any][] = this.#bindingsOf("%let", expr)
 
         const initRegs: number[] = []
         const boxed: boolean[] = []
         for (const [sym, init] of bindings) {
             const reg = opts.scope.allocTemp()
-            boxed.push(this.#compileInit(init, { ...opts, destReg: reg, isTail: false, name: sym.description }))
+            boxed.push((yield this.#compileInit(init, { ...opts, destReg: reg, isTail: false, name: sym.description })))
             initRegs.push(reg)
         }
 
@@ -758,7 +803,7 @@ export class Compiler {
             const destReg = opts.scope.addLocal(sym)
             opts.nodes.push({ k: boxed[i] ? "Box" : "Move", src: initRegs[i], dst: destReg })
         }
-        this.#compileBody(expr.slice(2), opts)
+        { const t = this.#compileBody(expr.slice(2), opts); if (t !== undefined) yield t }
         opts.scope.exitBlock()
         for (const reg of initRegs) opts.scope.freeTemp(reg)
     }
@@ -767,7 +812,7 @@ export class Compiler {
     // are made first, all at once; the other inits then run in order. A name that is never assigned holds its value
     // directly, and the upvars captured before it existed are filled in once it does (FixUpvar); an assigned name (or
     // one a closure may copy before its init has run, see lateValues) is a box
-    #compileLetrec(expr: any[], opts: CmpOpts) {
+    *#compileLetrec(expr: any[], opts: CmpOpts): Task<void> {
         const bindings: [symbol, any][] = this.#bindingsOf("%letrec", expr)
         const isLambda = bindings.map(([, init]) => isLetrecLambda(init))
         // a name the assignments pass boxed holds its box from the start, which its init sets
@@ -796,29 +841,30 @@ export class Compiler {
                 })
             }
         }
-        const compileInit = (i: number) => {
+        const self = this
+        const compileInit = function* (i: number): Task<{ dest: number, closure: Node | undefined }> {
             const dest = boxed[i] ? opts.scope.allocTemp() : regs[i]
             if (boxed[i]) temps.push(dest)
             const before = opts.nodes.length
-            this.#compile(unwrapBoxed(bindings[i][1]), { ...opts, destReg: dest, isTail: false, name: bindings[i][0].description })
+            { const t = self.#compile(unwrapBoxed(bindings[i][1]), { ...opts, destReg: dest, isTail: false, name: bindings[i][0].description }); if (t !== undefined) yield t }
             if (boxed[i]) opts.nodes.push({ k: "SetBox", dst: regs[i], src: dest })
             return { dest, closure: opts.nodes.slice(before).reverse().find(n => n.k === "NewClosure") }
         }
 
         for (let i = 0; i < bindings.length; i++) {
             if (!isLambda[i]) continue
-            const { dest, closure } = compileInit(i)
+            const { dest, closure } = yield compileInit(i)
             made.push({ reg: dest, captures: closure?.k === "NewClosure" ? closure.template.upvarLocs : [] })
         }
         for (let i = 0; i < bindings.length; i++) if (isLambda[i] && !boxed[i]) fillIn(regs[i])
         for (let i = 0; i < bindings.length; i++) {
             if (isLambda[i]) continue
-            compileInit(i)
+            yield compileInit(i)
             if (!boxed[i]) fillIn(regs[i])
         }
         for (const reg of temps) opts.scope.freeTemp(reg)
 
-        this.#compileBody(expr.slice(2), opts)
+        { const t = this.#compileBody(expr.slice(2), opts); if (t !== undefined) yield t }
         opts.scope.exitBlock()
     }
 
@@ -840,15 +886,15 @@ export class Compiler {
     }
 
     // a %let or %let* init: (%box e) is e, which the binding boxes (whether it did is the result)
-    #compileInit(init: any, opts: CmpOpts): boolean {
+    *#compileInit(init: any, opts: CmpOpts): Task<boolean> {
         const boxed = Array.isArray(init) && init[0] === BOX && init.length === 3
-        this.#compile(boxed ? init[2] : init, opts)
+        { const t = this.#compile(boxed ? init[2] : init, opts); if (t !== undefined) yield t }
         return boxed
     }
 
     // (%box e): a new box holding e's value
-    #compileBox(expr: any[], opts: CmpOpts) {
-        this.#compile(expr[1], { ...opts, isTail: false })
+    *#compileBox(expr: any[], opts: CmpOpts): Task<void> {
+        { const t = this.#compile(expr[1], { ...opts, isTail: false }); if (t !== undefined) yield t }
         if (opts.destReg !== undefined) opts.nodes.push({ k: "Box", src: opts.destReg, dst: opts.destReg })
     }
 
@@ -869,10 +915,10 @@ export class Compiler {
     }
 
     // (%set-box! x v): the box x holds now holds v; the value is <#void>
-    #compileSetBox(expr: any[], opts: CmpOpts) {
+    *#compileSetBox(expr: any[], opts: CmpOpts): Task<void> {
         const [, sym, val] = expr
         const valReg = opts.scope.allocTemp()
-        this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description })
+        { const t = this.#compile(val, { ...opts, destReg: valReg, isTail: false, name: sym.description }); if (t !== undefined) yield t }
         const resolved = opts.scope.resolve(sym)
         if (resolved.type === "Local") {
             opts.nodes.push({ k: "SetBox", src: valReg, dst: resolved.index })

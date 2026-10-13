@@ -59,12 +59,21 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // keeps every move: its registers are also read from the frame
     protected readonly substitutes: boolean = false;
     readonly #atoms = new Map<number, string>();
+    // the register each register that stands for another's variable stands for, and the registers that stand for each;
+    // `#since` is the order the registers came to stand for something
+    readonly #source = new Map<number, number>();
+    readonly #readers = new Map<number, Set<number>>();
+    readonly #since = new Map<number, number>();
+    #stamp = 0;
 
     protected startBlock(facts: Facts | undefined): void {
         this.facts = new Map(facts ?? []);
         this.aliases = new Map();
         this.one = new Set();
         this.#atoms.clear();
+        this.#source.clear();
+        this.#readers.clear();
+        this.#since.clear();
     }
 
     // the js of register `reg` where it is read
@@ -91,14 +100,42 @@ export abstract class FunctionEmitter extends CodeEmitter {
     // `reg` is about to change (its variable assigned, or itself made to stand for something): the registers that
     // stand for its variable take its value first. So a register never stands for one that stands for something
     #beforeWrite(reg: number): void {
-        for (const [other, atom] of [...this.#atoms]) if (atom === `r${reg}`) this.#materialise(other);
+        const readers = this.#readers.get(reg);
+        if (readers === undefined || readers.size === 0) return;
+        const since = this.#since;
+        for (const other of [...readers].sort((a, b) => since.get(a)! - since.get(b)!)) this.#materialise(other);
     }
 
     #materialise(reg: number): void {
         const atom = this.#atoms.get(reg);
         if (atom === undefined) return;
-        this.#atoms.delete(reg);
+        this.#forget(reg);
         this.emit(`r${reg} = ${atom};`);
+    }
+
+    // `reg` stands for `atom` from here: the variable of register `of`, or (-1) a constant
+    #standFor(reg: number, atom: string, of: number): void {
+        if (this.#atoms.has(reg)) this.#unlink(reg);
+        else this.#since.set(reg, this.#stamp++);
+        this.#atoms.set(reg, atom);
+        if (of === -1) return;
+        this.#source.set(reg, of);
+        const readers = this.#readers.get(of);
+        if (readers === undefined) this.#readers.set(of, new Set([reg]));
+        else readers.add(reg);
+    }
+
+    #unlink(reg: number): void {
+        const of = this.#source.get(reg);
+        if (of === undefined) return;
+        this.#source.delete(reg);
+        this.#readers.get(of)!.delete(reg);
+    }
+
+    #forget(reg: number): void {
+        if (!this.#atoms.delete(reg)) return;
+        this.#unlink(reg);
+        this.#since.delete(reg);
     }
 
     // a block's instructions. `fused` may emit some of them together itself, from `index` on: it says how many
@@ -110,19 +147,21 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 const atom = this.substitutes ? this.#atomOf(inst) : null;
                 if (atom !== null) {
                     const dst = (inst as { dst: number }).dst;
+                    // (a moved register that itself stands for something: that, which is never a register that does)
+                    const of = inst.k !== "Move" ? -1 : this.#source.get(inst.src) ?? (this.#atoms.has(inst.src) ? -1 : inst.src);
                     this.#beforeWrite(dst);
-                    if (atom === `r${dst}`) this.#atoms.delete(dst);
-                    else this.#atoms.set(dst, atom);
+                    if (of === dst) this.#forget(dst);
+                    else this.#standFor(dst, atom, of);
                 } else {
                     const defs = Liveness.defs(inst);
                     for (const reg of defs) this.#beforeWrite(reg);
                     this.emitInst(inst);
-                    for (const reg of defs) this.#atoms.delete(reg);
+                    for (const reg of defs) this.#forget(reg);
                 }
             }
             for (const end = i + Math.max(fused, 1); i < end; i++) {
                 const inst = block.insts[i];
-                if (fused !== 0) for (const reg of Liveness.defs(inst)) this.#atoms.delete(reg);
+                if (fused !== 0) for (const reg of Liveness.defs(inst)) this.#forget(reg);
                 transfer(inst, this.facts, this.table, this.constants, this.aliases);
                 for (const [reg, isOne] of this.#defines(inst, r => this.one.has(r))) {
                     if (isOne) this.one.add(reg);

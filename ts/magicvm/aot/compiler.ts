@@ -20,6 +20,7 @@ import type { ExecutionContext } from "../values";
 import { JIT_DEPS } from "../jit-deps";
 export { JIT_DEPS } from "../jit-deps";
 import { UnitLoader } from "../loader";
+import { Worklist } from "../visitor";
 
 
 export class AotCompiler {
@@ -57,16 +58,20 @@ export class AotCompiler {
     }
 
     public static compileAll(code: Code, tmpl?: ClosureTemplate): void {
-        if (code.resumeFn === null) {
-            this.compile(code, tmpl);
-        }
-        for (const c of code.constants) {
-            if (c instanceof ClosureTemplate) {
-                this.compileAll(c.code, c);
-            } else if (c instanceof Closure) {
-                this.compileAll(c.tmpl.code, c.tmpl);
+        const todo = new Worklist<ClosureTemplate | undefined>();
+        todo.add(code, tmpl);
+        todo.run((code: Code, tmpl) => {
+            if (code.resumeFn === null) {
+                this.compile(code, tmpl);
             }
-        }
+            for (const c of code.constants) {
+                if (c instanceof ClosureTemplate) {
+                    todo.add(c.code, c);
+                } else if (c instanceof Closure) {
+                    todo.add(c.tmpl.code, c.tmpl);
+                }
+            }
+        });
     }
 
     public static compile(code: Code, tmpl?: ClosureTemplate): ResumeFn {

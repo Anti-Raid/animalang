@@ -147,9 +147,24 @@ export class IR {
     constructor(private readonly table: Intrinsics, private readonly debug: boolean = false, private readonly assumed: ReadonlySet<number> = new Set(), private readonly reentrant: boolean = true) {}
 
     lower(nodes: Node[], numRegs: number, packRest: boolean = false): Code {
+        // the templates of the closures the code makes, their own code yet to be lowered: each is lowered after the
+        // code that makes it, not inside its lowering, so closures nested however deep go no deeper on the js stack
+        const pending: [ClosureTemplate, ClosureTemplateIR][] = []
+        const lowerTemplate = (t: ClosureTemplateIR): ClosureTemplate => {
+            const template = new ClosureTemplate(t.params, t.remParams, undefined as unknown as Code, t.upvarLocs, t.name, t.rest, t.pad)
+            pending.push([template, t])
+            return template
+        }
+        const code = this.#lower(nodes, numRegs, packRest, lowerTemplate)
+        while (pending.length > 0) {
+            const [template, t] = pending.pop()!
+            template.code = this.#lower(t.code, t.numRegs, t.rest === "packed", lowerTemplate)
+        }
+        return code
+    }
+
+    #lower(nodes: Node[], numRegs: number, packRest: boolean, lowerTemplate: (t: ClosureTemplateIR) => ClosureTemplate): Code {
         const cpool = new ConstPool()
-        const lowerTemplate = (t: ClosureTemplateIR) =>
-            new ClosureTemplate(t.params, t.remParams, this.lower(t.code, t.numRegs, t.rest === "packed"), t.upvarLocs, t.name, t.rest, t.pad)
         const { ops, used, use, inlines } = lowerOps(nodes, this.table, cpool, lowerTemplate)
         for (const pos of this.assumed) use(pos)
         const restPos = packRest ? use(this.table.pack!.pos) : -1

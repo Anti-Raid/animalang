@@ -4,6 +4,7 @@
 import { isPosSlot } from "../forms";
 import { CORE_FORMS } from "../core";
 import { bodyOf, clausesOf, namesOf } from "../lambda";
+import { DESCEND, Worklist, type Frame } from "../visitor";
 
 // how a form's operands are laid out after its head:
 //  - quote: one datum, not an expression
@@ -67,7 +68,10 @@ export const parts = (lang: Language, e: any[]): Parts => {
             return { exprs: [], rebuild: () => e };
         case "lambda": {
             const clauses = clausesOf(e);
-            const exprs = clauses.flatMap(c => bodyOf(c).map(x => [x, namesOf(c)] as [any, symbol[]]));
+            const exprs = clauses.flatMap(c => {
+                const names = namesOf(c);
+                return bodyOf(c).map(x => [x, names] as [any, symbol[]]);
+            });
             return { exprs, rebuild: next => {
                 let at = 0;
                 return [op, pos, ...clauses.map(c => {
@@ -121,22 +125,142 @@ export function* withBounds(p: Parts, bound: ReadonlySet<symbol>): Generator<[an
         }
         return;
     }
-    for (const [x, names] of p.exprs) yield [x, names.length === 0 ? bound : new Set([...bound, ...names])];
+    // (the positions of one binder are given the same names: one set for them)
+    let last: symbol[] | null = null, around = bound;
+    for (const [x, names] of p.exprs) {
+        if (names !== last) {
+            last = names;
+            around = names.length === 0 ? bound : new Set([...bound, ...names]);
+        }
+        yield [x, around];
+    }
 }
 
-// the expressions directly inside a form (not its binders, labels or quoted data)
-export const subExprs = (lang: Language, e: any[]): any[] => parts(lang, e).exprs.map(([x]) => x);
+// the expressions directly inside a form (not its binders, labels or quoted data), in the order `parts` gives them
+export const subExprs = (lang: Language, e: any[]): any[] => {
+    switch (lang.forms.get(e[0])) {
+        case undefined:
+        case "quote":
+            return [];
+        case "lambda": {
+            const out: any[] = [];
+            for (let k = 2; k < e.length; k++) {
+                const c = e[k];
+                for (let i = 3; i < c.length; i++) out.push(c[i]);
+            }
+            return out;
+        }
+        case "let":
+        case "letrec":
+        case "let*":
+        case "let-values": {
+            const at = lang.forms.get(e[0]) === "let-values" ? 2 : 1;
+            const bindings: any[][] = e[2], out: any[] = [];
+            for (let i = 0; i < bindings.length; i++) out.push(bindings[i][at]);
+            for (let i = 3; i < e.length; i++) out.push(e[i]);
+            return out;
+        }
+        case "assign":
+            return [e[3]];
+        case "label":
+        case "intrinsic":
+            return e.slice(3);
+        case "exprs":
+            return e.slice(2);
+    }
+};
+
+// `e` (with its position) with `next` for the expressions directly inside it
+export const rebuild = (lang: Language, e: any[], next: any[]): any[] => {
+    const op = e[0], pos = e[1];
+    switch (lang.forms.get(op)) {
+        case undefined:
+        case "quote":
+            return e;
+        case "lambda": {
+            const out: any[] = [op, pos];
+            let at = 0;
+            for (let k = 2; k < e.length; k++) {
+                const c = e[k], n = c.length - 3;
+                out.push([c[0], c[1], c[2], ...next.slice(at, at + n)]);
+                at += n;
+            }
+            return out;
+        }
+        case "let":
+        case "letrec":
+        case "let*": {
+            const bindings: any[][] = e[2];
+            return [op, pos, bindings.map((b, i) => [b[0], next[i]]), ...next.slice(bindings.length)];
+        }
+        case "let-values": {
+            const clauses: any[][] = e[2];
+            return [op, pos, clauses.map((c, i) => [c[0], c[1], next[i]]), ...next.slice(clauses.length)];
+        }
+        case "assign":
+            return [op, pos, e[2], next[0]];
+        case "label":
+        case "intrinsic":
+            return [op, pos, e[2], ...next];
+        case "exprs":
+            return [op, pos, ...next];
+    }
+};
 
 // `e` with `f` applied to each expression directly inside it, rebuilt (with its position) only if one changed
 export const mapExprs = (lang: Language, e: any[], f: (x: any) => any): any[] => {
-    const p = parts(lang, e);
-    let changed = false;
-    const next = p.exprs.map(([x]) => {
-        const y = f(x);
-        if (y !== x) changed = true;
-        return y;
-    });
-    return changed ? p.rebuild(next) : e;
+    const exprs = subExprs(lang, e);
+    let next: any[] | null = null;
+    for (let i = 0; i < exprs.length; i++) {
+        const y = f(exprs[i]);
+        if (next !== null) next.push(y);
+        else if (y !== exprs[i]) (next = exprs.slice(0, i)).push(y);
+    }
+    return next === null ? e : rebuild(lang, e, next);
+};
+
+// a visited form with its expressions' results for them (see Visitor): the form itself if none changed
+export const rebuilt = (lang: Language, f: Frame): any[] => {
+    const kids = f.kids, out = f.out;
+    for (let i = 0; i < out.length; i++) if (out[i] !== kids[i]) return rebuild(lang, f.e, out);
+    return f.e;
+};
+
+// `root` rebuilt from the inside out, on a stack of its own (see visitor.ts). `leaf` gives what stands for a node that
+// is not gone into, or DESCEND for a form whose expressions are mapped first; `done` then gets the form with their
+// results for them (`next`: the form itself if none changed, unless `always`) and the form as it was
+export const mapTree = (lang: Language, root: any, leaf: (e: any) => any, done: (next: any[], e: any[]) => any, always: boolean = false): any => {
+    const first = leaf(root);
+    if (first !== DESCEND) return first;
+    const forms: any[][] = [], kidsOf: any[][] = [], outs: (any[] | null)[] = [], ats: number[] = [];
+    let e: any[] = root, kids = subExprs(lang, e), out: any[] | null = always ? [] : null, i = 0;
+    for (;;) {
+        let r: any;
+        if (i < kids.length) {
+            r = leaf(kids[i]);
+            if (r === DESCEND) {
+                forms.push(e);
+                kidsOf.push(kids);
+                outs.push(out);
+                ats.push(i);
+                e = kids[i];
+                kids = subExprs(lang, e);
+                out = always ? [] : null;
+                i = 0;
+                continue;
+            }
+        } else {
+            r = done(out === null ? e : rebuild(lang, e, out), e);
+            if (forms.length === 0) return r;
+            e = forms.pop()!;
+            kids = kidsOf.pop()!;
+            out = outs.pop()!;
+            i = ats.pop()!;
+        }
+        if (out !== null) out.push(r);
+        else if (r !== kids[i]) (out = kids.slice(0, i)).push(r);
+        i++;
+    }
 };
 
 // why the form `e` is not laid out as its shape in `lang` says, or null if it is (its operands only, not their insides)
@@ -161,13 +285,16 @@ export const malformed = (lang: Language, e: any[]): string | null => {
 
 // Checks that `e` is in `lang`: no core form it does not allow, and each form laid out as its shape says. For tests and
 // debugging: a pass whose output fails it left a form its output language removed, or built one wrongly
-export const check = (lang: Language, e: any): void => {
-    if (!Array.isArray(e)) return;
-    const fail = (why: string) => { throw new Error(`internal error: not ${lang.name}: ${why} in (${String(e[0]?.description ?? e[0])} ...)`); };
-    const op = e[0];
-    if (!lang.forms.has(op)) fail(typeof op === "symbol" && CORE_FORMS.has(op) ? "a form the language does not have" : "a call without %call");
-    const why = malformed(lang, e);
-    if (why !== null) fail(why);
-    if (lang.forms.get(op) === "quote") return;
-    for (const x of subExprs(lang, e)) check(lang, x);
+export const check = (lang: Language, ast: any): void => {
+    const todo = new Worklist();
+    todo.add(ast);
+    todo.run(e => {
+        if (!Array.isArray(e)) return;
+        const fail = (why: string) => { throw new Error(`internal error: not ${lang.name}: ${why} in (${String(e[0]?.description ?? e[0])} ...)`); };
+        const op = e[0];
+        if (!lang.forms.has(op)) fail(typeof op === "symbol" && CORE_FORMS.has(op) ? "a form the language does not have" : "a call without %call");
+        const why = malformed(lang, e);
+        if (why !== null) fail(why);
+        todo.addAll(subExprs(lang, e));
+    });
 };

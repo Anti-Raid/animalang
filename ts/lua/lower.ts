@@ -9,6 +9,7 @@ import { L, isForm, offsetOf, type ParseResult } from "./syntax/ast";
 import { Lexer } from "./syntax/lexer";
 import { Tok } from "./syntax/tokens";
 import type * as C from "./syntax/ast";
+import { Worklist, isTask, run, start, type Task } from "../magicvm/visitor";
 
 export class LuauSyntaxError extends Error {
     constructor(readonly pos: SourcePos, readonly reason: string) {
@@ -47,14 +48,16 @@ const setter = (key: C.Expr): string => typeof key === "string" && key !== "__mo
 
 // the number a table constructor's key is when Luau's compiler knows it: a literal, or arithmetic on literals (Luau
 // also follows locals that are never assigned; this does not)
-const constNumber = (e: C.Expr): number | null => {
+const constNumber = (e: C.Expr): number | null => run(constNumberOf(e));
+const constNumberOf = function* (e: C.Expr): Task<number | null> {
     if (typeof e === "number") return e;
     if (!isForm(e)) return null;
     if (e[0] === L.ONE || e[0] === L.NEG) {
-        const v = constNumber(e[1]);
+        const v: number | null = yield constNumberOf(e[1]);
         return v === null ? null : e[0] === L.NEG ? -v : v;
     }
-    const a = e.length === 4 ? constNumber(e[1] as C.Expr) : null, b = a === null ? null : constNumber(e[2] as C.Expr);
+    const a: number | null = e.length === 4 ? yield constNumberOf(e[1] as C.Expr) : null;
+    const b: number | null = a === null ? null : yield constNumberOf(e[2] as C.Expr);
     if (a === null || b === null) return null;
     switch (e[0]) {
         case L.ADD: return a + b;
@@ -68,7 +71,20 @@ const constNumber = (e: C.Expr): number | null => {
 // the most fields a table made from a template has (BytecodeBuilder::TableShape::kMaxLength)
 const MAX_TEMPLATE = 32;
 
-const refers = (e: unknown, sym: symbol): boolean => e === sym || (Array.isArray(e) && e.some(x => refers(x, sym)));
+const refers = (e: unknown, sym: symbol): boolean => {
+    let found = false;
+    const todo = new Worklist();
+    todo.add(e);
+    todo.run(x => {
+        if (x === sym) {
+            found = true;
+            todo.stop();
+        } else if (Array.isArray(x)) todo.addAll(x);
+    });
+    return found;
+};
+
+type ExprForm = Extract<C.Expr, any[]>;
 
 // a step of a statement lowered in Luau's order: a name bound for the steps after it, or a form to run
 type Step = { bind: symbol[], init: any } | { run: any };
@@ -109,30 +125,45 @@ class Lowering {
         return this.error(form, `${what} is not supported yet`);
     }
 
-    chunk(): any[] {
+    *chunk(): Task<any[]> {
         const root = this.parsed.root;
         const pos = this.pos(root);
-        return this.functionBody(pos, root);
+        return (yield this.functionBody(pos, root));
     }
 
     // a function's body (or the chunk's): a block its returns escape from. A return that ends it is its value; without
     // one it returns nothing
-    functionBody(pos: SourcePos, block: C.Block): any[] {
+    *functionBody(pos: SourcePos, block: C.Block): Task<any[]> {
         const last = block.length > 2 ? block[block.length - 2] as C.Stat : null;
-        if (last === null || last[0] !== L.RETURN) return [CORE_BLOCK, pos, this.#ret, ...this.statements(block), [CORE_QUOTE, pos, NO_VALUES]];
+        if (last === null || last[0] !== L.RETURN) return [CORE_BLOCK, pos, this.#ret, ...(yield this.statements(block)), [CORE_QUOTE, pos, NO_VALUES]];
         const before = [...block.slice(0, -2), block[block.length - 1]] as C.Block;
-        return [CORE_BLOCK, pos, this.#ret, ...this.statements(before, () => [this.values(this.pos(last), last.slice(1, -1) as C.Expr[])])];
+        return [CORE_BLOCK, pos, this.#ret, ...(yield this.statements(before, () => this.#returned(last)))];
+    }
+
+    *#returned(last: C.Stat): Task<any[]> {
+        return [yield this.values(this.pos(last), last.slice(1, -1) as C.Expr[])];
+    }
+
+    // each of `exprs` lowered, in order
+    *#exprs(exprs: readonly C.Expr[]): Task<any[]> {
+        const out: any[] = [];
+        for (const e of exprs) {
+            let v = this.expr(e);
+            if (isTask(v)) v = yield v;
+            out.push(v);
+        }
+        return out;
     }
 
     // a block's statements as a list of forms, then `tail`'s (lowered with the block's locals declared); each local
     // statement binds the rest of the block. `onEach` is told the index of each statement before it is lowered
-    statements(block: C.Block, tail: () => any[] = () => [], onEach?: (i: number) => void): any[] {
+    *statements(block: C.Block, tail: () => any[] | Task<any[]> = () => [], onEach?: (i: number) => void): Task<any[]> {
         for (let i = 1; i < block.length - 1; i++) {
             const stat = block[i] as C.Stat;
             if (stat[0] === L.LOCAL) this.#declare(...(stat as C.LocalStat)[1]);
             else if (stat[0] === L.LOCALFN) this.#declare((stat as C.LocalFunction)[1]);
         }
-        let rest: any[] = tail();
+        let rest: any[] = yield tail();
         // the statements lowered since the last local, last first (put before `rest` one at a time, a long block
         // would be copied once for each of its statements)
         let run: any[] = [];
@@ -146,12 +177,12 @@ class Lowering {
         for (let i = block.length - 2; i >= 1; i--) {
             const stat = block[i] as C.Stat;
             onEach?.(i);
-            if (stat[0] === L.LOCAL) rest = [this.local(stat as C.LocalStat, after())];
+            if (stat[0] === L.LOCAL) rest = [(yield this.local(stat as C.LocalStat, after()))];
             else if (stat[0] === L.LOCALFN) {
                 const [, name, func] = stat as C.LocalFunction;
-                rest = [[CORE_LETREC, this.pos(stat), [[name, this.function(func)]], ...after()]];
+                rest = [[CORE_LETREC, this.pos(stat), [[name, (yield this.function(func))]], ...after()]];
             }
-            else run.push(this.statement(stat));
+            else run.push((yield this.statement(stat)));
         }
         return after();
     }
@@ -166,40 +197,41 @@ class Lowering {
         return typeof e === "symbol" && this.#owner.get(e) === this.#ret ? e : null;
     }
 
-    body(pos: SourcePos, block: C.Block): any[] {
-        return [CORE_BEGIN, pos, ...this.statements(block)];
+    *body(pos: SourcePos, block: C.Block): Task<any[]> {
+        return [CORE_BEGIN, pos, ...(yield this.statements(block))];
     }
 
-    local(stat: C.LocalStat, body: any[]): any[] {
-        return this.bind(this.pos(stat), stat[1], stat[2], body);
+    *local(stat: C.LocalStat, body: any[]): Task<any[]> {
+        return (yield this.bind(this.pos(stat), stat[1], stat[2], body));
     }
 
     // `names` bound to the values of `exprs` around `body`, as Luau adjusts a list of values: every expression is
     // evaluated, in order; a call or `...` that is last gives all its values; missing values are nil, extra ones dropped
-    bind(pos: SourcePos, names: symbol[], exprs: C.Expr[], body: any[]): any[] {
+    *bind(pos: SourcePos, names: symbol[], exprs: C.Expr[], body: any[]): Task<any[]> {
         const end = exprs[exprs.length - 1];
         const last = end !== undefined && isMulti(end) ? end : null;
         const fixed = last === null ? exprs : exprs.slice(0, -1);
-        const bindings: any[][] = fixed.map((e, i) => [i < names.length ? names[i] : Symbol("_"), this.expr(e)]);
+        const bindings: any[][] = [];
+        for (let i = 0; i < fixed.length; i++) bindings.push([i < names.length ? names[i] : Symbol("_"), yield this.expr(fixed[i])]);
         const rest = names.slice(fixed.length);
         if (last === null) return [CORE_LET, pos, [...bindings, ...rest.map(name => [name, undefined])], ...body];
         if (last[0] === L.VARARGS) return [CORE_LET, pos, [...bindings, ...rest.map((name, i) => [name, intcall(pos, "%luau-arg", this.#varargs, i)])], ...body];
-        if (rest.length === 0) return [CORE_LET, pos, [...bindings, [Symbol("_"), this.call(last)]], ...body];
-        if (rest.length === 1) return [CORE_LET, pos, [...bindings, [rest[0], this.expr(last)]], ...body];
-        const unpack = [CORE_LET_VALUES, pos, [[rest, null, this.call(last)]], ...body];
+        if (rest.length === 0) return [CORE_LET, pos, [...bindings, [Symbol("_"), (yield this.call(last))]], ...body];
+        if (rest.length === 1) return [CORE_LET, pos, [...bindings, [rest[0], (yield this.expr(last))]], ...body];
+        const unpack = [CORE_LET_VALUES, pos, [[rest, null, (yield this.call(last))]], ...body];
         return bindings.length === 0 ? unpack : [CORE_LET, pos, bindings, unpack];
     }
 
-    statement(stat: C.Stat): any {
+    *statement(stat: C.Stat): Task<any> {
         const pos = this.pos(stat);
         switch (stat[0]) {
-            case L.BLOCK: return this.body(pos, stat as C.Block);
+            case L.BLOCK: return (yield this.body(pos, stat as C.Block));
             case L.ASSIGN: {
                 const [, targets, exprs] = stat as C.Assign;
-                if (targets.length !== 1 || exprs.length !== 1) return this.assign(pos, targets, exprs);
+                if (targets.length !== 1 || exprs.length !== 1) return (yield this.assign(pos, targets, exprs));
                 const target = targets[0];
-                if (!isIndex(target)) return [CORE_SET, pos, this.variable(target), this.expr(exprs[0])];
-                return this.#inOrder(pos, [target[1], target[2], exprs[0]], ([o, k, v]) => intcall(pos, setter(target[2]), o, k, v));
+                if (!isIndex(target)) return [CORE_SET, pos, this.variable(target), (yield this.expr(exprs[0]))];
+                return (yield this.#inOrder(pos, [target[1], target[2], exprs[0]], ([o, k, v]) => intcall(pos, setter(target[2]), o, k, v)));
             }
             case L.OPSET: {
                 const [, op, target, value] = stat as C.OpSet;
@@ -212,38 +244,44 @@ class Lowering {
                         bindings.push([t, init]);
                         return t;
                     };
-                    const part = (e: C.Expr) => this.#own(e) ?? (isConstant(e) ? this.expr(e) : temp(this.expr(e)));
-                    const o = part(target[1]), k = part(target[2]);
+                    const self = this;
+                    const part = function* (e: C.Expr): Task<any> {
+                        return self.#own(e) ?? (isConstant(e) ? yield self.expr(e) : temp(yield self.expr(e)));
+                    };
+                    const o = yield part(target[1]), k = yield part(target[2]);
                     const old = temp(intcall(pos, getter(target[2]), o, k));
-                    const result = temp(this.binary(pos, op, old, this.expr(value), stat));
+                    const result = temp(this.binary(pos, op, old, (yield this.expr(value)), stat));
                     return [CORE_LET_STAR, pos, bindings, intcall(pos, setter(target[2]), o, k, result)];
                 }
                 const name = this.variable(target);
                 // a local of the function is read when the operation runs, after the value
                 if (this.#own(target) !== null && op !== L.CONCAT && !isSimple(value)) {
                     const v = Symbol("v");
-                    return [CORE_LET, pos, [[v, this.expr(value)]], [CORE_SET, pos, name, this.binary(pos, op, name, v, stat)]];
+                    return [CORE_LET, pos, [[v, (yield this.expr(value))]], [CORE_SET, pos, name, this.binary(pos, op, name, v, stat)]];
                 }
-                return [CORE_SET, pos, name, this.binary(pos, op, name, this.expr(value), stat)];
+                return [CORE_SET, pos, name, this.binary(pos, op, name, (yield this.expr(value)), stat)];
             }
             case L.RETURN: {
-                return [CORE_ESCAPE, pos, this.#ret, this.values(pos, (stat as C.Return).slice(1, -1) as C.Expr[])];
+                return [CORE_ESCAPE, pos, this.#ret, (yield this.values(pos, (stat as C.Return).slice(1, -1) as C.Expr[]))];
             }
             case L.IF: {
                 const out: any[] = [CORE_IF, pos];
                 let clause: C.If | C.Block | null = stat as C.If;
                 while (clause !== null && clause[0] === L.IF) {
                     const [, cond, then, rest] = clause as C.If;
-                    out.push(this.test(cond), this.body(this.pos(then), then));
+                    out.push((yield this.test(cond)), (yield this.body(this.pos(then), then)));
                     clause = rest;
                 }
-                if (clause !== null) out.push(this.body(this.pos(clause), clause as C.Block));
+                if (clause !== null) out.push((yield this.body(this.pos(clause), clause as C.Block)));
                 return out;
             }
             case L.WHILE: {
                 const [, cond, block] = stat as C.While;
-                return this.loop(pos, loop => [CORE_LOOP, pos,
-                    [CORE_IF, pos, this.test(cond), [CORE_BLOCK, pos, loop.cont, ...this.statements(block)], [CORE_ESCAPE, pos, loop.brk]]]);
+                const self = this;
+                return (yield this.loop(pos, function* (loop) {
+                    return [CORE_LOOP, pos,
+                        [CORE_IF, pos, yield self.test(cond), [CORE_BLOCK, pos, loop.cont, ...(yield self.statements(block))], [CORE_ESCAPE, pos, loop.brk]]];
+                }));
             }
             case L.REPEAT: {
                 const [, block, cond] = stat as C.Repeat;
@@ -253,13 +291,16 @@ class Lowering {
                     if (s[0] === L.LOCAL) for (const name of (s as C.LocalStat)[1]) locals.set(name, i);
                     else if (s[0] === L.LOCALFN) locals.set((s as C.LocalFunction)[1], i);
                 }
-                return this.loop(pos, loop => {
+                const self = this;
+                return (yield this.loop(pos, function* (loop) {
                     loop.repeat = { stat: stat as C.Repeat, locals, index: 0 };
-                    const check = () => [[CORE_IF, pos, this.test(cond), [CORE_ESCAPE, pos, loop.brk]]];
-                    return [CORE_LOOP, pos, [CORE_BLOCK, pos, loop.cont, ...this.statements(block, check, i => loop.repeat!.index = i)]];
-                });
+                    const check = function* (): Task<any[]> {
+                        return [[CORE_IF, pos, yield self.test(cond), [CORE_ESCAPE, pos, loop.brk]]];
+                    };
+                    return [CORE_LOOP, pos, [CORE_BLOCK, pos, loop.cont, ...(yield self.statements(block, check, i => loop.repeat!.index = i))]];
+                }));
             }
-            case L.FOR: return this.numericFor(stat as C.For, pos);
+            case L.FOR: return (yield this.numericFor(stat as C.For, pos));
             case L.BREAK: return [CORE_ESCAPE, pos, this.#innermost(stat).brk];
             case L.CONTINUE: {
                 const loop = this.#innermost(stat);
@@ -267,10 +308,10 @@ class Lowering {
                 // the condition is tested here, where the body's locals it may use are bound
                 const { stat: repeat, locals, index } = loop.repeat;
                 this.#checkUntil(repeat, locals, index, stat);
-                return [CORE_IF, pos, this.test(repeat[2]), [CORE_ESCAPE, pos, loop.brk], [CORE_ESCAPE, pos, loop.cont]];
+                return [CORE_IF, pos, (yield this.test(repeat[2])), [CORE_ESCAPE, pos, loop.brk], [CORE_ESCAPE, pos, loop.cont]];
             }
-            case L.FORIN: return this.forIn(stat as C.ForIn, pos);
-            case L.CALL: case L.METHOD: return this.call(stat as C.Call | C.Method);
+            case L.FORIN: return (yield this.forIn(stat as C.ForIn, pos));
+            case L.CALL: case L.METHOD: return (yield this.call(stat as C.Call | C.Method));
         }
         return this.unsupported(stat, "this statement");
     }
@@ -280,7 +321,7 @@ class Lowering {
     // the function takes its value as soon as it is computed, unless a value computed after it refers to it or an
     // indexed target uses it; other targets, and those locals, are assigned once every value is computed, a local given
     // as a value being read then
-    assign(pos: SourcePos, targets: C.Expr[], exprs: C.Expr[]): any {
+    *assign(pos: SourcePos, targets: C.Expr[], exprs: C.Expr[]): Task<any> {
         const n = targets.length, k = exprs.length;
         const steps: Step[] = [];
         const temp = (init: any): symbol => {
@@ -289,12 +330,14 @@ class Lowering {
             return t;
         };
         const used = new Set<symbol>();
-        const part = (e: C.Expr): any => {
-            const own = this.#own(e);
+        const self = this;
+        const part = function* (e: C.Expr): Task<any> {
+            const own = self.#own(e);
             if (own !== null) used.add(own);
-            return own ?? (isConstant(e) ? this.expr(e) : temp(this.expr(e)));
+            return own ?? (isConstant(e) ? yield self.expr(e) : temp(yield self.expr(e)));
         };
-        const places = targets.map(t => isIndex(t) ? { obj: part(t[1]), key: part(t[2]), set: setter(t[2]) } : { name: this.variable(t) });
+        const places: ({ obj: any, key: any, set: string } | { name: symbol })[] = [];
+        for (const t of targets) places.push(isIndex(t) ? { obj: yield part(t[1]), key: yield part(t[2]), set: setter(t[2]) } : { name: this.variable(t) });
         const names = places.map((p): symbol | null => "name" in p ? p.name! : null);
         const local = names.map(name => name !== null && this.#owner.get(name) === this.#ret);
         const assigned = new Set<symbol>(), conflict = new Set<symbol>();
@@ -318,23 +361,23 @@ class Lowering {
             if (i === k - 1 && n > k) {
                 // the last value gives the targets that are left theirs
                 const count = n - i;
-                if (!isMulti(e)) value.push(temp(this.expr(e)), ...Array.from({ length: count - 1 }, () => temp(undefined)));
+                if (!isMulti(e)) value.push(temp((yield this.expr(e))), ...Array.from({ length: count - 1 }, () => temp(undefined)));
                 else if (e[0] === L.VARARGS) for (let j = 0; j < count; j++) value.push(temp(intcall(pos, "%luau-arg", this.#varargs, j)));
                 else {
                     const temps = Array.from({ length: count }, () => Symbol("v"));
-                    steps.push({ bind: temps, init: this.call(e) });
+                    steps.push({ bind: temps, init: (yield this.call(e)) });
                     value.push(...temps);
                 }
             } else if (local[i] && !conflict.has(names[i]!)) {
-                steps.push({ run: store(i, this.expr(e)) });
+                steps.push({ run: store(i, (yield this.expr(e))) });
                 value.push(null);
             } else {
-                value.push((local[i] ? null : this.#own(e)) ?? temp(this.expr(e)));
+                value.push((local[i] ? null : this.#own(e)) ?? temp((yield this.expr(e))));
             }
         }
         for (let i = n; i < k; i++) {
             const e = exprs[i];
-            steps.push({ run: isCall(e) ? this.call(e) : this.expr(e) });
+            steps.push({ run: isCall(e) ? (yield this.call(e)) : (yield this.expr(e)) });
         }
         for (const want of [false, true]) {
             for (let i = 0; i < n; i++) if (local[i] === want && value[i] !== null) steps.push({ run: store(i, value[i]) });
@@ -346,11 +389,11 @@ class Lowering {
     }
 
     // (%block brk body): a loop's body is `make`'s, with the loop to break out of and continue
-    loop(pos: SourcePos, make: (loop: Loop) => any[]): any[] {
+    *loop(pos: SourcePos, make: (loop: Loop) => Task<any[]>): Task<any[]> {
         const loop: Loop = { brk: Symbol("break"), cont: Symbol("continue") };
         this.#loops.push(loop);
         try {
-            return [CORE_BLOCK, pos, loop.brk, make(loop)];
+            return [CORE_BLOCK, pos, loop.brk, yield make(loop)];
         } finally {
             this.#loops.pop();
         }
@@ -364,7 +407,9 @@ class Lowering {
     // a continue in a repeat may not jump over a local its condition uses, as Luau's compiler checks
     #checkUntil(repeat: C.Repeat, locals: Map<symbol, number>, index: number, cont: C.Stat): void {
         const cond = repeat[2];
-        const visit = (e: unknown, at: C.Form | null): void => {
+        const todo = new Worklist<C.Form | null>();
+        todo.add(cond, isForm(cond) ? cond : null);
+        todo.run((e: unknown, at) => {
             if (typeof e === "symbol") {
                 const declared = locals.get(e);
                 if (declared !== undefined && declared > index) {
@@ -373,12 +418,9 @@ class Lowering {
                     throw new LuauSyntaxError({ file: this.file, line: this.#untilLine(repeat), col: 1 }, reason);
                 }
             } else if (isForm(e)) {
-                for (let i = 1; i < e.length - 1; i++) visit(e[i], e);
-            } else if (Array.isArray(e)) {
-                for (const x of e) visit(x, at);
-            }
-        };
-        visit(cond, isForm(cond) ? cond : null);
+                for (let i = 1; i < e.length - 1; i++) todo.add(e[i], e);
+            } else if (Array.isArray(e)) todo.addAll(e, at);
+        });
     }
 
     // the line where a repeat's condition starts (a local has no position of its own): after its matching until
@@ -397,27 +439,31 @@ class Lowering {
     }
 
     // for i = a, b, c: Luau's FORNPREP and FORNLOOP, with a fresh local per iteration
-    numericFor([, name, from, to, step, block]: C.For, pos: SourcePos): any[] {
+    *numericFor([, name, from, to, step, block]: C.For, pos: SourcePos): Task<any[]> {
         this.#declare(name);
         const [a, b, c, i, limit, by] = [Symbol("from"), Symbol("to"), Symbol("step"), Symbol("i"), Symbol("limit"), Symbol("by")];
-        return [CORE_LET, pos, [[a, this.expr(from)], [b, this.expr(to)], [c, step === null ? 1 : this.expr(step)]],
+        const self = this;
+        return [CORE_LET, pos, [[a, (yield this.expr(from))], [b, (yield this.expr(to))], [c, step === null ? 1 : (yield this.expr(step))]],
             [CORE_LET, pos, [[i, intcall(pos, "%luau-for-number", a, "initial value")], [limit, intcall(pos, "%luau-for-number", b, "limit")], [by, intcall(pos, "%luau-for-number", c, "step")]],
-                this.loop(pos, loop => [CORE_LOOP, pos,
-                    [CORE_IF, pos, this.#forTest(pos, step, i, limit, by),
-                        [CORE_BEGIN, pos,
-                            [CORE_LET, pos, [[name, i]], [CORE_BLOCK, pos, loop.cont, ...this.statements(block)]],
-                            [CORE_SET, pos, i, intcall(pos, "%luau-add", i, by)]],
-                        [CORE_ESCAPE, pos, loop.brk]]])]];
+                yield this.loop(pos, function* (loop) {
+                    return [CORE_LOOP, pos,
+                        [CORE_IF, pos, self.#forTest(pos, step, i, limit, by),
+                            [CORE_BEGIN, pos,
+                                [CORE_LET, pos, [[name, i]], [CORE_BLOCK, pos, loop.cont, ...(yield self.statements(block))]],
+                                [CORE_SET, pos, i, intcall(pos, "%luau-add", i, by)]],
+                            [CORE_ESCAPE, pos, loop.brk]]];
+                })]];
     }
 
     // for v1, ..., vn in f, s, c: LOP_FORGPREP and LOP_FORGLOOP. What the loop does each time round is decided once
     // (%luau-for-prep): over a table by ipairs it reads the array part at the next index; over a table by pairs or next,
     // or a table itself, it moves to the next position that has an entry; otherwise it calls f(s, c), stops when the
     // first value is nil, and that value is the next c. Each iteration binds fresh locals
-    forIn([, names, exprs, block]: C.ForIn, pos: SourcePos): any[] {
+    *forIn([, names, exprs, block]: C.ForIn, pos: SourcePos): Task<any[]> {
         this.#declare(...names);
         const [f, s, c, kind, table, at, v] = ["f", "s", "c", "kind", "table", "at", "v"].map(n => Symbol(n));
         const temps = names.map(() => Symbol("v"));
+        const self = this;
         const stop = (loop: Loop, value: any) => [CORE_IF, pos, intcall(pos, "%luau-nil?", value), [CORE_ESCAPE, pos, loop.brk]];
         const set = (name: symbol, value: any) => [CORE_SET, pos, name, value];
         const second = temps.length > 1 ? (value: any) => [set(temps[1], value)] : () => [];
@@ -428,10 +474,10 @@ class Lowering {
             return got.length === 1 ? [CORE_LET, pos, [[got[0], intcall(pos, "%first-value", call, undefined)]], ...each]
                 : [CORE_LET_VALUES, pos, [[got, null, call]], ...each];
         };
-        return this.bind(pos, [f, s, c], exprs, [
+        return (yield this.bind(pos, [f, s, c], exprs, [
             [CORE_LET, pos, [[kind, intcall(pos, "%luau-for-prep", f, s, c)]],
                 [CORE_LET, pos, [[table, intcall(pos, "%luau-for-table", f, s)], [at, 0], ...temps.map(t => [t, undefined])],
-                    this.loop(pos, loop => [CORE_LOOP, pos,
+                    yield this.loop(pos, function* (loop) { return [CORE_LOOP, pos,
                         [CORE_BEGIN, pos,
                             [CORE_IF, pos,
                                 intcall(pos, "%luau-eq", kind, 1),
@@ -445,12 +491,12 @@ class Lowering {
                                     set(temps[0], intcall(pos, "%luau-key-at", table, at)),
                                     ...second(intcall(pos, "%luau-value-at", table, at))],
                                 called(loop)],
-                            [CORE_LET, pos, names.map((name, i) => [name, temps[i]]), [CORE_BLOCK, pos, loop.cont, ...this.statements(block)]]]])]]]);
+                            [CORE_LET, pos, names.map((name, i) => [name, temps[i]]), [CORE_BLOCK, pos, loop.cont, ...(yield self.statements(block))]]]]; })]]]));
     }
 
     // a padded closure, as Luau's functions take any number of arguments: missing ones are nil, extra ones dropped, or
     // are its `...`
-    function(func: C.Func): any[] {
+    *function(func: C.Func): Task<any[]> {
         const [, params, varargs, block] = func;
         const pos = this.pos(func);
         const outer = { loops: this.#loops, ret: this.#ret, varargs: this.#varargs };
@@ -460,7 +506,7 @@ class Lowering {
         this.#varargs = rest;
         this.#declare(...params);
         try {
-            return [CORE_LAMBDA, pos, clause([PAD], params, rest, [this.functionBody(pos, block)])];
+            return [CORE_LAMBDA, pos, clause([PAD], params, rest, [(yield this.functionBody(pos, block))])];
         } finally {
             this.#loops = outer.loops;
             this.#ret = outer.ret;
@@ -470,30 +516,30 @@ class Lowering {
 
     // all the values of a list of expressions (what a function returns): the values of a call or `...` that is last
     // after the others
-    values(pos: SourcePos, exprs: C.Expr[]): any {
+    *values(pos: SourcePos, exprs: C.Expr[]): Task<any> {
         if (exprs.length === 0) return [CORE_QUOTE, pos, NO_VALUES];
         const last = exprs[exprs.length - 1];
-        const fixed = exprs.slice(0, -1).map(e => this.expr(e));
-        if (!isMulti(last)) return exprs.length === 1 ? this.expr(last) : intcall(pos, "%values", ...fixed, this.expr(last));
+        const fixed: any[] = yield this.#exprs(exprs.slice(0, -1));
+        if (!isMulti(last)) return exprs.length === 1 ? (yield this.expr(last)) : intcall(pos, "%values", ...fixed, (yield this.expr(last)));
         if (last[0] === L.VARARGS) return fixed.length === 0 ? intcall(pos, "%luau-varargs", this.#varargs) : [CORE_INTAPPLY, pos, Symbol.for("%values"), ...fixed, this.#varargs];
-        return fixed.reduceRight((tail, e) => intcall(pos, "%values-cons", e, tail), this.call(last));
+        return fixed.reduceRight((tail, e) => intcall(pos, "%values-cons", e, tail), (yield this.call(last)));
     }
 
     // a call, whose value is all the values the function returns, or with `one`, the first of them (nil of none). An
     // argument list ending in `...` or a call passes all of its values; a call that gives one value (as most do) is
     // then an ordinary call
-    call(e: C.Call | C.Method, one: boolean = false): any[] {
-        if (e[0] === L.METHOD) return this.method(e as C.Method, one);
+    *call(e: C.Call | C.Method, one: boolean = false): Task<any[]> {
+        if (e[0] === L.METHOD) return (yield this.method(e as C.Method, one));
         const pos = this.pos(e);
         // (the VM makes a %call whose first value is taken a call that asks for one)
         const made = (call: any[]) => one ? intcall(pos, "%first-value", call, undefined) : call;
         const args = e.slice(2, -1) as C.Expr[];
         const last = args[args.length - 1];
-        if (last === undefined || !isMulti(last)) return made([CORE_CALL, pos, this.expr(e[1]), ...args.map(a => this.expr(a))]);
-        const fixed = args.slice(0, -1).map(a => this.expr(a));
-        if (last[0] === L.VARARGS) return made([CORE_APPLY, pos, this.expr(e[1]), ...fixed, this.#varargs]);
+        if (last === undefined || !isMulti(last)) return made([CORE_CALL, pos, (yield this.expr(e[1])), ...(yield this.#exprs(args))]);
+        const fixed: any[] = yield this.#exprs(args.slice(0, -1));
+        if (last[0] === L.VARARGS) return made([CORE_APPLY, pos, (yield this.expr(e[1])), ...fixed, this.#varargs]);
         const [f, v, ...temps] = [Symbol("f"), Symbol("v"), ...fixed.map(() => Symbol("a"))];
-        return [CORE_LET, pos, [[f, this.expr(e[1])], ...temps.map((t, i) => [t, fixed[i]]), [v, this.call(last)]],
+        return [CORE_LET, pos, [[f, (yield this.expr(e[1]))], ...temps.map((t, i) => [t, fixed[i]]), [v, (yield this.call(last))]],
             [CORE_IF, pos, intcall(pos, "%luau-several?", v),
                 made([CORE_APPLY, pos, f, ...temps, intcall(pos, "%values->array", v)]),
                 made([CORE_CALL, pos, f, ...temps, v])]];
@@ -501,7 +547,7 @@ class Lowering {
 
     // obj:name(args), as LOP_NAMECALL goes: the object (a local of the function being its register, read when the
     // method is looked up), then the arguments, and only then the method, which is called with the object first
-    method(e: C.Method, one: boolean): any[] {
+    *method(e: C.Method, one: boolean): Task<any[]> {
         const pos = this.pos(e);
         const made = (call: any[]) => one ? intcall(pos, "%first-value", call, undefined) : call;
         const args = e.slice(3, -1) as C.Expr[];
@@ -513,12 +559,13 @@ class Lowering {
             bindings.push([t, init]);
             return t;
         };
-        const o = this.#own(e[1]) ?? temp(this.expr(e[1]));
-        const given = (multi === null ? args : args.slice(0, -1)).map(a => isConstant(a) ? this.expr(a) : temp(this.expr(a)));
+        const o = this.#own(e[1]) ?? temp((yield this.expr(e[1])));
+        const given: any[] = [];
+        for (const a of multi === null ? args : args.slice(0, -1)) given.push(isConstant(a) ? yield this.expr(a) : temp(yield this.expr(a)));
         const found = () => intcall(pos, "%luau-method", o, intern(e[2]));
         if (multi === null) return [CORE_LET_STAR, pos, bindings, made([CORE_CALL, pos, found(), o, ...given])];
         if (multi[0] === L.VARARGS) return [CORE_LET_STAR, pos, bindings, made([CORE_APPLY, pos, found(), o, ...given, this.#varargs])];
-        const v = temp(this.call(multi)), f = temp(found());
+        const v = temp((yield this.call(multi))), f = temp(found());
         return [CORE_LET_STAR, pos, bindings,
             [CORE_IF, pos, intcall(pos, "%luau-several?", v),
                 made([CORE_APPLY, pos, f, o, ...given, intcall(pos, "%values->array", v)]),
@@ -527,18 +574,20 @@ class Lowering {
 
     // `a{x}b` is ("a%*b"):format(x), as Luau compiles it: the pieces with their % doubled, %* for each expression (one
     // value of it), and a string constant among the expressions written into the format
-    interp(e: C.Interp): any {
+    *interp(e: C.Interp): Task<any> {
         const pos = this.pos(e);
         const escaped = (s: string) => s.replace(/%/g, "%%");
         let format = "";
         const bindings: any[][] = [];
-        (e.slice(1, -1) as (string | C.Expr)[]).forEach((part, i) => {
+        const parts = e.slice(1, -1) as (string | C.Expr)[];
+        for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
             if (i % 2 === 0 || typeof part === "string") format += escaped(part as string);
             else {
                 format += "%*";
-                bindings.push([Symbol("a"), this.expr(part as C.Expr)]);
+                bindings.push([Symbol("a"), yield this.expr(part as C.Expr)]);
             }
-        });
+        }
         const fmt = intern(format);
         const call = [CORE_CALL, pos, intcall(pos, "%luau-method", fmt, "format"), fmt, ...bindings.map(b => b[0])];
         return [CORE_LET, pos, bindings, intcall(pos, "%first-value", call, undefined)];
@@ -546,23 +595,35 @@ class Lowering {
 
     // an operation on `operands`, which are evaluated in order, but a local of the function is its register, read when
     // the operation runs: after the operands that follow it
-    #inOrder(pos: SourcePos, operands: C.Expr[], make: (forms: any[]) => any): any {
+    *#inOrder(pos: SourcePos, operands: C.Expr[], make: (forms: any[]) => any): Task<any> {
         let last = -1;
         operands.forEach((e, i) => { if (!isSimple(e)) last = i; });
-        if (!operands.some((e, i) => i < last && this.#own(e) !== null)) return make(operands.map(e => this.expr(e)));
+        if (!operands.some((e, i) => i < last && this.#own(e) !== null)) {
+            const forms: any[] = [];
+            for (const e of operands) {
+                let v = this.expr(e);
+                if (isTask(v)) v = yield v;
+                forms.push(v);
+            }
+            return make(forms);
+        }
         const bindings: any[][] = [];
-        const forms = operands.map((e, i) => {
-            if (i > last || isConstant(e) || this.#own(e) !== null) return this.expr(e);
-            const t = Symbol("v");
-            bindings.push([t, this.expr(e)]);
-            return t;
-        });
+        const forms: any[] = [];
+        for (let i = 0; i < operands.length; i++) {
+            const e = operands[i];
+            if (i > last || isConstant(e) || this.#own(e) !== null) forms.push(yield this.expr(e));
+            else {
+                const t = Symbol("v");
+                bindings.push([t, yield this.expr(e)]);
+                forms.push(t);
+            }
+        }
         return [CORE_LET, pos, bindings, make(forms)];
     }
 
     // a table constructor, as compileExprTable makes it: a table of the sizes Luau's compiler works out, then the items
     // in order, a keyed one stored as an assignment is, the others into the array part, the last all of its values
-    table(e: C.Table): any {
+    *table(e: C.Table): Task<any> {
         const pos = this.pos(e);
         const items = e.slice(1, -1) as (C.Expr | C.Field | C.Pair)[];
         if (items.length === 0) {
@@ -581,7 +642,7 @@ class Lowering {
             // a table of fields only is a copy of a template with each name once (LOP_DUPTABLE)
             if (indexSize === 0 && hashSize === fields.length && fields.length <= MAX_TEMPLATE) {
                 hashSize = new Set(fields.map(f => f[1])).size;
-                if (hashSize === fields.length) return intcall(pos, "%luau-record", [CORE_QUOTE, pos, new RecordShape(fields.map(f => intern(f[1])))], ...fields.map(f => this.expr(f[2])));
+                if (hashSize === fields.length) return intcall(pos, "%luau-record", [CORE_QUOTE, pos, new RecordShape(fields.map(f => intern(f[1])))], ...(yield this.#exprs(fields.map(f => f[2]))));
             }
         }
         const end = items[items.length - 1];
@@ -589,7 +650,7 @@ class Lowering {
         const narray = arraySize - (multi !== null && multi[0] === L.VARARGS ? 1 : 0) + indexSize;
         let lead = 0;
         while (lead < items.length - (multi === null ? 0 : 1) && !keyed(items[lead])) lead++;
-        const made = intcall(pos, "%luau-table", narray, hashSize, ...items.slice(0, lead).map(item => this.expr(item as C.Expr)));
+        const made = intcall(pos, "%luau-table", narray, hashSize, ...(yield this.#exprs(items.slice(0, lead) as C.Expr[])));
         if (lead === items.length) return made;
         const t = Symbol("t");
         const steps: any[] = [];
@@ -598,12 +659,12 @@ class Lowering {
             const item = items[i];
             if (keyed(item)) {
                 const at = this.pos(item);
-                if (item[0] === L.FIELD) steps.push(intcall(at, setter(item[1]), t, intern(item[1]), this.expr(item[2])));
-                else steps.push(this.#inOrder(at, [item[1], item[2]], ([key, v]) => intcall(at, "%luau-setindex", t, key, v)));
+                if (item[0] === L.FIELD) steps.push(intcall(at, setter(item[1]), t, intern(item[1]), (yield this.expr(item[2]))));
+                else steps.push((yield this.#inOrder(at, [item[1], item[2]], ([key, v]) => intcall(at, "%luau-setindex", t, key, v))));
             } else if (i === items.length - 1 && multi !== null) {
-                steps.push(intcall(pos, "%luau-setlist", t, index, multi[0] === L.VARARGS ? this.#varargs : intcall(pos, "%values->array", this.call(multi))));
+                steps.push(intcall(pos, "%luau-setlist", t, index, multi[0] === L.VARARGS ? this.#varargs : intcall(pos, "%values->array", (yield this.call(multi)))));
             } else {
-                steps.push(intcall(pos, "%luau-seti", t, index++, this.expr(item)));
+                steps.push(intcall(pos, "%luau-seti", t, index++, (yield this.expr(item))));
             }
         }
         return [CORE_LET, pos, [[t, made]], ...steps, t];
@@ -635,55 +696,71 @@ class Lowering {
     // `e` as a condition: a boolean, as Luau's truthiness has it (nil and false are false)
     test(e: C.Expr): any {
         if (!isForm(e)) return typeof e === "boolean" ? e : e === L.NIL ? false : intcall(null, "%luau-truthy", this.expr(e));
-        const pos = this.pos(e);
-        switch (e[0]) {
-            case L.ONE: return this.test(e[1]);
-            case L.AND: return [CORE_IF, pos, this.test(e[1]), this.test(e[2]), false];
-            case L.OR: return [CORE_IF, pos, this.test(e[1]), true, this.test(e[2])];
-            case L.NOT: return [CORE_IF, pos, this.test(e[1]), false, true];
-            case L.EQ: case L.NE: case L.LT: case L.LE: case L.GT: case L.GE: return this.expr(e);
-        }
-        return intcall(pos, "%luau-truthy", this.expr(e));
+        return start(this.#testForm(e));
     }
 
+    *#testForm(e: ExprForm): Task<any> {
+        const pos = this.pos(e);
+        switch (e[0]) {
+            case L.ONE: return (yield this.test(e[1]));
+            case L.AND: return [CORE_IF, pos, (yield this.test(e[1])), (yield this.test(e[2])), false];
+            case L.OR: return [CORE_IF, pos, (yield this.test(e[1])), true, (yield this.test(e[2]))];
+            case L.NOT: return [CORE_IF, pos, (yield this.test(e[1])), false, true];
+            case L.EQ: case L.NE: case L.LT: case L.LE: case L.GT: case L.GE: return (yield this.expr(e));
+        }
+        return intcall(pos, "%luau-truthy", (yield this.expr(e)));
+    }
+
+    // (a walk, as every method here that lowers what is inside a form: see magicvm/visitor.ts. What is not a form is
+    // lowered where it is)
     expr(e: C.Expr): any {
         if (e === L.NIL) return undefined;
         if (!isForm(e)) return typeof e === "string" ? intern(e) : e;
+        if (e[0] === L.GLOBAL) return Symbol.for(e[1]);
+        return start(this.#exprForm(e));
+    }
+
+    *#exprForm(e: ExprForm): Task<any> {
         const pos = this.pos(e);
         switch (e[0]) {
-            case L.GLOBAL: return Symbol.for(e[1]);
-            case L.ONE: return this.expr(e[1]);
-            case L.NEG: return intcall(pos, "%luau-unm", this.expr(e[1]));
-            case L.NOT: return intcall(pos, "%luau-not", this.expr(e[1]));
+            case L.ONE: return (yield this.expr(e[1]));
+            case L.NEG: return intcall(pos, "%luau-unm", (yield this.expr(e[1])));
+            case L.NOT: return intcall(pos, "%luau-not", (yield this.expr(e[1])));
             case L.AND: case L.OR: {
                 const t = Symbol("t");
-                const [then, otherwise] = e[0] === L.AND ? [this.expr(e[2]), t] : [t, this.expr(e[2])];
-                return [CORE_LET, pos, [[t, this.expr(e[1])]], [CORE_IF, pos, intcall(pos, "%luau-truthy", t), then, otherwise]];
+                const [then, otherwise] = e[0] === L.AND ? [(yield this.expr(e[2])), t] : [t, (yield this.expr(e[2]))];
+                return [CORE_LET, pos, [[t, (yield this.expr(e[1]))]], [CORE_IF, pos, intcall(pos, "%luau-truthy", t), then, otherwise]];
             }
             case L.ADD: case L.SUB: case L.MUL: case L.DIV: case L.IDIV: case L.MOD: case L.POW: case L.CONCAT:
             case L.EQ: case L.NE: case L.LT: case L.LE: case L.GT: case L.GE: {
                 const [op, a, b] = e as C.Binary;
                 // a local of the function on the left is read when the operation runs, after the right operand
                 const left = op === L.CONCAT || isSimple(b) ? null : this.#own(a);
-                if (left === null) return this.binary(pos, op, this.expr(a), this.expr(b), e);
+                if (left === null) {
+                    let x = this.expr(a);
+                    if (isTask(x)) x = yield x;
+                    let y = this.expr(b);
+                    if (isTask(y)) y = yield y;
+                    return this.binary(pos, op, x, y, e);
+                }
                 const right = Symbol("r");
-                return [CORE_LET, pos, [[right, this.expr(b)]], this.binary(pos, op, left, right, e)];
+                return [CORE_LET, pos, [[right, (yield this.expr(b))]], this.binary(pos, op, left, right, e)];
             }
             case L.IFX: {
                 const [, cond, then, otherwise] = e as C.IfExpr;
-                return [CORE_IF, pos, this.test(cond), this.expr(then), this.expr(otherwise)];
+                return [CORE_IF, pos, (yield this.test(cond)), (yield this.expr(then)), (yield this.expr(otherwise))];
             }
-            case L.LEN: return intcall(pos, "%luau-len", this.expr(e[1]));
+            case L.LEN: return intcall(pos, "%luau-len", (yield this.expr(e[1])));
             case L.VARARGS: return intcall(pos, "%luau-arg", this.#varargs, 0);
-            case L.CALL: case L.METHOD: return this.call(e as C.Call | C.Method, true);
-            case L.INDEX: return this.#inOrder(pos, [e[1], e[2]], ([o, k]) => intcall(pos, getter(e[2] as C.Expr), o, k));
-            case L.FUNCTION: return this.function(e as C.Func);
-            case L.TABLE: return this.table(e as C.Table);
-            case L.INTERP: return this.interp(e as C.Interp);
+            case L.CALL: case L.METHOD: return (yield this.call(e as C.Call | C.Method, true));
+            case L.INDEX: return (yield this.#inOrder(pos, [e[1], e[2]], ([o, k]) => intcall(pos, getter(e[2] as C.Expr), o, k)));
+            case L.FUNCTION: return (yield this.function(e as C.Func));
+            case L.TABLE: return (yield this.table(e as C.Table));
+            case L.INTERP: return (yield this.interp(e as C.Interp));
         }
         return this.unsupported(e, "this expression");
     }
 }
 
 // a parsed chunk (with no errors) as core forms: a block whose value is what the chunk returns
-export const lowerLuau = (parsed: ParseResult, file: string, source: string): any[] => new Lowering(parsed, file, source).chunk();
+export const lowerLuau = (parsed: ParseResult, file: string, source: string): any[] => run(new Lowering(parsed, file, source).chunk());

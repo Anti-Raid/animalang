@@ -4,6 +4,7 @@
 import { corePos } from "../coreops";
 import { ClosureTemplateIR, type Node } from "../ir";
 import type { Pass } from "./pass";
+import { run, type Task } from "../visitor";
 
 export type FunctionIR = { nodes: Node[], numRegs: number };
 
@@ -12,7 +13,7 @@ const check = (): Node => ({ k: "HostCall", pos: corePos("%interrupt"), start: 0
 const calls = (nodes: Node[]): boolean =>
     nodes.some(n => n.k === "Call" || (n.k === "HostCall" && n.pos !== corePos("%interrupt")));
 
-const withChecks = (nodes: Node[]): Node[] => {
+const withChecks = function* (nodes: Node[]): Task<Node[]> {
     const entryCheck = calls(nodes);
     const out: Node[] = [];
     for (const n of nodes) {
@@ -20,7 +21,7 @@ const withChecks = (nodes: Node[]): Node[] => {
         if (n.k === "FunctionEntry" && entryCheck) out.push(check());
         if (n.k === "NewClosure") {
             const t = n.template;
-            out.push({ ...n, template: new ClosureTemplateIR(t.params, t.remParams, withChecks(t.code), t.numRegs, t.upvarLocs, t.name, t.rest, t.pad) });
+            out.push({ ...n, template: new ClosureTemplateIR(t.params, t.remParams, yield withChecks(t.code), t.numRegs, t.upvarLocs, t.name, t.rest, t.pad) });
             continue;
         }
         out.push(n);
@@ -30,5 +31,5 @@ const withChecks = (nodes: Node[]): Node[] => {
 
 export const interruptsPass: Pass<FunctionIR, FunctionIR> = {
     name: "interrupts",
-    run: (ir, ctx) => ctx.intrinsics.interrupts ? { nodes: withChecks(ir.nodes), numRegs: ir.numRegs } : ir,
+    run: (ir, ctx) => ctx.intrinsics.interrupts ? { nodes: run(withChecks(ir.nodes)), numRegs: ir.numRegs } : ir,
 };

@@ -9,7 +9,8 @@
 // allows a function 200 locals)
 import { CORE_LET, CORE_LET_STAR, CORE_LETREC } from "../../common";
 import { isLambda } from "../lambda";
-import { Lsrc, malformed, mapExprs } from "./lang";
+import { DESCEND, Visitor } from "../visitor";
+import { Lsrc, malformed, rebuilt, subExprs } from "./lang";
 
 const MIN_CHAIN = 200;
 
@@ -20,24 +21,43 @@ const isLink = (e: any): e is any[] => {
     return e[2].length === 1 && (e[0] === CORE_LET || isLambda(e[2][0][1]));
 };
 
-export const flattenLets = (ast: any): any => {
-    const walk = (e: any): any => {
-        // (a form that is not laid out as it should be is left for the compiler to refuse)
-        if (!Array.isArray(e) || malformed(Lsrc, e) !== null) return e;
-        if (!isLink(e)) return mapExprs(Lsrc, e, walk);
-        const links: any[][] = [];
-        for (let link: any = e; isLink(link); link = link[link.length - 1]) {
-            links.push(link);
-            if (link.length <= 3) break;
-        }
-        if (links.length <= MIN_CHAIN) return mapExprs(Lsrc, e, walk);
-        const bindings: [symbol, any][] = [];
-        const last = links[links.length - 1];
-        for (const link of links) {
-            for (const [name, init] of link[2]) bindings.push([name, link[0] === CORE_LETREC ? [CORE_LETREC, link[1], [[name, walk(init)]], name] : walk(init)]);
-            if (link !== last) for (const form of link.slice(3, -1)) bindings.push([Symbol("_"), walk(form)]);
-        }
-        return [CORE_LET_STAR, e[1], bindings, ...last.slice(3).map(walk)];
-    };
-    return walk(ast);
+// the links of the chain `e` starts
+const chainOf = (e: any[]): any[][] => {
+    const links: any[][] = [];
+    for (let link: any = e; isLink(link); link = link[link.length - 1]) {
+        links.push(link);
+        if (link.length <= 3) break;
+    }
+    return links;
 };
+
+export const flattenLets = (ast: any): any => new Visitor<undefined, any>(
+    // (a form that is not laid out as it should be is left for the compiler to refuse)
+    e => !Array.isArray(e) || malformed(Lsrc, e) !== null ? e : DESCEND,
+    f => {
+        const links = isLink(f.e) ? chainOf(f.e) : [];
+        if (links.length <= MIN_CHAIN) {
+            f.kids = subExprs(Lsrc, f.e);
+            return;
+        }
+        const kids: any[] = [], last = links[links.length - 1];
+        for (const link of links) {
+            for (const b of link[2]) kids.push(b[1]);
+            if (link !== last) for (let i = 3; i < link.length - 1; i++) kids.push(link[i]);
+        }
+        for (let i = 3; i < last.length; i++) kids.push(last[i]);
+        f.kids = kids;
+        f.state = links;
+    },
+    f => {
+        const links: any[][] | undefined = f.state, out = f.out;
+        if (links === undefined) return rebuilt(Lsrc, f);
+        const bindings: [symbol, any][] = [], last = links[links.length - 1];
+        let at = 0;
+        for (const link of links) {
+            for (const [name] of link[2]) bindings.push([name, link[0] === CORE_LETREC ? [CORE_LETREC, link[1], [[name, out[at++]]], name] : out[at++]]);
+            if (link !== last) for (let i = 3; i < link.length - 1; i++) bindings.push([Symbol("_"), out[at++]]);
+        }
+        return [CORE_LET_STAR, f.e[1], bindings, ...out.slice(at)];
+    },
+).visit(ast, undefined);

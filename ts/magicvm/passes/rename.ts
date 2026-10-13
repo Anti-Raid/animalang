@@ -7,7 +7,8 @@ import { CORE_SET, Msg, SPECIAL_FORMS, VMError } from "../../common";
 import { isPosSlot, posOf } from "../forms";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
-import { malformed, mapExprs } from "./lang";
+import { DESCEND, Visitor } from "../visitor";
+import { malformed, rebuilt, subExprs } from "./lang";
 import { Lconv, SET_BOX } from "./assignments";
 import type { Pass } from "./pass";
 
@@ -48,75 +49,105 @@ export const renamer = (intrinsics: Intrinsics) => {
         };
         const name = (sym: any) => typeof sym === "symbol" ? env.get(sym) ?? sym : sym;
 
-        const expr = (e: any): any => {
-            if (typeof e === "symbol") return name(e);
-            if (!Array.isArray(e) || e.length === 0) return e;
-            const op = e[0], pos = e[1];
-            const fail = (err: VMError) => {
-                err.at = posOf(e);
-                throw err;
-            };
-            if (!Lconv.forms.has(op)) fail(new VMError(Msg.BareCall, [op]));
-            if (e.length < 2 || !isPosSlot(pos)) fail(new VMError(Msg.FormArgs, [op.description, "a position slot (a position, or #null) after its head", e.length - 1]));
-            const shape = Lconv.forms.get(op);
-            if ((shape === "let" || shape === "letrec" || shape === "let*") && !(Array.isArray(e[2]) && e[2].every((b: any) => Array.isArray(b) && b.length === 2))) {
-                fail(new VMError(Msg.FormArgs, [op.description, "bindings of a name and an init each", e.length - 2]));
-            }
-            if (shape === "let-values" && !(Array.isArray(e[2]) && e[2].every((c: any) => Array.isArray(c) && c.length === 3 && Array.isArray(c[0])))) {
-                fail(new VMError(Msg.FormArgs, [op.description, "clauses of (params) rest init", e.length - 2]));
-            }
-            if (!traversable(e)) return e;
-            switch (shape) {
-                case "quote":
-                    return e;
-                case "lambda":
-                    return [op, pos, ...e.slice(2).map((c: any[]) => {
-                        const saved = bind(c[2] === null ? c[1] : [...c[1], c[2]]);
-                        const clause = [c[0], c[1].map(name), name(c[2]), ...c.slice(3).map(expr)];
-                        unbind(saved);
-                        return clause;
-                    })];
-                case "let": {
-                    const bindings: any[] = e[2];
-                    const inits = bindings.map(b => expr(b[1]));
-                    const saved = bind(bindings.map(b => b[0]));
-                    const out = [op, pos, bindings.map((b, i) => [name(b[0]), inits[i]]), ...e.slice(3).map(expr)];
-                    unbind(saved);
-                    return out;
+        // what a visited binding form keeps: the bindings to put back, and what its binders were renamed to
+        type State = { saved: Saved, bound: boolean, names: any[], at: number, starts: number[] };
+        const clauseNames = (c: any[]) => c[2] === null ? c[1] : [...c[1], c[2]];
+        const valuesNames = (clauses: any[]) => clauses.flatMap(c => c[1] === null ? c[0] : [...c[0], c[1]]);
+        // into the next clause of a lambda: the one before it out of scope, its own names in
+        const enterClause = (e: any[], st: State) => {
+            const c = e[2 + st.at++];
+            unbind(st.saved);
+            st.saved = bind(clauseNames(c));
+            st.names.push([c[1].map(name), name(c[2])]);
+        };
+        const bindRest = (e: any[], st: State, shape: string | undefined) => {
+            if (shape === "let*") {
+                for (let i = st.names.length; i < e[2].length; i++) {
+                    bind([e[2][i][0]], st.saved);
+                    st.names.push(name(e[2][i][0]));
                 }
-                case "letrec": {
-                    const bindings: any[] = e[2];
-                    const saved = bind(bindings.map(b => b[0]));
-                    const out = [op, pos, bindings.map(b => [name(b[0]), expr(b[1])]), ...e.slice(3).map(expr)];
-                    unbind(saved);
-                    return out;
-                }
-                case "let*": {
-                    const saved: Saved = [];
-                    const bindings = (e[2] as any[]).map(b => {
-                        const init = expr(b[1]);
-                        bind([b[0]], saved);
-                        return [name(b[0]), init];
-                    });
-                    const out = [op, pos, bindings, ...e.slice(3).map(expr)];
-                    unbind(saved);
-                    return out;
-                }
-                case "let-values": {
-                    const clauses: any[] = e[2];
-                    const inits = clauses.map(c => expr(c[2]));
-                    const saved = bind(clauses.flatMap(c => c[1] === null ? c[0] : [...c[0], c[1]]));
-                    const out = [op, pos, clauses.map((c, i) => [c[0].map(name), name(c[1]), inits[i]]), ...e.slice(3).map(expr)];
-                    unbind(saved);
-                    return out;
-                }
-                case "assign":
-                    return [op, pos, op === CORE_SET || op === SET_BOX ? name(e[2]) : e[2], expr(e[3])];
-                default:
-                    return mapExprs(Lconv, e, expr);
+            } else if (!st.bound) {
+                st.bound = true;
+                bind(shape === "let" ? e[2].map((b: any[]) => b[0]) : valuesNames(e[2]), st.saved);
             }
         };
-        return expr(ast);
+
+        return new Visitor<undefined, any>(
+            e => {
+                if (typeof e === "symbol") return name(e);
+                if (!Array.isArray(e) || e.length === 0) return e;
+                const op = e[0], pos = e[1];
+                const fail = (err: VMError) => {
+                    err.at = posOf(e);
+                    throw err;
+                };
+                if (!Lconv.forms.has(op)) fail(new VMError(Msg.BareCall, [op]));
+                if (e.length < 2 || !isPosSlot(pos)) fail(new VMError(Msg.FormArgs, [op.description, "a position slot (a position, or #null) after its head", e.length - 1]));
+                const shape = Lconv.forms.get(op);
+                if ((shape === "let" || shape === "letrec" || shape === "let*") && !(Array.isArray(e[2]) && e[2].every((b: any) => Array.isArray(b) && b.length === 2))) {
+                    fail(new VMError(Msg.FormArgs, [op.description, "bindings of a name and an init each", e.length - 2]));
+                }
+                if (shape === "let-values" && !(Array.isArray(e[2]) && e[2].every((c: any) => Array.isArray(c) && c.length === 3 && Array.isArray(c[0])))) {
+                    fail(new VMError(Msg.FormArgs, [op.description, "clauses of (params) rest init", e.length - 2]));
+                }
+                return !traversable(e) || shape === "quote" ? e : DESCEND;
+            },
+            f => {
+                const e = f.e, shape = Lconv.forms.get(e[0]);
+                f.kids = subExprs(Lconv, e);
+                switch (shape) {
+                    case "lambda": {
+                        const starts: number[] = [];
+                        let at = 0;
+                        for (let k = 2; k < e.length; k++) {
+                            starts.push(at);
+                            at += e[k].length - 3;
+                        }
+                        f.state = { saved: [], bound: false, names: [], at: 0, starts } satisfies State;
+                        return;
+                    }
+                    case "letrec":
+                        f.state = { saved: bind(e[2].map((b: any[]) => b[0])), bound: true, names: [], at: 0, starts: [] } satisfies State;
+                        return;
+                    case "let":
+                    case "let*":
+                    case "let-values":
+                        f.state = { saved: [], bound: false, names: [], at: 0, starts: [] } satisfies State;
+                }
+            },
+            f => {
+                const e = f.e, out = f.out, op = e[0], pos = e[1], st: State | undefined = f.state;
+                if (st === undefined) return Lconv.forms.get(op) === "assign" ? [op, pos, op === CORE_SET || op === SET_BOX ? name(e[2]) : e[2], out[0]] : rebuilt(Lconv, f);
+                const shape = Lconv.forms.get(op);
+                let next: any[];
+                if (shape === "lambda") {
+                    while (st.at < st.starts.length) enterClause(e, st);
+                    next = [op, pos, ...e.slice(2).map((c: any[], k: number) => [c[0], st.names[k][0], st.names[k][1], ...out.slice(st.starts[k], st.starts[k] + c.length - 3)])];
+                } else {
+                    bindRest(e, st, shape);
+                    const n = e[2].length;
+                    const heads = shape === "let*" ? e[2].map((_: any, i: number) => [st.names[i], out[i]])
+                        : shape === "let-values" ? e[2].map((c: any[], i: number) => [c[0].map(name), name(c[1]), out[i]])
+                        : e[2].map((b: any[], i: number) => [name(b[0]), out[i]]);
+                    next = [op, pos, heads, ...out.slice(n)];
+                }
+                unbind(st.saved);
+                return next;
+            },
+            // (called before each expression of a binding form: what is in scope there is bound by then)
+            (f, i) => {
+                const e = f.e, st: State = f.state, shape = Lconv.forms.get(e[0]);
+                if (shape === "lambda") {
+                    while (st.at < st.starts.length && st.starts[st.at] <= i) enterClause(e, st);
+                } else if (shape === "let*") {
+                    if (i > 0 && i <= e[2].length && st.names.length < i) {
+                        bind([e[2][i - 1][0]], st.saved);
+                        st.names.push(name(e[2][i - 1][0]));
+                    }
+                } else if (i >= e[2].length) bindRest(e, st, shape);
+                return undefined;
+            },
+        ).visit(ast, undefined);
     };
 };
 

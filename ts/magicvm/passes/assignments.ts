@@ -11,7 +11,8 @@
 import { CORE_SET } from "../../common";
 import { BOXED } from "../lambda";
 import type { VariableMetadata } from "../scope";
-import { Lsrc, extend, malformed, mapExprs } from "./lang";
+import { DESCEND, Visitor, Worklist } from "../visitor";
+import { Lsrc, extend, malformed, rebuilt, subExprs } from "./lang";
 
 export const Lconv = extend(Lsrc, "Lconv", { add: { "%box": "exprs", "%unbox": "exprs", "%box!": "exprs", "%set-box!": "assign", "%boxed": "exprs", "%inlined": "label", "%tail-inlined": "label" } });
 
@@ -32,47 +33,59 @@ export const convertAssignments = (ast: any, variables: ReadonlyMap<symbol, Vari
     };
     const boxInPlace = (names: any[]) => names.filter(boxed).map(x => [BOX_IN_PLACE, null, x]);
 
-    const walk = (e: any): any => {
-        if (typeof e === "symbol") return boxed(e) ? [UNBOX, null, e] : e;
-        if (!Array.isArray(e) || e.length === 0) return e;
-        const op = e[0], pos = e[1];
-        const shape = Lsrc.forms.get(op);
-        if (shape !== undefined && malformed(Lsrc, e) !== null) return e;
-        switch (shape) {
-            case "quote":
-                return e;
-            case "lambda":
-                return [op, pos, ...e.slice(2).map((c: any[]) =>
-                    [c[0], c[1], c[2], ...boxInPlace(c[2] === null ? c[1] : [...c[1], c[2]]), ...c.slice(3).map(walk)])];
-            case "let":
-            case "let*":
-                return [op, pos, e[2].map((b: any[]) => [b[0], boxed(b[0]) ? [BOX, null, walk(b[1])] : walk(b[1])]), ...e.slice(3).map(walk)];
-            case "let-values": {
-                const names = e[2].flatMap((c: any[]) => c[1] === null ? c[0] : [...c[0], c[1]]);
-                return [op, pos, e[2].map((c: any[]) => [c[0], c[1], walk(c[2])]), ...boxInPlace(names), ...e.slice(3).map(walk)];
+    const visitor = new Visitor<undefined, any>(
+        e => {
+            if (typeof e === "symbol") return boxed(e) ? [UNBOX, null, e] : e;
+            if (!Array.isArray(e) || e.length === 0) return e;
+            const shape = Lsrc.forms.get(e[0]);
+            return shape === "quote" || (shape !== undefined && malformed(Lsrc, e) !== null) ? e : DESCEND;
+        },
+        f => { f.kids = subExprs(Lsrc, f.e); },
+        f => {
+            const e = f.e, out = f.out, op = e[0], pos = e[1];
+            switch (Lsrc.forms.get(op)) {
+                case "lambda": {
+                    let at = 0;
+                    return [op, pos, ...e.slice(2).map((c: any[]) => {
+                        const n = c.length - 3;
+                        at += n;
+                        return [c[0], c[1], c[2], ...boxInPlace(c[2] === null ? c[1] : [...c[1], c[2]]), ...out.slice(at - n, at)];
+                    })];
+                }
+                case "let":
+                case "let*":
+                    return [op, pos, e[2].map((b: any[], i: number) => [b[0], boxed(b[0]) ? [BOX, null, out[i]] : out[i]]), ...out.slice(e[2].length)];
+                case "let-values": {
+                    const names = e[2].flatMap((c: any[]) => c[1] === null ? c[0] : [...c[0], c[1]]);
+                    return [op, pos, e[2].map((c: any[], i: number) => [c[0], c[1], out[i]]), ...boxInPlace(names), ...out.slice(e[2].length)];
+                }
+                case "letrec":
+                    return [op, pos, e[2].map((b: any[], i: number) => [b[0], boxed(b[0]) ? [BOXED, null, out[i]] : out[i]]), ...out.slice(e[2].length)];
+                case "assign":
+                    return [op === CORE_SET && boxed(e[2]) ? SET_BOX : op, pos, e[2], out[0]];
+                default:
+                    return rebuilt(Lsrc, f);
             }
-            case "letrec":
-                return [op, pos, e[2].map((b: any[]) => [b[0], boxed(b[0]) ? [BOXED, null, walk(b[1])] : walk(b[1])]), ...e.slice(3).map(walk)];
-            case "assign":
-                return [op === CORE_SET && boxed(e[2]) ? SET_BOX : op, pos, e[2], walk(e[3])];
-            default:
-                return mapExprs(Lsrc, e, walk);
-        }
-    };
-    return { ast: walk(ast), boxes };
+        },
+    );
+    return { ast: visitor.visit(ast, undefined), boxes };
 };
 
 // the variables a converted program has boxes of (those of a copy of converted code, whose names are new), into `boxes`
 export const boxesIn = (ast: any, boxes: Set<symbol>): void => {
-    if (!Array.isArray(ast) || ast.length === 0) return;
-    const op = ast[0];
-    const shape = Lconv.forms.get(op);
-    if (shape === "quote") return;
-    if (op === BOX_IN_PLACE && typeof ast[2] === "symbol") boxes.add(ast[2]);
-    if ((shape === "let" || shape === "let*" || shape === "letrec") && Array.isArray(ast[2])) {
-        for (const b of ast[2]) {
-            if (Array.isArray(b) && typeof b[0] === "symbol" && Array.isArray(b[1]) && (b[1][0] === BOX || b[1][0] === BOXED)) boxes.add(b[0]);
+    const todo = new Worklist();
+    todo.add(ast);
+    todo.run(e => {
+        if (!Array.isArray(e) || e.length === 0) return;
+        const op = e[0];
+        const shape = Lconv.forms.get(op);
+        if (shape === "quote") return;
+        if (op === BOX_IN_PLACE && typeof e[2] === "symbol") boxes.add(e[2]);
+        if ((shape === "let" || shape === "let*" || shape === "letrec") && Array.isArray(e[2])) {
+            for (const b of e[2]) {
+                if (Array.isArray(b) && typeof b[0] === "symbol" && Array.isArray(b[1]) && (b[1][0] === BOX || b[1][0] === BOXED)) boxes.add(b[0]);
+            }
         }
-    }
-    for (const x of ast) boxesIn(x, boxes);
+        todo.addAll(e);
+    });
 };

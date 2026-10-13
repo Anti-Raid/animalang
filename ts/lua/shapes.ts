@@ -4,6 +4,7 @@
 // table with holes
 import { L, isForm } from "./syntax/ast";
 import type * as C from "./syntax/ast";
+import { Worklist } from "../magicvm/visitor";
 
 export type Shape = { array: number, hash: number };
 
@@ -48,10 +49,12 @@ export const predictShapes = (root: C.Block): Map<C.Table, Shape> => {
             if (bound !== undefined && shapeOf(table).array === 0) shapeOf(table).array = bound;
         }
     };
-    const visit = (e: unknown): void => {
+    const todo = new Worklist();
+    todo.add(root);
+    todo.run((e: unknown) => {
         if (!Array.isArray(e)) return;
         if (!isForm(e)) {
-            for (const x of e) visit(x);
+            todo.addAll(e);
             return;
         }
         switch (e[0]) {
@@ -64,7 +67,7 @@ export const predictShapes = (root: C.Block): Map<C.Table, Shape> => {
             case L.ASSIGN: {
                 const [, targets, values] = e as C.Assign;
                 for (const target of targets) assign(target);
-                visit(values);
+                todo.add(values);
                 return;
             }
             case L.FOR: {
@@ -73,8 +76,7 @@ export const predictShapes = (root: C.Block): Map<C.Table, Shape> => {
                 break;
             }
         }
-        for (let i = 1; i < e.length - 1; i++) visit(e[i]);
-    };
-    visit(root);
+        for (let i = 1; i < e.length - 1; i++) todo.add(e[i]);
+    });
     return shapes;
 };

@@ -33,10 +33,12 @@ const addAlias = (aliases: Aliases | undefined, a: number, b: number): void => {
     aliases.set(b, set);
 };
 
+// (the registers that hold one value are known to be of one kind, or none of them is: so one that is already known
+// to be of `kind` has nothing to tell the others)
 const setWithAliases = (reg: number, kind: Kind | undefined, facts: Facts, aliases?: Aliases): void => {
     if (kind === undefined) {
         facts.delete(reg);
-    } else {
+    } else if (facts.get(reg) !== kind) {
         facts.set(reg, kind);
         const set = aliases?.get(reg);
         if (set) {
@@ -63,8 +65,9 @@ export const transfer = (
             return void set(inst.dst, kindOf(constants[inst.idx], table));
         case "Move": {
             addAlias(aliases, inst.dst, inst.src);
+            // (what else holds the value is known as `src` is)
             const srcKind = facts.get(inst.src);
-            if (srcKind !== undefined) set(inst.dst, srcKind);
+            if (srcKind !== undefined) facts.set(inst.dst, srcKind);
             else facts.delete(inst.dst);
             return;
         }
@@ -184,9 +187,15 @@ export const blockFacts = (blocks: AotBlock[], table: Intrinsics | null, constan
     const index = new Map(blocks.map((b, i) => [b.start, i]));
     const entry = new Map<number, Facts>([[blocks[0]?.start ?? 0, new Map(seed ?? [])]]);
     const out = new Map<number, Facts>();
-    const work = [0];
-    while (work.length > 0) {
-        const i = work.pop()!;
+    // the blocks to go through (again), taken in order: one is then reached after the blocks before it that lead to
+    // it, so only a loop's blocks are gone through more than once
+    const pending = new Uint8Array(blocks.length);
+    if (blocks.length > 0) pending[0] = 1;
+    for (let again = true; again;) {
+      again = false;
+      for (let i = 0; i < blocks.length; i++) {
+        if (pending[i] === 0) continue;
+        pending[i] = 0;
         const block = blocks[i];
         const facts = new Map(entry.get(block.start)!);
         const aliases: Aliases = new Map();
@@ -202,7 +211,8 @@ export const blockFacts = (blocks: AotBlock[], table: Intrinsics | null, constan
             const next = known === undefined ? new Map(edgeFacts) : meet(known, edgeFacts);
             if (known === undefined || !same(known, next)) {
                 entry.set(target, next);
-                work.push(j);
+                pending[j] = 1;
+                if (j <= i) again = true;
             }
         };
 
@@ -257,6 +267,7 @@ export const blockFacts = (blocks: AotBlock[], table: Intrinsics | null, constan
                 propagate(target, facts);
             }
         }
+      }
     }
     return entry;
 };

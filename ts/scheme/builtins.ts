@@ -35,9 +35,16 @@ const allBigints = (known: ArgKinds, n: number) => n > 0 && known.length === n &
 // `value` when every check holds, else `slow`; no check at all when every argument is known
 const guarded = (checks: string[], value: string, slow: string) => checks.length === 0 ? `(${value})` : `(${checks.join(" && ")} ? ${value} : ${slow})`;
 
+// the most arguments a template that nests an expression once per argument is used for: a js engine overflows its own
+// stack compiling an expression nested a few thousand deep
+const MAX_NESTED_ARGS = 128;
+// and the most pairs made in one expression: of more, the builtin's loop is the faster
+const MAX_INLINE_PAIRS = 16;
+
 // (op a b c) => ((a op b) op c) when every argument is a number; `unary` handles a single argument
 const foldInline = (op: string, empty: string | null, unary: (a: string) => string, divisors = false): InlineFn => (args, slow, _tmp, _d, known) => {
     if (args.length === 0) return empty;
+    if (args.length > MAX_NESTED_ARGS) return null;
     const nonZero = divisors ? (args.length === 1 ? args : args.slice(1)).map(d => `${d} !== 0`) : [];
     const value = args.length === 1 ? unary(args[0]) : args.slice(1).reduce((acc, b) => `(${acc} ${op} ${b})`, args[0]);
     // known bigints: JS does bigint arithmetic itself (division keeps its checks, in the builtin)
@@ -259,6 +266,7 @@ export const SCHEME_BUILTINS: readonly SchemeBuiltin[] = [
     }, (args, _slow, tmp, d) => {
         const tail = args[args.length - 1];
         if (args.length === 1) return tail;
+        if (args.length - 1 > MAX_INLINE_PAIRS) return null;
         const pairs = args.slice(0, -1).reduceRight((acc, arg, i) => `new ${d.Cons}(${arg}, ${acc}, ${tmp} + ${args.length - 1 - i})`, tail);
         return `(${tmp} = ${d.Cons}.lengthOf(${tail}), ${pairs})`;
     }),
@@ -572,7 +580,7 @@ export const registerSchemeIntrinsics = (intrinsics: Intrinsics): void => {
         let tail: Cons | null = null;
         for (let i = start + nargs - 1; i >= start; i--) tail = new Cons(regs[i], tail, start + nargs - i);
         return tail;
-    }, { leaf: true, sequence: "pack", effectFree: true, inline: (args, _slow, _tmp, d) => args.reduceRight((tail, arg, i) => `new ${d.Cons}(${arg}, ${tail}, ${args.length - i})`, "null"), deps: INLINE_DEPS });
+    }, { leaf: true, sequence: "pack", effectFree: true, inline: (args, _slow, _tmp, d) => args.length > MAX_INLINE_PAIRS ? null : args.reduceRight((tail, arg, i) => `new ${d.Cons}(${arg}, ${tail}, ${args.length - i})`, "null"), deps: INLINE_DEPS });
     intrinsics.register("%spread", (regs, start) => spreadList(regs[start]), { args: [1, 1], leaf: true, sequence: "spread" });
     // promises: (%make-lazy thunk) is (delay-force (thunk)); see $force in the prelude
     intrinsics.register("%make-lazy", (regs, start) => new SchemePromise({ done: false, value: regs[start] }), { args: [1, 1], leaf: true });

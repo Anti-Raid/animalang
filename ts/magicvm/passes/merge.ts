@@ -7,34 +7,45 @@
 // bound, to a procedure that calls the merged one, for the uses of it that are not such calls
 import { CORE_BEGIN, CORE_CALL, CORE_IF, CORE_LAMBDA, CORE_LET, CORE_LET_STAR, CORE_LET_VALUES, CORE_LET_VALUES_STRICT, CORE_LETREC, CORE_SET } from "../../common";
 import { bodyOf, clause, isSingleLambda, optionsOf, paramsOf, restOf, type Clause } from "../lambda";
-import { Lsrc, parts as partsOf, type Parts } from "./lang";
+import { DESCEND, Worklist, run, type Task } from "../visitor";
+import { Lsrc, mapTree, subExprs } from "./lang";
 
-const parts = (e: any[]): Parts => partsOf(Lsrc, e);
+const formOrAtom = (e: any) => Array.isArray(e) ? DESCEND : e;
 
 const only = (lambda: any[]): Clause => lambda[2];
 
 // most procedures made one: more would be a long chain of tests before each body
 const MAX_MERGED = 8;
 
-const assignedNames = (e: any, out: Set<symbol> = new Set()): Set<symbol> => {
-    if (!Array.isArray(e)) return out;
-    if (e[0] === CORE_SET) out.add(e[2]);
-    for (const [x] of parts(e).exprs) assignedNames(x, out);
+const assignedNames = (ast: any): Set<symbol> => {
+    const out = new Set<symbol>();
+    const todo = new Worklist();
+    todo.add(ast);
+    todo.run(e => {
+        if (!Array.isArray(e)) return;
+        if (e[0] === CORE_SET) out.add(e[2]);
+        todo.addAll(subExprs(Lsrc, e));
+    });
     return out;
 };
 
 // the calls in tail position of `e`, itself in tail position (those under a %block, a %loop, a mark or a catch are
 // left out: they only decide what is worth merging)
-const tailCalls = (e: any, out: any[][]): any[][] => {
-    if (!Array.isArray(e)) return out;
-    switch (e[0]) {
-        case CORE_CALL: out.push(e); break;
-        case CORE_IF: for (const branch of e.slice(3)) tailCalls(branch, out); break;
-        case CORE_BEGIN: if (e.length > 2) tailCalls(e[e.length - 1], out); break;
-        case CORE_LET: case CORE_LET_STAR: case CORE_LETREC: case CORE_LET_VALUES: case CORE_LET_VALUES_STRICT:
-            if (e.length > 3) tailCalls(e[e.length - 1], out);
-            break;
-    }
+const tailCalls = (ast: any): any[][] => {
+    const out: any[][] = [];
+    const todo = new Worklist();
+    todo.add(ast);
+    todo.run(e => {
+        if (!Array.isArray(e)) return;
+        switch (e[0]) {
+            case CORE_CALL: out.push(e); break;
+            case CORE_IF: todo.addAll(e.slice(3)); break;
+            case CORE_BEGIN: if (e.length > 2) todo.add(e[e.length - 1]); break;
+            case CORE_LET: case CORE_LET_STAR: case CORE_LETREC: case CORE_LET_VALUES: case CORE_LET_VALUES_STRICT:
+                if (e.length > 3) todo.add(e[e.length - 1]);
+                break;
+        }
+    });
     return out;
 };
 
@@ -43,13 +54,13 @@ const cycles = (count: number, edges: number[][]): number[][] => {
     const index: number[] = Array(count).fill(-1), low: number[] = Array(count).fill(0);
     const onStack: boolean[] = Array(count).fill(false), stack: number[] = [], out: number[][] = [];
     let next = 0;
-    const visit = (v: number): void => {
+    const visit = function* (v: number): Task<void> {
         index[v] = low[v] = next++;
         stack.push(v);
         onStack[v] = true;
         for (const w of edges[v]) {
             if (index[w] === -1) {
-                visit(w);
+                yield visit(w);
                 low[v] = Math.min(low[v], low[w]);
             } else if (onStack[w]) low[v] = Math.min(low[v], index[w]);
         }
@@ -63,7 +74,7 @@ const cycles = (count: number, edges: number[][]): number[][] => {
         }
         if (group.length > 1) out.push(group.sort((a, b) => a - b));
     };
-    for (let v = 0; v < count; v++) if (index[v] === -1) visit(v);
+    for (let v = 0; v < count; v++) if (index[v] === -1) run(visit(v));
     return out;
 };
 
@@ -72,8 +83,8 @@ export const mergeLoops = (ast: any): any => {
     // a procedure of one clause and a fixed count of parameters, bound to a name never assigned
     const isCandidate = (b: [symbol, any]) => isSingleLambda(b[1]) && restOf(only(b[1])) === null && !assigned.has(b[0]);
 
-    // `e`, a %letrec whose inits and body are already done, with one group of its procedures merged (and then the next)
-    const mergeIn = (e: any[]): any[] => {
+    // `e`, a %letrec whose inits and body are already done, with one group of its procedures merged
+    const mergeOne = (e: any[]): any[] => {
         const bindings: [symbol, any][] = e[2];
         const candidates = bindings.map((b, i) => isCandidate(b) ? i : -1).filter(i => i !== -1);
         if (candidates.length < 2) return e;
@@ -86,7 +97,7 @@ export const mergeLoops = (ast: any): any => {
         };
         const edges = candidates.map(i => {
             const body = bodyOf(only(bindings[i][1]));
-            const calls = body.length === 0 ? [] : tailCalls(body[body.length - 1], []);
+            const calls = body.length === 0 ? [] : tailCalls(body[body.length - 1]);
             return [...new Set(calls.map(callee).filter(c => c !== -1))];
         });
         const group = cycles(candidates.length, edges).find(g => g.length <= MAX_MERGED);
@@ -102,13 +113,10 @@ export const mergeLoops = (ast: any): any => {
         const shared = Array.from({ length: Math.max(...clauses.map(c => paramsOf(c).length)) }, (_, i) => Symbol(`p${i}`));
         const callOf = (pos: any, m: number, args: any[]): any[] =>
             [CORE_CALL, pos, merged, ...selectors.map((_, bit) => ((m >> bit) & 1) === 1), ...args, ...Array(shared.length - args.length).fill(undefined)];
-        const redirect = (x: any): any => {
-            if (!Array.isArray(x)) return x;
-            const p = parts(x);
-            const done = p.rebuild(p.exprs.map(([y]) => redirect(y)));
+        const redirect = (x: any): any => mapTree(Lsrc, x, formOrAtom, done => {
             const m = done[0] === CORE_CALL && typeof done[2] === "symbol" ? which.get(done[2]) : undefined;
             return m !== undefined && done.length - 3 === paramsOf(clauses[m]).length ? callOf(done[1], m, done.slice(3)) : done;
-        };
+        }, true);
         // member `m`'s body, its parameters bound to the shared ones
         const bodyAs = (m: number): any[] => [CORE_LET, null, paramsOf(clauses[m]).map((p, i) => [p, shared[i]]), ...bodyOf(clauses[m]).map(redirect)];
         // the members from `from` whose numbers agree on the bits below `bit`, told apart by the bits from it on
@@ -127,14 +135,16 @@ export const mergeLoops = (ast: any): any => {
             if (m === -1) return [[b[0], redirect(b[1])]];
             return m === 0 ? [whole, entry(0)] : [entry(m)];
         });
-        return mergeIn([CORE_LETREC, e[1], next, ...e.slice(3).map(redirect)]);
+        return [CORE_LETREC, e[1], next, ...e.slice(3).map(redirect)];
+    };
+    // (and then the next group, until none is left)
+    const mergeIn = (e: any[]): any[] => {
+        for (;;) {
+            const next = mergeOne(e);
+            if (next === e) return e;
+            e = next;
+        }
     };
 
-    const walk = (e: any): any => {
-        if (!Array.isArray(e)) return e;
-        const p = parts(e);
-        const done = p.rebuild(p.exprs.map(([x]) => walk(x)));
-        return done[0] === CORE_LETREC ? mergeIn(done) : done;
-    };
-    return walk(ast);
+    return mapTree(Lsrc, ast, formOrAtom, done => done[0] === CORE_LETREC ? mergeIn(done) : done, true);
 };

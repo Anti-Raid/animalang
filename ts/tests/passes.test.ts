@@ -5,6 +5,7 @@ import { form, opKinds, runNative } from './helpers';
 import { impl } from '../magicvm/meta';
 import { Lsrc, check, extend, mapExprs, parts, withBounds } from '../magicvm/passes/lang';
 import { Lconv } from '../magicvm/passes/assignments';
+import { AnalysisScope, CompilerScope, RegAlloc, Scope } from '../magicvm/scope';
 
 const S = Symbol.for;
 
@@ -215,5 +216,153 @@ describe("The optimizer", () => {
         const err = (optimize: boolean) => { try { run(`(define (tb-f) (define (bad x) (car x)) (list (bad '()))) (tb-f)`, optimize); } catch (e: any) { return e.animaTraceback; } };
         expect(err(true)).toBe(err(false));
         expect(err(true)).toContain("in bad");
+    });
+});
+
+describe("Register allocation", () => {
+    // the lowest free register, or run of them, among those ever used; new ones past them all
+    class Scan {
+        used: boolean[] = [];
+        alloc(): number { return this.allocBlock(1); }
+        allocBlock(n: number): number {
+            for (let start = 0; n > 0 && start + n <= this.used.length; start++) {
+                if (this.used.slice(start, start + n).every(u => !u) && (start === 0 || n === 1 || this.used[start - 1])) {
+                    this.used.fill(true, start, start + n);
+                    return start;
+                }
+            }
+            const start = this.used.length;
+            for (let i = 0; i < n; i++) this.used.push(true);
+            return start;
+        }
+        free(reg: number) { this.used[reg] = false; }
+        freeBlock(start: number, n: number) { this.used.fill(false, start, start + n); }
+    }
+
+    it("gives the registers a scan for the lowest free ones would", () => {
+        let seed = 12345;
+        const random = (n: number) => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n;
+        for (let round = 0; round < 8; round++) {
+            const regs = new RegAlloc(), scan = new Scan();
+            const held: [number, number][] = [];
+            for (let step = 0; step < 1200; step++) {
+                const op = random(10);
+                if (op < 3) {
+                    const reg = regs.alloc();
+                    expect(reg).toBe(scan.alloc());
+                    expect(regs.isHeld(reg)).toBe(false);
+                    if (op === 0) regs.hold(reg);
+                    expect(regs.isHeld(reg)).toBe(op === 0);
+                    held.push([reg, 1]);
+                } else if (op < 5) {
+                    const n = random(round % 2 === 0 ? 6 : 300);
+                    const start = regs.allocBlock(n);
+                    expect(start).toBe(scan.allocBlock(n));
+                    held.push([start, n]);
+                } else if (held.length > 0) {
+                    const [[start, n]] = held.splice(random(held.length), 1);
+                    if (n === 1 && op < 8) {
+                        regs.free(start);
+                        scan.free(start);
+                    } else {
+                        regs.freeBlock(start, n);
+                        scan.freeBlock(start, n);
+                    }
+                    // (freed again: nothing changes)
+                    if (op === 9 && n > 0) {
+                        regs.free(start);
+                        scan.free(start);
+                    }
+                }
+                expect(regs.total).toBe(scan.used.length);
+            }
+        }
+    });
+});
+
+describe("Scopes", () => {
+    let seed = 99;
+    const random = (n: number) => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n;
+    const names = Array.from({ length: 12 }, (_, i) => Symbol(`v${i}`));
+
+    it("finds a name where a walk out through the scopes would", () => {
+        // (each scope with the scope around it and what it binds)
+        type Plain = { outer: Plain | null, own: Map<symbol, number> };
+        const walk = (from: Plain | null, sym: symbol): number | undefined => {
+            for (let at = from; at !== null; at = at.outer) if (at.own.has(sym)) return at.own.get(sym);
+            return undefined;
+        };
+        // `spread`: how many scopes there are to open one in (few: they nest deep). `once`: each name bound in one scope
+        for (const [spread, once] of [[1, true], [1, false], [3, true], [3, false], [50, false]] as const) {
+            const scopes: [Scope<number>, Plain][] = [[new Scope<number>(), { outer: null, own: new Map() }]];
+            const bound = new Set<symbol>();
+            for (let step = 0; step < 1000; step++) {
+                const [scope, plain] = scopes[Math.max(0, scopes.length - 1 - random(spread))];
+                const sym = once ? Symbol(`s${step}`) : names[random(names.length)];
+                if (random(4) === 0 && !(once && bound.has(sym))) {
+                    scope.set(sym, step);
+                    plain.own.set(sym, step);
+                    bound.add(sym);
+                }
+                scopes.push([new Scope(scope), { outer: plain, own: new Map() }]);
+                const [from, plainFrom] = scopes[random(scopes.length)];
+                for (const name of once ? [...bound].slice(-20) : names) expect(from.get(name)).toBe(walk(plainFrom, name));
+                expect(from.get(Symbol("unbound"))).toBe(undefined);
+            }
+        }
+    });
+
+    it("marks a variable captured when a function lies between its scope and where it is read", () => {
+        for (const far of [false, true]) {
+            const top = new AnalysisScope(null);
+            const [a, b, c] = [Symbol("a"), Symbol("b"), Symbol("c")];
+            top.define(a);
+            let block = new AnalysisScope(top, false);
+            block.define(b);
+            for (let i = 0; far && i < 5000; i++) block = new AnalysisScope(block, false);
+            const lambda = new AnalysisScope(block);
+            lambda.define(c);
+            let inner = new AnalysisScope(lambda, false);
+            for (let i = 0; far && i < 5000; i++) inner = new AnalysisScope(inner, false);
+            expect(block.readVar(a)).toBe(true);
+            expect(top.getVarinfo(a)!.isCaptured).toBe(false);
+            expect(inner.readVar(c)).toBe(true);
+            expect(lambda.getVarinfo(c)!.isCaptured).toBe(false);
+            expect(inner.readVar(b)).toBe(true);
+            expect(inner.getVarinfo(b)!.isCaptured).toBe(true);
+            expect(inner.getVarinfo(b)).toBe(top.variables.get(b));
+            expect(inner.readVar(Symbol("global"))).toBe(false);
+            // (not around `block`: not visible from it)
+            expect(block.getVarinfo(c)).toBe(null);
+            inner.markMutable(a);
+            expect(top.getVarinfo(a)!.mutable).toBe(true);
+            expect(top.getVarinfo(a)!.isCaptured).toBe(true);
+            // a name defined again further in is the one found from there, the first from outside it
+            const again = new AnalysisScope(inner, false);
+            again.define(a);
+            let deep = again;
+            for (let i = 0; far && i < 50; i++) deep = new AnalysisScope(deep, false);
+            expect(deep.getVarinfo(a)).not.toBe(top.getVarinfo(a));
+            expect(deep.getVarinfo(a)).toBe(again.getVarinfo(a));
+            expect(inner.getVarinfo(a)).toBe(top.getVarinfo(a));
+        }
+    });
+
+    it("gives a variable the register of the innermost open block that binds it", () => {
+        const scope = new CompilerScope(null);
+        const [a, b] = [Symbol("a"), Symbol("b")];
+        const local = (sym: symbol) => { const at = scope.resolve(sym); return at.type === "Local" ? at.index : at.type; };
+        const outer = scope.addLocal(a);
+        scope.enterBlock();
+        expect(local(a)).toBe(outer);
+        const hiding = scope.addLocal(a), again = scope.addLocal(a), other = scope.addLocal(b);
+        expect(new Set([outer, hiding, again, other]).size).toBe(4);
+        expect(local(a)).toBe(again);
+        expect(local(b)).toBe(other);
+        scope.exitBlock();
+        expect(local(a)).toBe(outer);
+        expect(local(b)).toBe("Global");
+        // (the block's registers are free again, the lowest first)
+        expect(scope.allocTemp()).toBe(hiding);
     });
 });
