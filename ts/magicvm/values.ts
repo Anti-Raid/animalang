@@ -115,8 +115,9 @@ export class ExecutionContext {
     public epoch: number = 0;
     public wind: WindPoint | null = null;
     public pendingWind: PendingWindTransition | null = null;
-    // the catches of code that is not re-entrant its frames are under, outermost first, two entries each: the handler
-    // list (the EXCEPTION_HANDLERS mark) and the wind it was entered with. Such a catch has no token and sets no mark:
+    // the catches of code that is not re-entrant its frames are under, outermost first, four entries each: the handler
+    // list (the EXCEPTION_HANDLERS mark), the wind it was entered with, its pre-unwind handler (null: none, else the
+    // catch gets a token when an error comes to it) and what that handler is called with before the error. Such a catch has no token and sets no mark:
     // an error is its to take when it is the last here and the handler list where the error was raised is the one it
     // was entered with (a handler installed inside it would be on that list before). `ncatch` entries are in use (the
     // array only grows: setting an array's length is slow)
@@ -291,9 +292,7 @@ export class VMContinuation extends IProcedure {
 export const countControlSuspend = (code: Code): void => {
     // (the VM's own code stays direct: an error in it is placed by the frames it leaves through)
     if (code.internal) return;
-    if (++code.controlSuspends === DIRECT_SUSPEND_LIMIT) {
-        code.direct = false;
-    }
+    if (++code.controlSuspends === DIRECT_SUSPEND_LIMIT) code.leaveDirect();
 };
 
 // an escape-only continuation (call/ec), usable while the frame whose pending call it was made for still holds it
@@ -316,9 +315,10 @@ export class CatchToken extends EscapeContinuation {
     // a pre of #f or <#void> is none (e.g. xpcall with no handler)
     public readonly pre: any;
 
-    constructor(ctxId: number, wind: WindPoint | null, pre: any = null, public readonly guarded: boolean = false, readonly of: CatchToken | null = null) {
+    // `first`: what `pre` is called with before the error, if anything
+    constructor(ctxId: number, wind: WindPoint | null, pre: any = null, public readonly guarded: boolean = false, readonly of: CatchToken | null = null, readonly first: any = MISSING) {
         super(ctxId, wind);
-        this.pre = pre === false || pre === undefined ? null : pre;
+        this.pre = catchPre(pre);
     }
 
     get inPre(): boolean {
@@ -357,6 +357,9 @@ export const catchHere = (e: any, tok: CatchToken, ctx: ExecutionContext): any =
     return handlers instanceof Handlers && handlers.handler === tok ? new Caught(caughtValue(e.error, ctx.vm)) : null;
 };
 
+// a catch's pre-unwind handler: #f or <#void> is none
+export const catchPre = (pre: any): any => pre === false || pre === undefined ? null : pre;
+
 // what the frame of a catch on its context's stack holds for `escape` (see Frame.catchAt)
 export const STACK_CATCH = new EscapeContinuation(0, null);
 
@@ -365,7 +368,7 @@ export const STACK_CATCH = new EscapeContinuation(0, null);
 // It is not the last there when a catch inside it let the exception go on, its frame rebuilt
 export const caughtAt = (e: any, at: number, ctx: ExecutionContext): any => {
     const catches = ctx.catches;
-    if (ctx.ncatch !== at + 2 || ctx.wind !== catches[at + 1]) return null;
+    if (ctx.ncatch !== at + 4 || ctx.wind !== catches[at + 1] || catches[at + 2] !== null) return null;
     let caught;
     if (!(e instanceof Suspend)) {
         if (e instanceof EscapedError || e instanceof InterruptError) return null;
@@ -479,7 +482,7 @@ export class Suspend {
     // for the next frame pushed: the token of the direct-mode %call/ec or %catch it was left through
     pendingEscape: EscapeContinuation | null = null;
     // the same of a catch on the context's stack (where in `catches`, -1: none); and for a raise, the catch there it
-    // goes to, which a direct-mode catch on the way out takes it at (with `escapeVal`)
+    // goes to, which a direct-mode catch on the way out takes it at (with `escapeVal`): see toCatch
     pendingCatch: number = -1;
     catchAt: number = -1;
     // the marks where it was thrown, when that was a tail call (which rebuilds no frame): errors are raised with them
@@ -488,6 +491,19 @@ export class Suspend {
 
     // `control`: suspended for call/cc, invoking a continuation, a yield or a coroutine resume, rather than for depth or an error
     constructor(public readonly action: SuspendAction | null, public readonly error?: any, public readonly control: boolean = false) {}
+
+    // This goes to the catch last on `ctx`'s stack, whose handler list is the one where it was thrown (`marks`), if that
+    // catch takes it as it is: no pre-unwind handler to run first, no dynamic-wind to leave. The direct frames it
+    // leaves through on the way are then not rebuilt (see unwind), and the catch has `caught`
+    toCatch(ctx: ExecutionContext, caught: Caught, marks: Marks, mframe: number): boolean {
+        const n = ctx.ncatch, catches = ctx.catches;
+        if (catches[n - 2] !== null || catches[n - 3] !== ctx.wind) return false;
+        this.catchAt = n - 4;
+        this.escapeVal = caught;
+        this.marks = marks;
+        this.mframe = mframe;
+        return true;
+    }
 
     // the error it carries happened at `pos`, if nothing has said where yet (a tail call into the VM's own code leaves
     // no frame to say)
@@ -525,12 +541,11 @@ export class Suspend {
 
     // raising from direct code: an escape when the innermost handler is a plain catch token (which a direct %catch
     // further out can take), else delivered from heap frames
-    static raise(obj: any, continuable: boolean, marks: Marks, ctx?: ExecutionContext) {
-        const sig = new Suspend((ctx, executor, caller) => executor.raise(ctx, caller, obj, continuable), undefined, true);
+    static raise(obj: any, continuable: boolean, marks: Marks, ctx?: ExecutionContext, mframe: number = 0) {
+        const sig = new Suspend((ctx, executor, caller, sig) => sig.catchAt !== -1 ? executor.raise(ctx, caller, obj, continuable, sig.marks, sig.mframe) : executor.raise(ctx, caller, obj, continuable), undefined, true);
         const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
-        if (ctx !== undefined && ctx.ncatch !== 0 && ctx.catches[ctx.ncatch - 2] === handlers) {
-            sig.catchAt = ctx.ncatch - 2;
-            sig.escapeVal = new Caught(obj);
+        if (ctx !== undefined && ctx.ncatch !== 0 && ctx.catches[ctx.ncatch - 4] === handlers) {
+            sig.toCatch(ctx, new Caught(obj), marks, mframe);
         } else if (handlers instanceof Handlers && handlers.handler instanceof CatchToken && handlers.handler.pre === null) {
             sig.escape = handlers.handler;
             sig.escapeVal = new Caught(obj);
@@ -614,7 +629,8 @@ export const formatTraceback = (frames: FrameInfo[], msg: string | undefined, fm
     [fmt(Msg.TracebackHeader, [msg], fmt, null), ...frames.map(f => fmt(Msg.TracebackFrame, [f.name, f.pos, f.tails], fmt, f.pos))].join("\n");
 
 // What a direct entry's catch does with `e`, thrown out of `closure`'s code: the Suspend to throw on (a stop leaves as
-// it is: no frame needs rebuilding, and no handler may see it). `regs` are the registers a heap frame resuming at `rip`
+// it is: no frame needs rebuilding, and no handler may see it; one on its way to a catch that takes it as it is, see
+// Suspend.toCatch, does not come here at all). `regs` are the registers a heap frame resuming at `rip`
 // reads, or null when it was leaving by a tail call (`rip` -1; `tip`: that call's ip, or -1), which rebuilds no frame.
 // `dip`, `derr`: the ip an error was noted at, and that error (debug code notes the ip of everything it runs)
 export const unwind = (e: any, closure: Closure, regs: any[] | null, rip: number, tip: number, dip: number, derr: any, isite: number, ctx: ExecutionContext, marks: Marks, mframe: number): Suspend => {
@@ -624,6 +640,9 @@ export const unwind = (e: any, closure: Closure, regs: any[] | null, rip: number
     const code = closure.tmpl.code;
     // the error it carries, which may have come through the VM's own code without getting a position
     const err = e instanceof Suspend ? e.error : e;
+    // whether this is where it is settled if a catch takes the error as it is (see toPlainCatch): where the error is
+    // made a Suspend, or, for one of the VM's own code, where it gets its position
+    const settles = sig !== e || (sig.action === null && err instanceof VMError && err.at === null);
     if (regs === null) {
         // a tail call that failed, or whose callee did: no frame is left to say where it was
         if (tip !== -1 && err instanceof VMError && err.at === null) err.at = code.positionAt(tip);
@@ -631,6 +650,7 @@ export const unwind = (e: any, closure: Closure, regs: any[] | null, rip: number
             sig.marks = marks;
             sig.mframe = mframe;
         }
+        if (settles) toPlainCatch(sig, ctx);
         return sig;
     }
     const f = new Frame(closure, regs, rip, null, ctx, marks, mframe);
@@ -638,13 +658,29 @@ export const unwind = (e: any, closure: Closure, regs: any[] | null, rip: number
     f.isite = isite;
     if (err instanceof VMError && err.at === null) err.at = errorPos(f);
     sig.push(f);
+    if (settles) toPlainCatch(sig, ctx);
     return sig;
+};
+
+// Suspend.toCatch for `sig`, which carries an error: if it knows where it happened (one of the VM's own code gets that
+// from the first frame that is not the VM's own) and the innermost handler where it was thrown is the catch last on
+// the context's stack
+const toPlainCatch = (sig: Suspend, ctx: ExecutionContext): void => {
+    const err = sig.error;
+    if (ctx.ncatch === 0 || err instanceof EscapedError || (err instanceof VMError && err.at === null)) return;
+    const from = sig.marks !== undefined ? null : sig.innermost;
+    const marks = from !== null ? from.marks : sig.marks!, mframe = from !== null ? from.mframe : sig.mframe;
+    if (ctx.catches[ctx.ncatch - 4] === markFirst(marks, EXCEPTION_HANDLERS, null)) sig.toCatch(ctx, new Caught(caughtValue(err, ctx.vm)), marks, mframe);
 };
 
 // where an error in `frame` happened
 export const errorPos = (frame: Frame | null): SourcePos | null => {
     for (let f = frame; f !== null; f = f.parent) {
-        if (!f.code.internal) return f.code.frameAt(f.isite, Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)).pos;
+        if (f.code.internal) continue;
+        // (a frame waiting in a catch of its own, reached through the VM's own code alone: the error is caught there,
+        // not one that leaves through it)
+        if (f !== frame && f.catchAt !== -1) return null;
+        return f.code.frameAt(f.isite, Math.max((f.posIp !== -1 ? f.posIp : f.ip) - 1, 0)).pos;
     }
     return null;
 };

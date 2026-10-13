@@ -159,7 +159,7 @@ export const method = (strings: LuaTable, obj: any, name: string): any => {
 export type LuauIterators = { next: unknown, pairsNext: unknown, inext: unknown };
 // what of the library the operators use: those, the string library (a string is indexed through it), and where print
 // writes a line
-export type LuauLibrary = LuauIterators & { readonly string: LuaTable, readonly print: (line: string) => void };
+export type LuauLibrary = LuauIterators & { readonly string: LuaTable, readonly print: (line: string) => void, pcall: unknown, xpcall: unknown, handler: unknown, error: unknown };
 
 // luaB_tonumber
 const tonumberOf = (a: Args): number | undefined => {
@@ -366,11 +366,38 @@ export const registerLuauOps = (table: Intrinsics, library: LuauLibrary): void =
         const e = regs[s] instanceof ErrorObject ? regs[s].error : regs[s];
         return e instanceof Error ? e.message : e;
     }, { args: [1, 1], leaf: true, oneValue: true });
+    // imports (see lower.ts): what the chunk reads as it starts, and a field of a global read then, nil if anything on
+    // the way is nil or fails (luaV_getimport, with propagatenil)
+    table.register("%luau-imports", (regs, s, n) => regs.slice(s, s + n), { args: [0, Infinity], leaf: true, oneValue: true, fresh: true });
+    table.register("%luau-import-chain", (regs, s, n) => {
+        let v = regs[s];
+        try {
+            for (let i = 1; i < n && v !== undefined; i++) v = index(strings, v, regs[s + i]);
+        } catch {
+            return undefined;
+        }
+        return v;
+    }, { args: [2, 3], leaf: true, oneValue: true });
+    // the library's pcall or xpcall, whatever the global is, and what makes xpcall's handler the catch's (see lower.ts)
+    table.register("%luau-library", (regs, s) => library[regs[s] as "pcall" | "xpcall" | "handler"], {
+        args: [1, 1], leaf: true, effectFree: true, oneValue: true, inline: ([name], _slow, _tmp, d) => `${d.library}[${name}]`, deps: { library },
+    });
+    // error written out where it is called (see lower.ts): whether a value is the library's error, and what error
+    // raises for a value at level 1, where the call is (a string or a number after where that is, anything else itself)
+    table.register("%luau-error?", (regs, s) => regs[s] === library.error, {
+        args: [1, 1], leaf: true, effectFree: true, returns: "boolean", inline: ([v], _slow, _tmp, d) => `(${v} === ${d.library}.error)`, deps: { library },
+    });
+    table.register("%luau-error-here", (regs, s) => typeof regs[s] === "string" ? regs[s + 1] + regs[s] : typeof regs[s] === "number" ? regs[s + 1] + num2str(regs[s]) : regs[s], {
+        args: [2, 2], leaf: true, effectFree: true, oneValue: true,
+    });
     // xpcall (luaB_xpcally): its handler is a function; what it calls the function with; and what its handler gave
     // for the error, "error in error handling" if the handler failed itself
     table.register("%luau-xpcall-check", (regs, s) => {
         if (!(regs[s][1] instanceof IProcedure)) throw argError(regs[s], 2, "xpcall", "function");
     }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-xpcall-handler", (regs, s) => {
+        if (!(regs[s] instanceof IProcedure)) throw argError([undefined, regs[s]], 2, "xpcall", "function");
+    }, { args: [1, 1], leaf: true, oneValue: true, inline: ([h], slow, _tmp, d) => `(${h} instanceof ${d.IProcedure} ? undefined : ${slow})`, deps: { IProcedure } });
     table.register("%luau-xpcall-args", (regs, s) => regs[s].slice(2), { args: [1, 1], leaf: true, oneValue: true, fresh: true, effectFree: true });
     table.register("%luau-xpcall-caught", (regs, s) => {
         const v = regs[s];

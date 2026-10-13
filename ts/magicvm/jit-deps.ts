@@ -19,6 +19,7 @@ import {
     WindPoint,
     catchHere,
     caughtAt,
+    catchPre,
     countControlSuspend,
     frameInfos,
     oneValue,
@@ -77,6 +78,7 @@ export const JIT_DEPS = {
     Caught,
     catchHere,
     caughtAt,
+    catchPre,
     markFirst,
     EXCEPTION_HANDLERS,
 };

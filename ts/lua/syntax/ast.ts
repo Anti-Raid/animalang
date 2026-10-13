@@ -131,4 +131,8 @@ export type ParseResult = {
     lineCount: number,
     hotComments: HotComment[],
     comments: Comment[],
+    // the globals the chunk assigns somewhere (`g = v`, `g += v`, `function g()`), and its index expressions written
+    // `e[k]`, not `e.k`: what Luau's compiler goes by to read a global, or a field of one, when the chunk is loaded
+    written: ReadonlySet<string>,
+    bracketed: WeakSet<object>,
 };

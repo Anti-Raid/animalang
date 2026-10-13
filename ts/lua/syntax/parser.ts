@@ -98,6 +98,12 @@ class Parser {
     readonly #errors: C.ParseError[] = [];
     readonly #comments: C.Comment[] = [];
     readonly #hotComments: C.HotComment[] = [];
+    // the globals the chunk assigns, and its index expressions written with brackets (see ParseResult)
+    readonly #written = new Set<string>();
+    readonly #bracketed = new WeakSet<object>();
+    #assigned(target: C.Expr): void {
+        if (isHead(target, L.GLOBAL)) this.#written.add((target as C.Global)[1]);
+    }
     readonly #locals = new Map<string, C.Local>();
     readonly #localStack: C.Local[] = [];
     readonly #localNames: string[] = [];
@@ -144,6 +150,8 @@ class Parser {
             lines,
             lineCount: lines.line(this.#lexer.to) + (this.source.length > 0 && !this.source.endsWith("\n") ? 1 : 0),
             hotComments: this.#hotComments,
+            written: this.#written,
+            bracketed: this.#bracketed,
             comments: this.#comments,
         };
     }
@@ -602,6 +610,7 @@ class Parser {
         this.#stop(Tok.End, 1);
         const func = this.#parseFunctionBody(hasSelf, matchFunction, debugName, null, attributes, false).func;
         this.#stop(Tok.End, -1);
+        this.#assigned(expr);
         return [L.ASSIGN, [expr], [func], start];
     }
 
@@ -770,6 +779,7 @@ class Parser {
         this.#expectAndConsume(Tok.Assign, "assignment");
         const values: C.Expr[] = [];
         this.#parseExprList(values);
+        for (const v of vars) this.#assigned(v);
         return [L.ASSIGN, vars, values, start];
     }
 
@@ -779,6 +789,7 @@ class Parser {
         const target = this.#isLValue(initial) ? initial : this.#lvalueError(initial);
         this.#take();
         const value = this.#parseExpr();
+        this.#assigned(target);
         return [L.OPSET, op, target, value, start];
     }
 
@@ -1329,7 +1340,9 @@ class Parser {
         const index = this.#parseExpr();
         const end = this.#lexer.to;
         this.#expectMatchAndConsume(Tok.RBracket, matchBracket, false);
-        return this.#expr([L.INDEX, expr, index, start], start, end);
+        const indexed = this.#expr([L.INDEX, expr, index, start], start, end);
+        this.#bracketed.add(indexed);
+        return indexed;
     }
 
     #parseMethodCall(start: number, expr: C.Expr): C.Expr {

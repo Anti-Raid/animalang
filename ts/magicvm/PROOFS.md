@@ -481,9 +481,9 @@ A call of a closure from direct code is a JavaScript call of the closure's direc
 
 ### 8.2 The site
 
-Each call site $S$ with $nargs$ arguments has a cache $CC = (tmpl, fn)$, initially `(NO_TEMPLATE, null)`, where `NO_TEMPLATE` is the template of no closure and `NO_TEMPLATE.code.direct` is false. The site is
+Each call site $S$ with $nargs$ arguments has a cache $CC = (tmpl, fn)$, initially `(NO_TEMPLATE, null)`, where `NO_TEMPLATE` is the template of no closure. The site is
 
-1. if $proc?.tmpl \equiv CC.tmpl \wedge CC.tmpl.code.direct \wedge depth < MAX\_JS\_DEPTH$: call $CC.fn(ctx, proc, executor, depth + 1, \dots, args)$;
+1. if $proc?.tmpl \equiv CC.tmpl \wedge depth < MAX\_JS\_DEPTH$: call $CC.fn(ctx, proc, executor, depth + 1, \dots, args)$;
 2. else, with $callee$ the clause `proc.select(nargs)` if $proc$ is a `CaseLambda` and $proc$ otherwise, and $fn = $ `executor.entry(callee, CC, nargs, depth)`: call $fn(ctx, callee, \dots, args)$ if $fn \ne$ `null`, else `executor.callArray(ctx, callee, [args], ...)`.
 
 A call of the running closure itself with its own parameter count is tested first and calls `direct$`, as before.
@@ -493,9 +493,9 @@ A call of the running closure itself with its own parameter count is tested firs
 **Theorem 10.** *Branch 1 calls what branch 2 would.*
 
 *Proof.*
-1. **The template identifies a closure.** $CC.tmpl$ is `NO_TEMPLATE` or a template `executor.entry` stored, which it stores only from a value whose constructor is `Closure`. `NO_TEMPLATE.code.direct` is false, so branch 1 is not taken on an empty cache. A `ClosureTemplate` is the value of a `tmpl` property only on `Closure` objects (no other VM object has one, and the VM hands templates to no front end or host value), and $proc?.tmpl$ is `undefined` for `null`, `undefined` and primitives. So in branch 1 $proc$ is a `Closure` with $proc.tmpl \equiv CC.tmpl$, and is its own $callee$.
-2. **The entry is the one for this call.** $CC.fn$ was `CC.tmpl.code.entry(nargs)` for this site's $nargs$, which is fixed. `Code.entry` depends only on the code's arity (immutable), its direct entry (immutable once compiled), `nargs`, and `code.direct`; the rest entries it makes are kept per count. So while `code.direct` holds, `executor.entry(proc, CC, nargs, depth)` returns that same function, given $depth < MAX\_JS\_DEPTH$, which branch 1 also tests.
-3. **Demotion.** `countControlSuspend` clears `code.direct`. Branch 1 tests it, so a demoted code's cached entry is never called; branch 2's `executor.entry` then returns `null` and `callArray` throws `Suspend.invoke`, the heap call. Without the test, a cached site would keep entering code whose direct calls keep suspending, paying a JavaScript exception unwind each time. □
+1. **The template identifies a closure.** $CC.tmpl$ is `NO_TEMPLATE` or a template `executor.entry` stored, which it stores only from a value whose constructor is `Closure`. `NO_TEMPLATE` is the `tmpl` of no value, so branch 1 is not taken on an empty cache. A `ClosureTemplate` is the value of a `tmpl` property only on `Closure` objects (no other VM object has one, and the VM hands templates to no front end or host value), and $proc?.tmpl$ is `undefined` for `null`, `undefined` and primitives. So in branch 1 $proc$ is a `Closure` with $proc.tmpl \equiv CC.tmpl$, and is its own $callee$.
+2. **The entry is the one for this call.** $CC.fn$ was `CC.tmpl.code.entry(nargs)` for this site's $nargs$, which is fixed. `Code.entry` depends only on the code's arity (immutable), its direct entry (immutable once compiled), `nargs`, and `code.direct`; the rest entries it makes are kept per count. So while `code.direct` holds, `executor.entry(proc, CC, nargs, depth)` returns that same function, given $depth < MAX\_JS\_DEPTH$, which branch 1 tests; and `code.direct` holds for every template a cache keeps, by 3.
+3. **Demotion.** `code.direct` is cleared in one place, `Code.leaveDirect` (which `countControlSuspend` calls), and never set again. Every cache that keeps a template of the code was given it by `Code.keep`, which records the cache; `leaveDirect` puts `(NO_TEMPLATE, null)` back in each of those slots before it returns, and `Code.entry` gives `executor.entry` nothing to keep from then on. So a demoted code's entry is in no cache: branch 1 is not taken for it, branch 2's `executor.entry` returns `null` and `callArray` throws `Suspend.invoke`, the heap call. (The site once tested `CC.tmpl.code.direct` itself; that was two loads and a branch on every call, 12 to 17% of a call-heavy loop.) □
 
 ### 8.4 Calls that want one value
 

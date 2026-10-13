@@ -42,3 +42,29 @@ export const comparer = (luau: Anima) => (programs: string[]): string[] => {
     const expected = theirs(programs);
     return programs.flatMap((p, i) => { const a = ours(p); return a === expected[i] ? [] : [`${p}\n--- ours:   ${a}\n--- Luau's: ${expected[i]}`]; });
 };
+
+// The same for programs of several chunks that share their globals, each chunk loaded and run after the one before
+// (a program in an instance of its own; Luau runs them all in one state, so a program's first chunk is to reset the
+// globals it uses): the programs whose chunks give something else here than in Luau, each with both results
+export const chunkComparer = (make: () => Anima) => (programs: string[][]): string[] => {
+    const lua = [
+        ...header,
+        "local function chunk(src) local f, err = loadstring(src, '=c') if not f then return 'error: ' .. esc(err) end local r = table.pack(pcall(f)) if not r[1] then return 'error: ' .. esc(tostring(r[2])) end local out = {} for i = 2, r.n do out[#out + 1] = shown(r[i]) end return table.concat(out, ' ') end",
+        ...programs.map(chunks => `print(${chunks.map(c => `chunk(${JSON.stringify(c)})`).join(" .. ' | ' .. ")})`),
+    ];
+    const file = join(mkdtempSync(join(tmpdir(), "luau-")), "chunks.luau");
+    writeFileSync(file, lua.join("\n"));
+    const expected = execFileSync(process.env.LUAU!, [file], { encoding: "utf8", maxBuffer: 1 << 26, timeout: 60000 }).split("\n");
+    return programs.flatMap((chunks, i) => {
+        const luau = make();
+        const ours = chunks.map(c => {
+            try {
+                const r = luau.evaluateRaw(luau.compileRaw(c, "c"));
+                return (r instanceof MultipleValues ? r.values : [r]).map(show).join(" ");
+            } catch (e: any) {
+                return "error: " + escaped(String(e.message));
+            }
+        }).join(" | ");
+        return ours === expected[i] ? [] : [`${chunks.join("\n-- then:\n")}\n--- ours:   ${ours}\n--- Luau's: ${expected[i]}`];
+    });
+};

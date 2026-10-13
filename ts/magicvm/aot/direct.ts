@@ -153,7 +153,9 @@ export class DirectEmitter extends FunctionEmitter {
         `);
         this.emit(`
                 } catch (e) {
+                    // (the loop first: without it V8 takes twice as long over a caught error, measured)
                     for (ic = 16; ic > 0; ic--);
+                    if (e.catchAt >= 0) throw e;
                     throw unwind(e, closure, rip === -1 ? null : [${allRegs}], rip, tip, dip, ${this.debug ? "undefined" : "derr"}, ${this.#hasSites ? "isite" : "-1"}, ctx, marks, mframe);
                 }
             }
@@ -323,7 +325,8 @@ export class DirectEmitter extends FunctionEmitter {
     // a call of `proc` (in scope), leaving its value in acc, or returning it for a tail call. `args` are the argument
     // expressions, or null for the array `args` (in scope). `want`: how many values the call wants (a tail call wants what
     // this entry's calls do). Expressions go to this entry itself for the running closure, else to the entry the site's cache
-    // keeps for the callee's template, else to the one the executor finds, else as executor.callArray does
+    // keeps for the callee's template (which is one of code that runs directly: see Code.leaveDirect), else to the one
+    // the executor finds, else as executor.callArray does
     #call({ args, tail, site, want = 0, marks = "marks" }: { args: string[] | null, tail: boolean, site?: number, want?: number, marks?: string }): string {
         if (tail) want = this.#want;
         const use = tail ? "return" : "acc =";
@@ -339,13 +342,13 @@ export class DirectEmitter extends FunctionEmitter {
             ${tail ? `rip = -1;${site !== undefined ? ` tip = ${site};` : ""}` : ""}
             ${!tail && args.length === this.#selfArity && want === this.#want ? `if (proc === closure && depth < MAX_JS_DEPTH) {
                 acc = direct$(ctx, proc, ${rest});
-            } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.t0 && ${cache}.t0.code.direct && depth < MAX_JS_DEPTH) {
+            } else ` : ""}${cache !== null ? `if (proc?.tmpl === ${cache}.t0 && depth < MAX_JS_DEPTH) {
                 ${use} ${cache}.f0(ctx, proc, ${rest});
-            } else if (proc?.tmpl === ${cache}.t1 && ${cache}.t1.code.direct && depth < MAX_JS_DEPTH) {
+            } else if (proc?.tmpl === ${cache}.t1 && depth < MAX_JS_DEPTH) {
                 ${use} ${cache}.f1(ctx, proc, ${rest});
-            } else if (proc?.tmpl === ${cache}.t2 && ${cache}.t2.code.direct && depth < MAX_JS_DEPTH) {
+            } else if (proc?.tmpl === ${cache}.t2 && depth < MAX_JS_DEPTH) {
                 ${use} ${cache}.f2(ctx, proc, ${rest});
-            } else if (proc?.tmpl === ${cache}.t3 && ${cache}.t3.code.direct && depth < MAX_JS_DEPTH) {
+            } else if (proc?.tmpl === ${cache}.t3 && depth < MAX_JS_DEPTH) {
                 ${use} ${cache}.f3(ctx, proc, ${rest});
             } else ` : ""}{
                 const callee = proc?.constructor === CaseLambda ? proc.select(${args.length}) : proc;
@@ -377,14 +380,14 @@ export class DirectEmitter extends FunctionEmitter {
                 if (control !== undefined) {
                     const site = { args: this.#args(term), isTail: term.isTail, resume: term.resume, loopCount: this.structure.endLoops.has(term.resume), reentrant: this.reentrant, deeper: this.#deeper };
                     return this.emit(`
-                        ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}${term.isTail ? ` tip = ${term.resume};` : ""}
-                        ${control.direct(site, this.#call({ args: null, tail: term.isTail }), (args, marks) => this.#call({ args, tail: false, marks }))}
+                        ${control.setsResume ? "" : `rip = ${term.isTail ? -1 : term.resume};`}${term.isTail ? ` tip = ${term.resume - 1};` : ""}
+                        ${control.direct(site, this.#call({ args: null, tail: term.isTail }), (args, marks) => this.#call({ args, tail: false, marks, site: term.at }))}
                         ${term.isTail ? "" : this.#afterCall(term.resume, next)}
                     `);
                 }
                 return this.emit(`
                     {
-                        rip = ${term.isTail ? `-1; tip = ${term.resume}` : term.resume};
+                        rip = ${term.isTail ? `-1; tip = ${term.resume - 1}` : term.resume};
                         const res = ${this.intrinsicCall(term.pos, term.start, term.nargs)};
                         if (${this.isRequest("res", "HostTail")}) {
                             ${term.isTail ? this.tailMark("res") : ""}

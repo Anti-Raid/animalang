@@ -20,6 +20,18 @@ literals, interpolated strings, if-expressions, and the operators (arithmetic, `
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
   (`undefined`) as its `unbound` value, so an unassigned global reads as nil.
+- **Imports** (Luau's `GETIMPORT`): a global the chunk assigns nowhere (`g = v`, `g += v`, `function g()`; the parser
+  lists them, `ParseResult.written`), and a field of one written `a.b` or `a.b.c` (not `a["b"]`:
+  `ParseResult.bracketed`), is read once when the chunk starts, with the others, into an array the chunk's functions
+  share (`%luau-imports`; a field through `%luau-import-chain`, which gives nil if anything on the way is nil or fails).
+  Where it is used, what was read then is its value, however the global or the field has changed since; one that was
+  nil then is read where it is used, each time, as any other global is. So a chunk goes on calling the function a
+  global named when it started, and reads a table's field as it was then (`t.x = 2 return t.x` gives the old value
+  when another chunk made `t`), exactly as in Luau, where code that changes what it reads this way assigns the global
+  itself, or reads it through a local or with brackets. Two differences: a chunk starts when it is run
+  (`evaluateRaw`), there being no `loadstring` to load one without running it; and Luau calls some builtins without
+  reading their global at all when their arguments are of the usual types (`FASTCALL`), so replacing one of those
+  globals is not seen there even by a chunk loaded afterwards, while here it is.
 - Operators are intrinsics (`%luau-add` ... `%luau-unm`, `%luau-concat`) doing what Luau's VM does: numbers, strings
   that read as numbers (coerced as `tonumber` reads them), vectors as `lvmutils.cpp` allows, integers with integers,
   and Luau's errors otherwise (`attempt to perform arithmetic (add) on nil and number`, `attempt to concatenate
@@ -115,6 +127,16 @@ literals, interpolated strings, if-expressions, and the operators (arithmetic, `
   value, the value is raised as it is. A level further up reads the position from the stack (`%current-stack`), which
   differs from Luau's in two ways: a call in tail position leaves no frame here (Luau makes no tail calls), and the
   library's functions are not levels (Luau counts `pcall`, and gives no position at it).
+- **Written out where they are called**: `pcall(f, ...)` and `xpcall(f, handler, ...)` of the global, in a chunk that
+  does not assign it, are not calls of the library's function: the lowering writes the call of `f` under the catch
+  (`%catch-call`, `%catch-call/pre`: no arguments in an array, the call through its own site's cache, and no multiple
+  values made where the call's values are bound, `local ok, v = pcall(...)`). xpcall's handler is given to the catch
+  as it is, with a procedure of the library's that calls it (`%luau-library`), so nothing is allocated for a call that
+  raises no error. Luau's compiler does the same (its fast
+  pcall instruction), so there too such a call is the library's whatever the global has become. `error(v)`,
+  `error(v, 0)` and `error(v, 1)` are written out when the `error` the chunk read is the library's: the value is
+  raised from the call itself, a string or a number after `file:line: ` of the call, known when compiling; no error
+  object is made. A call whose last argument may give several values calls the library's function, as before.
 - `type`, `select`, `assert` and `setmetatable` are `luaB_type`, `luaB_select`, `luaB_assert` and `luaB_setmetatable`:
   their argument errors are Luau's, `assert` raises its message (a string or a number, else an argument error) as
   the library's own errors are raised, and `setmetatable` refuses a table whose metatable has a `__metatable` field
@@ -145,8 +167,6 @@ Where it differs from Luau's compiler, in the sizes a table starts with only:
 - Luau predicts a hash slot for `t.name = v` but not for `t["name"] = v`; the tree does not tell them apart, so both
   count here.
 
-Luau also resolves `a.b.c` on a global its chunk never assigns when the chunk is loaded (`GETIMPORT`); here it is read
-when it runs.
 
 ## Tables
 `LuaTable` is Luau's table, ported from Luau's `VM/src/ltable.cpp`, so that what a program can see of a table is Luau's:

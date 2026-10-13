@@ -7,7 +7,7 @@ import { createLuau, toString } from '../lua';
 import { impl } from '../magicvm/meta';
 import { MultipleValues } from '../common';
 import { listing } from '../magicvm/exec';
-import { comparer } from './luau-compare';
+import { chunkComparer, comparer } from './luau-compare';
 
 const luau = createLuau(impl);
 
@@ -246,6 +246,48 @@ describe("Luau lowered functions", () => {
 });
 
 describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
+    it("reads a global its chunk does not assign when the chunk starts, as Luau does", () => {
+        let seed = 91;
+        const rand = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };
+        const pick = <T,>(xs: readonly T[]): T => xs[rand(xs.length)];
+        const g = () => pick(["g1", "g2", "g3"]), t = () => pick(["t1", "t2"]), r = () => pick(["r1", "r2", "r3"]);
+        const value = () => pick(["1", "2", "'s'", "nil", "true", `{ x = ${rand(9)}, y = { z = ${rand(9)} } }`, "function() return 'fn' end"]);
+        const note = (e: string) => `out = out .. tostring(select(2, pcall(function() local v = ${e} return type(v) == 'table' and 'table' or type(v) == 'function' and 'function' or v end))) .. ' '`;
+        const read = () => pick([g(), `${t()}.x`, `${t()}.y`, `${t()}.y.z`, `${t()}['x']`, `${g()}.x`, `${r()}()`, `${t()}.y.z == nil`, `#tostring(${g()})`]);
+        const stmt = (): string => {
+            switch (rand(12)) {
+                case 0: case 1: return `${g()} = ${value()}`;
+                case 2: return `${t()} = { x = ${rand(9)}, y = { z = ${rand(9)} } }`;
+                case 3: return `${t()}.x = ${rand(9)}`;
+                case 4: return `${t()}.y.z = ${rand(9)}`;
+                case 5: return `${t()}.y = { z = ${rand(9)} }`;
+                case 6: return `function ${r()}() return ${read()} end`;
+                case 7: return `local l = ${t()} l.x = ${rand(9)}`;
+                case 8: return `${g()} ${pick(["+=", "..="])} 1`;
+                default: return note(read());
+            }
+        };
+        const chunk = () => `local out = '' ${Array.from({ length: 1 + rand(6) }, stmt).join(" ")} return out`;
+        const programs = [
+            ["g1 = 'old'", "function r1() return g1 end return r1()", "g1 = 'new'", "return r1()"],
+            ["function r1() return g2 end return r1()", "g2 = 'now'", "return r1()"],
+            ["t1 = { x = 1 }", "t1.x = 2 return t1.x, t1['x']", "return t1.x"],
+            ["t1 = { y = { z = 1 } }", "t1.y.z = 2 return t1.y.z, t1.y", "return t1.y.z"],
+            // (no builtin is replaced: Luau also calls some of them without reading the global at all, see the README)
+            ["g1 = 1", "function r1() g1 += 1 end function r2() return g1 end r1() return r2()", "g1 = 100 return r2()"],
+            ["g1 = 'at load'", "function r1() return function() return g1 end end", "g1 = 'later' return r1()()"],
+            // a call of pcall written `pcall(...)` is the library's whatever the global is by then (Luau's fast pcall
+            // instruction); read as a value, the global is an import as any other
+            ["function r1() return pcall(tostring, 1) end return r1()", "pcall = function() return 'replaced' end", "local p = pcall return r1(), pcall(tostring, 2), p(tostring, 3)", "pcall = nil"],
+            ["function r1() return (xpcall(tostring, tostring, 1)) end return r1()", "xpcall = function() return 'replaced' end", "local x = xpcall return r1(), (xpcall(tostring, tostring, 2)), x(tostring, tostring, 3)", "xpcall = nil"],
+            // error has no instruction of its own: the global as it was when the chunk started is what is called
+            ["function r1() return pcall(function() error('first') end) end return r1()", "error = function(v) return 'replaced:' .. tostring(v) end", "return error('x'), pcall(error, 'y'), r1()", "error = nil"],
+            ...Array.from({ length: 600 }, () => ["g1, g2, g3, t1, t2, r1, r2, r3 = nil, nil, nil, nil, nil, nil, nil, nil", ...Array.from({ length: 2 + rand(4) }, chunk)]),
+        ];
+        expect(new Set(programs.map(p => p.join("|"))).size).toBeGreaterThan(550);
+        expect(chunkComparer(() => createLuau(impl))(programs).slice(0, 4)).toEqual([]);
+    }, 120000);
+
     it("declares a local, then assigns it, as Luau does", () => {
         let seed = 17;
         const rand = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };

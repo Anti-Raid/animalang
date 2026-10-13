@@ -375,9 +375,12 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     generated("%call/cc", [1, 1]);
     generated("%call/ec", [1, 1], false);
     // (%call-catching thunk [pre [guarded]]): what %catch compiles to. (%apply-catching proc array [pre [guarded]]) calls
-    // proc with the array's elements instead (the array is the call's own from then on)
+    // proc with the array's elements instead (the array is the call's own from then on), (%catch-call proc arg ...) with
+    // the arguments, (%catch-call/pre pre with proc arg ...) the same with a pre-unwind handler (guarded), which is called with `with` and the error
     generated("%call-catching", [1, 3], false);
     generated("%apply-catching", [2, 4], false);
+    generated("%catch-call", [1, Infinity], false);
+    generated("%catch-call/pre", [3, Infinity], false);
     generated("%coroutine-yield", [0, Infinity], false);
     generated("%coroutine-resume", [1, Infinity]);
     generated("%coroutine-resume-array", [2, 2]);
@@ -401,6 +404,11 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     generated("%apply-array", [2, Infinity]);
     generated("%apply-fresh", [2, 2]);
     control("%host-then", [2, 2], (regs, start) => regs[start](regs[start + 1]));
+    // an array's element; whether a value is <#void>; and (%array-ref-or array index otherwise): the element unless it
+    // is <#void>, else `otherwise`, which is evaluated only then (the compiler writes it as an %if of the other two)
+    core("%array-ref", [2, 2], (regs, start) => regs[start][regs[start + 1]], { effectFree: true, inline: (args) => args.length === 2 ? `${args[0]}[${args[1]}]` : null });
+    core("%nothing?", [1, 1], (regs, start) => regs[start] === undefined, { effectFree: true, returns: "boolean", inline: unaryInline(v => `(${v} === undefined)`) });
+    core("%array-ref-or", [3, 3], (regs, start) => regs[start][regs[start + 1]] === undefined ? regs[start + 2] : regs[start][regs[start + 1]]);
     return table.freeze();
 })();
 

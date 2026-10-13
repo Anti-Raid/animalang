@@ -9,7 +9,7 @@ import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
 import type { CallCache, DirectFn } from "./code";
 import type { VMHost } from "./code";
 import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, helperClosure, tracebackMessage } from "./coreops";
-import { Aborted, CatchToken, STACK_CATCH, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
+import { Aborted, CatchToken, MISSING, STACK_CATCH, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
 
 // Frames the VM puts under a handler it calls: `handlerReturned` raises the secondary error when the handler of a
 // non-continuable raise returns (its marks hold the outer handlers); `escapeWith` escapes to the catch token in its
@@ -234,19 +234,7 @@ export class VMExecutor {
         const code: Code = proc.tmpl.code;
         if (want !== 0 && code.direct && code.wanted[want] === undefined) AotCompiler.compileWant(code, proc.tmpl, want);
         const fn = code.entry(nargs, want);
-        if (fn !== null && cache !== null) {
-            // (the empty slot's template is one whose code does not run directly)
-            const tmpl = proc.tmpl;
-            if (cache.t0 === tmpl || !cache.t0.code.direct) {
-                cache.t0 = tmpl; cache.f0 = fn;
-            } else if (cache.t1 === tmpl || !cache.t1.code.direct) {
-                cache.t1 = tmpl; cache.f1 = fn;
-            } else if (cache.t2 === tmpl || !cache.t2.code.direct) {
-                cache.t2 = tmpl; cache.f2 = fn;
-            } else if (cache.t3 === tmpl || !cache.t3.code.direct) {
-                cache.t3 = tmpl; cache.f3 = fn;
-            }
-        }
+        if (fn !== null && cache !== null) code.keep(cache, proc.tmpl, fn);
         return fn;
     }
 
@@ -383,7 +371,8 @@ export class VMExecutor {
     // direct code's %call/ec or %catch, as an exception it does not take leaves it: the frame rebuilt for it holds the
     // token, and a call not yet made is made with `marks`
     public pushEscape(e: any, tok: EscapeContinuation, marks: Marks, mframe: number): any {
-        if (e instanceof Suspend) {
+        // (one on its way to a catch on the context's stack rebuilds no frame: see Suspend.toCatch)
+        if (e instanceof Suspend && e.catchAt === -1) {
             if (e.innermost === null && e.marks === undefined) {
                 e.marks = marks;
                 e.mframe = mframe + 1;
@@ -415,6 +404,13 @@ export class VMExecutor {
         return e;
     }
 
+    // the same of one with a pre-unwind handler, as pushToken is of a token with one
+    public pushCatchPre(e: any, at: number, marks: Marks, mframe: number): any {
+        if (e instanceof Suspend && e.error instanceof VMError && e.error.at === null) this.vm.message(e.error);
+        const sig = e instanceof Suspend || e instanceof EscapedError || e instanceof InterruptError ? e : Suspend.error(caughtValue(e, this.vm));
+        return this.pushCatch(sig, at, marks, mframe);
+    }
+
     // calls `proc` with a new escape continuation, which `frame` holds until it resumes
     public callEscape(ctx: ExecutionContext, proc: any, frame: Frame): Frame | null {
         const tok = frame.escape = new EscapeContinuation(ctx.id, ctx.wind);
@@ -422,29 +418,34 @@ export class VMExecutor {
     }
 
     // calls `proc` with a new catch token as the innermost exception handler; its value, or a Caught, is returned to `frame`
-    public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, pre: any, guarded: boolean, args: any[] = []): Frame | null {
-        const tok = frame.escape = new CatchToken(ctx.id, ctx.wind, pre, guarded);
+    public callCatch(ctx: ExecutionContext, proc: any, frame: Frame, pre: any, guarded: boolean, args: any[] = [], first: any = MISSING): Frame | null {
+        const tok = frame.escape = new CatchToken(ctx.id, ctx.wind, pre, guarded, null, first);
         const marks = markSet(frame.marks, frame.mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(frame.marks, EXCEPTION_HANDLERS, null)));
         try {
             return this.invoke(ctx, proc, frame, args, 0, args.length, false, marks, frame.mframe + 1);
         } catch (err) {
             if (err instanceof EscapedError || err instanceof InterruptError) throw err;
+            // (the call itself failed, with no frame of the callee's: the handler sees that error as any other)
+            if (tok.pre !== null) return this.raise(ctx, frame, caughtValue(err, this.vm), false, marks, frame.mframe + 1);
             ctx.acc = new Caught(caughtValue(err, this.vm));
             return frame;
         }
     }
 
-    // callCatch for code that is not re-entrant, without a pre-unwind handler: the catch goes on the context's stack
-    public callCatchStack(ctx: ExecutionContext, proc: any, frame: Frame, args: any[] = []): Frame | null {
+    // callCatch for code that is not re-entrant: the catch goes on the context's stack
+    public callCatchStack(ctx: ExecutionContext, proc: any, frame: Frame, args: any[] = [], pre: any = null, first: any = undefined): Frame | null {
         frame.escape = STACK_CATCH;
         const at = frame.catchAt = ctx.ncatch;
         ctx.catches[at] = markFirst(frame.marks, EXCEPTION_HANDLERS, null);
         ctx.catches[at + 1] = ctx.wind;
-        ctx.ncatch = at + 2;
+        ctx.catches[at + 2] = pre;
+        ctx.catches[at + 3] = first;
+        ctx.ncatch = at + 4;
         try {
             return this.invoke(ctx, proc, frame, args, 0, args.length, false);
         } catch (err) {
             if (err instanceof EscapedError || err instanceof InterruptError) throw err;
+            if (pre !== null) return this.raise(ctx, frame, caughtValue(err, this.vm), false);
             ctx.acc = new Caught(caughtValue(err, this.vm));
             return frame;
         }
@@ -601,12 +602,19 @@ export class VMExecutor {
         if (obj instanceof ErrorObject) this.vm.message(obj.error);
         const handlers = markFirst(marks, EXCEPTION_HANDLERS, null);
         // a catch on the context's stack is innermost when no handler was installed inside it
-        const catches = ctx.catches, at = ctx.ncatch - 2;
+        const catches = ctx.catches, at = ctx.ncatch - 4;
         if (at >= 0 && catches[at] === handlers) {
             let target = frame;
             while (target !== null && target.catchAt !== at) target = target.parent;
             if (target === null) throw vmError(Msg.CatchOutsideExtent);
-            return this.#jumpTo(ctx, target, catches[at + 1], new Caught(obj));
+            const pre = catches[at + 2];
+            if (pre === null) return this.#jumpTo(ctx, target, catches[at + 1], new Caught(obj));
+            // its pre-unwind handler runs first: the catch gets a token for what the handler returns to escape to,
+            // and for an error raised meanwhile
+            const tok = target.escape = new CatchToken(ctx.id, catches[at + 1]);
+            const preMarks = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok.forPre(), handlers as Handlers | null));
+            const escape = new Frame(raiseHelpers().escapeWith, [tok, undefined, undefined], 0, frame, ctx, preMarks, mframe + 1);
+            return this.invoke(ctx, pre, escape, [catches[at + 3], obj], 0, 2, false);
         }
         if (!(handlers instanceof Handlers)) return this.#unhandled(ctx, frame, obj);
         const handler = handlers.handler;
@@ -615,7 +623,7 @@ export class VMExecutor {
             if (handler.pre !== null) {
                 const preMarks = handler.guarded ? markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(handler.forPre(), handlers.outer)) : outer;
                 const escape = new Frame(raiseHelpers().escapeWith, [handler, undefined, undefined], 0, frame, ctx, preMarks, mframe + 1);
-                return this.invoke(ctx, handler.pre, escape, [obj], 0, 1, false);
+                return handler.first === MISSING ? this.invoke(ctx, handler.pre, escape, [obj], 0, 1, false) : this.invoke(ctx, handler.pre, escape, [handler.first, obj], 0, 2, false);
             }
             const target = escapeTarget(handler, frame);
             if (target === null) throw vmError(Msg.CatchOutsideExtent);

@@ -20,9 +20,9 @@ export type DirectFn = (ctx: ExecutionContext, closure: Closure, executor: VMExe
 export const NO_TEMPLATE = { code: { direct: false } } as unknown as ClosureTemplate;
 
 // what a call site keeps of its callees: the templates of up to four, each with its entry for the site's argument
-// count (Code.entry). A slot is taken by the first callee that finds it free, or holding a template whose code no
-// longer runs directly; once all four hold live templates, other callees go the slow way each time (a site that kept
-// replacing them would spend more on that than it saves)
+// count (Code.entry). A slot is taken by the first callee that finds it free; once all four are taken, other callees
+// go the slow way each time (a site that kept replacing them would spend more on that than it saves). A callee whose
+// code no longer runs directly gives its slots up (Code.leaveDirect): a site calls what it keeps without asking
 export type CallCache = {
     t0: ClosureTemplate, f0: DirectFn | null,
     t1: ClosureTemplate, f1: DirectFn | null,
@@ -48,6 +48,36 @@ export class Code {
     // whether calls may go through directFn: set when it is compiled, cleared when its calls keep suspending (see
     // countControlSuspend), from when on they use heap frames
     public direct: boolean = false;
+    // the call sites that keep an entry of this code
+    readonly #keptBy: CallCache[] = [];
+
+    // `cache` keeps `fn`, an entry of this code, for the template `tmpl` of it, in a free slot if it has one
+    keep(cache: CallCache, tmpl: ClosureTemplate, fn: DirectFn): void {
+        if (cache.t0 === tmpl) cache.f0 = fn;
+        else if (cache.t1 === tmpl) cache.f1 = fn;
+        else if (cache.t2 === tmpl) cache.f2 = fn;
+        else if (cache.t3 === tmpl) cache.f3 = fn;
+        else {
+            if (cache.t0 === NO_TEMPLATE) { cache.t0 = tmpl; cache.f0 = fn; }
+            else if (cache.t1 === NO_TEMPLATE) { cache.t1 = tmpl; cache.f1 = fn; }
+            else if (cache.t2 === NO_TEMPLATE) { cache.t2 = tmpl; cache.f2 = fn; }
+            else if (cache.t3 === NO_TEMPLATE) { cache.t3 = tmpl; cache.f3 = fn; }
+            else return;
+            this.#keptBy.push(cache);
+        }
+    }
+
+    // from now on its calls use heap frames: no call site keeps an entry of it
+    leaveDirect(): void {
+        this.direct = false;
+        for (const cache of this.#keptBy) {
+            if (cache.t0.code === this) { cache.t0 = NO_TEMPLATE; cache.f0 = null; }
+            if (cache.t1.code === this) { cache.t1 = NO_TEMPLATE; cache.f1 = null; }
+            if (cache.t2.code === this) { cache.t2 = NO_TEMPLATE; cache.f2 = null; }
+            if (cache.t3.code === this) { cache.t3 = NO_TEMPLATE; cache.f3 = null; }
+        }
+        this.#keptBy.length = 0;
+    }
     // how its closures bind their arguments (their template's arity), once compiled
     public arity: Arity | null = null;
     // its direct entries for calls that say how many values they want, by that count. For one, it returns the first of

@@ -33,18 +33,24 @@ export const applyArgsOf = (name: string, args: string[]) => name === "%apply-fr
 const LOOP_COUNT = "--ic < 0 && (ic = 255, (executor.interruptLeft -= 256) <= 0)";
 // a catch in direct code that is not re-entrant, around `call` (which leaves the value in acc): no token and no mark, its
 // place is on the context's stack (ExecutionContext.catches) while the call runs
-const stackCatch = (call: string) => `{
+// `counts`: whether an error caught counts toward running the function on heap frames (see countControlSuspend), as one
+// that passes through does: not for a catch that is all there is to a library's own catching call written where it is
+// called, which would turn every function that calls it and often fails into heap code
+// `pre`: its pre-unwind handler and what that is called with before the error (it runs in heap code: nothing is caught
+// here then)
+const stackCatch = (call: string, counts: boolean = true, pre: [string, string] | null = null) => `{
     const at = ctx.ncatch;
     ctx.catches[at] = marks === null ? null : markFirst(marks, EXCEPTION_HANDLERS, null);
     ctx.catches[at + 1] = ctx.wind;
-    ctx.ncatch = at + 2;
+    ctx.catches[at + 2] = ${pre === null ? "null" : `catchPre(${pre[0]}); ctx.catches[at + 3] = ${pre[1]}`};
+    ctx.ncatch = at + 4;
     try {
         ${call}
         ctx.ncatch = at;
     } catch (e) {
         const caught = caughtAt(e, at, ctx);
-        if (caught === null) throw executor.pushCatch(e, at, marks, mframe);
-        countControlSuspend(closure.tmpl.code);
+        if (caught === null) throw executor.${pre === null ? "pushCatch" : "pushCatchPre"}(e, at, marks, mframe);
+        ${counts ? "countControlSuspend(closure.tmpl.code);" : ""}
         acc = caught;
     }
 }`;
@@ -85,6 +91,44 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
             }
         }`,
     }],
+    // (%catch-call proc arg ...): %call-catching of a call of proc with the arguments, with no thunk in between
+    ["%catch-call", {
+        heap: s => !s.reentrant ? `return executor.callCatchStack(ctx, ${s.args[0]}, frame, [${s.args.slice(1).join(", ")}]);`
+            : `return executor.callCatch(ctx, ${s.args[0]}, frame, null, false, [${s.args.slice(1).join(", ")}]);`,
+        direct: (s, callArray, call) => !s.reentrant ? stackCatch(`const proc = ${s.args[0]}; ${call(s.args.slice(1), "marks")}`, false) : `{
+            const tok = new CatchToken(ctx.id, ctx.wind, null, false);
+            const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
+            try {
+                const proc = ${s.args[0]};
+                ${call(s.args.slice(1), "handlers")}
+            } catch (e) {
+                const caught = catchHere(e, tok, ctx);
+                if (caught === null) throw executor.pushToken(e, tok, handlers, mframe);
+                countControlSuspend(closure.tmpl.code);
+                acc = caught;
+            }
+        }`,
+    }],
+    // (%catch-call/pre pre with proc arg ...): the same with a pre-unwind handler, called with `with` and the error
+    // (so that a handler which needs a value of the caller's is no closure made for every call); an error raised while
+    // it runs comes to the catch too (as %call-catching's guarded one)
+    ["%catch-call/pre", {
+        heap: s => !s.reentrant ? `return executor.callCatchStack(ctx, ${s.args[2]}, frame, [${s.args.slice(3).join(", ")}], catchPre(${s.args[0]}), ${s.args[1]});`
+            : `return executor.callCatch(ctx, ${s.args[2]}, frame, ${s.args[0]}, true, [${s.args.slice(3).join(", ")}], ${s.args[1]});`,
+        direct: (s, callArray, call) => !s.reentrant ? stackCatch(`const proc = ${s.args[2]}; ${call(s.args.slice(3), "marks")}`, false, [s.args[0], s.args[1]]) : `{
+            const tok = new CatchToken(ctx.id, ctx.wind, ${s.args[0]}, true, null, ${s.args[1]});
+            const handlers = markSet(marks, mframe + 1, EXCEPTION_HANDLERS, new Handlers(tok, markFirst(marks, EXCEPTION_HANDLERS, null)));
+            try {
+                const proc = ${s.args[2]};
+                ${call(s.args.slice(3), "handlers")}
+            } catch (e) {
+                const caught = catchHere(e, tok, ctx);
+                if (caught === null) throw executor.pushToken(e, tok, handlers, mframe);
+                countControlSuspend(closure.tmpl.code);
+                acc = caught;
+            }
+        }`,
+    }],
     ["%apply-catching", {
         heap: s => s.args.length === 2 && !s.reentrant ? `return executor.callCatchStack(ctx, ${s.args[0]}, frame, arrayArg("%apply-catching", ${s.args[1]}));`
             : `return executor.callCatch(ctx, ${s.args[0]}, frame, ${s.args[2] ?? "null"}, ${s.args.length === 4 ? `catchGuard(${s.args[3]})` : "false"}, arrayArg("%apply-catching", ${s.args[1]}));`,
@@ -113,7 +157,7 @@ export const CONTROL_AOT: ReadonlyMap<string, ControlAot> = new Map<string, Cont
     }]),
     ["%raise", {
         heap: s => `return executor.raise(ctx, frame, ${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"});`,
-        direct: s => `throw Suspend.raise(${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"}, marks, ctx);`,
+        direct: s => `throw Suspend.raise(${s.args[0]}, ${s.args.length === 2 ? `raiseContinuable(${s.args[1]})` : "false"}, marks, ctx, mframe);`,
     }],
     // An interrupt check: the count, and only when it runs out, the handler (see VMExecutor.interruptSlow). Heap code
     // counts every check. Direct code counts cheaply, as interrupts only have to come eventually:

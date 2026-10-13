@@ -119,6 +119,34 @@ describe('Anima', () => {
             expect(nrun(`(%catch (lambda () (%intcall %apply-catching + 5)) (lambda (e) 'not-an-array))`)).toBe("not-an-array")
         })
 
+        it('%catch-call and %catch-call/pre call a procedure with the arguments written out, in code of either kind', () => {
+            for (const a of [evaluator, createScheme({ ...vmImpl, reentrant: false }), createScheme({ ...vmImpl, reentrant: false, debug: true, optimize: false })]) {
+                const nrun = (expr: string) => s.stringify(runNative(a, expr))
+                const shown = (call: string) => `(let ((r ${call})) (%if (%intcall %caught? r) (%call list 'caught (%intcall %caught-value r)) r))`
+                expect(nrun(shown("(%intcall %catch-call + 1 2)"))).toBe("3")
+                expect(nrun(shown("(%intcall %catch-call (lambda () 'none))"))).toBe("none")
+                expect(nrun(`(%call call-with-values (lambda () (%intcall %catch-call values 1 2)) list)`)).toBe("(1 2)")
+                expect(nrun(shown("(%intcall %catch-call (lambda (x) (%intcall %raise x)) 'boom)"))).toBe("(caught boom)")
+                expect(nrun(`(%call car ${shown("(%intcall %catch-call 5 1)")})`)).toBe("caught")
+                expect(nrun(`(%catch (lambda () ${shown("(%intcall %catch-call (lambda (x) (%intcall %raise x)) 'inner)")}) (lambda (e) 'outer))`)).toBe("(caught inner)")
+                // the handler is called with what it was given and the error, where the error is raised
+                const pre = "(lambda (w e) (%call list w e))"
+                expect(nrun(shown(`(%intcall %catch-call/pre ${pre} 'w + 1 2)`))).toBe("3")
+                expect(nrun(shown(`(%intcall %catch-call/pre ${pre} 'w (lambda (x) (%intcall %raise x)) 'boom)`))).toBe("(caught (w boom))")
+                expect(nrun(shown(`(%intcall %catch-call/pre ${pre} 'w (lambda (x) (%call + 1 (%call (lambda (y) (%intcall %raise y)) x))) 'deep)`))).toBe("(caught (w deep))")
+                expect(nrun(`(%call car (%call car (%call cdr ${shown(`(%intcall %catch-call/pre ${pre} 'w 5 1)`)})))`)).toBe("w")
+                // an error raised by the handler comes to the catch, and a catch inside the handler takes its own
+                expect(nrun(`(let ((r (%intcall %catch-call/pre (lambda (w e) (%intcall %raise 'again)) 'w (lambda () (%intcall %raise 'first))))) (%call list (%intcall %caught? r) (%call symbol? (%intcall %caught-value r))))`)).toBe("(#t #f)")
+                expect(nrun(shown(`(%intcall %catch-call/pre (lambda (w e) (%call list e (%intcall %caught-value (%intcall %catch-call (lambda () (%intcall %raise 'inside)))))) 'w (lambda () (%intcall %raise 'first)))`))).toBe("(caught (first inside))")
+                expect(nrun(shown(`(%intcall %catch-call/pre ${pre} 'outer (lambda () (%call list 'got (%intcall %caught-value (%intcall %catch-call/pre ${pre} 'inner (lambda () (%intcall %raise 'x)))))))`))).toBe("(got (inner x))")
+                // over once left: a later error is not theirs
+                expect(nrun(`(%catch (lambda () (%begin (%intcall %catch-call/pre ${pre} 'w (lambda () (%intcall %raise 'first))) (%intcall %raise 'later))) (lambda (e) (%call list 'outer e)))`)).toBe("(outer later)")
+                // caught often
+                expect(nrun(`(define-global (cc-run) (let loop ((i 0) (n 0)) (%if (%call = i 30) n (%call loop (%call + i 1) (%call + n (%intcall %caught-value (%intcall %catch-call (lambda (a b) (%intcall %raise (%call + a b))) i 1))))))) (%call list (%call cc-run) (%call cc-run) (%call cc-run))`)).toBe("(465 465 465)")
+                expect(nrun(`(define-global (cp-run) (let loop ((i 0) (n 0)) (%if (%call = i 30) n (%call loop (%call + i 1) (%call + n (%intcall %caught-value (%intcall %catch-call/pre (lambda (w e) (%call + w e)) 1 (lambda (a) (%intcall %raise a)) i))))))) (%call list (%call cp-run) (%call cp-run) (%call cp-run))`)).toBe("(465 465 465)")
+            }
+        })
+
         it('calls the %catch handler in tail position', () => {
             expect(nrun(`(define-global (ce-loop n) (%if (%call = n 0) 'ok (%catch (lambda () (%call raise n)) (lambda (e) (%call ce-loop (%call - e 1)))))) (%call ce-loop 100000)`)).toBe("ok")
         })

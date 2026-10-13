@@ -35,7 +35,7 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
     // Luau has no re-entrant continuations (coroutines resume their one suspended frame)
     const anima = new Anima({ ...options, reentrant: false });
     const iterators: LuauLibrary = {
-        next: undefined, pairsNext: undefined, inext: undefined, string: new LuaTable(),
+        next: undefined, pairsNext: undefined, inext: undefined, string: new LuaTable(), pcall: undefined, xpcall: undefined, handler: undefined, error: undefined,
         print: host.print ?? (line => console.log(luauText(line))),
     };
     anima.intrinsics.setFormatter(luauFormat);
@@ -88,11 +88,11 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
     define("string", iterators.string);
     const call = (op: string, ...args: any[]) => [CORE_INTCALL, null, Symbol.for(op), ...args];
     // error raises its value; a string gets where the function that called it (or one further up) was
-    define("error", procedure("error", [CORE_LAMBDA, null, clause([PAD], [], rest, [
+    define("error", iterators.error = procedure("error", [CORE_LAMBDA, null, clause([PAD], [], rest, [
         call("%raise", [CORE_IF, null, call("%luau-error-far?", rest), call("%luau-error-at", rest, call("%current-stack")), call("%luau-error", rest)])])]));
     // pcall calls its function catching: true and what it returns, or false and the error
     const r = Symbol("r");
-    define("pcall", procedure("pcall", [CORE_LAMBDA, null, clause([PAD], [], rest, [
+    define("pcall", iterators.pcall = procedure("pcall", [CORE_LAMBDA, null, clause([PAD], [], rest, [
         call("%luau-pcall-check", rest),
         [CORE_LET, null, [[r, call("%apply-catching", call("%luau-arg", rest, 0), call("%luau-pcall-args", rest))]],
             [CORE_IF, null, call("%caught?", r),
@@ -101,7 +101,8 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
     // xpcall is pcall whose handler runs where the error is raised, before anything unwinds (the catch's `pre`), and
     // gives what xpcall returns after false: its first value; a handler that fails is "error in error handling"
     const [h, e] = [Symbol("handler"), Symbol("e")];
-    define("xpcall", procedure("xpcall", [CORE_LAMBDA, null, clause([PAD], [], rest, [
+    iterators.handler = procedure("handler", [CORE_LAMBDA, null, clause([], [h, e], null, [call("%first-value", [CORE_CALL, null, h, call("%luau-caught", e)], undefined)])]);
+    define("xpcall", iterators.xpcall = procedure("xpcall", [CORE_LAMBDA, null, clause([PAD], [], rest, [
         call("%luau-xpcall-check", rest),
         [CORE_LET, null, [[h, call("%luau-arg", rest, 1)]],
             [CORE_LET, null, [[r, call("%apply-catching", call("%luau-arg", rest, 0), call("%luau-xpcall-args", rest),

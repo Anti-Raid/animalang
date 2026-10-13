@@ -107,6 +107,12 @@ class Lowering {
     // uses a register itself as an operand, so such a local is read when the operation runs, not where it is written
     readonly #owner = new Map<symbol, symbol>();
     readonly #shapes: Map<C.Table, Shape>;
+    // Imports, as Luau's compiler makes them (LOP_GETIMPORT): a global the chunk does not assign, and a field of one
+    // (`a.b`, `a.b.c`), is read once when the chunk starts, into an array its functions share; where it is used, what
+    // was read then is what it is, unless that was nil: then it is read as any other, each time
+    readonly #imports = Symbol("imports");
+    readonly #imported = new Map<string, number>();
+    readonly #importing: any[] = [];
 
     constructor(readonly parsed: ParseResult, readonly file: string, readonly source: string) {
         this.#shapes = predictShapes(parsed.root);
@@ -128,7 +134,34 @@ class Lowering {
     *chunk(): Task<any[]> {
         const root = this.parsed.root;
         const pos = this.pos(root);
-        return (yield this.functionBody(pos, root));
+        const body = (yield this.functionBody(pos, root));
+        return this.#importing.length === 0 ? body : [CORE_LET, pos, [[this.#imports, intcall(null, "%luau-imports", ...this.#importing)]], body];
+    }
+
+    // `live` (what reads it now) as an import: `read` is what reads it when the chunk starts
+    #import(key: string, read: any, live: any): any {
+        let i = this.#imported.get(key);
+        if (i === undefined) {
+            this.#imported.set(key, i = this.#importing.length);
+            this.#importing.push(read);
+        }
+        return intcall(null, "%array-ref-or", this.#imports, i, live);
+    }
+
+    #global(name: string): any {
+        const sym = Symbol.for(name);
+        return this.parsed.written.has(name) ? sym : this.#import(name, sym, sym);
+    }
+
+    // the global and the names of `e` when it is `a.b` or `a.b.c`, written so, of a global the chunk does not assign
+    #chain(e: C.Index): [string, ...string[]] | null {
+        const names: string[] = [];
+        let at: C.Expr = e;
+        while (isIndex(at) && names.length < 2 && typeof at[2] === "string" && !this.parsed.bracketed.has(at)) {
+            names.unshift(at[2]);
+            at = at[1];
+        }
+        return names.length > 0 && isForm(at) && at[0] === L.GLOBAL && !this.parsed.written.has(at[1]) ? [at[1], ...names] : null;
     }
 
     // a function's body (or the chunk's): a block its returns escape from. A return that ends it is its value; without
@@ -218,6 +251,15 @@ class Lowering {
         if (last[0] === L.VARARGS) return [CORE_LET, pos, [...bindings, ...rest.map((name, i) => [name, intcall(pos, "%luau-arg", this.#varargs, i)])], ...body];
         if (rest.length === 0) return [CORE_LET, pos, [...bindings, [Symbol("_"), (yield this.call(last))]], ...body];
         if (rest.length === 1) return [CORE_LET, pos, [...bindings, [rest[0], (yield this.expr(last))]], ...body];
+        // (pcall's values without multiple values made of them: true and what the function returned, or false and
+        // the error)
+        const caught: { bindings: any[][], r: symbol, error: any } | null = yield this.#protected(last);
+        if (caught !== null) {
+            const r = caught.r, failed = Symbol("failed");
+            const others = [CORE_LET_VALUES, pos, [[rest.slice(1), null, [CORE_IF, pos, failed, caught.error, r]]], ...body];
+            const all = [CORE_LET_STAR, pos, [...caught.bindings, [failed, intcall(pos, "%caught?", r)]], [CORE_LET, pos, [[rest[0], [CORE_IF, pos, failed, false, true]]], others]];
+            return bindings.length === 0 ? all : [CORE_LET, pos, bindings, all];
+        }
         const unpack = [CORE_LET_VALUES, pos, [[rest, null, (yield this.call(last))]], ...body];
         return bindings.length === 0 ? unpack : [CORE_LET, pos, bindings, unpack];
     }
@@ -534,18 +576,70 @@ class Lowering {
     // a call, whose value is all the values the function returns, or with `one`, the first of them (nil of none). An
     // argument list ending in `...` or a call passes all of its values; a call that gives one value (as most do) is
     // then an ordinary call
+    // pcall(f, arg ...) and xpcall(f, handler, arg ...) of the global, where the chunk does not assign it: Luau's
+    // compiler makes such a call the library's function whatever the global is by then (its fast pcall instruction).
+    // Here it is the call under a catch, written where it is: no call of pcall, no arguments in an array. What is
+    // bound: the function and the arguments, then `r`, what the function returned or a Caught, whose error `error`
+    // gives. Null for any other call, and for one whose last argument may give several values (which calls the
+    // library's function as any function is called, see `call`)
+    #protecting(e: C.Call | C.Method): "pcall" | "xpcall" | null {
+        const f = e[1];
+        if (e[0] !== L.CALL || !isForm(f) || f[0] !== L.GLOBAL || this.parsed.written.has(f[1])) return null;
+        return f[1] === "pcall" && e.length > 3 ? "pcall" : f[1] === "xpcall" && e.length > 4 ? "xpcall" : null;
+    }
+    *#protected(e: C.Call | C.Method): Task<{ bindings: any[][], r: symbol, error: any } | null> {
+        const which = this.#protecting(e);
+        if (which === null) return null;
+        const args = e.slice(2, -1) as C.Expr[], pos = this.pos(e);
+        if (isMulti(args[args.length - 1])) return null;
+        const r = Symbol("r"), bindings: any[][] = [], given: any[] = [];
+        for (const a of args) {
+            const t = Symbol("a");
+            bindings.push([t, (yield this.expr(a))]);
+            given.push(t);
+        }
+        const value = intcall(pos, "%caught-value", r);
+        if (which === "pcall") {
+            bindings.push([r, intcall(pos, "%catch-call", ...given)]);
+            return { bindings, r, error: intcall(pos, "%luau-caught", value) };
+        }
+        // (the handler is called with the error where it is raised, and its first value is the error xpcall gives:
+        // through a procedure of the library's, which is no frame of the program's)
+        const [f, h, ...rest] = given;
+        bindings.push([Symbol("_"), intcall(pos, "%luau-xpcall-handler", h)], [r, intcall(pos, "%catch-call/pre", intcall(pos, "%luau-library", "handler"), h, f, ...rest)]);
+        return { bindings, r, error: intcall(pos, "%luau-xpcall-caught", value) };
+    }
+
     *call(e: C.Call | C.Method, one: boolean = false): Task<any[]> {
         if (e[0] === L.METHOD) return (yield this.method(e as C.Method, one));
         const pos = this.pos(e);
+        const caught: { bindings: any[][], r: symbol, error: any } | null = yield this.#protected(e);
+        if (caught !== null) {
+            const { bindings, r, error } = caught, failed = intcall(pos, "%caught?", r);
+            return [CORE_LET_STAR, pos, bindings, one ? [CORE_IF, pos, failed, false, true]
+                : [CORE_IF, pos, failed, intcall(pos, "%values", false, error), intcall(pos, "%values-cons", true, r)]];
+        }
+        // error(v), error(v, 0) and error(v, 1) of the global, where the chunk does not assign it: if what it read is
+        // the library's, the value is raised from here, a string with where this call is before it. No call of
+        // error, and no error object made for the message to be read back out of
+        const called = e[1], level = e.length === 5 ? e[3] : e.length === 4 ? 1 : null;
+        if (isForm(called) && called[0] === L.GLOBAL && called[1] === "error" && !this.parsed.written.has("error") && (level === 0 || level === 1) && !isMulti(e[2] as C.Expr)) {
+            const [error, v] = [Symbol("error"), Symbol("v")];
+            const raised = level === 0 ? v : intcall(pos, "%luau-error-here", v, `${pos.file}:${pos.line}: `);
+            return [CORE_LET_STAR, pos, [[error, this.#global("error")], [v, (yield this.expr(e[2] as C.Expr))]],
+                [CORE_IF, pos, intcall(pos, "%luau-error?", error), intcall(pos, "%raise", raised), [CORE_CALL, pos, error, v, ...(e.length === 5 ? [level] : [])]]];
+        }
         // (the VM makes a %call whose first value is taken a call that asks for one)
         const made = (call: any[]) => one ? intcall(pos, "%first-value", call, undefined) : call;
+        const which = this.#protecting(e);
+        const callee = which !== null ? intcall(pos, "%luau-library", which) : (yield this.expr(e[1]));
         const args = e.slice(2, -1) as C.Expr[];
         const last = args[args.length - 1];
-        if (last === undefined || !isMulti(last)) return made([CORE_CALL, pos, (yield this.expr(e[1])), ...(yield this.#exprs(args))]);
+        if (last === undefined || !isMulti(last)) return made([CORE_CALL, pos, callee, ...(yield this.#exprs(args))]);
         const fixed: any[] = yield this.#exprs(args.slice(0, -1));
-        if (last[0] === L.VARARGS) return made([CORE_APPLY, pos, (yield this.expr(e[1])), ...fixed, this.#varargs]);
+        if (last[0] === L.VARARGS) return made([CORE_APPLY, pos, callee, ...fixed, this.#varargs]);
         const [f, v, ...temps] = [Symbol("f"), Symbol("v"), ...fixed.map(() => Symbol("a"))];
-        return [CORE_LET, pos, [[f, (yield this.expr(e[1]))], ...temps.map((t, i) => [t, fixed[i]]), [v, (yield this.call(last))]],
+        return [CORE_LET, pos, [[f, callee], ...temps.map((t, i) => [t, fixed[i]]), [v, (yield this.call(last))]],
             [CORE_IF, pos, intcall(pos, "%luau-several?", v),
                 made([CORE_APPLY, pos, f, ...temps, intcall(pos, "%values->array", v)]),
                 made([CORE_CALL, pos, f, ...temps, v])]];
@@ -722,7 +816,15 @@ class Lowering {
     expr(e: C.Expr): any {
         if (e === L.NIL) return undefined;
         if (!isForm(e)) return typeof e === "string" ? intern(e) : e;
-        if (e[0] === L.GLOBAL) return Symbol.for(e[1]);
+        if (e[0] === L.GLOBAL) return this.#global(e[1]);
+        if (e[0] === L.INDEX) {
+            const chain = this.#chain(e as C.Index);
+            if (chain !== null) {
+                const [root, ...names] = chain, sym = Symbol.for(root), pos = this.pos(e);
+                return this.#import(chain.join("."), intcall(null, "%luau-import-chain", sym, ...names.map(intern)),
+                    names.reduce((o: any, name) => intcall(pos, "%luau-field", o, intern(name)), sym));
+            }
+        }
         return start(this.#exprForm(e));
     }
 

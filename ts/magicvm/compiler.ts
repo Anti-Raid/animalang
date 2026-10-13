@@ -26,6 +26,7 @@ import { ascend, descend, run, start, type Task } from "./visitor";
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, null, ...body]
 
 const OP_APPLY = Symbol.for("%apply");
+const AT_OR = corePos("%array-ref-or"), ARRAY_REF = Symbol.for("%array-ref"), IS_VOID = Symbol.for("%nothing?");
 
 type Analyzed = { ast: any, analyzer: AstAnalysis, ascope: AnalysisScope }
 type Closed = Unboxed & { captures: Captures }
@@ -278,6 +279,13 @@ export class Compiler {
                     // itself when it is entered for one (see Code.wanted), with nothing to check after it
                     if (intrinsic.pos === corePos("%first-value") && call.length === 3 && call[2] === undefined && Array.isArray(call[1]) && call[1][0] === CORE_CALL && call[1].length >= 3) {
                         return this.#compile(call[1], { ...opts, isTail: false, one: true })
+                    }
+                    // (%array-ref-or array index otherwise): the element if it is something, and only otherwise the
+                    // last operand. One form where a front end reads the same way in many places (the passes before
+                    // this one go through one form for each, not four)
+                    if (intrinsic.pos === AT_OR && call.length === 4 && typeof call[1] === "symbol" && typeof call[2] === "number") {
+                        const element = [CORE_INTCALL, null, ARRAY_REF, call[1], call[2]]
+                        return this.#compileIfCall([CORE_IF, [CORE_INTCALL, null, IS_VOID, element], call[3], element], opts)
                     }
                     if (intrinsic.leaf) {
                         return this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {

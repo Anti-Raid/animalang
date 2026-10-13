@@ -4,7 +4,7 @@ import { impl } from "../magicvm/meta";
 import { UnitSerializer } from "../magicvm/aot/serializer";
 import { UnitLoader } from "../magicvm/loader";
 import { AnimaVM, Code } from "../magicvm/vm";
-import { Closure, ClosureTemplate, newCallCache } from "../magicvm/code";
+import { Closure, ClosureTemplate, NO_TEMPLATE, newCallCache } from "../magicvm/code";
 import { Env } from "../env";
 import type { AnimaExecutionUnit, UnitMeta } from "../magicvm/unit-types";
 import { ASTStringifier } from "../scheme/printer";
@@ -453,7 +453,7 @@ describe("Execution Unit (.animau) Serializer & Loader", () => {
 });
 
 describe("A call site's cache", () => {
-    it("keeps the first four callees, and gives a slot up only when its callee no longer runs directly", () => {
+    it("keeps the first four callees, and has a slot free again only when its callee no longer runs directly", () => {
         const anima = createScheme(impl);
         const vm = new AnimaVM(anima.intrinsics);
         const closures = Array.from({ length: 6 }, (_, i) => anima.evaluateRaw(anima.compileRaw(`(lambda (x) (+ x ${i}))`)) as Closure);
@@ -463,10 +463,24 @@ describe("A call site's cache", () => {
         // a fifth callee is not kept, however often it comes
         vm.executor.entry(closures[4], cache, 1, 0);
         expect([cache.t0, cache.t1, cache.t2, cache.t3]).toEqual(closures.slice(0, 4).map(c => c.tmpl));
-        closures[1].tmpl.code.direct = false;
+        closures[1].tmpl.code.leaveDirect();
+        expect([cache.t0, cache.t2, cache.t3]).toEqual([closures[0], closures[2], closures[3]].map(c => c.tmpl));
+        expect([cache.t1, cache.f1]).toEqual([NO_TEMPLATE, null]);
         vm.executor.entry(closures[5], cache, 1, 0);
         expect(cache.t1).toBe(closures[5].tmpl);
         expect(cache.f1).toBe(closures[5].tmpl.code.entry(1));
+    });
+
+    it("no longer holds a callee that came to run on heap frames, which is called all the same", () => {
+        const anima = createScheme(impl);
+        anima.evaluateRaw(anima.compileRaw(`(define last #f)
+                                            (define (inner x) (call/cc (lambda (k) (set! last k) (+ x 1))))
+                                            (define (run n) (let loop ((i 0) (s 0)) (if (= i n) s (loop (+ i 1) (+ s (inner i))))))`));
+        const inner = anima.evaluateRaw(anima.compileRaw("inner")) as Closure;
+        expect(inner.tmpl.code.direct).toBe(true);
+        const sums = [1, 2, 3].map(() => anima.evaluateRaw(anima.compileRaw("(run 100)")));
+        expect(sums).toEqual([5050, 5050, 5050]);
+        expect(inner.tmpl.code.direct).toBe(false);
     });
 
     it("calls the right procedure at a site that sees many", () => {
