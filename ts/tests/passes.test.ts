@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createScheme } from '../scheme';
+import { createLuau } from '../lua';
 import { ASTStringifier } from '../scheme/printer';
 import { form, opKinds, runNative } from './helpers';
 import { impl } from '../magicvm/meta';
@@ -56,14 +57,67 @@ describe("The compiler's passes", () => {
         const seen: string[] = [];
         anima.compiler.trace = (name, output) => {
             seen.push(name);
-            if (name === "flatten-lets" || name === "rename" || name === "block-escapes" || name === "split-case-lambdas" || name === "merge-loops" || name === "lift-lambdas") check(Lsrc, output);
+            if (name === "flatten-lets" || name === "rename" || name === "bind-once" || name === "block-escapes" || name === "split-case-lambdas" || name === "merge-loops" || name === "lift-lambdas") check(Lsrc, output);
             if (name === "assignments" || name === "cp0") check(Lconv, (output as any).ast);
         };
         anima.compileRaw(`
             (define (f . xs) (let* ((a 1) (b (+ a 1))) (set! a (lambda () b)) (call/cc (lambda (k) (if (null? xs) (k b) a)))))
             (define (g n) (define h (case-lambda ((x) x) ((x y) (+ x y)))) (letrec ((loop (lambda (i) (if (= i n) (h i) (loop (+ i 1)))))) (loop 0)))
             (let-values (((a . b) (values 1 2))) (g 3))`);
-        expect(seen).toEqual(["flatten-lets", "rename", "block-escapes", "split-case-lambdas", "merge-loops", "lift-lambdas", "resolve", "assignments", "cp0", "unbox", "closures", "generate", "interrupts", "lower"]);
+        expect(seen).toEqual(["flatten-lets", "rename", "bind-once", "block-escapes", "split-case-lambdas", "merge-loops", "lift-lambdas", "resolve", "assignments", "cp0", "unbox", "closures", "generate", "interrupts", "lower"]);
+    });
+});
+
+describe("Binding once", () => {
+    const [SET, LET, LETREC] = ["%set!", "%let", "%letrec"].map(n => Symbol.for(n));
+    // the names a program's forms of `head` assign or bind, after the pass
+    const after = (src: string) => {
+        const luau = createLuau(impl);
+        let out: any;
+        luau.compiler.trace = (name, output) => { if (name === "bind-once") out = output; };
+        luau.compileRaw(src, "t");
+        check(Lsrc, out);
+        const names = (head: symbol): string[] => {
+            const found: string[] = [], todo: any[] = [out];
+            while (todo.length > 0) {
+                const e = todo.pop();
+                if (!Array.isArray(e)) continue;
+                if (e[0] === head) found.push(...(head === SET ? [e[2]] : e[2].map((b: any) => b[0])).map((n: symbol) => n.description!));
+                todo.push(...e);
+            }
+            return found.sort();
+        };
+        return { set: names(SET), let: names(LET), letrec: names(LETREC) };
+    };
+
+    it("binds a local to the one value it is assigned before anything reads it", () => {
+        expect(after("local x x = 5 local y y = x + 1 return x + y")).toEqual({ set: [], let: ["x", "y"], letrec: [] });
+        // a function declared, then written: a %letrec, with those written in between that call it
+        expect(after("local f f = function(n) if n == 0 then return 1 end return f(n - 1) end return f(3)")).toEqual({ set: [], let: [], letrec: ["f"] });
+        expect(after("local a local function b(n) return a(n) end a = function(n) if n == 0 then return 1 end return b(n - 1) end return b(2)")).toEqual({ set: [], let: [], letrec: ["a", "b"] });
+        // (a lambda assigned to something else in between is made with them, then assigned)
+        expect(after("local a function g() return a() end a = function() return 1 end return g()")).toEqual({ set: ["g"], let: [], letrec: ["a", "g"] });
+        expect(after("local a local k = 2 local function b() return a(k) end local z = 3 a = function(n) return n * z end return b()").set).toEqual([]);
+    });
+
+    it("leaves a local that may be read, or assigned again, as it is", () => {
+        const same = (src: string, name = "x") => expect(after(src).set).toContain(name);
+        same("local x print(x) x = 1 return x");
+        same("local x x = 1 x = 2 return x");
+        same("local x if g then x = 1 end return x");
+        same("local x for i = 1, 2 do x = i end return x");
+        same("local x x = x return x");
+        // a closure that holds it has run, or may have, before it is assigned
+        same("local x local function f() return x end print(f()) x = function() end return f()");
+        same("local x local function f() return x end x = 5 return f()");
+        same("local x local t = { get = function() return x end } x = function() end return t");
+        // re-entrant code runs a frame again from before an assignment
+        const anima = createScheme(impl);
+        const seen: string[] = [];
+        anima.compiler.trace = name => { seen.push(name); };
+        const value = anima.evaluateRaw(anima.compileRaw("(define (f) (let ((x #f)) (set! x (lambda () 1)) (x))) (f)"));
+        expect(value).toBe(1);
+        expect(seen).toContain("bind-once");
     });
 });
 

@@ -11,6 +11,7 @@ import { corePos, type Code } from "./exec";
 import { runPass, type Pass, type PassContext } from "./passes/pass";
 import { interruptsPass, type FunctionIR } from "./passes/interrupts";
 import { renamePass } from "./passes/rename";
+import { bindOncePass } from "./passes/once";
 import { closureCaptures, type Captures } from "./passes/closures";
 import { BOX, BOX_IN_PLACE, SET_BOX, UNBOX, convertAssignments, type Converted } from "./passes/assignments";
 import { removeBoxes, type Unboxed } from "./passes/unbox";
@@ -118,7 +119,7 @@ export class Compiler {
         const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, reentrant: this.reentrant, assumed: new Set(), trace: this.trace }
         try {
             const renamed = runPass(renamePass, runPass(flattenPass, trExpr, ctx), ctx)
-            const escaped = runPass(escapesPass, renamed, ctx)
+            const escaped = runPass(escapesPass, runPass(bindOncePass, renamed, ctx), ctx)
             const split = runPass(caseLambdasPass, escaped, ctx)
             const lifted = runPass(liftPass, ctx.optimize ? runPass(mergePass, split, ctx) : split, ctx)
             const converted = runPass(assignmentsPass, runPass(resolvePass, lifted, ctx), ctx)

@@ -183,6 +183,78 @@ const resolveBranchCondition = (
 // is: a block's are those every way into it agrees on, to a fixpoint through loops. (Resume code is entered at any
 // block, with registers read back from a frame, so it keeps facts only within a block)
 // `seed`: what is known on entry (a version of the function for number parameters)
+// The kind each parameter is wanted of: that of the intrinsics that may read it (their `wants`) as it came in, from its
+// own register or one it was moved to; none for a parameter read as two kinds. Which parameters' values a register may
+// hold is worked out block by block, as the kinds are below: a register holds what was last moved to it, so one used
+// for a parameter and then for another value says nothing of the first where the second is read
+const MAX_KINDED_PARAMS = 30;
+export const paramKinds = (blocks: AotBlock[], table: Intrinsics | null, params: number): Map<number, Kind> => {
+    const out = new Map<number, Kind>();
+    if (params === 0 || blocks.length === 0 || table === null) return out;
+    const index = new Map(blocks.map((b, i) => [b.start, i]));
+    // (the parameters a register may hold: a bit for each)
+    const step = (inst: AotInst, holds: Map<number, number>): void => {
+        if (inst.k !== "Move") for (const reg of written(inst)) holds.delete(reg);
+        else {
+            const held = holds.get(inst.src);
+            if (held === undefined) holds.delete(inst.dst);
+            else holds.set(inst.dst, held);
+        }
+    };
+    // what each register may hold where a block starts (the first block: the parameters' own, also when a tail call of
+    // the function itself comes back to it, with its new arguments)
+    const entry: (Map<number, number> | undefined)[] = new Array(blocks.length).fill(undefined);
+    entry[0] = new Map(Array.from({ length: Math.min(params, MAX_KINDED_PARAMS) }, (_, i) => [i, 1 << i]));
+    const pending = new Uint8Array(blocks.length);
+    pending[0] = 1;
+    for (let again = true; again;) {
+        again = false;
+        for (let i = 0; i < blocks.length; i++) {
+            if (pending[i] === 0) continue;
+            pending[i] = 0;
+            const holds = new Map(entry[i]!);
+            for (const inst of blocks[i].insts) step(inst, holds);
+            for (const target of successors(blocks[i].term)) {
+                const j = index.get(target);
+                if (j === undefined || j === 0) continue;
+                let known = entry[j], grew = known === undefined;
+                if (known === undefined) entry[j] = known = new Map();
+                for (const [reg, held] of holds) {
+                    const before = known.get(reg) ?? 0;
+                    if ((before | held) !== before) {
+                        known.set(reg, before | held);
+                        grew = true;
+                    }
+                }
+                if (!grew) continue;
+                pending[j] = 1;
+                if (j <= i) again = true;
+            }
+        }
+    }
+    const wanted = new Map<number, Kind | null>();
+    for (let i = 0; i < blocks.length; i++) {
+        if (entry[i] === undefined) continue;
+        const holds = new Map(entry[i]!);
+        for (const inst of blocks[i].insts) {
+            const kind = inst.k === "IntCall" || inst.k === "IntApply" ? table.entries[inst.pos]?.wants : undefined;
+            if (kind !== undefined && holds.size > 0) {
+                for (const reg of windowRegs((inst as { start: number }).start, (inst as { nargs: number }).nargs)) {
+                    for (let held = holds.get(reg) ?? 0, param = 0; held !== 0; held >>>= 1, param++) {
+                        if ((held & 1) !== 0) wanted.set(param, wanted.has(param) && wanted.get(param) !== kind ? null : kind);
+                    }
+                }
+            }
+            step(inst, holds);
+        }
+    }
+    for (let param = 0; param < params; param++) {
+        const kind = wanted.get(param);
+        if (kind !== undefined && kind !== null) out.set(param, kind);
+    }
+    return out;
+};
+
 export const blockFacts = (blocks: AotBlock[], table: Intrinsics | null, constants: readonly any[], seed: Facts | null = null): Map<number, Facts> => {
     const index = new Map(blocks.map((b, i) => [b.start, i]));
     const entry = new Map<number, Facts>([[blocks[0]?.start ?? 0, new Map(seed ?? [])]]);

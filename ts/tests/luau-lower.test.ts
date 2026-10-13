@@ -7,6 +7,7 @@ import { createLuau, toString } from '../lua';
 import { impl } from '../magicvm/meta';
 import { MultipleValues } from '../common';
 import { listing } from '../magicvm/exec';
+import { comparer } from './luau-compare';
 
 const luau = createLuau(impl);
 
@@ -245,6 +246,64 @@ describe("Luau lowered functions", () => {
 });
 
 describe.skipIf(!process.env.LUAU)("Luau lowered against Luau", () => {
+    it("declares a local, then assigns it, as Luau does", () => {
+        let seed = 17;
+        const rand = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };
+        const vars = ["a", "b", "c"];
+        const pick = () => vars[rand(vars.length)];
+        const note = (e: string) => `out = out .. tostring(${e}) .. ' '`;
+        const tried = (e: string) => `do local ok, v = pcall(function() return ${e} end) ${note("ok")} ${note("ok and v")} end`;
+        const fn = (x: string) => [
+            `function(n) return (n or 0) + 1 end`,
+            `function(n) if (n or 0) > 0 then return ${pick()}(n - 1) end return k end`,
+            `function(n) return ${x} == nil, ${pick()} ~= nil end`,
+            `function(n) k = k + 1 return ${pick()} and k end`,
+        ][rand(4)];
+        const stmt = (depth: number): string => {
+            const x = pick(), y = pick();
+            switch (rand(depth > 1 ? 13 : 16)) {
+                case 0: case 1: return `local ${x}`;
+                case 2: case 3: case 4: return `${x} = ${fn(x)}`;
+                case 5: return `local function ${y}(n) return ${x} ~= nil, ${x} and k end`;
+                case 6: return `local h${rand(3)} = function(n) return ${x}(n) end`;
+                case 7: return `g${rand(3)} = function(n) return ${x}(n or 2) end`;
+                case 8: return tried(`${x}(2)`);
+                case 9: return tried(`(g${rand(3)} or tostring)(1)`);
+                case 10: return [`${x} = ${rand(9)}`, `${x} = ${x}`, `${x} = { ${y} }`, `${x} = nil`, `k = k * 2`, `local k = k + ${rand(3)}`][rand(6)];
+                case 11: return note(`${x} ~= nil`);
+                case 12: return `local z${rand(2)} = ${rand(5)}`;
+                case 13: return `do ${block(depth + 1)} end`;
+                case 14: return `for i = 1, 2 do ${block(depth + 1)} end`;
+                default: return `if k % 2 == ${rand(2)} then ${block(depth + 1)} end`;
+            }
+        };
+        const block = (depth: number): string => Array.from({ length: 2 + rand(6) }, () => stmt(depth)).join(" ");
+        const programs = [
+            "local f f = function(n) if n < 2 then return n end return f(n - 1) + f(n - 2) end return f(15)",
+            "local a local function b(n) return a(n) end a = function(n) if n == 0 then return 'done' end return b(n - 1) end return b(5)",
+            "local a local k = 2 local function b() return a(k) end local z = 3 a = function(n) return n * z end return b()",
+            "local x local function get() return x end x = 5 return get()",
+            "local f local function g() return f() end local ok = pcall(g) f = function() return 1 end return ok, g()",
+            "local fs = {} for i = 1, 3 do local f f = function() return i end fs[i] = f end return fs[1](), fs[3]()",
+            "do local f f = function() return 1 end end local t t = {} return t ~= nil",
+            "local f function gg() return f() end f = function() error('boom') end local ok, e = pcall(gg) return ok, e",
+            "local x x = x return x",
+            "local a, b a = function() return b end b = function() return a end return a() == b, b() == a",
+            // (every global a program reads is one it assigns: Luau reads one a chunk only reads when it loads the chunk)
+            ...Array.from({ length: 1500 }, () => `local out, k = '', 1 a, b, c, g0, g1, g2 = nil, nil, nil, nil, nil, nil ${block(0)} return out`),
+        ];
+        expect(new Set(programs).size).toBeGreaterThan(1400);
+        // (an instance of its own: the programs assign globals)
+        const own = createLuau(impl);
+        let renamed: unknown, rebound = 0;
+        own.compiler.trace = (name, output) => {
+            if (name === "rename") renamed = output;
+            else if (name === "bind-once" && output !== renamed) rebound++;
+        };
+        expect(comparer(own)(programs)).toEqual([]);
+        expect(rebound).toBeGreaterThan(programs.length / 10);
+    });
+
     it("computes what Luau computes, and fails where it fails", () => {
         let seed = 7;
         const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return (n > 4096 ? seed : Math.floor(seed / 4096)) % n; };

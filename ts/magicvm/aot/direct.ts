@@ -1,6 +1,6 @@
 // The direct entry of a compiled function: no frames, entered at its start
 import { windowRegs } from "./liveness";
-import { blockFacts, type Facts } from "./facts";
+import { blockFacts, paramKinds, type Facts } from "./facts";
 import { MAX_STRUCTURED_NESTING, STRUCTURE_MISMATCH, capturesOf } from "./types";
 import type { AotBlock, AotTerm } from "./types";
 import { corePos } from "../coreops";
@@ -56,39 +56,6 @@ export class DirectEmitter extends FunctionEmitter {
     #seed: Facts | null = null;
     #specCheck: string | null = null;
 
-    // the kinds of the positional parameters intrinsics want (`wants`) where they read them (directly, or through the
-    // moves a parameter is usually copied by first): a version knowing them can drop their checks, which cost most in hot
-    // loops over the floats computed from them. A parameter wanted as two kinds is left out
-    #paramKinds(params: number): Map<number, Kind> {
-        const wanted = new Map<number, Kind | null>();
-        const want = (reg: number, kind: Kind) => wanted.set(reg, wanted.has(reg) && wanted.get(reg) !== kind ? null : kind);
-        for (const block of this.blocks) {
-            for (const x of block.insts) {
-                if (x.k !== "IntCall" && x.k !== "IntApply") continue;
-                const kind = this.table?.entries[x.pos]?.wants;
-                if (kind !== undefined) for (const r of windowRegs(x.start, x.nargs)) want(r, kind);
-            }
-        }
-        for (let grew = true; grew;) {
-            grew = false;
-            for (const block of this.blocks) {
-                for (const x of block.insts) {
-                    const kind = x.k === "Move" ? wanted.get(x.dst) : undefined;
-                    if (x.k === "Move" && kind !== undefined && kind !== null && wanted.get(x.src) !== kind) {
-                        const before = wanted.get(x.src);
-                        want(x.src, kind);
-                        grew = wanted.get(x.src) !== before || grew;
-                    }
-                }
-            }
-        }
-        const out = new Map<number, Kind>();
-        for (let i = 0; i < params; i++) {
-            const kind = wanted.get(i);
-            if (kind !== undefined && kind !== null) out.set(i, kind);
-        }
-        return out;
-    }
     protected readonly endOfCode = "return undefined;";
     protected readonly siteVar = "isite";
 
@@ -151,7 +118,9 @@ export class DirectEmitter extends FunctionEmitter {
         // a parameter whose kind has no check (guard) the front end can write stays checked in the body
         const types = this.table?.types ?? null;
         const guards = new Map<number, string>();
-        const kinds = types === null ? new Map<number, Kind>() : this.#paramKinds(closureArity.params);
+        // (a version knowing the kinds its parameters are wanted of can drop their checks, which cost most in hot loops
+        // over the floats computed from them)
+        const kinds = types === null ? new Map<number, Kind>() : paramKinds(this.blocks, this.table, closureArity.params);
         for (const [i, kind] of kinds) {
             const test = types!.guard(kind, `r${i}`, inlineDeps({ name: "the type system", deps: this.table!.typeDeps } as Intrinsic, this.usedDeps));
             if (test !== null) guards.set(i, test);
