@@ -3,11 +3,23 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { MultipleValues } from '../common';
+import { createLuau, toString } from '../lua';
+import { impl } from '../magicvm/meta';
 import { num2str } from '../lua/number';
 import { LuaTable } from '../lua/table';
 import { LuaVector, vadd, vdiv, vidiv, vmul, vsub, vunm, vector } from '../lua/vector';
 
 const v = (x: number, y: number, z?: number) => new LuaVector(x, y, z);
+const luau = createLuau(impl);
+const run = (src: string): string => {
+    try {
+        const r = luau.evaluateRaw(luau.compileRaw(src, "t"));
+        return (r instanceof MultipleValues ? r.values : [r]).map(toString).join("\t");
+    } catch (e: any) {
+        return "error: " + e.message;
+    }
+};
 
 describe("Luau vectors", () => {
     // the expected values are what Luau gives
@@ -88,5 +100,95 @@ describe.skipIf(!process.env.LUAU)("Luau vectors against Luau", () => {
             }
         });
         expect(actual).toEqual(expected.slice(0, actual.length));
+    });
+});
+
+describe("Luau vector SROA in VM", () => {
+    it("handles field accesses on vectors", () => {
+        expect(run("local v = vector.create(1, 2, 3); return v.x, v.y, v.z")).toBe("1\t2\t3");
+        expect(run("local v = vector.create(4, 5); return v.x, v.y, v.z")).toBe("4\t5\t0");
+    });
+
+    it("evaluates vector arithmetic and reduction without boxing", () => {
+        expect(run("local a = vector.create(1, 2, 3); local b = vector.create(4, 5, 6); local c = a + b; return c.x, c.y, c.z"))
+            .toBe("5\t7\t9");
+        expect(run("local a = vector.create(1, 2, 3); local b = vector.create(4, 5, 6); local c = a - b; return c.x, c.y, c.z"))
+            .toBe("-3\t-3\t-3");
+        expect(run("local a = vector.create(1, -2, 3); local c = -a; return c.x, c.y, c.z"))
+            .toBe("-1\t2\t-3");
+        expect(run("local a = vector.create(1, 2, 3); local c = a * 2; return c.x, c.y, c.z"))
+            .toBe("2\t4\t6");
+        expect(run("local a = vector.create(2, 4, 6); local c = a / 2; return c.x, c.y, c.z"))
+            .toBe("1\t2\t3");
+        expect(run("local a = vector.create(1, 2, 3); local b = vector.create(4, 5, 6); return vector.dot(a, b)"))
+            .toBe("32");
+        expect(run("local a = vector.create(3, 4, 0); return vector.magnitude(a)"))
+            .toBe("5");
+    });
+
+    it("computes arithmetic in loops", () => {
+        const src = `
+            local v = vector.create(0, 0, 0)
+            local d = vector.create(1, 2, 3)
+            for i = 1, 100 do
+                v = v + d
+            end
+            return v.x, v.y, v.z
+        `;
+        expect(run(src)).toBe("100\t200\t300");
+    });
+
+    it("passes and returns vectors in self-tail-call loops", () => {
+        const src = `
+            local function loop(n, acc)
+                if n <= 0 then return acc end
+                return loop(n - 1, acc + vector.create(1, 2, 3))
+            end
+            local r = loop(5, vector.create(0, 0, 0))
+            return r.x, r.y, r.z
+        `;
+        expect(run(src)).toBe("5\t10\t15");
+    });
+
+    it("materializes vectors when stored into tables, closures, or returned as objects", () => {
+        const src = `
+            local v = vector.create(10, 20, 30)
+            local t = { vec = v }
+            local function f() return v.x + v.y + v.z end
+            return t.vec.x, t.vec.y, t.vec.z, f(), type(v)
+        `;
+        expect(run(src)).toBe("10\t20\t30\t60\tvector");
+    });
+
+    it("handles control flow branches with vectors", () => {
+        const src = `
+            local function branch(flag)
+                local v = vector.create(1, 2, 3)
+                if flag then
+                    v = v * 2
+                else
+                    v = v + vector.create(10, 10, 10)
+                end
+                return v.x, v.y, v.z
+            end
+            local x1, y1, z1 = branch(true)
+            local x2, y2, z2 = branch(false)
+            return x1, y1, z1, x2, y2, z2
+        `;
+        expect(run(src)).toBe("2\t4\t6\t11\t12\t13");
+    });
+
+    it("unwinds and restores vector registers across coroutine yield/resume", () => {
+        const src = `
+            local co = coroutine.create(function(start)
+                local v = start + vector.create(1, 2, 3)
+                coroutine.yield(v.x)
+                return v.x, v.y, v.z
+            end)
+            local ok1, r1 = coroutine.resume(co, vector.create(10, 20, 30))
+            local ok2, x, y, z = coroutine.resume(co)
+            return ok1, r1, ok2, x, y, z
+        `;
+        expect(run(src)).toBe("true\t11\ttrue\t11\t22\t33");
     });
 });

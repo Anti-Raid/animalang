@@ -60,8 +60,8 @@ export class LuaVector implements Datum {
 const V = (x: number, y: number, z: number) => new LuaVector(x, y, z);
 // (a product that is added to or subtracted from is rounded once, with the sum, as arm64's compiler makes of it: the
 // product of two singles is exact in a double)
-const fma = (a: number, b: number, c: number) => f(a * b + c);
-const dot3 = (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => fma(az, bz, fma(ax, bx, f(ay * by)));
+export const fma = (a: number, b: number, c: number) => f(a * b + c);
+export const dot3 = (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => fma(az, bz, fma(ax, bx, f(ay * by)));
 const idiv = (a: number, b: number) => Math.floor(a / b);
 
 // the arithmetic Luau has on vectors: v+v, v-v, -v, and v*v, s*v, v*s, likewise / and //
