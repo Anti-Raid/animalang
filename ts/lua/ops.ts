@@ -368,7 +368,6 @@ export const registerLuauOps = (table: Intrinsics, library: LuauLibrary): void =
     }, { args: [1, 1], leaf: true, oneValue: true });
     // imports (see lower.ts): what the chunk reads as it starts, and a field of a global read then, nil if anything on
     // the way is nil or fails (luaV_getimport, with propagatenil)
-    table.register("%luau-imports", (regs, s, n) => regs.slice(s, s + n), { args: [0, Infinity], leaf: true, oneValue: true, fresh: true });
     table.register("%luau-import-chain", (regs, s, n) => {
         let v = regs[s];
         try {

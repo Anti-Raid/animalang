@@ -187,7 +187,7 @@ export class AotCompiler {
     }
 
     static #globalLoads(code: Code): number[] {
-        return code.ops.filter(op => op.k === "LoadGlobal").map(op => op.ip);
+        return code.ops.filter(op => op.k === "LoadGlobal" || op.k === "LoadImport").map(op => op.ip);
     }
 
     // the calls of leaf intrinsics that keep state of their own where they are called (IntrinsicOptions.site)

@@ -15,6 +15,15 @@ export type Op = { ip: number, where?: SourcePos | null } & (
     | { k: "SetUpvar"; src: number; idx: number; box: boolean }
     | { k: "FixUpvar"; clo: number; idx: number; src: number }
     | { k: "LoadGlobal"; dst: number; sym: number }
+    // The unit's imports (code.ts, Imports: `imp` is where they are among the constants; a function that uses them
+    // binds the values for the scope it runs in where it starts). LoadImport: what the unit
+    // read of the global `sym` when it started, unless that was <#void>: then the global now, as LoadGlobal.
+    // ImportGlobals reads them (`syms`: the constant array of their symbols, by slot) unless they are read, and says
+    // whether it did. ImportRef and ImportSet read and write one slot
+    | { k: "LoadImport"; dst: number; slot: number; sym: number; imp: number }
+    | { k: "ImportGlobals"; dst: number; syms: number; imp: number }
+    | { k: "ImportRef"; dst: number; slot: number; imp: number }
+    | { k: "ImportSet"; src: number; slot: number; imp: number }
     | { k: "SetGlobal"; src: number; sym: number }
     // jump to `else` if reg[cond] is false; `elseif` continues the chain an If started
     | { k: "If"; cond: number; else: number; elseif: boolean }

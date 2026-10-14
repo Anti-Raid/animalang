@@ -105,10 +105,10 @@ export const transfer = (
             facts.delete(inst.reg);
             facts.delete(inst.reg + 1);
             return;
-        case "LoadUpvar": case "LoadGlobal": case "Box": case "Unbox": case "NewClosure": case "MoveAcc": case "CurMarks":
+        case "LoadUpvar": case "LoadGlobal": case "LoadImport": case "ImportGlobals": case "ImportRef": case "Box": case "Unbox": case "NewClosure": case "MoveAcc": case "CurMarks":
             removeAlias(aliases, inst.dst);
             return void facts.delete(inst.dst);
-        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "SetBox": case "SetMark": case "MarkRestore": case "InlineSite":
+        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "ImportSet": case "SetBox": case "SetMark": case "MarkRestore": case "InlineSite":
             return;
         default: {
             const _: never = inst;
@@ -139,10 +139,10 @@ const written = (inst: AotInst): number[] => {
     switch (inst.k) {
         case "Unpack": return windowRegs(inst.start, inst.count + 1);
         case "MarkSave": return [inst.reg, inst.reg + 1];
-        case "LoadInt": case "LoadConst": case "Move": case "IntCall": case "IntApply": case "LoadUpvar": case "LoadGlobal":
+        case "LoadInt": case "LoadConst": case "Move": case "IntCall": case "IntApply": case "LoadUpvar": case "LoadGlobal": case "LoadImport": case "ImportGlobals": case "ImportRef":
         case "Box": case "Unbox": case "NewClosure": case "MoveAcc": case "CurMarks":
             return [inst.dst];
-        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "SetBox": case "SetMark": case "MarkRestore": case "InlineSite":
+        case "SetUpvar": case "FixUpvar": case "SetGlobal": case "ImportSet": case "SetBox": case "SetMark": case "MarkRestore": case "InlineSite":
             return [];
     }
 };

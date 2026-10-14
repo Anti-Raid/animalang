@@ -6,7 +6,7 @@ export { UNPACK_REST, UNPACK_STRICT } from "./ops";
 export type { Op, OpKind } from "./ops";
 export { AotCompiler } from "./aot/compiler";
 export { CodeEmitter } from "./aot/code-emitter";
-export { Code, Closure, ClosureTemplate, createRegs } from "./code";
+export { Code, Closure, ClosureTemplate, Imports, createRegs } from "./code";
 export type { DirectFn, InlineSite, ResumeFn, UpVarLoc, UsedIntrinsic, VMHost } from "./code";
 export { CORE_COUNT, CORE_INTRINSICS, ControlRequest, HostTail, InterruptRequest, corePos, hostInterruptError, hostCall, hostTail, hostTailFrom, hostYield } from "./coreops";
 export { VMExecutor } from "./executor";

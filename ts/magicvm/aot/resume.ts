@@ -135,6 +135,7 @@ export class ResumeEmitter extends FunctionEmitter {
                 const upvars = frame.upvars;
                 let ip = frame.ip, tmp;
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
+                ${this.importsDef()}
                 try {
                     top: while (true) {
                         switch (ip) {

@@ -136,6 +136,7 @@ export class DirectEmitter extends FunctionEmitter {
                 let rip = 0, tip = -1, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ", dip = -1, derr"}${this.#hasSites ? ", isite = -1" : ""};
                 ${locals.length > 0 ? `let ${locals.join(", ")};` : ""}
                 ${uvDefs}
+                ${this.importsDef()}
         `);
         this.emit(`
                 ${special !== null ? `let spec = ${this.#specCheck};` : ""}

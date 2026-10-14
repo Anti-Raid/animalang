@@ -28,6 +28,8 @@ export type UnitConstant =
     | { k: "tmpl"; id: number }
     | { k: "clo"; tmpl: number; name?: string }
     | { k: "values"; v: UnitConstant[] }
+    // the unit's imports (code.ts, Imports): one object for the unit, made when it is loaded
+    | { k: "imports"; n: number }
     // `q`: a constant the program quoted (see isQuotedConstant), marked again when loaded
     | { k: "arr"; v: UnitConstant[]; q?: boolean }
     | { k: "datum"; type: string; data: any; q?: boolean };

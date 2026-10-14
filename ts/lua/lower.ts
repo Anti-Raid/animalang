@@ -2,7 +2,7 @@
 // while, repeat, numeric for, for ... in, break, continue, return, functions, calls and method calls, several values
 // and `...`, tables, indexing, literals, and the operators; the rest is "not supported yet"
 import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LETREC, CORE_LET_STAR, CORE_LET_VALUES, CORE_LOOP, CORE_QUOTE, CORE_SET, MultipleValues, type SourcePos } from "../common";
-import { PAD, UNNAMED, clause } from "../magicvm/lambda";
+import { PAD, UNNAMED, clause, isSingleLambda } from "../magicvm/lambda";
 import { predictShapes, type Shape } from "./shapes";
 import { RecordShape } from "./table";
 import { L, isForm, offsetOf, type ParseResult } from "./syntax/ast";
@@ -108,11 +108,14 @@ class Lowering {
     readonly #owner = new Map<symbol, symbol>();
     readonly #shapes: Map<C.Table, Shape>;
     // Imports, as Luau's compiler makes them (LOP_GETIMPORT): a global the chunk does not assign, and a field of one
-    // (`a.b`, `a.b.c`), is read once when the chunk starts, into an array its functions share; where it is used, what
-    // was read then is what it is, unless that was nil: then it is read as any other, each time
-    readonly #imports = Symbol("imports");
+    // (`a.b`, `a.b.c`), is read once when the chunk starts; where it is used, what was read then is what it is, unless
+    // that was nil: then it is read as any other, each time. They are the VM's imports (%import-globals): a global is
+    // read where it is used as any global, and a field has a slot of its own, which the chunk fills when it starts.
+    // So has a global a field is read of somewhere (`rooted`): where the field was not there at the start, Luau reads
+    // the global anew each time, so that global is read as it is unless it is asked for through its slot
     readonly #imported = new Map<string, number>();
-    readonly #importing: any[] = [];
+    readonly #slots: (symbol | undefined)[] = [];
+    readonly #fields: any[] = [];
 
     constructor(readonly parsed: ParseResult, readonly file: string, readonly source: string) {
         this.#shapes = predictShapes(parsed.root);
@@ -135,22 +138,31 @@ class Lowering {
         const root = this.parsed.root;
         const pos = this.pos(root);
         const body = (yield this.functionBody(pos, root));
-        return this.#importing.length === 0 ? body : [CORE_LET, pos, [[this.#imports, intcall(null, "%luau-imports", ...this.#importing)]], body];
-    }
-
-    // `live` (what reads it now) as an import: `read` is what reads it when the chunk starts
-    #import(key: string, read: any, live: any): any {
-        let i = this.#imported.get(key);
-        if (i === undefined) {
-            this.#imported.set(key, i = this.#importing.length);
-            this.#importing.push(read);
-        }
-        return intcall(null, "%array-ref-or", this.#imports, i, live);
+        if (this.#slots.length === 0) return body;
+        const read = intcall(null, "%import-globals", [CORE_QUOTE, null, this.#slots]);
+        return [CORE_BEGIN, pos, this.#fields.length === 0 ? read : [CORE_IF, null, read, [CORE_BEGIN, null, ...this.#fields], undefined], body];
     }
 
     #global(name: string): any {
         const sym = Symbol.for(name);
-        return this.parsed.written.has(name) ? sym : this.#import(name, sym, sym);
+        if (this.parsed.written.has(name)) return sym;
+        if (this.parsed.rooted.has(name)) return intcall(null, "%import-or", this.#slot(name, sym), sym);
+        if (!this.#imported.has(name)) {
+            this.#imported.set(name, this.#slots.length);
+            this.#slots.push(sym);
+        }
+        return sym;
+    }
+
+    // the slot of what `read` reads when the chunk starts
+    #slot(key: string, read: any): number {
+        let slot = this.#imported.get(key);
+        if (slot === undefined) {
+            this.#imported.set(key, slot = this.#slots.length);
+            this.#slots.push(undefined);
+            this.#fields.push(intcall(null, "%import-set!", slot, read));
+        }
+        return slot;
     }
 
     // the global and the names of `e` when it is `a.b` or `a.b.c`, written so, of a global the chunk does not assign
@@ -587,26 +599,32 @@ class Lowering {
         if (e[0] !== L.CALL || !isForm(f) || f[0] !== L.GLOBAL || this.parsed.written.has(f[1])) return null;
         return f[1] === "pcall" && e.length > 3 ? "pcall" : f[1] === "xpcall" && e.length > 4 ? "xpcall" : null;
     }
+    // (A function written where it is called so is bound by a %letrec around the call, as a procedure only ever
+    // called: one that assigns no variable around it then needs no closure, the VM passing it what it uses, see
+    // passes/lift.ts)
     *#protected(e: C.Call | C.Method): Task<{ bindings: any[][], r: symbol, error: any } | null> {
         const which = this.#protecting(e);
         if (which === null) return null;
         const args = e.slice(2, -1) as C.Expr[], pos = this.pos(e);
         if (isMulti(args[args.length - 1])) return null;
         const r = Symbol("r"), bindings: any[][] = [], given: any[] = [];
+        let written: any[] | null = null;
         for (const a of args) {
-            const t = Symbol("a");
-            bindings.push([t, (yield this.expr(a))]);
+            const t = Symbol("a"), value = (yield this.expr(a));
+            if (a === args[0] && isSingleLambda(value)) written = [t, value];
+            else bindings.push([t, value]);
             given.push(t);
         }
+        const calling = (call: any[]) => written === null ? call : [CORE_LETREC, pos, [written], call];
         const value = intcall(pos, "%caught-value", r);
         if (which === "pcall") {
-            bindings.push([r, intcall(pos, "%catch-call", ...given)]);
+            bindings.push([r, calling(intcall(pos, "%catch-call", ...given))]);
             return { bindings, r, error: intcall(pos, "%luau-caught", value) };
         }
         // (the handler is called with the error where it is raised, and its first value is the error xpcall gives:
         // through a procedure of the library's, which is no frame of the program's)
         const [f, h, ...rest] = given;
-        bindings.push([Symbol("_"), intcall(pos, "%luau-xpcall-handler", h)], [r, intcall(pos, "%catch-call/pre", intcall(pos, "%luau-library", "handler"), h, f, ...rest)]);
+        bindings.push([Symbol("_"), intcall(pos, "%luau-xpcall-handler", h)], [r, calling(intcall(pos, "%catch-call/pre", intcall(pos, "%luau-library", "handler"), h, f, ...rest))]);
         return { bindings, r, error: intcall(pos, "%luau-xpcall-caught", value) };
     }
 
@@ -821,8 +839,8 @@ class Lowering {
             const chain = this.#chain(e as C.Index);
             if (chain !== null) {
                 const [root, ...names] = chain, sym = Symbol.for(root), pos = this.pos(e);
-                return this.#import(chain.join("."), intcall(null, "%luau-import-chain", sym, ...names.map(intern)),
-                    names.reduce((o: any, name) => intcall(pos, "%luau-field", o, intern(name)), sym));
+                const slot = this.#imported.get(chain.join(".")) ?? this.#slot(chain.join("."), intcall(null, "%luau-import-chain", sym, ...names.map(intern)));
+                return intcall(null, "%import-or", slot, names.reduce((o: any, name) => intcall(pos, "%luau-field", o, intern(name)), sym));
             }
         }
         return start(this.#exprForm(e));

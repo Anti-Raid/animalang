@@ -68,7 +68,7 @@ export class Liveness {
 
     static #instUses(inst: AotInst, constants: readonly any[]): number[] {
         switch (inst.k) {
-            case "Move": case "Box": case "Unbox": return [inst.src];
+            case "Move": case "Box": case "Unbox": case "ImportSet": return [inst.src];
             case "SetBox": return [inst.dst, inst.src];
             case "SetUpvar": case "SetGlobal": return [inst.src];
             case "FixUpvar": return [inst.clo, inst.src];

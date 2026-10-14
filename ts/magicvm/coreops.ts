@@ -404,11 +404,17 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     generated("%apply-array", [2, Infinity]);
     generated("%apply-fresh", [2, 2]);
     control("%host-then", [2, 2], (regs, start) => regs[start](regs[start + 1]));
-    // an array's element; whether a value is <#void>; and (%array-ref-or array index otherwise): the element unless it
-    // is <#void>, else `otherwise`, which is evaluated only then (the compiler writes it as an %if of the other two)
-    core("%array-ref", [2, 2], (regs, start) => regs[start][regs[start + 1]], { effectFree: true, inline: (args) => args.length === 2 ? `${args[0]}[${args[1]}]` : null });
+    // whether a value is <#void>
     core("%nothing?", [1, 1], (regs, start) => regs[start] === undefined, { effectFree: true, returns: "boolean", inline: unaryInline(v => `(${v} === undefined)`) });
-    core("%array-ref-or", [3, 3], (regs, start) => regs[start][regs[start + 1]] === undefined ? regs[start + 2] : regs[start][regs[start + 1]]);
+    // A unit's imports, each compiled to instructions of its own (compiler.ts). (%import-globals (%quote #(sym ...))): once in
+    // a unit, where it starts. The first time it runs (in a scope), each global named is read, and from then on a read
+    // of that global anywhere in the unit gives what was read, unless that was <#void> (then the global as it is, each
+    // time); #t then, #f when they were read before. A <#void> in the array is a slot of the front end's own:
+    // (%import-set! slot value) and (%import-ref slot) write and read one, and (%import-or slot otherwise) is the
+    // slot's value unless it is <#void>, else `otherwise`, evaluated only then
+    for (const [name, args] of [["%import-globals", 1], ["%import-set!", 2], ["%import-ref", 1], ["%import-or", 2]] as const) {
+        core(name, [args, args], () => { throw new Error(`internal error: ${name} is compiled where it is written and has no function to call`); });
+    }
     return table.freeze();
 })();
 

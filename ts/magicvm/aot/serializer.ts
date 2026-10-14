@@ -1,6 +1,6 @@
 // Serializer for MagicVM pre-compiled execution units (.animau)
 import { MultipleValues, isQuotedConstant } from "../../common";
-import { Closure, ClosureTemplate, type Code } from "../code";
+import { Closure, ClosureTemplate, Imports, type Code } from "../code";
 import type {
     AnimaExecutionUnit,
     UnitArity,
@@ -68,6 +68,7 @@ export const serializeConstant = (
         }
         return { k: "clo", tmpl: id, name: c.debugName };
     }
+    if (c instanceof Imports) return { k: "imports", n: c.size };
     if (c instanceof MultipleValues) {
         return { k: "values", v: c.values.map(item => serializeConstant(item, templateMap, uniques)) };
     }

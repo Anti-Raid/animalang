@@ -197,6 +197,8 @@ Every step preserves `≈`, and `≈` preserves values, effects, errors and term
 
 ---
 
+**Catching calls as known calls.** `liftLambdas` counts `(%intcall %catch-call f a…)` and `(%intcall %catch-call/pre p w f a…)` among the calls of `f`, and rewrites them as it rewrites `(%call f a…)`: the extra variables `v…` go right after `f`. This keeps the argument for `%call`. Both forms evaluate their operands as a `%call` evaluates its own, left to right, before anything else happens, so the `v…` are read where the call is, under the same conditions (not assigned, not a `%letrec` value that may be unset, not shadowed there: names are unique). Both then call `f` with exactly the arguments written after it (control.ts: `invoke(ctx, proc, frame, args, …)` in heap code, the site's call in direct code) and use `f` in no other way: it is not returned, stored, or handed to the handler. What differs from a `%call` is only where the call's errors go, which does not depend on which closure of the lambda is called nor on how it gets its variables. In `%catch-call/pre` the handler `p` and its argument `w` are ordinary operands: a name there is a use as a value (`other`), which stops the lifting of that name.
+
 ## 4. Liveness
 
 ### 4.1 What the VM does differently from locations

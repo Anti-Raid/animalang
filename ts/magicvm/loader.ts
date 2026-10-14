@@ -6,6 +6,7 @@ import {
     Closure,
     ClosureTemplate,
     Code,
+    Imports,
     newCallCache,
     type CallCache,
     type DirectFn,
@@ -38,8 +39,8 @@ export const registerDatumDeserializer = (
 export const deserializeConstant = (
     c: UnitConstant,
     templates: ClosureTemplate[],
-    // the symbols made so far for the unit's own (see UnitConstant's `u`)
-    uniques: symbol[] = []
+    // the symbols made so far for the unit's own (see UnitConstant's `u`), and its imports once made
+    uniques: symbol[] & { imports?: Imports } = []
 ): any => {
     switch (c.k) {
         case "lit":
@@ -62,6 +63,8 @@ export const deserializeConstant = (
             return templates[c.id];
         case "clo":
             return Closure.fromTemplate(templates[c.tmpl], c.name);
+        case "imports":
+            return uniques.imports ??= new Imports(c.n);
         case "values":
             return new MultipleValues(c.v.map(item => deserializeConstant(item, templates, uniques)));
         case "datum": {

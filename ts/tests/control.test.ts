@@ -147,6 +147,29 @@ describe('Anima', () => {
             }
         })
 
+        it('a procedure only ever called by a catching call is passed what it uses, and is no closure', () => {
+            for (const a of [evaluator, createScheme({ ...vmImpl, reentrant: false })]) {
+                const nrun = (expr: string) => s.stringify(runNative(a, expr))
+                const made = (src: string): number => {
+                    const code = (runNative(a, src) as any).tmpl.code
+                    return code.ops.filter((op: any) => op.k === "NewClosure").length
+                }
+                const sum = (call: string) => `(lambda (k) (let loop ((i 0) (n 0)) (%if (%call = i 5) n (%call loop (%call + i 1) (%call + n (%letrec ((p (lambda (x) (%call + x (%call + i k))))) ${call}))))))`
+                expect(nrun(`(%call ${sum("(%intcall %catch-call p 1)")} 10)`)).toBe("65")
+                expect(made(sum("(%intcall %catch-call p 1)"))).toBe(0)
+                expect(nrun(`(%call ${sum("(%intcall %catch-call/pre (lambda (w e) e) 'w p 1)")} 10)`)).toBe("65")
+                expect(made(sum("(%intcall %catch-call/pre (lambda (w e) e) 'w p 1)"))).toBe(0)
+                // an error in it is caught as ever
+                expect(nrun(`(%call (lambda (k) (%letrec ((p (lambda () (%intcall %raise (%call list 'raised k))))) (%intcall %caught-value (%intcall %catch-call p)))) 3)`)).toBe("(raised 3)")
+                // used any other way, or using a variable that is assigned, it stays a closure
+                expect(made(`(lambda (k) (%letrec ((p (lambda () k))) (%call list p (%intcall %catch-call p))))`)).toBe(1)
+                expect(nrun(`(%call (lambda (k) (%letrec ((p (lambda () k))) (%begin (%set! k 9) (%intcall %catch-call p)))) 1)`)).toBe("9")
+                expect(made(`(lambda (k) (%letrec ((p (lambda () k))) (%begin (%set! k 9) (%intcall %catch-call p))))`)).toBe(1)
+                // the handler of %catch-call/pre is a value, not what is called
+                expect(made(`(lambda (k) (%letrec ((h (lambda (w e) (%call list k e)))) (%intcall %catch-call/pre h 'w + 1 2)))`)).toBe(1)
+            }
+        })
+
         it('calls the %catch handler in tail position', () => {
             expect(nrun(`(define-global (ce-loop n) (%if (%call = n 0) 'ok (%catch (lambda () (%call raise n)) (lambda (e) (%call ce-loop (%call - e 1)))))) (%call ce-loop 100000)`)).toBe("ok")
         })

@@ -22,16 +22,23 @@ literals, interpolated strings, if-expressions, and the operators (arithmetic, `
   (`undefined`) as its `unbound` value, so an unassigned global reads as nil.
 - **Imports** (Luau's `GETIMPORT`): a global the chunk assigns nowhere (`g = v`, `g += v`, `function g()`; the parser
   lists them, `ParseResult.written`), and a field of one written `a.b` or `a.b.c` (not `a["b"]`:
-  `ParseResult.bracketed`), is read once when the chunk starts, with the others, into an array the chunk's functions
-  share (`%luau-imports`; a field through `%luau-import-chain`, which gives nil if anything on the way is nil or fails).
-  Where it is used, what was read then is its value, however the global or the field has changed since; one that was
-  nil then is read where it is used, each time, as any other global is. So a chunk goes on calling the function a
-  global named when it started, and reads a table's field as it was then (`t.x = 2 return t.x` gives the old value
-  when another chunk made `t`), exactly as in Luau, where code that changes what it reads this way assigns the global
-  itself, or reads it through a local or with brackets. Two differences: a chunk starts when it is run
-  (`evaluateRaw`), there being no `loadstring` to load one without running it; and Luau calls some builtins without
-  reading their global at all when their arguments are of the usual types (`FASTCALL`), so replacing one of those
-  globals is not seen there even by a chunk loaded afterwards, while here it is.
+  `ParseResult.bracketed`), is read once, when the chunk starts. Where it is used, what was read then is its value,
+  however the global or the field has changed since; one that was nil then is read where it is used, each time, as
+  any other global is. So a chunk goes on calling the function a global named when it started, and reads a table's
+  field as it was then (`t.x = 2 return t.x` gives the old value when another chunk made `t`), exactly as in Luau,
+  where code that changes what it reads this way assigns the global itself, or reads it through a local or with
+  brackets. They are the VM's imports (`%import-globals`, see its README): a global is lowered as any global read
+  (the passes see a symbol, and the VM makes it one instruction that reads the chunk's slot, then the global if the
+  slot is nil), so a function that only reads globals captures nothing. A field has a slot the chunk fills when it
+  starts (`%import-set!` of `%luau-import-chain`, which gives nil if anything on the way is nil or fails) and is read
+  with `%import-or`, the field itself read only when the slot is nil. A global a field is read of somewhere
+  (`ParseResult.rooted`) has such a slot too, not the VM's own import: where the field was nil at the start, Luau
+  reads the global anew each time. A compiled chunk reads its imports the first time it runs, and keeps them when it
+  is run again, as Luau's loaded chunk does when called again; the same source compiled again is another chunk. Two
+  differences: a chunk starts when it is first run (`evaluateRaw`), there being no `loadstring` to load one without
+  running it; and Luau calls some builtins without reading their global at all when their arguments are of the usual
+  types (`FASTCALL`), so replacing one of those globals is not seen there even by a chunk loaded afterwards, while
+  here it is.
 - Operators are intrinsics (`%luau-add` ... `%luau-unm`, `%luau-concat`) doing what Luau's VM does: numbers, strings
   that read as numbers (coerced as `tonumber` reads them), vectors as `lvmutils.cpp` allows, integers with integers,
   and Luau's errors otherwise (`attempt to perform arithmetic (add) on nil and number`, `attempt to concatenate
@@ -132,7 +139,9 @@ literals, interpolated strings, if-expressions, and the operators (arithmetic, `
   (`%catch-call`, `%catch-call/pre`: no arguments in an array, the call through its own site's cache, and no multiple
   values made where the call's values are bound, `local ok, v = pcall(...)`). xpcall's handler is given to the catch
   as it is, with a procedure of the library's that calls it (`%luau-library`), so nothing is allocated for a call that
-  raises no error. Luau's compiler does the same (its fast
+  raises no error. A function written where it is given, `pcall(function() ... end)`, is bound by a `%letrec` around
+  the catching call, where the VM's lambda lifting sees a procedure that is only called: unless it assigns a variable
+  around it, it gets those it uses as arguments and no closure is made. Luau's compiler does the same (its fast
   pcall instruction), so there too such a call is the library's whatever the global has become. `error(v)`,
   `error(v, 0)` and `error(v, 1)` are written out when the `error` the chunk read is the library's: the value is
   raised from the call itself, a string or a number after `file:line: ` of the call, known when compiling; no error

@@ -101,6 +101,7 @@ class Parser {
     // the globals the chunk assigns, and its index expressions written with brackets (see ParseResult)
     readonly #written = new Set<string>();
     readonly #bracketed = new WeakSet<object>();
+    readonly #rooted = new Set<string>();
     #assigned(target: C.Expr): void {
         if (isHead(target, L.GLOBAL)) this.#written.add((target as C.Global)[1]);
     }
@@ -152,6 +153,7 @@ class Parser {
             hotComments: this.#hotComments,
             written: this.#written,
             bracketed: this.#bracketed,
+            rooted: this.#rooted,
             comments: this.#comments,
         };
     }
@@ -1305,6 +1307,7 @@ class Parser {
                 const dot = this.#lexer.from;
                 this.#take();
                 const index = this.#parseIndexName(null, dot);
+                if (isHead(expr, L.GLOBAL)) this.#rooted.add((expr as C.Global)[1]);
                 expr = this.#expr([L.INDEX, expr, index.name, start], start, index.to);
             } else if (k === Tok.LBracket) {
                 expr = this.#parseIndexExpr(start, expr);

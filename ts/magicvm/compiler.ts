@@ -26,7 +26,8 @@ import { ascend, descend, run, start, type Task } from "./visitor";
 const bodyExpr = (body: any[]): any => body.length === 0 ? null : body.length === 1 ? body[0] : [CORE_BEGIN, null, ...body]
 
 const OP_APPLY = Symbol.for("%apply");
-const AT_OR = corePos("%array-ref-or"), ARRAY_REF = Symbol.for("%array-ref"), IS_VOID = Symbol.for("%nothing?");
+const IMPORT_GLOBALS = corePos("%import-globals"), IMPORT_SET = corePos("%import-set!"), IMPORT_REF = corePos("%import-ref"), IMPORT_OR = corePos("%import-or");
+const IMPORT_REF_OP = Symbol.for("%import-ref"), IS_VOID = Symbol.for("%nothing?");
 
 type Analyzed = { ast: any, analyzer: AstAnalysis, ascope: AnalysisScope }
 type Closed = Unboxed & { captures: Captures }
@@ -61,7 +62,7 @@ const resolvePass: Pass<any, Analyzed> = {
     },
 }
 
-const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numRegs }, ctx) => new IR(ctx.intrinsics, ctx.debug, ctx.assumed, ctx.reentrant).lower(nodes, numRegs) }
+const lowerPass: Pass<FunctionIR, Code> = { name: "lower", run: ({ nodes, numRegs, imports }, ctx) => new IR(ctx.intrinsics, ctx.debug, ctx.assumed, ctx.reentrant, imports).lower(nodes, numRegs) }
 
 // the optimizer (see passes/cp0.ts)
 const cp0Pass: Pass<Converted, Converted> = {
@@ -134,10 +135,14 @@ export class Compiler {
         }
     }
 
+    // what the unit being compiled imports, by slot (%import-globals), once that is met
+    #imports: (symbol | undefined)[] | null = null
+
     // the IR of a top-level expression, its variables analysed
     readonly #generatePass: Pass<Closed, FunctionIR> = {
         name: "generate",
         run: ({ ast, forwards, captures }) => {
+            this.#imports = null
             const scope = new CompilerScope(null)
             const nodes: Node[] = []
             const retReg = scope.allocTemp()
@@ -145,7 +150,7 @@ export class Compiler {
             if (!this.#nodesEndsInRet(nodes)) {
                 nodes.push({ k: "Return", src: retReg })
             }
-            return { nodes, numRegs: scope.numRegs }
+            return { nodes, numRegs: scope.numRegs, imports: this.#imports }
         },
     }
 
@@ -280,12 +285,9 @@ export class Compiler {
                     if (intrinsic.pos === corePos("%first-value") && call.length === 3 && call[2] === undefined && Array.isArray(call[1]) && call[1][0] === CORE_CALL && call[1].length >= 3) {
                         return this.#compile(call[1], { ...opts, isTail: false, one: true })
                     }
-                    // (%array-ref-or array index otherwise): the element if it is something, and only otherwise the
-                    // last operand. One form where a front end reads the same way in many places (the passes before
-                    // this one go through one form for each, not four)
-                    if (intrinsic.pos === AT_OR && call.length === 4 && typeof call[1] === "symbol" && typeof call[2] === "number") {
-                        const element = [CORE_INTCALL, null, ARRAY_REF, call[1], call[2]]
-                        return this.#compileIfCall([CORE_IF, [CORE_INTCALL, null, IS_VOID, element], call[3], element], opts)
+                    // a unit's imports (see coreops.ts)
+                    if (intrinsic.pos === IMPORT_GLOBALS || intrinsic.pos === IMPORT_SET || intrinsic.pos === IMPORT_REF || intrinsic.pos === IMPORT_OR) {
+                        return this.#compileImport(intrinsic.pos, call, opts)
                     }
                     if (intrinsic.leaf) {
                         return this.#compileRuntimeOp(call, opts, intrinsic.min, intrinsic.max, (start, nargs, dest) => {
@@ -644,6 +646,27 @@ export class Compiler {
         for (let i = next; i < nargs; i++) { const t = this.#compile(expr[i + 1], { ...opts, destReg: startReg + i, isTail: false }); if (t !== undefined) yield t }
         emit(startReg, nargs, opts.destReg)
         opts.scope.regAlloc.freeBlock(startReg, nargs)
+    }
+
+    #compileImport(op: number, call: any[], opts: CmpOpts): void | Task<void> {
+        const malformed = () => new VMError(Msg.FormArgs, [String(call[0].description)])
+        if (op === IMPORT_GLOBALS) {
+            const quoted = call[1]
+            if (call.length !== 2 || !Array.isArray(quoted) || quoted[0] !== CORE_QUOTE || !Array.isArray(quoted[2]) || this.#imports !== null) throw malformed()
+            const syms: (symbol | undefined)[] = this.#imports = quoted[2]
+            return this.#withDest(opts, opts.destReg, dst => opts.nodes.push({ k: "ImportGlobals", dst, syms }))
+        }
+        const slot = call[1]
+        if (typeof slot !== "number") throw malformed()
+        if (op === IMPORT_REF) return this.#withDest(opts, opts.destReg, dst => opts.nodes.push({ k: "ImportRef", dst, slot }))
+        if (op === IMPORT_OR) {
+            const read = [CORE_INTCALL, null, IMPORT_REF_OP, slot]
+            return this.#compileIfCall([CORE_IF, [CORE_INTCALL, null, IS_VOID, read], call[2], read], opts)
+        }
+        return this.#compileRuntimeOp([call[0], call[2]], opts, 1, 1, (start, _nargs, dest) => {
+            opts.nodes.push({ k: "ImportSet", src: start, slot })
+            if (dest !== undefined) opts.nodes.push({ k: "LoadValue", constant: undefined, dst: dest })
+        })
     }
 
     #withRtResult(opts: CmpOpts, op: string, startReg: number, nargs: number, use: (reg: number) => void) {

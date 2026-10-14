@@ -190,7 +190,8 @@ export abstract class FunctionEmitter extends CodeEmitter {
         switch (inst.k) {
             case "LoadInt": case "NewClosure": case "CurMarks": case "Box": return [[inst.dst, true]];
             case "LoadConst": return [[inst.dst, !(this.constants[inst.idx] instanceof MultipleValues)]];
-            case "LoadUpvar": case "LoadGlobal": case "Unbox": return [[inst.dst, variables]];
+            case "LoadUpvar": case "LoadGlobal": case "LoadImport": case "ImportRef": case "Unbox": return [[inst.dst, variables]];
+            case "ImportGlobals": return [[inst.dst, true]];
             case "Move": return [[inst.dst, moved(inst.src)]];
             case "MoveAcc": return [[inst.dst, inst.one === true]];
             case "IntCall": case "IntApply": {
@@ -322,6 +323,40 @@ export abstract class FunctionEmitter extends CodeEmitter {
         return moves.join("\n");
     }
 
+    // the unit's imports for a function that uses them, bound where the function starts: `iv` is the values of the
+    // scope it runs in
+    protected importsDef(): string {
+        for (const block of this.blocks) {
+            for (const inst of block.insts) {
+                if (inst.k === "LoadImport" || inst.k === "ImportRef" || inst.k === "ImportSet" || inst.k === "ImportGlobals") {
+                    return `const IM = CONSTANTS[${inst.imp}]; let iv = IM.scope === ctx.scope ? IM.values : IM.none;`;
+                }
+            }
+        }
+        return "";
+    }
+
+    #loadGlobal(inst: { ip: number, dst: number, sym: number }): string {
+        return `
+            {
+                const cache = GC${inst.ip};
+                if (cache.scope === ctx.scope && cache.version === Env.globalsVersion) {
+                    r${inst.dst} = cache.value;
+                } else {
+                    const cell = ctx.scope.cell(CONSTANTS[${inst.sym}], ctx.scope.unbound);
+                    if (cell.v === Env.ERROR) {
+                        ${this.recordIp(inst.ip)}
+                        const err = new MissingVarError(CONSTANTS[${inst.sym}]);
+                        ${this.debug ? "" : this.errorSite(inst.ip, "err")}
+                        throw err;
+                    }
+                    ctx.scope.watch();
+                    r${inst.dst} = Env.remember(cache, ctx.scope, cell);
+                }
+            }
+        `;
+    }
+
     protected emitInst(inst: AotInst): void {
         if (this.debug) this.emit(this.debugHooks(inst.ip));
         switch (inst.k) {
@@ -336,24 +371,21 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "FixUpvar":
                 return this.emit(`${this.operand(inst.clo)}.upvars[${inst.idx}] = ${this.use(inst.src)};`);
             case "LoadGlobal":
+                return this.emit(this.#loadGlobal(inst));
+            case "LoadImport":
                 return this.emit(`
                     {
-                        const cache = GC${inst.ip};
-                        if (cache.scope === ctx.scope && cache.version === Env.globalsVersion) {
-                            r${inst.dst} = cache.value;
-                        } else {
-                            const cell = ctx.scope.cell(CONSTANTS[${inst.sym}], ctx.scope.unbound);
-                            if (cell.v === Env.ERROR) {
-                                ${this.recordIp(inst.ip)}
-                                const err = new MissingVarError(CONSTANTS[${inst.sym}]);
-                                ${this.debug ? "" : this.errorSite(inst.ip, "err")}
-                                throw err;
-                            }
-                            ctx.scope.watch();
-                            r${inst.dst} = Env.remember(cache, ctx.scope, cell);
-                        }
+                        const read = iv[${inst.slot}];
+                        if (read !== undefined) r${inst.dst} = read;
+                        else ${this.#loadGlobal(inst)}
                     }
                 `);
+            case "ImportGlobals":
+                return this.emit(`r${inst.dst} = executor.importGlobals(ctx, IM, CONSTANTS[${inst.syms}]); iv = IM.values;`);
+            case "ImportRef":
+                return this.emit(`r${inst.dst} = iv[${inst.slot}];`);
+            case "ImportSet":
+                return this.emit(`if (IM.scope === ctx.scope) IM.values[${inst.slot}] = ${this.use(inst.src)};`);
             case "SetGlobal":
                 return this.emit(`ctx.scope.set(CONSTANTS[${inst.sym}], ${this.use(inst.src)});`);
             case "Move":

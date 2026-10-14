@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { createLuau, toString } from '../lua';
 import { impl } from '../magicvm/meta';
 import { MultipleValues } from '../common';
-import { listing } from '../magicvm/exec';
+import { listing, type Closure } from '../magicvm/exec';
+import { UnitSerializer } from '../magicvm/aot/serializer';
 import { chunkComparer, comparer } from './luau-compare';
 
 const luau = createLuau(impl);
@@ -242,6 +243,91 @@ describe("Luau lowered functions", () => {
         expect(run("local x\nreturn x(1)")).toBe("error: t:2: attempt to call a nil value");
         expect(run("local x = 5\nlocal y = x()")).toBe("error: t:2: attempt to call a number value");
         expect(run("local function f()\n  local x = 'a'\n  return x()\nend\nreturn f()")).toBe("error: t:3: attempt to call a string value");
+    });
+});
+
+describe("A function written where pcall or xpcall is given it", () => {
+    const fast = createLuau({ ...impl, debug: false, optimize: true });
+    const made = (src: string): number => ((fast.evaluateRaw(fast.compileRaw(`return function(k, t) ${src} end`, "t")) as Closure).tmpl.code.ops as any[]).filter(op => op.k === "NewClosure").length;
+    const result = (src: string) => {
+        const r = fast.evaluateRaw(fast.compileRaw(src, "t"));
+        return (r instanceof MultipleValues ? r.values : [r]).map(toString).join("\t");
+    };
+
+    it("is no closure when it assigns none of the variables around it", () => {
+        expect(made("local n = 0 for i = 1, 3 do local ok, v = pcall(function() return i + k end) if ok then t[i] = v end end")).toBe(0);
+        expect(made("return pcall(function(a, b) return a + b + k end, 1, 2)")).toBe(0);
+        expect(made("return xpcall(function() return t.x.y end, function(e) return k .. e end)")).toBe(1);
+        expect(made("local n = 0 pcall(function() n = n + k end) return n")).toBe(1);
+        expect(result("local function f(k) local s = 0 for i = 1, 4 do local ok, v = pcall(function() return i * k end) s = s + v end return s end return f(3)")).toBe("30");
+        expect(result("local function f(k) return pcall(function(a, ...) return a + k, select('#', ...) end, 1, 2, 3) end return f(10)")).toBe("true\t11\t2");
+        expect(result("local function f(k) return pcall(function() error('e' .. k, 0) end) end return f(7)")).toBe("false\te7");
+        expect(result("local function f(k) return xpcall(function(a) return a.x end, function(e) return 'h:' .. k end, nil) end return f(1)")).toBe("false\th:1");
+        expect(result("local function f() local n = 0 for i = 1, 3 do pcall(function() n = n + i end) end return n end return f()")).toBe("6");
+        expect(result("local fs = {} for i = 1, 3 do pcall(function() fs[i] = function() return i end end) end return fs[1](), fs[3]()")).toBe("1\t3");
+    });
+});
+
+describe("Luau's imports", () => {
+    const values = (r: any) => (r instanceof MultipleValues ? r.values : [r]).map(toString).join("\t");
+
+    it("are read the first time a compiled chunk runs, and kept when it runs again (Luau's loaded chunk, called again)", () => {
+        const a = createLuau(impl);
+        const exec = (src: string) => values(a.evaluateRaw(a.compileRaw(src, "t")));
+        exec("g = 1 lib = { f = function() return 'old' end }");
+        const src = "return g, t and t.x, lib.f(), late == nil";
+        const code = a.compileRaw(src, "t");
+        expect(values(a.evaluateRaw(code))).toBe("1\tnil\told\ttrue");
+        exec("g = 2 t = { x = 5 } lib = { f = function() return 'new' end } late = 1");
+        // what was there is kept; what was not is read each time
+        expect(values(a.evaluateRaw(code))).toBe("1\t5\told\tfalse");
+        // the same source compiled again is another chunk
+        expect(exec(src)).toBe("2\t5\tnew\tfalse");
+    });
+
+    it("are those of the functions a chunk made, whichever chunk calls them", () => {
+        const a = createLuau(impl);
+        const exec = (src: string) => values(a.evaluateRaw(a.compileRaw(src, "t")));
+        exec("g = 'first'");
+        exec("function read() return g, h end function make() return function() return g, h end end inner = make()");
+        exec("g = 'second' h = 'late'");
+        expect(exec("return read()")).toBe("first\tlate");
+        expect(exec("return inner()")).toBe("first\tlate");
+        expect(exec("return make()()")).toBe("first\tlate");
+        expect(exec("return g, h")).toBe("second\tlate");
+    });
+
+    it("leave a global a field is read of to be read as it is where the field was not there", () => {
+        const a = createLuau(impl);
+        const exec = (src: string) => values(a.evaluateRaw(a.compileRaw(src, "t")));
+        exec("t = { x = 1 }");
+        exec("function field() return t.y end function whole() return t end");
+        exec("t = { y = 2 }");
+        // t.y was nil when the chunk started, so t is read anew for it; t itself is what it was
+        expect(exec("return field(), whole().x, whole().y")).toBe("2\t1\tnil");
+    });
+
+    it("are per instance for one compiled chunk, and survive being saved and loaded", () => {
+        const a = createLuau(impl), b = createLuau(impl);
+        a.evaluateRaw(a.compileRaw("g = 'a' lib = { v = 'la' }", "t"));
+        b.evaluateRaw(b.compileRaw("g = 'b' lib = { v = 'lb' }", "t"));
+        const code = a.compileRaw("function get() return g, lib.v, tostring(1) end return get()", "t");
+        const json = UnitSerializer.serialize(code, { id: "imports", version: "1", scriptname: "t" });
+        expect(values(a.evaluateRaw(code))).toBe("a\tla\t1");
+        expect(values(b.evaluateRaw(b.loadUnit(json).code))).toBe("b\tlb\t1");
+        a.evaluateRaw(a.compileRaw("g = 'a2' lib = { v = 'la2' }", "t"));
+        b.evaluateRaw(b.compileRaw("g = 'b2' lib = { v = 'lb2' }", "t"));
+        expect(values(a.evaluateRaw(a.compileRaw("return get()", "t")))).toBe("a\tla\t1");
+        expect(values(b.evaluateRaw(b.compileRaw("return get()", "t")))).toBe("b\tlb\t1");
+    });
+
+    it("are single instructions where a global is read, and make no closure capture anything", () => {
+        const code = luau.compileRaw("local function f(x) return type(x), print end return f", "t");
+        const chunk = [listing(code)].flat().join("\n"), f = [listing((luau.evaluateRaw(code) as Closure).tmpl.code)].flat().join("\n");
+        expect(chunk).toContain("ImportGlobals");
+        expect(chunk).not.toContain("NewClosure");
+        expect(f.match(/LoadImport/g)).toHaveLength(2);
+        expect(f).not.toContain("LoadGlobal");
     });
 });
 

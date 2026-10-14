@@ -1,5 +1,6 @@
 // Lambda lifting, a pass over the core forms before analysis. A lambda bound by a %letrec whose name is never assigned
-// and only ever called (so every call is known) gets its free local variables as extra parameters, passed by every call,
+// and only ever called (so every call is known: a %call, or a catching call, %catch-call and %catch-call/pre, which
+// calls it with the arguments after it) gets its free local variables as extra parameters, passed by every call,
 // so it captures nothing and compiles to a constant closure: none is made each time the %letrec runs. The variables
 // passed include the lifted lambdas it calls (itself too, if it recurses), which it receives as values, and those its
 // callees need. A free variable that is assigned anywhere stops the lifting (a copy would miss the assignments)
@@ -33,6 +34,11 @@ const assignedNames = (ast: any): Set<symbol> => {
 
 // whether `e` is a call of `name`
 const isCallOf = (e: any, name: symbol): boolean => Array.isArray(e) && e[0] === CORE_CALL && e[2] === name;
+
+const CATCH_CALL = Symbol.for("%catch-call"), CATCH_CALL_PRE = Symbol.for("%catch-call/pre");
+// where in `e` what it calls is, when `e` is a form that calls a procedure with the arguments after it and does nothing
+// else with it (a %call, and a catching call, which calls it the same way): else -1
+const calleeAt = (e: any[]): number => e[0] === CORE_CALL ? 2 : e[0] !== CORE_INTCALL ? -1 : e[2] === CATCH_CALL ? 3 : e[2] === CATCH_CALL_PRE && e.length > 5 ? 5 : -1;
 
 // Locals have names of their own (the rename pass), so a name is never shadowed: a use of it anywhere is a use of the
 // one variable
@@ -72,12 +78,12 @@ const usesOfAll = (es: readonly any[], names: ReadonlySet<symbol>): Map<symbol, 
             const u = all.get(e[2]);
             if (u !== undefined) u.other = true;
         }
-        const called = e[0] === CORE_CALL && typeof e[2] === "symbol" ? all.get(e[2]) : undefined;
-        const exprs = subExprs(e);
+        const at = calleeAt(e), called = at !== -1 && typeof e[at] === "symbol" ? all.get(e[at]) : undefined;
         if (called !== undefined) {
             called.calls.push(e);
-            for (let i = 1; i < exprs.length; i++) todo.add(exprs[i]);
-        } else todo.addAll(exprs);
+            // (what is before the callee in a catching call is an operand like those after it)
+            for (let i = 3; i < e.length; i++) if (i !== at) todo.add(e[i]);
+        } else todo.addAll(subExprs(e));
     });
     return all;
 };
@@ -137,7 +143,9 @@ const freeIn = (ast: any, scope: ReadonlySet<symbol>): Set<symbol> => {
 const rewrite = (ast: any, map: ReadonlyMap<symbol, symbol>, extra: ReadonlyMap<any[], symbol[]>): any =>
     mapTree(Lsrc, ast, e => typeof e === "symbol" ? map.get(e) ?? e : formOrAtom(e), (next, e) => {
         const added = extra.get(e);
-        return added === undefined ? next : [CORE_CALL, e[1], next[2], ...added.map(a => map.get(a) ?? a), ...next.slice(3)];
+        if (added === undefined) return next;
+        const at = calleeAt(e);
+        return [...next.slice(0, at + 1), ...added.map(a => map.get(a) ?? a), ...next.slice(at + 1)];
     }, true);
 
 // `e` with the calls in `map` calling the name given for them instead
@@ -296,7 +304,7 @@ export const liftLambdas = (ast: any): any => {
             const next = new Set<symbol>();
             for (const name of lifted) {
                 const uses = usesOfEach.get(name)!;
-                if (uses.other || uses.calls.some((c: any[]) => !accepts(only(inits.get(name)), c.length - 3))) continue;
+                if (uses.other || uses.calls.some((c: any[]) => !accepts(only(inits.get(name)), c.length - calleeAt(c) - 1))) continue;
                 next.add(name);
                 calls.set(name, uses.calls);
             }

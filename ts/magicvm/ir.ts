@@ -1,5 +1,5 @@
 import { ConstPool, type SourcePos } from "../common";
-import { Code, Closure, ClosureTemplate, type InlineSite, type UpVarLoc, type UsedIntrinsic } from "./exec";
+import { Code, Closure, ClosureTemplate, Imports, type InlineSite, type UpVarLoc, type UsedIntrinsic } from "./exec";
 import type { Intrinsics } from "./intrinsics";
 import type { RestKind } from "./arity";
 import { returnedFrom, type DistributiveOmit, type Op } from "./ops";
@@ -22,6 +22,9 @@ export type Node =
     | Unplaced<"LoadUpvar" | "SetUpvar" | "FixUpvar" | "EndIf" | "Return" | "Move" | "Box" | "Unbox" | "SetBox" | "MoveAcc" | "SetMark" | "MarkSave" | "MarkRestore" | "CurMarks" | "IntCall" | "IntApply">
     | { k: "LoadValue"; dst: number; constant: any }
     | { k: "LoadGlobal"; dst: number; sym: symbol }
+    | { k: "ImportGlobals"; dst: number; syms: readonly (symbol | undefined)[] }
+    | { k: "ImportRef"; dst: number; slot: number }
+    | { k: "ImportSet"; src: number; slot: number }
     | { k: "SetGlobal"; src: number; sym: symbol }
     | { k: "NewClosure"; dst: number; template: ClosureTemplateIR }
     // `elseif`: the next condition of an %if chain (like an If, but continuing the chain one started)
@@ -48,8 +51,16 @@ export type Node =
     | { k: "Pos"; pos: SourcePos };
 
 // a function's code from its IR nodes (see Op)
-export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, lowerTemplate: (t: ClosureTemplateIR) => ClosureTemplate) => {
+// `unit`: the imports of the unit the function is of, and the slot of each global among them (null: it has none)
+export type Unit = { readonly imports: Imports, readonly slots: ReadonlyMap<symbol, number> }
+
+export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, lowerTemplate: (t: ClosureTemplateIR) => ClosureTemplate, unit: Unit | null = null) => {
     const ops: Op[] = []
+    let imp = -1
+    const imports = (): number => {
+        if (unit === null) throw new Error("internal error: an import is used in a unit with no %import-globals")
+        return imp !== -1 ? imp : imp = cpool.mutPush(unit.imports)
+    }
     let ip = 0
     // the position the instructions pushed now come from (the last Pos node)
     let where: SourcePos | null = null
@@ -89,7 +100,15 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
                 else push({ k: "LoadConst", dst: node.dst, idx: cpool.push(v) })
                 break
             }
-            case "LoadGlobal": push({ k: "LoadGlobal", dst: node.dst, sym: cpool.push(node.sym) }); break
+            case "LoadGlobal": {
+                const slot = unit !== null ? unit.slots.get(node.sym) : undefined
+                if (slot === undefined) push({ k: "LoadGlobal", dst: node.dst, sym: cpool.push(node.sym) })
+                else push({ k: "LoadImport", dst: node.dst, slot, sym: cpool.push(node.sym), imp: imports() })
+                break
+            }
+            case "ImportGlobals": push({ k: "ImportGlobals", dst: node.dst, syms: cpool.mutPush(node.syms), imp: imports() }); break
+            case "ImportRef": push({ k: "ImportRef", dst: node.dst, slot: node.slot, imp: imports() }); break
+            case "ImportSet": push({ k: "ImportSet", src: node.src, slot: node.slot, imp: imports() }); break
             case "SetGlobal": push({ k: "SetGlobal", src: node.src, sym: cpool.push(node.sym) }); break
             case "Label": labels.set(node.label, ip); break
             case "FunctionEntry": break
@@ -144,7 +163,12 @@ export const lowerOps = (nodes: Node[], table: Intrinsics, cpool: ConstPool, low
 }
 
 export class IR {
-    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false, private readonly assumed: ReadonlySet<number> = new Set(), private readonly reentrant: boolean = true) {}
+    readonly #unit: Unit | null
+
+    // `imports`: the globals the unit imports, by slot (see %import-globals)
+    constructor(private readonly table: Intrinsics, private readonly debug: boolean = false, private readonly assumed: ReadonlySet<number> = new Set(), private readonly reentrant: boolean = true, imports: readonly (symbol | undefined)[] | null = null) {
+        this.#unit = imports === null ? null : { imports: new Imports(imports.length), slots: new Map(imports.flatMap((sym, slot): [symbol, number][] => sym === undefined ? [] : [[sym, slot]])) }
+    }
 
     lower(nodes: Node[], numRegs: number, packRest: boolean = false): Code {
         // the templates of the closures the code makes, their own code yet to be lowered: each is lowered after the
@@ -165,7 +189,7 @@ export class IR {
 
     #lower(nodes: Node[], numRegs: number, packRest: boolean, lowerTemplate: (t: ClosureTemplateIR) => ClosureTemplate): Code {
         const cpool = new ConstPool()
-        const { ops, used, use, inlines } = lowerOps(nodes, this.table, cpool, lowerTemplate)
+        const { ops, used, use, inlines } = lowerOps(nodes, this.table, cpool, lowerTemplate, this.#unit)
         for (const pos of this.assumed) use(pos)
         const restPos = packRest ? use(this.table.pack!.pos) : -1
         const code = new Code(cpool.constants, ops, numRegs, this.debug, used.size > 0 ? this.table : null, [...used.values()])

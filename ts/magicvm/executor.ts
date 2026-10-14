@@ -6,7 +6,7 @@ import type { Marks } from "../marks";
 import { AotCompiler } from "./aot/compiler";
 import { bindArgs, checkArity } from "./arity";
 import { Code, CaseLambda, Closure, ClosureTemplate, createRegs } from "./code";
-import type { CallCache, DirectFn } from "./code";
+import type { CallCache, DirectFn, Imports } from "./code";
 import type { VMHost } from "./code";
 import { CORE_INTRINSICS, ControlRequest, InterruptRequest, YieldRequest, corePos, helperClosure, tracebackMessage } from "./coreops";
 import { Aborted, CatchToken, MISSING, STACK_CATCH, ComposableContinuation, Coroutine, EscapeContinuation, EscapedError, ExecutionContext, Frame, INTERRUPT_INTERVAL, InterruptError, MAX_JS_DEPTH, ReRaise, Suspend, VMContinuation, WindPoint, caughtValue, mapWind, computeWindTransition, countControlSuspend, errorPos, formatTraceback, frameInfos, type Resumer } from "./values";
@@ -359,6 +359,20 @@ export class VMExecutor {
         if (arity.rest === "none" && !arity.pad) for (let i = 0; i < nargs; i++) closureRegs[i] = args[startOffset + i];
         else bindArgs(arity, closureRegs, args, startOffset, nargs, closure.tmpl.code.pack);
         return closureRegs;
+    }
+
+    // (%import-globals syms): reads the unit's imports for the scope it runs in, unless it has; whether it did
+    public importGlobals(ctx: ExecutionContext, imports: Imports, syms: readonly (symbol | undefined)[]): boolean {
+        const scope = ctx.scope;
+        if (imports.scope === scope) return false;
+        const values: any[] = [];
+        for (let i = 0; i < imports.size; i++) {
+            const sym = syms[i];
+            values.push(sym === undefined ? undefined : scope.lookup(sym, undefined));
+        }
+        imports.scope = scope;
+        imports.values = values;
+        return true;
     }
 
     // --- continuations and dynamic-wind ---

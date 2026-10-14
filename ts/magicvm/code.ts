@@ -7,6 +7,7 @@ import type { VMExecutor } from "./executor";
 import { Intrinsics, type Intrinsic, type IntrinsicFn } from "./intrinsics";
 import type { ExecutionContext, Frame } from "./values";
 import type { Op } from "./ops";
+import type { Env } from "../env";
 
 // what the executor needs of the VM it runs for (AnimaVM)
 export type VMHost = { readonly intrinsics: Intrinsics, print(v: any): string, message<E>(err: E, at?: SourcePos | null): E };
@@ -31,6 +32,21 @@ export type CallCache = {
 };
 // (every cache is made here, so all have one shape)
 export const newCallCache = (): CallCache => ({ t0: NO_TEMPLATE, f0: null, t1: NO_TEMPLATE, f1: null, t2: NO_TEMPLATE, f2: null, t3: NO_TEMPLATE, f3: null });
+
+// What a compiled unit imports (%import-globals), which all its code shares: `values[slot]` is what was read when the
+// unit first ran in `scope`, <#void> where there was nothing (such a one is read where it is used, each time). Code
+// that runs in another scope reads nothing here: it reads `none`, as many slots of <#void>
+export class Imports {
+    scope: Env | null = null;
+    values: any[];
+    readonly none: readonly undefined[];
+
+    constructor(readonly size: number) {
+        // (no holes: V8 reads such an array faster)
+        this.values = this.none = Array.from({ length: size }, () => undefined);
+    }
+}
+const IMPORT_COPIES = new WeakMap<Map<Code, Code>, Map<Imports, Imports>>();
 
 // an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
 export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };
@@ -213,6 +229,13 @@ export class Code {
         copy.bind(table);
         copy.constants = this.constants.map(c => {
             if (c instanceof ClosureTemplate) return c.withCode(c.code.fresh(copies, table));
+            if (c instanceof Imports) {
+                let made = IMPORT_COPIES.get(copies);
+                if (made === undefined) IMPORT_COPIES.set(copies, made = new Map());
+                let own = made.get(c);
+                if (own === undefined) made.set(c, own = new Imports(c.size));
+                return own;
+            }
             // a closure with no upvars (made once, when compiled) is shared by the copies, unless it must be bound. Its code's
             // adaptive counters and compiled functions are then shared too: deliberately, as they only choose how the same
             // code runs, and a copy per instance would compile every prelude function for each one (see the README)

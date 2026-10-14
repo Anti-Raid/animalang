@@ -6,7 +6,8 @@ import { ClosureTemplateIR, type Node } from "../ir";
 import type { Pass } from "./pass";
 import { run, type Task } from "../visitor";
 
-export type FunctionIR = { nodes: Node[], numRegs: number };
+// `imports`: what the unit imports, by slot (see %import-globals)
+export type FunctionIR = { nodes: Node[], numRegs: number, imports: readonly (symbol | undefined)[] | null };
 
 const check = (): Node => ({ k: "HostCall", pos: corePos("%interrupt"), start: 0, nargs: 0, tail: false });
 
@@ -31,5 +32,5 @@ const withChecks = function* (nodes: Node[]): Task<Node[]> {
 
 export const interruptsPass: Pass<FunctionIR, FunctionIR> = {
     name: "interrupts",
-    run: (ir, ctx) => ctx.intrinsics.interrupts ? { nodes: run(withChecks(ir.nodes)), numRegs: ir.numRegs } : ir,
+    run: (ir, ctx) => ctx.intrinsics.interrupts ? { ...ir, nodes: run(withChecks(ir.nodes)) } : ir,
 };
