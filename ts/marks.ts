@@ -39,6 +39,21 @@ export const markFirst = (marks: Marks, key: any, none: any): any => {
     return none;
 };
 
+// a continuation barrier: a mark under this key, with a new object as its value, over the extent it guards. A full
+// continuation captured inside cannot be called from where that object is not a mark (re-entering), escapes out can
+export const BARRIER = Symbol("continuation barrier");
+
+// whether jumping to a continuation whose marks are `target`, from one whose marks are `current`, would re-enter a barrier
+export const reentersBarrier = (target: Marks, current: Marks): boolean => {
+    for (let e = target; e !== null; e = e.next) {
+        if (e.key !== BARRIER) continue;
+        let found = false;
+        for (let c = current; c !== null && !found; c = c.next) found = c.key === BARRIER && c.value === e.value;
+        if (!found) return true;
+    }
+    return false;
+};
+
 // the values of `key`, one per frame, innermost first
 export const markValues = (marks: Marks, key: any): any[] => {
     const out: any[] = [];
@@ -77,6 +92,11 @@ export const recordTailMark = (marks: Marks, frame: number, name: string): Marks
 // The exception handlers in effect are a mark under this key: a list, innermost first, of handler procedures and the
 // catch tokens of enclosing %catch forms
 export const EXCEPTION_HANDLERS = Symbol("exception handlers");
+
+// the value of the EXCEPTION_HANDLERS mark: handler procedures and catch tokens, innermost first
+export class Handlers {
+    constructor(readonly handler: any, readonly outer: Handlers | null) {}
+}
 
 // what a %catch receives when an error is caught: it unwinds to the %catch, which then calls its handler
 export class Caught {

@@ -1,6 +1,6 @@
-import { SOURCE_POS, type SourcePos } from "../common";
-import { OP_BEGIN, OP_QUOTE } from "./symbols";
-import { Cons } from "../list";
+import { SyntaxPositions, type SourcePos } from "../common";
+import { OP_BEGIN, OP_QUOTE, sourceSymbol } from "./symbols";
+import { Cons } from "./list";
 
 export class ASPTokenError extends Error {
     pos: number;
@@ -59,7 +59,9 @@ const unescapeString = (body: string): string => {
     return out
 }
 
-const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', '{', '}', ';', '"', "'"])
+const ASP_SPECIAL_TOKENS = new Set(['(', ')', '[', ']', '{', '}', ';', '"', "'", "`", ","])
+// the reader's abbreviations: 'x is (quote x), `x (quasiquote x), ,x (unquote x) and ,@x (unquote-splicing x)
+const ASP_ABBREVIATIONS = new Map([["'", OP_QUOTE], ["`", Symbol.for("quasiquote")], [",", Symbol.for("unquote")], [",@", Symbol.for("unquote-splicing")]])
 const ASP_CLOSING_TOKENS = new Set([')', ']', '}'])
 
 export class ASP {    
@@ -68,7 +70,10 @@ export class ASP {
     #supportsDottedPairs: boolean = false // only bytecode compiler supports these, AST interpreter does not
     #file: string
     #tokenOffsets: number[] = []
-    constructor(str: string, supportsDottedPairs: boolean = false, file: string = "<input>") {
+    // `positions`: where each list read is recorded
+    readonly #positions: SyntaxPositions
+    constructor(str: string, supportsDottedPairs: boolean = false, file: string = "<input>", positions: SyntaxPositions = new SyntaxPositions()) {
+        this.#positions = positions
         this.#str = str
         this.#currPos = 0
         this.#supportsDottedPairs = supportsDottedPairs
@@ -157,9 +162,15 @@ export class ASP {
                 continue;
             }
 
-            // Quote/'reader' has similar behavior to lists
-            if (char === "'") {
-                push(this.advance());
+            // abbreviations: ' ` , ,@
+            if (char === "'" || char === "`" || char === ",") {
+                this.advance();
+                if (char === "," && this.peek() === "@") {
+                    this.advance();
+                    push(",@");
+                } else {
+                    push(char);
+                }
                 continue;
             }
 
@@ -213,14 +224,13 @@ export class ASP {
 
             const startOffset = this.#tokenOffsets[current];
 
-            // Quote
-            if (token === "'") {
-                current++; // Skip the quote
+            const abbreviation = ASP_ABBREVIATIONS.get(token);
+            if (abbreviation !== undefined) {
+                current++;
                 if (current >= tokens.length) {
-                    throw new ASPParseError("Unexpected end of input: Missing expression after '", current);
+                    throw new ASPParseError(`Unexpected end of input: Missing expression after ${token}`, current);
                 }
-                const nextExpr = walk(); // Parse the next expr after the quote
-                return Cons.list(OP_QUOTE, nextExpr);  // Wrap in quote builtin proc
+                return Cons.list(abbreviation, walk());
             }
 
             // Vectors
@@ -286,7 +296,7 @@ export class ASP {
                 for (let i = lst.length - 1; i >= 0; i--) {
                     tail = new Cons(lst[i], tail);
                 }
-                if (tail instanceof Cons) SOURCE_POS.set(tail, this.#posAt(startOffset));
+                if (tail instanceof Cons) this.#positions.set(tail, this.#posAt(startOffset));
                 return tail;
             }
 
@@ -308,7 +318,7 @@ export class ASP {
                     throw new ASPParseError("table literal requires an even number of key-value expressions", current);
                 }
                 const table = Cons.list(Symbol.for("table"), ...items);
-                if (table !== null) SOURCE_POS.set(table, this.#posAt(startOffset));
+                if (table !== null) this.#positions.set(table, this.#posAt(startOffset));
                 return table;
             }
 
@@ -334,7 +344,12 @@ export class ASP {
 
             // Numbers
             if (token.trim() !== "") {
+                // bigints are written 123n; an integer a double cannot hold exactly is an error rather than rounded
+                if (/^[+-]?\d+n$/.test(token)) return BigInt(token.slice(0, -1));
                 const num = Number(token);
+                if (/^[+-]?\d+$/.test(token) && (!Number.isFinite(num) || BigInt(num) !== BigInt(token))) {
+                    throw new ASPParseError(`integer ${token} is too large for a double to hold exactly; write ${token}n for a bigint`, current);
+                }
                 if (!Number.isNaN(num)) return num;
             }
 
@@ -347,8 +362,7 @@ export class ASP {
                 }
             }
 
-            // Symbol
-            return Symbol.for(token);
+            return sourceSymbol(token);
         };
 
         const exprs = []

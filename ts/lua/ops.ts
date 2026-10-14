@@ -1,0 +1,765 @@
+// Luau's operators (VM/src/lvmutils.cpp), as intrinsics: numbers, strings that read as numbers, vectors, and (a
+// deviation from Luau) integers with integers
+import { ErrorObject, IProcedure, Msg, MultipleValues, TRY_CALL, VMError } from "../common";
+import { Coroutine } from "../magicvm/exec";
+import { severalValues } from "../magicvm/coreops";
+import { argError, argInvalid, integerArg, optInteger, stringArg, tableArg, type Args } from "./args";
+import { NOWHERE, luauError } from "./errors";
+import type { AggregateOpRule, ArgKinds, InlineFn, Intrinsics, Returns, TypeSystem } from "../magicvm/intrinsics";
+import { integer, ipow } from "./integer";
+import { toString, typeName } from "./messages";
+import { cstring, luaPow, num2str, str2integer, str2number } from "./number";
+import { MATH_LIBRARY, seedRng, type Rng } from "./mathlib";
+import { TABLE_CALLERS, TABLE_LIBRARY } from "./tablib";
+import { BIT_LIBRARY } from "./bitlib";
+import { UTF8_LIBRARY, utf8Next } from "./utf8lib";
+import { OS_LIBRARY } from "./oslib";
+import { BUFFER_LIBRARY, VECTOR_LIBRARY } from "./buflib";
+import { STRING_LIBRARY, gmatchNext, gmatchState } from "./strlib";
+import { LuaTable, type SlotCache } from "./table";
+import { LuaVector, vadd, vdiv, vidiv, vmul, vsub, vunm, vector, fma, dot3 } from "./vector";
+
+// a function's name in a traceback (a proto's debugname): none for a chunk or a function nothing names
+const functionName = (name: any): string | null => typeof name !== "string" || name === "lambda" || name === "top-level" || name.startsWith("lambda@") ? null : name;
+
+export type ArithOp = "add" | "sub" | "mul" | "div" | "idiv" | "mod" | "pow" | "unm";
+
+export { luaPow };
+
+const numeric = (op: ArithOp, a: number, b: number): number => {
+    switch (op) {
+        case "add": return a + b;
+        case "sub": return a - b;
+        case "mul": return a * b;
+        case "div": return a / b;
+        case "idiv": return Math.floor(a / b);
+        case "mod": return a - Math.floor(a / b) * b;
+        case "pow": return luaPow(a, b);
+        case "unm": return -a;
+    }
+};
+
+const integral = (op: ArithOp, a: bigint, b: bigint): bigint => {
+    switch (op) {
+        case "add": return integer.add(a, b);
+        case "sub": return integer.sub(a, b);
+        case "mul": return integer.mul(a, b);
+        case "div": return integer.div(a, b);
+        case "idiv": return integer.idiv(a, b);
+        case "mod": return integer.mod(a, b);
+        case "pow": return ipow(a, b);
+        case "unm": return integer.neg(a);
+    }
+};
+
+// luaV_tonumber: a number, or a string that reads as one
+const tonumber = (v: any): number | undefined => typeof v === "number" ? v : typeof v === "string" ? str2number(v) : undefined;
+
+const arithError = (op: ArithOp, a: any, b: any): Error => {
+    const t1 = typeName(a), t2 = typeName(b);
+    return luauError(t1 === t2 ? `attempt to perform arithmetic (${op}) on ${t1}` : `attempt to perform arithmetic (${op}) on ${t1} and ${t2}`);
+};
+
+// luaV_doarith: `b` is `a` for unm
+export const arith = (op: ArithOp, a: any, b: any): any => {
+    if (typeof a === "bigint" && typeof b === "bigint") return integral(op, a, b);
+    const va = a instanceof LuaVector, vb = b instanceof LuaVector;
+    if (va && vb) {
+        switch (op) {
+            case "add": return vadd(a, b);
+            case "sub": return vsub(a, b);
+            case "mul": return vmul(a, b);
+            case "div": return vdiv(a, b);
+            case "idiv": return vidiv(a, b);
+            case "unm": return vunm(a);
+        }
+    } else if (va || vb) {
+        const n = tonumber(va ? b : a);
+        if (n !== undefined) {
+            const [x, y] = va ? [a, n] : [n, b];
+            switch (op) {
+                case "mul": return vmul(x, y);
+                case "div": return vdiv(x, y);
+                case "idiv": return vidiv(x, y);
+            }
+        }
+    }
+    const na = tonumber(a), nb = tonumber(b);
+    if (na !== undefined && nb !== undefined) return numeric(op, na, nb);
+    throw arithError(op, a, b);
+};
+
+// luaV_concat of two values: strings, numbers and (a deviation from Luau) integers
+const concatable = (v: any): boolean => typeof v === "string" || typeof v === "number" || typeof v === "bigint";
+
+export const concat = (a: any, b: any): string => {
+    if (typeof a === "string" && typeof b === "string") return a + b;
+    if (!concatable(a) || !concatable(b)) throw luauError(`attempt to concatenate ${typeName(a)} with ${typeName(b)}`);
+    return (typeof a === "number" ? num2str(a) : String(a)) + (typeof b === "number" ? num2str(b) : String(b));
+};
+
+// raw equality: the same value, or equal vectors (metamethods come later)
+export const rawequal = (a: any, b: any): boolean => a === b || (a instanceof LuaVector && a.equals(b));
+
+// luaV_lessthan / luaV_lessequal: numbers, strings (by bytes) and (a deviation from Luau) integers
+const ordered = (a: any, b: any): boolean => {
+    const t = typeof a;
+    return t === typeof b && (t === "number" || t === "string" || t === "bigint");
+};
+
+export const lessThan = (a: any, b: any): boolean => {
+    if (ordered(a, b)) return a < b;
+    throw luauError(`attempt to compare ${typeName(a)} < ${typeName(b)}`);
+};
+
+export const lessEqual = (a: any, b: any): boolean => {
+    if (ordered(a, b)) return a <= b;
+    throw luauError(`attempt to compare ${typeName(a)} <= ${typeName(b)}`);
+};
+
+// luaV_prepareFORN: a numeric for's initial value, limit or step, as a number
+export const forNumber = (v: any, what: string): number => {
+    const n = tonumber(v);
+    if (n === undefined) throw luauError(`invalid 'for' ${what} (number expected, got ${typeName(v)})`);
+    return n;
+};
+
+// luaG_indexerror (a long key is not quoted, and C prints a string up to its first NUL)
+const indexError = (t: any, key: any): Error =>
+    luauError(typeof key === "string" && key.length <= 64 ? `attempt to index ${typeName(t)} with '${cstring(key)}'` : `attempt to index ${typeName(t)} with ${typeName(key)}`);
+
+// luaV_gettable, without metamethods (they come later): a table's entry, a string's entry in the string library
+// (`strings`, its metatable's __index), a vector's component
+export const index = (strings: LuaTable, t: any, key: any): any => {
+    if (t instanceof LuaTable) return t.rawget(key);
+    if (typeof t === "string") return strings.rawget(key);
+    if (t instanceof LuaVector && typeof key === "string" && key.length === 1) {
+        const c = (key.charCodeAt(0) | 32) - 120;
+        if (c >= 0 && c < 3) return c === 0 ? t.x : c === 1 ? t.y : t.z;
+    }
+    throw indexError(t, key);
+};
+
+// luaV_settable, without metamethods
+export const setindex = (t: any, key: any, value: any): void => {
+    if (!(t instanceof LuaTable)) throw indexError(t, key);
+    t.rawset(key, value);
+};
+
+// luaV_dolen: #v
+export const len = (v: any): number => {
+    if (typeof v === "string") return v.length;
+    if (v instanceof LuaTable) return v.rawlen();
+    throw luauError(`attempt to get length of a ${typeName(v)} value`);
+};
+
+// what obj:name(...) calls (LOP_NAMECALL)
+export const method = (strings: LuaTable, obj: any, name: string): any => {
+    const m = index(strings, obj, name);
+    if (m === undefined) throw luauError(`attempt to call missing method '${cstring(name)}' of ${typeName(obj)}`);
+    return m;
+};
+
+// the functions a generic for knows (see forPrep): `next` and the ones pairs and ipairs return, set once they are made
+export type LuauIterators = { next: unknown, pairsNext: unknown, inext: unknown };
+// what of the library the operators use: those, the string library (a string is indexed through it), and where print
+// writes a line
+export type LuauLibrary = LuauIterators & { readonly string: LuaTable, readonly print: (line: string) => void, pcall: unknown, xpcall: unknown, handler: unknown, error: unknown, utf8Next: unknown };
+
+// luaB_tonumber
+const tonumberOf = (a: Args): number | undefined => {
+    const base = optInteger(a, 2, "tonumber", 10);
+    if (base === 10) {
+        const n = tonumber(a[0]);
+        if (n === undefined && a.length < 1) throw luauError("missing argument #1");
+        return n;
+    }
+    const s = stringArg(a, 1, "tonumber");
+    if (base < 2 || base > 36) throw argInvalid(2, "tonumber", "base out of range");
+    return str2integer(s, base);
+};
+
+// LOP_FORGPREP and its _NEXT and _INEXT forms, of `for ... in f, s, c`: how the loop goes on. 0: it calls f(s, c). 1: f
+// is ipairs's function over a table from index 0, so it walks the array part. 2: f is next over a table from nil, or f
+// is itself a table (which is not called): it walks the table by position, as Luau does
+export const forPrep = (its: LuauIterators, f: any, s: any, c: any): number => {
+    if (f instanceof IProcedure) {
+        if (!(s instanceof LuaTable)) return 0;
+        return f === its.inext && c === 0 ? 1 : (f === its.next || f === its.pairsNext) && c === undefined ? 2 : 0;
+    }
+    if (f instanceof LuaTable) return f[TRY_CALL] !== undefined ? 0 : 2;
+    throw luauError(`attempt to iterate over a ${typeName(f)} value`);
+};
+
+// luaB_next (`name`: next, or null for the one pairs returns)
+export const nextOf = (name: string | null, args: readonly any[]): any => {
+    const t = tableArg(args, 1, name);
+    let entry;
+    try {
+        entry = t.next(args[1]);
+    } catch (e: any) {
+        // (an error of the table's, not of the arguments: Luau gives it no position)
+        e.at = NOWHERE;
+        throw e;
+    }
+    return entry === undefined ? undefined : new MultipleValues(entry);
+};
+
+// luaB_inext, what ipairs returns: (i + 1, t[i + 1]), or nothing when that is nil
+export const inextOf = (args: readonly any[]): any => {
+    const n = tonumber(args[1]);
+    if (n === undefined) throw argError(args, 2, null, "number");
+    const i = Math.trunc(n) + 1;
+    const v = tableArg(args, 1, null).rawget(i);
+    return new MultipleValues(v === undefined ? [] : [i, v]);
+};
+
+// what a field access keeps where it is compiled: the slot its name was last found in (Luau's predicted slot)
+const slotCache = (): SlotCache => ({ slot: 0 });
+
+// Luau's kinds: numbers, integers (bigints), strings, tables, and vectors
+export const LUAU_TYPES: TypeSystem = {
+    ofConstant: v => typeof v === "number" ? "number" : typeof v === "bigint" ? "integer" : typeof v === "string" ? "string" : undefined,
+    guard: (kind, e, d) => kind === "number" ? `typeof ${e} === "number"` : kind === "integer" ? `typeof ${e} === "bigint"` : kind === "string" ? `typeof ${e} === "string"` : LUAU_TYPES.aggregates?.[kind]?.guard(e, d) ?? null,
+    coerce: (kind, e) => kind === "number" ? `+${e}` : null,
+    // the lowering takes one value of a call before it binds or assigns it (a call it keeps whole is never returned
+    // from a variable)
+    oneValueVariables: true,
+    aggregates: {
+        vector: {
+            kind: "vector",
+            fields: ["x", "y", "z"],
+            fieldType: "number",
+            box: (fields, d) => `new ${d.LuaVector}(${fields.join(", ")})`,
+            unbox: (expr) => ({
+                x: `${expr}.x`,
+                y: `${expr}.y`,
+                z: `${expr}.z`,
+            }),
+            guard: (expr, d) => `${expr} instanceof ${d.LuaVector}`,
+            deps: { LuaVector, dot3, fma },
+        },
+    },
+};
+
+const sameKind: Returns = (kinds: ArgKinds) => kinds.every(k => k === "number") ? "number" : kinds.every(k => k === "integer") ? "integer" : kinds.includes("vector") ? "vector" : undefined;
+
+const VECTOR_ARITH_AGG: Partial<Record<ArithOp, AggregateOpRule>> = {
+    add: {
+        type: "component-wise",
+        kind: "vector",
+        applies: kinds => kinds[0] === "vector" && kinds[1] === "vector",
+        emit: ([a, b]) => [
+            `Math.fround(${a[0]} + ${b[0]})`,
+            `Math.fround(${a[1]} + ${b[1]})`,
+            `Math.fround(${a[2]} + ${b[2]})`,
+        ],
+    },
+    sub: {
+        type: "component-wise",
+        kind: "vector",
+        applies: kinds => kinds[0] === "vector" && kinds[1] === "vector",
+        emit: ([a, b]) => [
+            `Math.fround(${a[0]} - ${b[0]})`,
+            `Math.fround(${a[1]} - ${b[1]})`,
+            `Math.fround(${a[2]} - ${b[2]})`,
+        ],
+    },
+    unm: {
+        type: "component-wise",
+        kind: "vector",
+        applies: kinds => kinds[0] === "vector",
+        emit: ([a]) => [
+            `Math.fround(-${a[0]})`,
+            `Math.fround(-${a[1]})`,
+            `Math.fround(-${a[2]})`,
+        ],
+    },
+    mul: {
+        type: "component-wise",
+        kind: "vector",
+        applies: kinds => (kinds[0] === "vector" && (kinds[1] === "vector" || kinds[1] === "number" || kinds[1] === "integer")) || (kinds[1] === "vector" && (kinds[0] === "number" || kinds[0] === "integer")),
+        emit: ([a, b]) => {
+            const ax = a.length === 3 ? a[0] : a[0];
+            const ay = a.length === 3 ? a[1] : a[0];
+            const az = a.length === 3 ? a[2] : a[0];
+            const bx = b.length === 3 ? b[0] : b[0];
+            const by = b.length === 3 ? b[1] : b[0];
+            const bz = b.length === 3 ? b[2] : b[0];
+            return [
+                `Math.fround(${ax} * ${bx})`,
+                `Math.fround(${ay} * ${by})`,
+                `Math.fround(${az} * ${bz})`,
+            ];
+        },
+    },
+    div: {
+        type: "component-wise",
+        kind: "vector",
+        applies: kinds => kinds[0] === "vector" && (kinds[1] === "vector" || kinds[1] === "number" || kinds[1] === "integer"),
+        emit: ([a, b]) => {
+            const bx = b.length === 3 ? b[0] : b[0];
+            const by = b.length === 3 ? b[1] : b[0];
+            const bz = b.length === 3 ? b[2] : b[0];
+            return [
+                `Math.fround(${a[0]} / ${bx})`,
+                `Math.fround(${a[1]} / ${by})`,
+                `Math.fround(${a[2]} / ${bz})`,
+            ];
+        },
+    },
+};
+
+// the js of `op` on numbers and on integers, given the arguments' expressions, the deps' names
+const NUMBER_JS: Record<ArithOp, (a: string, b: string, d: Readonly<Record<string, string>>) => string> = {
+    add: (a, b) => `${a} + ${b}`,
+    sub: (a, b) => `${a} - ${b}`,
+    mul: (a, b) => `${a} * ${b}`,
+    div: (a, b) => `${a} / ${b}`,
+    idiv: (a, b) => `Math.floor(${a} / ${b})`,
+    mod: (a, b) => `${a} - Math.floor(${a} / ${b}) * ${b}`,
+    pow: (a, b, d) => `${d.luaPow}(${a}, ${b})`,
+    unm: a => `-${a}`,
+};
+const INTEGER_JS: Partial<Record<ArithOp, (a: string, b: string) => string>> = {
+    add: (a, b) => `BigInt.asIntN(64, ${a} + ${b})`,
+    sub: (a, b) => `BigInt.asIntN(64, ${a} - ${b})`,
+    mul: (a, b) => `BigInt.asIntN(64, ${a} * ${b})`,
+    unm: a => `BigInt.asIntN(64, -${a})`,
+};
+
+const arithInline = (op: ArithOp): InlineFn => (args, slow, _tmp, d, known) => {
+    const [a, b] = op === "unm" ? [args[0], args[0]] : args;
+    const ints = INTEGER_JS[op];
+    if (ints !== undefined && known.length > 0 && known.every(k => k === "integer")) return `(${ints(a, b)})`;
+    const checks = [...new Set(args.filter((_, i) => known[i] !== "number"))].map(x => `typeof ${x} === "number"`);
+    const value = NUMBER_JS[op](a, b, d);
+    return checks.length === 0 ? `(${value})` : `(${checks.join(" && ")} ? ${value} : ${slow})`;
+};
+
+export const ARITH_OPS: readonly ArithOp[] = ["add", "sub", "mul", "div", "idiv", "mod", "pow", "unm"];
+
+export const registerLuauOps = (table: Intrinsics, library: LuauLibrary): void => {
+    for (const op of ARITH_OPS) {
+        const unary = op === "unm";
+        table.register(`%luau-${op}`, unary ? (regs, s) => arith(op, regs[s], regs[s]) : (regs, s) => arith(op, regs[s], regs[s + 1]), {
+            args: unary ? [1, 1] : [2, 2], leaf: true, foldable: true, oneValue: true,
+            inline: arithInline(op), deps: { luaPow }, returns: sameKind, wants: "number",
+            aggregate: VECTOR_ARITH_AGG[op],
+        });
+    }
+    table.register("%luau-concat", (regs, s) => concat(regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, foldable: true, returns: "string",
+        inline: (args, slow, _tmp, _d, known) => {
+            const checks = args.filter((_, i) => known[i] !== "string").map(x => `typeof ${x} === "string"`);
+            return checks.length === 0 ? `(${args[0]} + ${args[1]})` : `(${checks.join(" && ")} ? ${args[0]} + ${args[1]} : ${slow})`;
+        },
+    });
+    const bool = { leaf: true, foldable: true, returns: "boolean" } as const;
+    table.register("%luau-truthy", (regs, s) => regs[s] !== undefined && regs[s] !== false, {
+        ...bool, args: [1, 1], effectFree: true, inline: ([a]) => `(${a} !== undefined && ${a} !== false)`,
+    });
+    table.register("%luau-not", (regs, s) => regs[s] === undefined || regs[s] === false, {
+        ...bool, args: [1, 1], effectFree: true, inline: ([a]) => `(${a} === undefined || ${a} === false)`,
+    });
+    // only two vectors are equal other than by ===
+    const eqInline = (negate: boolean): InlineFn => ([a, b], slow, _tmp, _d, known) =>
+        known.some(k => k !== undefined) ? `(${a} ${negate ? "!==" : "==="} ${b})`
+            : `(${a} === ${b} ? ${!negate} : typeof ${a} === "object" && ${a} !== null ? ${slow} : ${negate})`;
+    table.register("%luau-eq", (regs, s) => rawequal(regs[s], regs[s + 1]), { ...bool, args: [2, 2], effectFree: true, inline: eqInline(false) });
+    table.register("%luau-ne", (regs, s) => !rawequal(regs[s], regs[s + 1]), { ...bool, args: [2, 2], effectFree: true, inline: eqInline(true) });
+    // a > b and a >= b are b < a and b <= a, as Luau compiles them (its messages say so)
+    const compare = (name: string, op: string, fn: (a: any, b: any) => boolean, swap: boolean) => {
+        table.register(name, swap ? (regs, s) => fn(regs[s + 1], regs[s]) : (regs, s) => fn(regs[s], regs[s + 1]), {
+            ...bool, args: [2, 2], wants: "number",
+            inline: (args, slow, _tmp, _d, known) => {
+                const [a, b] = swap ? [args[1], args[0]] : args;
+                const checks = [...new Set(args.filter((_, i) => known[i] !== "number"))].map(x => `typeof ${x} === "number"`);
+                return checks.length === 0 ? `(${a} ${op} ${b})` : `(${checks.join(" && ")} ? ${a} ${op} ${b} : ${slow})`;
+            },
+        });
+    };
+    compare("%luau-lt", "<", lessThan, false);
+    compare("%luau-le", "<=", lessEqual, false);
+    compare("%luau-gt", "<", lessThan, true);
+    compare("%luau-ge", "<=", lessEqual, true);
+    table.register("%luau-for-number", (regs, s) => forNumber(regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, returns: "number",
+        inline: ([v], slow) => `(typeof ${v} === "number" ? ${v} : ${slow})`,
+    });
+    // whether a numeric for goes on: the same test entering and looping, so NaNs behave alike
+    table.register("%luau-for-test", (regs, s) => regs[s + 2] > 0 ? regs[s] <= regs[s + 1] : regs[s + 1] <= regs[s], {
+        ...bool, args: [3, 3], effectFree: true,
+        inline: ([i, limit, step]) => `(${step} > 0 ? ${i} <= ${limit} : ${limit} <= ${i})`,
+    });
+    // an element of `...` (an array), nil past its end
+    table.register("%luau-arg", (regs, s) => regs[s][regs[s + 1]], { args: [2, 2], leaf: true, effectFree: true, oneValue: true, inline: ([a, i]) => `${a}[${i}]` });
+    // all of `...` as values (the array is never changed, so several values keep it)
+    table.register("%luau-varargs", (regs, s) => regs[s].length === 1 ? regs[s][0] : new MultipleValues(regs[s]), {
+        args: [1, 1], leaf: true, effectFree: true, deps: { MultipleValues },
+        inline: ([a], _slow, _tmp, d) => `(${a}.length === 1 ? ${a}[0] : new ${d.MultipleValues}(${a}))`,
+    });
+    // whether a call gave other than one value
+    table.register("%luau-several?", (regs, s) => regs[s] instanceof MultipleValues, {
+        ...bool, foldable: false, args: [1, 1], effectFree: true, inline: ([v], _slow, _tmp, d) => `(${severalValues(v, d)})`, deps: { MultipleValues },
+    });
+    table.register("%luau-tostring", (regs, s) => toString(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+
+    // the string library, which a string is indexed through
+    const strings = library.string;
+    for (const [name, fn] of Object.entries(STRING_LIBRARY)) {
+        // (gsub may call a function for each match)
+        table.register(`%luau-string-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: name !== "gsub" });
+    }
+    // the math library; its generator starts from the clock, as Luau's does
+    const rng: Rng = { hi: 0, lo: 0 };
+    seedRng(rng, (Math.random() * 0x100000000) >>> 0, Date.now() >>> 0);
+    for (const [name, fn] of Object.entries(MATH_LIBRARY)) table.register(`%luau-math-${name}`, (regs, s) => fn(regs[s], rng), { args: [1, 1], leaf: true });
+    for (const [name, fn] of Object.entries(BIT_LIBRARY)) table.register(`%luau-bit32-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+    for (const [name, fn] of Object.entries(UTF8_LIBRARY)) table.register(`%luau-utf8-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true });
+    table.register("%luau-utf8-next", (regs, s) => utf8Next(regs[s]), { args: [1, 1], leaf: true });
+    // utf8.codes: its function, the string (as a string) and 0
+    table.register("%luau-utf8-codes", (regs, s) => new MultipleValues([library.utf8Next, stringArg(regs[s], 1, "codes"), 0]), { args: [1, 1], leaf: true });
+    for (const [name, fn] of Object.entries(OS_LIBRARY)) table.register(`%luau-os-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+    // The coroutine library (VM/src/lcorolib.cpp), over the VM's coroutines: what checks its arguments and words its
+    // results; the library's functions themselves are core forms (index.ts). `failed`: the error a coroutine died of,
+    // which coroutine.close gives once
+    const failed = new WeakMap<Coroutine, { error: any }>();
+    const threadArg = (a: Args, name: string): Coroutine => {
+        if (!(a[0] instanceof Coroutine)) throw argError(a, 1, name, "thread");
+        return a[0];
+    };
+    table.register("%luau-co-function", (regs, s) => {
+        if (!(regs[s][0] instanceof IProcedure)) throw argError(regs[s], 1, regs[s + 1], "function");
+        return regs[s][0];
+    }, { args: [2, 2], leaf: true, oneValue: true });
+    table.register("%luau-co-thread", (regs, s) => threadArg(regs[s], regs[s + 1]), { args: [2, 2], leaf: true, oneValue: true });
+    table.register("%luau-co-suspended?", (regs, s) => regs[s].status === "suspended", { ...bool, args: [1, 1] });
+    table.register("%luau-co-cannot", (regs, s) => `cannot resume ${regs[s].status} coroutine`, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-co-failed", (regs, s) => {
+        failed.set(regs[s], { error: regs[s + 1] });
+        return regs[s + 1];
+    }, { args: [2, 2], leaf: true, oneValue: true });
+    // what a wrapped coroutine's function raises for the error `v`: a string (or a number, as one) is an error of the
+    // function's own, so it gets where the function was called; anything else is raised as it is
+    table.register("%luau-co-rethrow", (regs, s) => {
+        const v = regs[s];
+        if (typeof v === "string" || typeof v === "number") throw luauError(typeof v === "number" ? num2str(v) : v);
+        return v;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-fn-costatus", (regs, s) => threadArg(regs[s], "status").status, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-co-closing", (regs, s) => {
+        const co = threadArg(regs[s], "close");
+        if (co.status !== "suspended" && co.status !== "dead") throw luauError(`cannot close ${co.status} coroutine`);
+        return co;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-co-closed", (regs, s) => {
+        const died = failed.get(regs[s]);
+        if (died === undefined) return true;
+        failed.delete(regs[s]);
+        return new MultipleValues([false, died.error]);
+    }, { args: [1, 1], leaf: true });
+    for (const [name, fn] of Object.entries(BUFFER_LIBRARY)) table.register(`%luau-buffer-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true });
+    table.register("%luau-vector-create", (regs, s, n) => {
+        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.create(regs[s]);
+        return vector.create(regs[s], regs[s + 1], n >= 3 ? regs[s + 2] : 0);
+    }, {
+        args: [1, 3], leaf: true, oneValue: true, returns: "vector",
+        aggregate: {
+            type: "constructor",
+            kind: "vector",
+            emit: args => [
+                `Math.fround(${args[0]})`,
+                `Math.fround(${args[1]})`,
+                `Math.fround(${args[2] ?? 0})`,
+            ],
+        },
+    });
+    table.register("%luau-vector-dot", (regs, s, n) => {
+        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.dot(regs[s]);
+        return vector.dot(regs[s], regs[s + 1]);
+    }, {
+        args: [1, 2], leaf: true, oneValue: true, returns: "number", deps: { dot3 },
+        aggregate: {
+            type: "reduction",
+            kind: "vector",
+            emit: ([a, b], d) => `${d.dot3}(${a[0]}, ${a[1]}, ${a[2]}, ${b[0]}, ${b[1]}, ${b[2]})`,
+        },
+    });
+    table.register("%luau-vector-cross", (regs, s, n) => {
+        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.cross(regs[s]);
+        return vector.cross(regs[s], regs[s + 1]);
+    }, {
+        args: [1, 2], leaf: true, oneValue: true, returns: "vector", deps: { fma },
+        aggregate: {
+            type: "component-wise",
+            kind: "vector",
+            emit: ([a, b], d) => [
+                `${d.fma}(${a[1]}, ${b[2]}, -Math.fround(${a[2]} * ${b[1]}))`,
+                `${d.fma}(${a[2]}, ${b[0]}, -Math.fround(${a[0]} * ${b[2]}))`,
+                `${d.fma}(${a[0]}, ${b[1]}, -Math.fround(${a[1]} * ${b[0]}))`,
+            ],
+        },
+    });
+    table.register("%luau-vector-magnitude", (regs, s, n) => {
+        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.magnitude(regs[s]);
+        return vector.magnitude(regs[s]);
+    }, {
+        args: [1, 1], leaf: true, oneValue: true, returns: "number", deps: { dot3 },
+        aggregate: {
+            type: "reduction",
+            kind: "vector",
+            emit: ([a], d) => `Math.fround(Math.sqrt(${d.dot3}(${a[0]}, ${a[1]}, ${a[2]}, ${a[0]}, ${a[1]}, ${a[2]})))`,
+        },
+    });
+    table.register("%luau-vector-normalize", (regs, s, n) => {
+        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.normalize(regs[s]);
+        return vector.normalize(regs[s]);
+    }, {
+        args: [1, 1], leaf: true, oneValue: true, returns: "vector", deps: { dot3 },
+        aggregate: {
+            type: "component-wise",
+            kind: "vector",
+            emit: ([a], d) => {
+                const dot = `${d.dot3}(${a[0]}, ${a[1]}, ${a[2]}, ${a[0]}, ${a[1]}, ${a[2]})`;
+                const inv = `Math.fround(1 / Math.fround(Math.sqrt(${dot})))`;
+                return [
+                    `Math.fround(${a[0]} * ${inv})`,
+                    `Math.fround(${a[1]} * ${inv})`,
+                    `Math.fround(${a[2]} * ${inv})`,
+                ];
+            },
+        },
+    });
+    for (const [name, fn] of Object.entries(VECTOR_LIBRARY)) {
+        if (!["create", "dot", "cross", "magnitude", "normalize"].includes(name)) {
+            table.register(`%luau-vector-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+        }
+    }
+    const tableOps = { lessThan, rawequal };
+    for (const [name, fn] of Object.entries(TABLE_LIBRARY)) table.register(`%luau-table-${name}`, (regs, s) => fn(regs[s], tableOps), { args: [1, 1], leaf: !TABLE_CALLERS.has(name) });
+    // luaB_rawequal, luaB_rawget, luaB_rawset, luaB_rawlen, luaB_getmetatable (a string's metatable is the one table
+    // whose __index is the string library), luaB_typeof
+    const stringMeta = new LuaTable();
+    stringMeta.rawset("__index", strings);
+    const any = (a: Args, n: number): void => { if (a.length < n) throw luauError(`missing argument #${n}`); };
+    const rawOf = <T>(run: () => T): T => {
+        try {
+            return run();
+        } catch (e: any) {
+            e.at = NOWHERE;
+            throw e;
+        }
+    };
+    const base: Record<string, (a: Args) => any> = {
+        rawequal: a => { any(a, 1); any(a, 2); return rawequal(a[0], a[1]); },
+        rawget: a => { const t = tableArg(a, 1, "rawget"); any(a, 2); return t.rawget(a[1]); },
+        rawset: a => { const t = tableArg(a, 1, "rawset"); any(a, 2); any(a, 3); return rawOf(() => t.rawset(a[1], a[2])); },
+        rawlen: a => {
+            const v = a[0];
+            if (v instanceof LuaTable) return v.rawlen();
+            if (typeof v === "string") return v.length;
+            throw argInvalid(1, "rawlen", "table or string expected");
+        },
+        getmetatable: a => {
+            any(a, 1);
+            const v = a[0], mt = v instanceof LuaTable ? v.metatable : typeof v === "string" ? stringMeta : null;
+            if (mt === null) return undefined;
+            const shown = mt.rawget("__metatable");
+            return shown !== undefined ? shown : mt;
+        },
+        typeof: a => { any(a, 1); return typeName(a[0]); },
+    };
+    for (const [name, fn] of Object.entries(base)) table.register(`%luau-fn-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-string-gmatch", (regs, s) => gmatchState(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-gmatch-next", (regs, s) => gmatchNext(regs[s]), { args: [1, 1], leaf: true });
+
+    // a generic for (see forPrep and LuaTable's traversal by position), and the functions it knows
+    const its = library;
+    table.register("%luau-for-prep", (regs, s) => forPrep(its, regs[s], regs[s + 1], regs[s + 2]), { args: [3, 3], leaf: true, returns: "number" });
+    table.register("%luau-for-table", (regs, s) => regs[s] instanceof LuaTable ? regs[s] : regs[s + 1], { args: [2, 2], leaf: true, effectFree: true, oneValue: true });
+    table.register("%luau-nil?", (regs, s) => regs[s] === undefined, { ...bool, args: [1, 1], effectFree: true, inline: ([v]) => `(${v} === undefined)` });
+    table.register("%luau-array-at", (regs, s) => regs[s].arrayAt(regs[s + 1]), { args: [2, 2], leaf: true, oneValue: true, inline: ([t, i]) => `${t}.arrayAt(${i})` });
+    table.register("%luau-next-pos", (regs, s) => regs[s].nextPos(regs[s + 1]), { args: [2, 2], leaf: true, returns: "number", inline: ([t, p]) => `${t}.nextPos(${p})` });
+    table.register("%luau-key-at", (regs, s) => regs[s].keyAt(regs[s + 1]), { args: [2, 2], leaf: true, oneValue: true, inline: ([t, p]) => `${t}.keyAt(${p})` });
+    table.register("%luau-value-at", (regs, s) => regs[s].valueAt(regs[s + 1]), { args: [2, 2], leaf: true, oneValue: true, inline: ([t, p]) => `${t}.valueAt(${p})` });
+    // the library's next, pairs and ipairs, over their arguments (an array)
+    table.register("%luau-fn-next", (regs, s) => nextOf(regs[s] ?? null, regs[s + 1]), { args: [2, 2], leaf: true });
+    table.register("%luau-fn-inext", (regs, s) => inextOf(regs[s]), { args: [1, 1], leaf: true });
+    table.register("%luau-fn-pairs", (regs, s) => new MultipleValues([its.pairsNext, tableArg(regs[s], 1, "pairs"), undefined]), { args: [1, 1], leaf: true });
+    // luaB_error. A string (or a number) is raised with where the function `level` calls up was, 1 being the one that
+    // called error: (%luau-error args) raises it so for level 1, as an error of the library's own is, and gives what is
+    // raised as it is otherwise; (%luau-error-at args stack) gives it for a level further up, from the stack
+    const errorLevel = (a: Args): number => typeof a[0] === "string" || typeof a[0] === "number" ? optInteger(a, 2, "error", 1) : (optInteger(a, 2, "error", 1), 0);
+    table.register("%luau-error-far?", (regs, s) => errorLevel(regs[s]) > 1, { args: [1, 1], leaf: true, returns: "boolean" });
+    table.register("%luau-error", (regs, s) => {
+        const v = regs[s][0];
+        if (errorLevel(regs[s]) > 0) throw luauError(toString(v));
+        return v;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-error-at", (regs, s) => {
+        const at = regs[s + 1].frames[errorLevel(regs[s]) - 1]?.pos ?? null;
+        return (at === null ? "" : `${at.file}:${at.line}: `) + toString(regs[s][0]);
+    }, { args: [2, 2], leaf: true, oneValue: true });
+    // luaB_pcall: the arguments for the function (the first of pcall's), and what a caught error is to Luau (an error
+    // of the VM or the library is its message)
+    table.register("%luau-pcall-check", (regs, s) => {
+        if (regs[s].length < 1) throw luauError("missing argument #1");
+    }, { args: [1, 1], leaf: true, oneValue: true, inline: ([a], slow) => `(${a}.length < 1 ? ${slow} : undefined)` });
+    table.register("%luau-pcall-args", (regs, s) => regs[s].slice(1), {
+        args: [1, 1], leaf: true, oneValue: true, fresh: true, effectFree: true, inline: ([a]) => `${a}.slice(1)`,
+    });
+    table.register("%luau-caught", (regs, s) => {
+        const e = regs[s] instanceof ErrorObject ? regs[s].error : regs[s];
+        return e instanceof Error ? e.message : e;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    // imports (see lower.ts): what the chunk reads as it starts, and a field of a global read then, nil if anything on
+    // the way is nil or fails (luaV_getimport, with propagatenil)
+    table.register("%luau-import-chain", (regs, s, n) => {
+        let v = regs[s];
+        try {
+            for (let i = 1; i < n && v !== undefined; i++) v = index(strings, v, regs[s + i]);
+        } catch {
+            return undefined;
+        }
+        return v;
+    }, { args: [2, 3], leaf: true, oneValue: true });
+    // the library's pcall or xpcall, whatever the global is, and what makes xpcall's handler the catch's (see lower.ts)
+    table.register("%luau-library", (regs, s) => library[regs[s] as "pcall" | "xpcall" | "handler"], {
+        args: [1, 1], leaf: true, effectFree: true, oneValue: true, inline: ([name], _slow, _tmp, d) => `${d.library}[${name}]`, deps: { library },
+    });
+    // error written out where it is called (see lower.ts): whether a value is the library's error, and what error
+    // raises for a value at level 1, where the call is (a string or a number after where that is, anything else itself)
+    table.register("%luau-error?", (regs, s) => regs[s] === library.error, {
+        args: [1, 1], leaf: true, effectFree: true, returns: "boolean", inline: ([v], _slow, _tmp, d) => `(${v} === ${d.library}.error)`, deps: { library },
+    });
+    table.register("%luau-error-here", (regs, s) => typeof regs[s] === "string" ? regs[s + 1] + regs[s] : typeof regs[s] === "number" ? regs[s + 1] + num2str(regs[s]) : regs[s], {
+        args: [2, 2], leaf: true, effectFree: true, oneValue: true,
+    });
+    // xpcall (luaB_xpcally): its handler is a function; what it calls the function with; and what its handler gave
+    // for the error, "error in error handling" if the handler failed itself
+    table.register("%luau-xpcall-check", (regs, s) => {
+        if (!(regs[s][1] instanceof IProcedure)) throw argError(regs[s], 2, "xpcall", "function");
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-xpcall-handler", (regs, s) => {
+        if (!(regs[s] instanceof IProcedure)) throw argError([undefined, regs[s]], 2, "xpcall", "function");
+    }, { args: [1, 1], leaf: true, oneValue: true, inline: ([h], slow, _tmp, d) => `(${h} instanceof ${d.IProcedure} ? undefined : ${slow})`, deps: { IProcedure } });
+    table.register("%luau-xpcall-args", (regs, s) => regs[s].slice(2), { args: [1, 1], leaf: true, oneValue: true, fresh: true, effectFree: true });
+    table.register("%luau-xpcall-caught", (regs, s) => {
+        const v = regs[s];
+        if (!(v instanceof ErrorObject)) return v;
+        if (v.error instanceof VMError && v.error.op === Msg.ErrorInHandler) return "error in error handling";
+        return v.error instanceof Error ? v.error.message : v.error;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    // luaB_type, luaB_assert, luaB_select, luaB_setmetatable
+    table.register("%luau-fn-type", (regs, s) => {
+        if (regs[s].length < 1) throw luauError("missing argument #1");
+        return typeName(regs[s][0]);
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-fn-assert", (regs, s) => {
+        const a: Args = regs[s];
+        if (a.length < 1) throw luauError("missing argument #1");
+        if (a[0] === false || a[0] === undefined) throw luauError(a[1] === undefined ? "assertion failed!" : stringArg(a, 2, "assert"));
+        return a.length === 1 ? a[0] : new MultipleValues(a.slice());
+    }, { args: [1, 1], leaf: true });
+    table.register("%luau-fn-select", (regs, s) => {
+        const a: Args = regs[s], n = a.length;
+        if (typeof a[0] === "string" && a[0].charCodeAt(0) === 35) return n - 1;
+        let i = integerArg(a, 1, "select");
+        if (i < 0) i = n + i;
+        else if (i > n) i = n;
+        if (i < 1) throw argInvalid(1, "select", "index out of range");
+        return n - i === 1 ? a[i] : new MultipleValues(a.slice(i));
+    }, { args: [1, 1], leaf: true });
+    table.register("%luau-fn-setmetatable", (regs, s) => {
+        const a: Args = regs[s], t = tableArg(a, 1, "setmetatable"), mt = a[1];
+        if (a.length < 2 || (mt !== undefined && !(mt instanceof LuaTable))) throw argError(a, 2, "setmetatable", "nil or table");
+        if (t.metatable !== null && t.metatable.rawget("__metatable") !== undefined) throw luauError("cannot change a protected metatable");
+        if (t.frozen) {
+            const e = luauError("attempt to modify a readonly table");
+            e.at = NOWHERE;
+            throw e;
+        }
+        t.metatable = mt ?? null;
+        return t;
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    // debug.traceback (db_traceback, luaL_traceback): the thread it is given as the array %debug-frames takes one in,
+    // and the traceback of those frames (each #(name file line col), the innermost first: the function that called
+    // debug.traceback, which Luau counts as level 1, or the frame a thread it is given is at, level 0)
+    table.register("%luau-traceback-thread", (regs, s) => regs[s][0] instanceof Coroutine ? [regs[s][0]] : [], { args: [1, 1], leaf: true, oneValue: true, fresh: true });
+    table.register("%luau-fn-traceback", (regs, s) => {
+        const a: Args = regs[s], frames: any[][] = regs[s + 1], at = a[0] instanceof Coroutine ? 1 : 0;
+        const msg = a[at] === undefined ? null : stringArg(a, at + 1, "traceback");
+        const level = optInteger(a, at + 2, "traceback", 1 - at);
+        if (level < 0) throw argInvalid(at + 2, "traceback", "level can't be negative");
+        let out = msg === null ? "" : msg + "\n";
+        for (let i = at === 1 ? level : Math.max(level - 1, 0); i < frames.length; i++) {
+            const [name, file, line] = frames[i];
+            out += `${file ?? ""}${line > 0 ? ":" + line : ""}${functionName(name) === null ? "" : " function " + functionName(name)}\n`;
+        }
+        return out;
+    }, { args: [2, 2], leaf: true, oneValue: true });
+    table.register("%luau-fn-tostring", (regs, s) => {
+        if (regs[s].length < 1) throw luauError("missing argument #1");
+        return toString(regs[s][0]);
+    }, { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-fn-tonumber", (regs, s) => tonumberOf(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+    table.register("%luau-fn-print", (regs, s) => {
+        let line = "";
+        for (let i = 0; i < regs[s].length; i++) line += (i > 0 ? "\t" : "") + toString(regs[s][i]);
+        library.print(line);
+        return new MultipleValues([]);
+    }, { args: [1, 1], leaf: true });
+    table.register("%luau-fn-ipairs", (regs, s) => new MultipleValues([its.inext, tableArg(regs[s], 1, "ipairs"), 0]), { args: [1, 1], leaf: true });
+    const isTable = (v: string, d: Readonly<Record<string, string>>) => `${v}?.constructor === ${d.LuaTable}`;
+    // (narray nhash value ...): a constructor's table, with the items before its first keyed one
+    table.register("%luau-table", (regs, s, n) => LuaTable.of(regs.slice(s + 2, s + n), regs[s], regs[s + 1]), {
+        args: [2, Infinity], leaf: true, returns: "table", deps: { LuaTable },
+        inline: ([narray, nhash, ...values], _slow, _tmp, d) => values.length === 0 ? `new ${d.LuaTable}(${narray}, ${nhash})` : `${d.LuaTable}.of([${values.join(", ")}], ${narray}, ${nhash})`,
+    });
+    // (table index value): a constructor's item that has no key, after one that has (the array part may have shrunk)
+    table.register("%luau-seti", (regs, s) => regs[s].seti(regs[s + 1], regs[s + 2]), { args: [3, 3], leaf: true, oneValue: true });
+    // (table start array): the values of a constructor's last item, a call or `...`
+    table.register("%luau-setlist", (regs, s) => regs[s].setlist(regs[s + 1], regs[s + 2]), { args: [3, 3], leaf: true, oneValue: true });
+    table.register("%luau-index", (regs, s) => index(strings, regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, oneValue: true, deps: { LuaTable },
+        inline: ([t, k], slow, _tmp, d, known) => known[0] === "table" ? `${t}.rawget(${k})` : `(${isTable(t, d)} ? ${t}.rawget(${k}) : ${slow})`,
+    });
+    table.register("%luau-setindex", (regs, s) => setindex(regs[s], regs[s + 1], regs[s + 2]), {
+        args: [3, 3], leaf: true, oneValue: true, deps: { LuaTable },
+        // (its errors are the table's own too: the slow path is in the expression, so they get where they happened)
+        inline: ([t, k, v], slow, _tmp, d) => `(${isTable(t, d)} ? ${t}.rawset(${k}, ${v}) : ${slow})`,
+    });
+    // (shape value ...): a table of fields only, each name once (LOP_DUPTABLE and its stores)
+    table.register("%luau-record", (regs, s, n) => LuaTable.record(regs[s], regs.slice(s + 1, s + n)), {
+        args: [1, Infinity], leaf: true, returns: "table", deps: { LuaTable },
+        inline: ([shape, ...values], _slow, _tmp, d) => `${d.LuaTable}.record(${shape}, [${values.join(", ")}])`,
+    });
+    // t.name and t.name = v (LOP_GETTABLEKS, LOP_SETTABLEKS): %luau-index and %luau-setindex of a name, which a table
+    // looks for first where the same code last found it
+    table.register("%luau-field", (regs, s) => index(strings, regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, oneValue: true, deps: { LuaTable }, site: slotCache,
+        returns: (kinds: ArgKinds) => kinds[0] === "vector" ? "number" : undefined,
+        inline: ([t, k], slow, _tmp, d, known, site) => {
+            const get = site === undefined ? `${t}.rawget(${k})` : `${t}.getfield(${k}, ${site})`;
+            return known[0] === "table" ? get : `(${isTable(t, d)} ? ${get} : ${slow})`;
+        },
+    });
+    table.register("%luau-setfield", (regs, s) => setindex(regs[s], regs[s + 1], regs[s + 2]), {
+        args: [3, 3], leaf: true, oneValue: true, deps: { LuaTable }, site: slotCache,
+        inline: ([t, k, v], slow, _tmp, d, _known, site) => `(${isTable(t, d)} ? ${site === undefined ? `${t}.rawset(${k}, ${v})` : `${t}.setfield(${k}, ${v}, ${site})`} : ${slow})`,
+    });
+    table.register("%luau-len", (regs, s) => len(regs[s]), {
+        args: [1, 1], leaf: true, returns: "number", deps: { LuaTable },
+        inline: ([v], slow, _tmp, d, known) => known[0] === "table" ? `${v}.rawlen()` : known[0] === "string" ? `${v}.length`
+            : `(typeof ${v} === "string" ? ${v}.length : ${isTable(v, d)} ? ${v}.rawlen() : ${slow})`,
+    });
+    table.register("%luau-method", (regs, s) => method(strings, regs[s], regs[s + 1]), {
+        args: [2, 2], leaf: true, oneValue: true, deps: { LuaTable, strings }, site: slotCache,
+        inline: ([o, name], slow, tmp, d, known, site) => {
+            const get = (t: string) => site === undefined ? `${t}.rawget(${name})` : `${t}.getfield(${name}, ${site})`;
+            const found = known[0] === "string" ? get(d.strings) : `${isTable(o, d)} ? ${get(o)} : typeof ${o} === "string" ? ${get(d.strings)} : undefined`;
+            return `((${tmp} = ${found}) !== undefined ? ${tmp} : ${slow})`;
+        },
+    });
+};
