@@ -417,7 +417,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
         `;
     }
 
-    protected emitAggregateIntCall(inst: Extract<AotInst, { k: "IntCall" }>): boolean {
+    protected emitAggregateIntCall(inst: { pos: number; dst: number; start: number; nargs: number }): boolean {
         if (!this.substitutes || this.table?.types?.aggregates === undefined) return false;
         const entry = this.table.entries[inst.pos];
         if (entry === undefined) return false;
