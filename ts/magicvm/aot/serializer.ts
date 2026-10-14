@@ -26,8 +26,21 @@ export const serializeConstant = (
     c: any,
     templateMap: Map<ClosureTemplate, number>,
     // the unit's symbols that are not of the global registry, numbered as they are met
-    uniques: Map<symbol, number> = new Map()
+    uniques: Map<symbol, number> = new Map(),
+    // the objects among the unit's constants (not those inside one), numbered as they are met: one that several
+    // functions hold is the same object in each when the unit is loaded
+    shared: Map<object, number> | null = null
 ): UnitConstant => {
+    if (shared !== null && typeof c === "object" && c !== null) {
+        const id = shared.get(c);
+        if (id !== undefined) return { k: "same", id };
+        const made: any = serializeConstant(c, templateMap, uniques);
+        if (made.k === "datum" || made.k === "arr") {
+            made.id = shared.size;
+            shared.set(c, made.id);
+        }
+        return made;
+    }
     if (typeof c === "boolean" || typeof c === "string") {
         return { k: "lit", v: c };
     }
@@ -123,6 +136,7 @@ export class UnitSerializer {
         const templates: ClosureTemplate[] = [];
         const templateMap = new Map<ClosureTemplate, number>();
         const uniques = new Map<symbol, number>();
+        const shared = new Map<object, number>();
 
         const todo = new Worklist();
         todo.addAll(code.constants);
@@ -145,6 +159,9 @@ export class UnitSerializer {
 
         // 2. Emit AOT JS sources for root (the code itself is left as it was: running it compiles it as usual)
         const rootEmitted = AotCompiler.emitCodeSources(code, effectiveTmpl);
+
+        // (the root's constants first, as the loader reads them: an object shared with a template is written here)
+        const rootConstants = code.constants.map(c => serializeConstant(c, templateMap, uniques, shared));
 
         // 3. Emit AOT JS sources for each child template
         const serializedTemplates: UnitTemplate[] = templates.map((t, id) => {
@@ -171,7 +188,7 @@ export class UnitSerializer {
                     intrinsics: emitted.intrinsicSites,
                 },
                 usedDeps: emitted.usedDeps,
-                constants: t.code.constants.map(c => serializeConstant(c, templateMap, uniques)),
+                constants: t.code.constants.map(c => serializeConstant(c, templateMap, uniques, shared)),
                 ops: [...t.code.ops],
                 sources: {
                     direct: emitted.directSource,
@@ -204,7 +221,7 @@ export class UnitSerializer {
                 intrinsics: rootEmitted.intrinsicSites,
             },
             usedDeps: rootEmitted.usedDeps,
-            constants: code.constants.map(c => serializeConstant(c, templateMap, uniques)),
+            constants: rootConstants,
             templates: serializedTemplates,
             ops: [...code.ops],
             sources: {

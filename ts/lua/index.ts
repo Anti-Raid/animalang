@@ -1,7 +1,13 @@
 // Luau: an instance whose language is Luau (syntax/ parses it, lower.ts lowers it to core forms, ops.ts has its operators)
 import { Anima } from "../anima";
 import { CORE_CALL, CORE_IF, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LETREC, Env } from "../common";
-import { ClosureTemplate, type Closure, type Code } from "../magicvm/code";
+import { ClosureTemplate, intrinsicProcedure, type Closure, type Code } from "../magicvm/code";
+import { MATH_CONSTANTS, MATH_LIBRARY } from "./mathlib";
+import { TABLE_LIBRARY } from "./tablib";
+import { BIT_LIBRARY } from "./bitlib";
+import { UTF8_CHARPATTERN, UTF8_LIBRARY } from "./utf8lib";
+import { OS_LIBRARY } from "./oslib";
+import { BUFFER_LIBRARY, VECTOR_CONSTANTS, VECTOR_LIBRARY } from "./buflib";
 import { PAD, clause } from "../magicvm/lambda";
 import type { AnimaOptions } from "../magicvm/meta";
 import { LuauSyntaxError, lowerLuau } from "./lower";
@@ -35,7 +41,7 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
     // Luau has no re-entrant continuations (coroutines resume their one suspended frame)
     const anima = new Anima({ ...options, reentrant: false });
     const iterators: LuauLibrary = {
-        next: undefined, pairsNext: undefined, inext: undefined, string: new LuaTable(), pcall: undefined, xpcall: undefined, handler: undefined, error: undefined,
+        next: undefined, pairsNext: undefined, inext: undefined, string: new LuaTable(), pcall: undefined, xpcall: undefined, handler: undefined, error: undefined, utf8Next: undefined,
         print: host.print ?? (line => console.log(luauText(line))),
     };
     anima.intrinsics.setFormatter(luauFormat);
@@ -58,6 +64,12 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
     // a library function: a procedure of any number of arguments whose body is the intrinsic `op` over them (an array,
     // after `before`). Its code is the VM's own, so an error in it is where it was called, as Luau reports a C function's
     const library = (name: string, op: string, ...before: any[]): Closure => {
+        // (one that is a leaf intrinsic over its arguments and nothing else is made without compiling it)
+        if (before.length === 0 && anima.intrinsics.byName(op)?.leaf === true) {
+            const made = intrinsicProcedure(anima.intrinsics, op, name, options.debug === true, false);
+            made.tmpl.code.internal = true;
+            return made;
+        }
         const rest = Symbol("...");
         return procedure(name, [CORE_LAMBDA, null, clause([PAD], [], rest, [[CORE_INTCALL, null, Symbol.for(op), ...before, rest]])]);
     };
@@ -86,6 +98,25 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
         [CORE_LET, null, [[state, [CORE_INTCALL, null, Symbol.for("%luau-string-gmatch"), rest]]],
             [CORE_LAMBDA, null, clause([PAD], [], null, [[CORE_INTCALL, null, Symbol.for("%luau-gmatch-next"), state]])]]])]));
     define("string", iterators.string);
+    const tableOf = (prefix: string, names: readonly string[], constants: Record<string, unknown> = {}): LuaTable => {
+        const t = new LuaTable();
+        for (const name of names) t.set(name, library(name, `%luau-${prefix}-${name}`));
+        for (const [name, value] of Object.entries(constants)) t.set(name, value);
+        return t;
+    };
+    define("math", tableOf("math", Object.keys(MATH_LIBRARY), MATH_CONSTANTS));
+    const tables = tableOf("table", Object.keys(TABLE_LIBRARY));
+    define("table", tables);
+    // (a function of its own, as Luau's is: unpack ~= table.unpack)
+    define("unpack", library("unpack", "%luau-table-unpack"));
+    for (const name of ["rawequal", "rawget", "rawset", "rawlen", "getmetatable", "typeof"]) define(name, library(name, `%luau-fn-${name}`));
+    define("_VERSION", "Luau");
+    define("bit32", tableOf("bit32", Object.keys(BIT_LIBRARY)));
+    iterators.utf8Next = library("", "%luau-utf8-next");
+    define("utf8", tableOf("utf8", [...Object.keys(UTF8_LIBRARY), "codes"], { charpattern: UTF8_CHARPATTERN }));
+    define("os", tableOf("os", Object.keys(OS_LIBRARY)));
+    define("buffer", tableOf("buffer", Object.keys(BUFFER_LIBRARY)));
+    define("vector", tableOf("vector", Object.keys(VECTOR_LIBRARY), VECTOR_CONSTANTS));
     const call = (op: string, ...args: any[]) => [CORE_INTCALL, null, Symbol.for(op), ...args];
     // error raises its value; a string gets where the function that called it (or one further up) was
     define("error", iterators.error = procedure("error", [CORE_LAMBDA, null, clause([PAD], [], rest, [
@@ -115,5 +146,33 @@ export const createLuau = (options: AnimaOptions, host: LuauHost = {}): Anima =>
     debug.set("traceback", procedure("traceback", [CORE_LAMBDA, null, clause([PAD], [], rest, [
         call("%luau-fn-traceback", rest, call("%debug-frames", call("%current-stack"), call("%luau-traceback-thread", rest), undefined))])]));
     define("debug", debug);
+    // The coroutine library, over the VM's coroutines. A resume is a call that catches (as pcall's): the error a
+    // coroutine dies of comes to whatever resumed it
+    const [co, args] = [Symbol("co"), Symbol("args")];
+    const resumed = (thread: symbol, given: any) => call("%catch-call", [CORE_LAMBDA, null, clause([], [co, args], null, [call("%coroutine-resume-array", co, args)])], thread, given);
+    const coroutine = new LuaTable();
+    const member = (name: string, ...body: any[]) => coroutine.set(name, procedure(name, [CORE_LAMBDA, null, clause([PAD], [], rest, body)]));
+    member("create", call("%coroutine-create", call("%luau-co-function", rest, "create")));
+    member("resume", [CORE_LET, null, [[co, call("%luau-co-thread", rest, "resume")]],
+        [CORE_IF, null, call("%luau-co-suspended?", co),
+            [CORE_LET, null, [[r, resumed(co, call("%luau-pcall-args", rest))]],
+                [CORE_IF, null, call("%caught?", r),
+                    call("%values", false, call("%luau-co-failed", co, call("%luau-caught", call("%caught-value", r)))),
+                    call("%values-cons", true, r)]],
+            call("%values", false, call("%luau-co-cannot", co))]]);
+    member("wrap", [CORE_LET, null, [[co, call("%coroutine-create", call("%luau-co-function", rest, "wrap"))]],
+        [CORE_LAMBDA, null, clause([PAD], [], args, [
+            [CORE_IF, null, call("%luau-co-suspended?", co),
+                [CORE_LET, null, [[r, resumed(co, args)]],
+                    [CORE_IF, null, call("%caught?", r),
+                        call("%raise", call("%luau-co-rethrow", call("%luau-co-failed", co, call("%luau-caught", call("%caught-value", r))))),
+                        r]],
+                call("%raise", call("%luau-co-rethrow", call("%luau-co-cannot", co)))]])]]);
+    member("yield", call("%coroutine-yield", call("%luau-varargs", rest)));
+    member("running", call("%current-coroutine", undefined));
+    member("isyieldable", call("%coroutine-yieldable?"));
+    member("close", [CORE_LET, null, [[co, call("%luau-co-closing", rest)]], call("%coroutine-close", co), call("%luau-co-closed", co)]);
+    coroutine.set("status", library("status", "%luau-fn-costatus"));
+    define("coroutine", coroutine);
     return anima;
 };

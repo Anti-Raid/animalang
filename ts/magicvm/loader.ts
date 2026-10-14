@@ -40,7 +40,7 @@ export const deserializeConstant = (
     c: UnitConstant,
     templates: ClosureTemplate[],
     // the symbols made so far for the unit's own (see UnitConstant's `u`), and its imports once made
-    uniques: symbol[] & { imports?: Imports } = []
+    uniques: symbol[] & { imports?: Imports, shared?: any[] } = []
 ): any => {
     switch (c.k) {
         case "lit":
@@ -74,12 +74,19 @@ export const deserializeConstant = (
             }
             const datum = deserializer(c.data, child => deserializeConstant(child, templates, uniques));
             if (c.q) markQuoted(datum);
+            if (c.id !== undefined) (uniques.shared ??= [])[c.id] = datum;
             return datum;
         }
         case "arr": {
             const array = c.v.map(item => deserializeConstant(item, templates, uniques));
             if (c.q) markQuoted(array);
+            if (c.id !== undefined) (uniques.shared ??= [])[c.id] = array;
             return array;
+        }
+        case "same": {
+            const made = uniques.shared?.[c.id];
+            if (made === undefined) throw new Error(`Unit constant ${c.id} is used before it is defined`);
+            return made;
         }
         default:
             return (c as any).v;

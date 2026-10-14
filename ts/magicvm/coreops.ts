@@ -404,6 +404,11 @@ export const CORE_INTRINSICS: Intrinsics = (() => {
     generated("%apply-array", [2, Infinity]);
     generated("%apply-fresh", [2, 2]);
     control("%host-then", [2, 2], (regs, start) => regs[start](regs[start + 1]));
+    // (%kept? value held): whether `value` is what is held, the same one, and is something: a slot that holds nothing
+    // yet holds <#void>, which is no match for a value that is <#void> too
+    core("%kept?", [2, 2], (regs, start) => regs[start] !== undefined && regs[start] === regs[start + 1], {
+        effectFree: true, returns: "boolean", inline: (args) => args.length === 2 ? `(${args[0]} !== undefined && ${args[0]} === ${args[1]})` : null,
+    });
     // whether a value is <#void>
     core("%nothing?", [1, 1], (regs, start) => regs[start] === undefined, { effectFree: true, returns: "boolean", inline: unaryInline(v => `(${v} === undefined)`) });
     // A unit's imports, each compiled to instructions of its own (compiler.ts). (%import-globals (%quote #(sym ...))): once in

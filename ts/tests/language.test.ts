@@ -2048,6 +2048,14 @@ describe('Anima', () => {
             expect(run("(define ys '(1 2)) (list `(,@ys 3) (eq? (cdr `(0 ,@ys)) ys) (eq? `(,@ys 3) ys))")).toBe("((1 2 3) #t #f)")
         })
 
+        it('gives one object for a constant a procedure quotes, wherever the procedure is inlined', () => {
+            expect(run("(define (k) '(1 2)) (define (j) (k)) (list (eq? (k) (k)) (eq? (k) (j)))")).toBe("(#t #t)")
+            expect(run("(let ((k (lambda () '(1 2)))) (let ((j (lambda () (k)))) (list (eq? (k) (k)) (eq? (k) (j)))))")).toBe("(#t #t)")
+            expect(run("(define (gi-add a b) (+ a b)) (define (gi-run) (let loop ((i 0) (s 0)) (if (< i 10) (loop (+ i 1) (gi-add s i)) s))) (gi-run)")).toBe("45")
+            expect(run("(set! gi-add (lambda (a b) (* a (+ b 1)))) (gi-run)")).toBe("0")
+            expect(run("(set! gi-add -) (gi-run)")).toBe("-45")
+        })
+
         it('builds only what changes', () => {
             // the constant tail after the last unquote is one shared constant
             expect(run("(define (qf x) `(a ,x b c)) (list (qf 1) (qf 2) (eq? (cddr (qf 1)) (cddr (qf 2))) (length (qf 1)))")).toBe("((a 1 b c) (a 2 b c) #t 4)")

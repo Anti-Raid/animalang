@@ -189,6 +189,11 @@ export class LuaTable implements Datum, Iterable<[any, any]> {
         return this.#sizearray;
     }
 
+    // luaH_resizearray: the array part made `size` long, the hash part as large as it is
+    resizeArray(size: number): void {
+        this.#resize(size, this.#capacity);
+    }
+
     get sizenode(): number {
         return this.#capacity;
     }

@@ -260,7 +260,7 @@ describe("Instructions", () => {
         const lines = listing(bc)
         const sum = listing(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-sum").tmpl.code)
         const ap = listing(bc.constants.find((c: any) => c instanceof Closure && c.debugName === "ds-ap").tmpl.code)
-        expect(lines).toContain("0000: LoadConst   dst=r1, idx=c.fn(f . xs)")
+        expect(lines.some(line => /LoadConst +dst=r\d+, idx=c\.fn\(f \. xs\)$/.test(line))).toBe(true)
         expect(lines.some(line => /Unpack +src=r\d+, start=r\d+, count=1, flags=rest\|strict/.test(line))).toBe(true)
         expect(lines.some(line => /IntCall +pos=%car, /.test(line))).toBe(true)
         expect(lines.some(line => /LoadConst +dst=r\d+, idx=\(2\)$/.test(line))).toBe(true)

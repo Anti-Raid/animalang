@@ -80,9 +80,10 @@ describe('Anima', () => {
             // a tail resume replaces its caller's frame, so the trace starts below it
             expect(runFile(`(define tb-outer2 #f)
 (define tb-inner2 (coroutine-create (lambda () (debug-traceback tb-outer2))))
-(define (tb-resumer2) (coroutine-resume tb-inner2))
+(define tb-resumer2 #f)
+(set! tb-resumer2 (lambda () (coroutine-resume tb-inner2)))
 (set! tb-outer2 (coroutine-create (lambda () (car (list (tb-resumer2))))))
-(coroutine-resume tb-outer2)`)).toMatch(/^stack traceback:\n  t\.anima:4:\d+ in lambda@t\.anima:4$/);
+(coroutine-resume tb-outer2)`)).toMatch(/^stack traceback:\n  t\.anima:5:\d+ in lambda@t\.anima:5$/);
         });
 
         it("takes stack snapshots without capturing a continuation", () => {

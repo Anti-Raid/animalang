@@ -275,6 +275,59 @@ describe("A function written where pcall or xpcall is given it", () => {
     });
 });
 
+describe("A global function a chunk defines and calls", () => {
+    const make = () => {
+        const a = createLuau({ ...impl, debug: false, optimize: true });
+        return (src: string) => {
+            try {
+                const r = a.evaluateRaw(a.compileRaw(src, "t"));
+                return (r instanceof MultipleValues ? r.values : [r]).map(toString).join("\t");
+            } catch (e: any) {
+                return "error: " + e.message;
+            }
+        };
+    };
+
+    it("is inlined where it is called, behind a test that the global still holds it", () => {
+        const fast = createLuau({ ...impl, debug: false, optimize: true });
+        const code = fast.compileRaw("function add(a, b) return a + b end function run(n) local s = 0 for i = 1, n do s = add(s, i) end return s end return run", "t");
+        const run = fast.evaluateRaw(code) as Closure;
+        const text = [listing(run.tmpl.code)].flat().join("\n");
+        expect(text).toContain("InlineSite");
+        expect(text).toMatch(/IntCall +pos=%kept\?/);
+        // (the call is still there, for a global that holds something else)
+        expect(text).toMatch(/Call +proc=/);
+        expect(fast.evaluateClosure(run, [10])).toBe(55);
+    });
+
+    it("calls whatever the global holds once it holds something else", () => {
+        const exec = make();
+        expect(exec("function add(a, b) return a + b end function run() local s = 0 for i = 1, 10 do s = add(s, i) end return s end return run()")).toBe("55");
+        expect(exec("return run()")).toBe("55");
+        expect(exec("add = function(a, b) return a * b + 1 end return run()")).toBe("6235301");
+        expect(exec("add = nil return pcall(run)")).toBe("false\tt:1: attempt to call a nil value");
+        expect(exec("add = 5 return pcall(run)")).toBe("false\tt:1: attempt to call a number value");
+        expect(exec("function add(a, b) return 'again' end return run()")).toBe("again");
+    });
+
+    it("calls what the global held before, where the call comes before the definition", () => {
+        const exec = make();
+        expect(exec("local ok, e = pcall(function() local v = later() return v end) function later() return 'new' end return ok, e, later()")).toBe("false\tt:1: attempt to call a nil value\tnew");
+        exec("function older() return 'old' end");
+        expect(exec("local before = older() function older() return 'new' end return before, older()")).toBe("old\tnew");
+    });
+
+    it("recurses, alone and with another, and keeps its frame in a traceback", () => {
+        const exec = make();
+        expect(exec("function fact(n) if n < 2 then return 1 end return n * fact(n - 1) end return fact(10)")).toBe("3628800");
+        expect(exec("function even(n) if n == 0 then return true end return odd(n - 1) end function odd(n) if n == 0 then return false end return even(n - 1) end return even(10), odd(7), even(7)")).toBe("true\ttrue\tfalse");
+        expect(exec("function fails()\n  error('inside')\nend\nfunction caller()\n  local v = fails()\n  return v\nend\nlocal ok, e = pcall(caller) return e")).toBe("t:2: inside");
+        expect(exec("function where() return debug.traceback('m') end function asks() local s = where() return s end return asks()")).toContain("function where");
+        expect(exec("function two() return 1, 2 end function none() end local a, b = two() local c = none() return a, b, c, select('#', two()), select('#', none()), (two())")).toBe("1\t2\tnil\t2\t0\t1");
+        expect(exec("function pick(t) return t.x end function all(...) return ... end return pick({ x = 7 }), all(1, 2, 3)")).toBe("7\t1\t2\t3");
+    });
+});
+
 describe("Luau's imports", () => {
     const values = (r: any) => (r instanceof MultipleValues ? r.values : [r]).map(toString).join("\t");
 

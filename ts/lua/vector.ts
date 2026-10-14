@@ -58,7 +58,10 @@ export class LuaVector implements Datum {
 }
 
 const V = (x: number, y: number, z: number) => new LuaVector(x, y, z);
-const dot3 = (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => f(f(f(ax * bx) + f(ay * by)) + f(az * bz));
+// (a product that is added to or subtracted from is rounded once, with the sum, as arm64's compiler makes of it: the
+// product of two singles is exact in a double)
+const fma = (a: number, b: number, c: number) => f(a * b + c);
+const dot3 = (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => fma(az, bz, fma(ax, bx, f(ay * by)));
 const idiv = (a: number, b: number) => Math.floor(a / b);
 
 // the arithmetic Luau has on vectors: v+v, v-v, -v, and v*v, s*v, v*s, likewise / and //
@@ -90,11 +93,11 @@ export const vector = {
         const inv = f(1 / f(Math.sqrt(dot3(v.x, v.y, v.z, v.x, v.y, v.z))));
         return V(v.x * inv, v.y * inv, v.z * inv);
     },
-    cross: (a: LuaVector, b: LuaVector) => V(f(a.y * b.z) - f(a.z * b.y), f(a.z * b.x) - f(a.x * b.z), f(a.x * b.y) - f(a.y * b.x)),
+    cross: (a: LuaVector, b: LuaVector) => V(fma(a.y, b.z, -f(a.z * b.y)), fma(a.z, b.x, -f(a.x * b.z)), fma(a.x, b.y, -f(a.y * b.x))),
     dot: (a: LuaVector, b: LuaVector) => dot3(a.x, a.y, a.z, b.x, b.y, b.z),
     angle: (a: LuaVector, b: LuaVector, axis?: LuaVector) => {
         const c = vector.cross(a, b);
-        const angle = Math.atan2(Math.sqrt(dot3(c.x, c.y, c.z, c.x, c.y, c.z)), dot3(a.x, a.y, a.z, b.x, b.y, b.z));
+        const angle = Math.atan2(f(Math.sqrt(dot3(c.x, c.y, c.z, c.x, c.y, c.z))), dot3(a.x, a.y, a.z, b.x, b.y, b.z));
         return axis !== undefined && dot3(c.x, c.y, c.z, axis.x, axis.y, axis.z) < 0 ? -angle : angle;
     },
     floor: (v: LuaVector) => V(Math.floor(v.x), Math.floor(v.y), Math.floor(v.z)),
@@ -127,7 +130,7 @@ export const vector = {
     },
     lerp: (a: LuaVector, b: LuaVector, t: number) => {
         const s = f(t);
-        const lerp = (p: number, q: number) => s === 1 ? q : f(p + f(f(q - p) * s));
+        const lerp = (p: number, q: number) => s === 1 ? q : fma(f(q - p), s, p);
         return V(lerp(a.x, b.x), lerp(a.y, b.y), lerp(a.z, b.z));
     },
 };

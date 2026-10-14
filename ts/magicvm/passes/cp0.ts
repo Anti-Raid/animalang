@@ -12,7 +12,7 @@
 // whose binders code generation rejects, and lambdas that escape to a %block outside them, are left as they are, so their
 // errors stay. Globals are never inlined or
 // propagated: they can be changed
-import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_VALUES_STRICT, CORE_LOOP, CORE_QUOTE, SPECIAL_FORMS } from "../../common";
+import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY, CORE_INTCALL, CORE_LAMBDA, CORE_LET, CORE_LET_VALUES_STRICT, CORE_LOOP, CORE_QUOTE, MultipleValues, SPECIAL_FORMS } from "../../common";
 import { isCoreForm } from "../core";
 import type { Intrinsics } from "../intrinsics";
 import { BOXED, isLetrecLambda, isPadded, isUnnamed, unwrapBoxed } from "../lambda";
@@ -271,10 +271,18 @@ const freeIn = (e: any): Set<symbol> => {
 // Asking those of each binding in turn costs a function with many locals its length squared. Null for a program with
 // a form that is not laid out as it should be (which those walk as far as they can)
 type Uses = { uses: number, straight: number, nested: boolean, other: boolean, boxed: boolean };
-const usesOfAll = (ast: any): Map<symbol, Uses> | null => {
+// what the same walk finds for the inlining of global procedures: every assignment, the names the program binds, and
+// the unit's %import-globals
+type Found = { assigns: any[][], bound: ReadonlyMap<symbol, number>, imports: any[] | null };
+const IMPORT_GLOBALS = Symbol.for("%import-globals"), IMPORT_SET = Symbol.for("%import-set!"), IMPORT_REF = Symbol.for("%import-ref");
+const KEPT = Symbol.for("%kept?"), FIRST_VALUE = Symbol.for("%first-value");
+// a global procedure the unit defines, inlined where the unit calls it (see `guarded` in optimize)
+type Definition = { readonly lambda: any[], readonly slot: number, readonly name: string, readonly size: number };
+const usesOfAll = (ast: any, found: Found | null = null): Map<symbol, Uses> | null => {
     const all = new Map<symbol, Uses>();
     // how many lambdas and loops a variable's binder is inside
     const bound = new Map<symbol, number>();
+    if (found !== null) found.bound = bound;
     const of = (sym: symbol): Uses => {
         let u = all.get(sym);
         if (u === undefined) all.set(sym, u = { uses: 0, straight: 0, nested: false, other: false, boxed: false });
@@ -302,7 +310,10 @@ const usesOfAll = (ast: any): Map<symbol, Uses> | null => {
             return;
         }
         if (x[0] === BOX_IN_PLACE && typeof x[2] === "symbol") of(x[2]).boxed = true;
-        if (shape === "assign" && typeof x[2] === "symbol") of(x[2]).uses++;
+        if (shape === "assign" && typeof x[2] === "symbol") {
+            of(x[2]).uses++;
+            if (found !== null) found.assigns.push(x);
+        } else if (found !== null && x[0] === CORE_INTCALL && x[2] === IMPORT_GLOBALS) found.imports = x;
         const inner = x[0] === CORE_LAMBDA || x[0] === CORE_LOOP ? depth + 1 : depth;
         const exprs = parts(Lconv, x).exprs;
         // (a variable nothing uses is known too: as one with no uses)
@@ -329,7 +340,8 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     const locals = new Set<symbol>();
     const copy = renamer(intrinsics);
     // (a variable made by inlining is not among them: its scope is looked through)
-    const known = usesOfAll(ast);
+    const found: Found = { assigns: [], bound: new Map(), imports: null };
+    const known = usesOfAll(ast, found);
     let budget = INLINE_BUDGET;
     const boxes = new Set<symbol>();
 
@@ -421,6 +433,33 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
     // whether a call with `nargs` arguments binds the clause's parameters (else it is left to fail as a call)
     const fits = (c: any[], nargs: number) => isPadded(c) || (c[2] === null ? nargs === c[1].length : nargs >= c[1].length);
 
+    // The global procedures of the unit that are inlined where the unit calls them: a global the unit assigns once, a
+    // small lambda that uses no variable around it (so every closure of it does the same, wherever its body is put).
+    // Another unit, or the host, may assign the global, so the inlined body is behind a test: the unit keeps the
+    // procedure it assigned in a slot of its imports (%import-set!, where the assignment is), and a call first asks
+    // whether the global still holds that (`guarded`). `defined`: the assignments themselves
+    const defs = new Map<symbol, Definition>();
+    const defined = new Map<any[], symbol>();
+    const called = new WeakSet<any[]>();
+    if (known !== null) {
+        const count = new Map<symbol, number>();
+        for (const a of found.assigns) if (!found.bound.has(a[2])) count.set(a[2], (count.get(a[2]) ?? 0) + 1);
+        let slot = found.imports !== null && Array.isArray(found.imports[3]?.[2]) ? found.imports[3][2].length : 0;
+        for (const a of found.assigns) {
+            const g: symbol = a[2], lambda = a[3];
+            if (count.get(g) !== 1 || !Array.isArray(lambda) || lambda[0] !== CORE_LAMBDA || known.get(g)!.uses < 2) continue;
+            // (its size first: that walk stops at the limit, the others go through all of a procedure)
+            const size = sizeOf(lambda, INLINE_SIZE);
+            if (size > INLINE_SIZE || !inlinable(lambda) || [...freeIn(lambda)].some(v => found.bound.has(v))) continue;
+            defs.set(g, { lambda, slot: slot++, name: g.description ?? "lambda", size });
+            defined.set(a, g);
+        }
+    }
+    const definitionOf = (head: any, k: K, nargs: number): Definition | undefined => {
+        const def = typeof head === "symbol" && !k.own.has(head) ? defs.get(head) : undefined;
+        return def !== undefined && budget >= def.size && fits(def.lambda[2], nargs) ? def : undefined;
+    };
+
     // the elements of a sequence made of locals and constants (by the table's pack, or %array where it has none), or null
     const sequenceOf = (e: any): any[] | null => {
         if (!isIntCall(e, PACK)) return null;
@@ -466,6 +505,11 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         if (shape !== undefined && malformed(Lconv, e) !== null) return e;
         if (shape === "quote") return ctx === "effect" ? VOID : e;
         if (op === CORE_CALL && e.length >= 3) return start(walkCall(e, ctx, k));
+        if (defs.size > 0) {
+            if (shape === "assign" && defined.has(e)) return start(walkDefinition(e, k));
+            // (a slot for each procedure kept, after the front end's own)
+            if (e === found.imports) return [op, e[1], e[2], [e[3][0], e[3][1], [...e[3][2], ...new Array(defs.size).fill(undefined)]]];
+        }
         if (op === CORE_INTCALL && intrinsicOf(e[2]) !== undefined) return start(walkIntrinsic(e, ctx, k));
         if (op === CORE_IF) return start(walkIf(e, ctx, k));
         return start(walkForm(e, ctx, k, shape));
@@ -559,7 +603,11 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
             }
             case "let-values": {
                 const clauses: any[][] = [];
-                for (const c of e[2]) clauses.push([c[0], c[1], yield value(c[2], k)]);
+                for (const c of e[2]) {
+                    // (a call whose values are bound at once stays a call, which gives them as they are asked for)
+                    if (Array.isArray(c[2]) && c[2][0] === CORE_CALL) called.add(c[2]);
+                    clauses.push([c[0], c[1], yield value(c[2], k)]);
+                }
                 for (const n of clauses.flatMap((c: any[]) => c[1] === null ? c[0] : [...c[0], c[1]])) if (typeof n === "symbol") locals.add(n);
                 // the values of a (%values e ...): each name is bound to its expression, with no multiple values made
                 // (missing ones <#void>, extra ones still evaluated); a strict form with another count is left to fail
@@ -689,8 +737,69 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         return walk(lambdas.length === 0 ? bound : [CORE_LET, at, lambdas, bound], ctx, k);
     };
 
+    // the assignment of a global procedure that is inlined: the procedure is kept in its slot too
+    const walkDefinition = function* (e: any[], k: K): Task<any> {
+        const g: symbol = e[2], def = defs.get(g)!, v = Symbol(def.name);
+        let lambda = value(e[3], { ...k, own: new Set([...k.own, g]) });
+        if (isTask(lambda)) lambda = yield lambda;
+        locals.add(v);
+        return [CORE_LET, e[1], [[v, lambda]], [CORE_INTCALL, null, IMPORT_SET, def.slot, v], [e[0], e[1], g, v]];
+    };
+
+    // A call `e` of the global `g`, whose procedure the unit defines: if the global holds what the unit assigned, the
+    // procedure's body, else the call. The global and the arguments are evaluated once, in order, before either
+    // (`wrap`: what is made of the call, on both sides)
+    const guarded = function* (def: Definition, g: symbol, e: any[], ctx: Ctx, k: K, wrap: (call: any) => any): Task<any> {
+        budget -= def.size;
+        const pos = e[1], nk = notTail(k), f = Symbol(def.name);
+        const bindings: any[][] = [[f, g]], args: any[] = [];
+        locals.add(f);
+        for (let i = 3; i < e.length; i++) {
+            let v = walk(e[i], "value", nk);
+            if (isTask(v)) v = yield v;
+            if (isConst(v) || (typeof v === "symbol" && locals.has(v))) args.push(v);
+            else {
+                const t = Symbol("arg");
+                locals.add(t);
+                bindings.push([t, v]);
+                args.push(t);
+            }
+        }
+        const body = copy(def.lambda);
+        boxesIn(body, boxes);
+        let fast = inlined(def.name, body, [CORE_CALL, pos, f, ...args], ctx, { ...k, own: new Set([...k.own, g]) });
+        if (isTask(fast)) fast = yield fast;
+        const kept = [CORE_INTCALL, null, KEPT, f, [CORE_INTCALL, null, IMPORT_REF, def.slot]];
+        return [CORE_LET, pos, bindings, [CORE_IF, pos, kept, wrap(fast), wrap([CORE_CALL, pos, f, ...args])]];
+    };
+
+    // whether `e` is one value however it is evaluated, as it is written: what a variable holds (where the front end
+    // says variables hold one), a constant that is not several, an intrinsic that gives one, and an inlined body that
+    // is one such expression (in a %block nothing escapes from, as a body with one way out is)
+    const single = (e: any): boolean => {
+        if (typeof e === "symbol") return intrinsics.types?.oneValueVariables === true;
+        if (!Array.isArray(e)) return !(e instanceof MultipleValues);
+        const op = e[0];
+        if (op === CORE_QUOTE) return e.length === 3 && !(e[2] instanceof MultipleValues);
+        if (op === CORE_INTCALL) return intrinsicOf(e[2])?.oneValue === true;
+        if ((op === INLINED || op === TAIL_INLINED) && e.length === 4) return single(e[3]);
+        if (op === CORE_BLOCK && e.length === 4) return single(e[3]) && !escapesOut(e[3]);
+        return false;
+    };
+
     const walkIntrinsic = function* (e: any[], ctx: Ctx, k: K): Task<any> {
         const entry = intrinsicOf(e[2])!;
+        // the first value of a call of a global procedure that is inlined: taken on both sides, so the call is still one
+        // that asks for one value
+        if (e[2] === FIRST_VALUE && e.length === 5 && Array.isArray(e[3]) && e[3][0] === CORE_CALL && e[3].length >= 3) {
+            const g = aliasOf(e[3][2], k.env), def = definitionOf(g, k, e[3].length - 3);
+            if (def !== undefined) {
+                let otherwise = value(e[4], k);
+                if (isTask(otherwise)) otherwise = yield otherwise;
+                // (what is one value as it is written needs nothing taken of it)
+                return yield guarded(def, g, e[3], "value", notTail(k), call => single(call) ? call : [CORE_INTCALL, e[1], e[2], call, otherwise]);
+            }
+        }
         const args: any[] = [], nk = notTail(k);
         for (let i = 3; i < e.length; i++) {
             let v = walk(e[i], "value", nk);
@@ -733,6 +842,8 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
                 return yield inlined(info.name, body, e, ctx, { ...k, own: new Set([...k.own, head]) });
             }
         }
+        const def = called.has(e) ? undefined : definitionOf(head, k, nargs);
+        if (def !== undefined) return yield guarded(def, head, e, ctx, k, call => call);
         // a known global's procedure, where it would pay: an argument it may call is a lambda or a known procedure
         const known = typeof head === "symbol" && !locals.has(head) && !k.own.has(head) ? intrinsics.known.get(head) : undefined;
         if (known !== undefined && e.slice(3).some(x => knownProcedure(x, k.env))) {
@@ -760,5 +871,7 @@ export const optimize = (ast: any, intrinsics: Intrinsics): Optimized => {
         return info?.k === "lambda" || (!locals.has(x) && intrinsics.known.has(x));
     };
 
-    return { ast: run(walk(ast, "value", { env: new Env(), own: new Set(), tail: true, blocks: new Map() })), assumed, boxes };
+    const walked = run(walk(ast, "value", { env: new Env(), own: new Set(), tail: true, blocks: new Map() }));
+    const slots = defs.size > 0 && found.imports === null ? [CORE_INTCALL, null, IMPORT_GLOBALS, [CORE_QUOTE, null, new Array(defs.size).fill(undefined)]] : null;
+    return { ast: slots === null ? walked : [CORE_BEGIN, null, slots, walked], assumed, boxes };
 };

@@ -13,9 +13,12 @@ So far: locals, assignment (to locals, globals and table entries, several at onc
 `local function`, `function a.b:c()`), calls and method calls, several values and `...`, table constructors, indexing,
 literals, interpolated strings, if-expressions, and the operators (arithmetic, `..`, comparisons, `and`, `or`, `not`,
 `#`). Anything else is a positioned "not supported yet" error. Of the standard library there are `next`, `pairs`,
-`ipairs`, `tostring`, `tonumber`, `print`, `type`, `select`, `assert`, `setmetatable`, `error`, `pcall`, `xpcall`,
-`debug.traceback` and `string` (but `pack`, `unpack` and `packsize`); the rest, and metamethods (but `__call`, `__mode` and
-`__metatable`), come later.
+`ipairs`, `tostring`, `tonumber`, `print`, `type`, `typeof`, `select`, `assert`, `setmetatable`, `getmetatable`,
+`rawget`, `rawset`, `rawequal`, `rawlen`, `unpack`, `error`, `pcall`, `xpcall`, `_VERSION`, `debug.traceback`, and the
+libraries `string` (but `pack`, `unpack` and `packsize`), `math`, `table`, `bit32`, `utf8`, `os`, `coroutine`, `buffer`
+(but `readinteger` and `writeinteger`) and `vector` (see **The libraries** below). Not there: `_G`, `getfenv`,
+`setfenv`, `loadstring`, `require`, `newproxy`, `gcinfo`, `collectgarbage`, `debug.info`, the `integer` library as a
+global, and metamethods (but `__call`, `__mode` and `__metatable`).
 
 - A chunk is a `%block` that `return` escapes from; each `local` binds the rest of its block (`%let`), and locals are
   the parser's own symbols, so shadowing needs nothing more. Globals live in the instance's `Env`, made with nil
@@ -217,6 +220,37 @@ Where it differs from Luau's compiler, in the sizes a table starts with only:
 lengths after every write and traversals (the guaranteed order, the rest as a set) for a thousand random programs.
 
 ## Strings
+## The libraries
+
+Each library is a module of functions over an array of arguments (`mathlib.ts`, `tablib.ts`, `bitlib.ts`, `utf8lib.ts`,
+`oslib.ts`, `buflib.ts`, and `strlib.ts`), written from Luau's C (`VM/src/l*lib.cpp`) function by function: the same
+checks in the same order, so the same error for the same wrong call. Each function is an intrinsic
+(`%luau-math-floor` ...), and the Luau function is a procedure of that one intrinsic over its arguments, made without
+compiling (`intrinsicProcedure` in the VM: three instructions, compiled to JS when first called), which is what keeps
+making an instance at under two milliseconds with some 250 functions. `ts/tests/luau-libs.test.ts` compares each
+library with a Luau binary, call by call.
+
+- **math**: what C's `libm` computes and JS's `Math` does not is written out (`round`, `modf`, `frexp`, `ldexp`, `pow`);
+  `random` and `randomseed` are Luau's PCG32, so a seed gives Luau's numbers; `noise` is its Perlin noise in single
+  precision, rounding a product and the sum it goes into once, as the arm64 compiler does (`fma`), to the last bit.
+  `sin`, `exp`, `log` and the like are the engine's, and may differ from a C library's in the last digit.
+- **table**: `sort` is Luau's (a quicksort that falls back to a heap sort), written as a walk that asks for each
+  comparison, so it makes the same comparisons in the same order and fails the same way (`invalid order function for
+  sorting`, `table modified during sorting`). `sort` with an order function, `foreach` and `foreachi` call the
+  program's function through the VM (`hostCall`); unlike in Luau, that function may yield. `move` resizes the array
+  part as Luau's does. Errors of the table itself (`attempt to modify a readonly table`, values that do not compare)
+  have no position, as in Luau.
+- **bit32**, **utf8**: as Luau's; a number becomes 32 unsigned bits the way C's `(unsigned)(long long)` makes it.
+- **os**: `clock`, `time`, `difftime`, `date`, with C's `strftime` in the C locale written out. `%Z` is the zone name
+  the host's `Intl` gives. One difference: `os.date("!%z")` is `+0000`, where the C library of macOS gives the local
+  zone's offset.
+- **coroutine**: over the VM's coroutines. `resume` is a catching call of the VM's resume, so the error a coroutine
+  dies of comes back as `false, error`; `wrap` raises it again (a string as an error of the function's own, so it gets
+  where the function was called); `close` gives the error once. `coroutine.running()` is nil in a chunk the host runs,
+  which is no coroutine (Luau's command line runs a script in one). Where a tail call left no frame, an error of a
+  wrapped coroutine gets no second position.
+- **buffer**, **vector**: `buffer.ts` and `vector.ts` with Luau's checks of the arguments around them (`buflib.ts`).
+
 `strlib.ts` is Luau's string library (`lstrlib.cpp`) but `pack`, `unpack` and `packsize`: each function takes its
 arguments as an array, checked as `luaL_check*` do (`args.ts`: a number is a string where one is wanted, a numeric
 string a number; an integer is the number cut toward zero), and is an intrinsic (`%luau-string-<name>`) under a

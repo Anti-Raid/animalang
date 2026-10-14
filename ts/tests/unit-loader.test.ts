@@ -474,7 +474,8 @@ describe("A call site's cache", () => {
     it("no longer holds a callee that came to run on heap frames, which is called all the same", () => {
         const anima = createScheme(impl);
         anima.evaluateRaw(anima.compileRaw(`(define last #f)
-                                            (define (inner x) (call/cc (lambda (k) (set! last k) (+ x 1))))
+                                            (define inner #f)
+                                            (set! inner (lambda (x) (call/cc (lambda (k) (set! last k) (+ x 1)))))
                                             (define (run n) (let loop ((i 0) (s 0)) (if (= i n) s (loop (+ i 1) (+ s (inner i))))))`));
         const inner = anima.evaluateRaw(anima.compileRaw("inner")) as Closure;
         expect(inner.tmpl.code.direct).toBe(true);

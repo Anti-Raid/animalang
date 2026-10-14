@@ -141,12 +141,15 @@ export class Compiler {
 
     // what the unit being compiled imports, by slot (%import-globals), once that is met
     #imports: (symbol | undefined)[] | null = null
+    // the constants made of what the unit quotes, by the datum quoted
+    #quoted = new Map<object, any>()
 
     // the IR of a top-level expression, its variables analysed
     readonly #generatePass: Pass<Closed, FunctionIR> = {
         name: "generate",
         run: ({ ast, forwards, captures }) => {
             this.#imports = null
+            this.#quoted = new Map()
             const scope = new CompilerScope(null)
             const nodes: Node[] = []
             const retReg = scope.allocTemp()
@@ -388,7 +391,15 @@ export class Compiler {
             throw new VMError(Msg.QuoteArgs, [expr.length - 1])
         }
         if (opts.destReg === undefined) return
-        opts.nodes.push({ k: "LoadValue", constant: normalizeExpr(expr[1]), dst: opts.destReg })
+        // (what a program quotes is one constant wherever the optimizer has put copies of the form: a procedure
+        // inlined in two places gives the same object in both, as it does called)
+        const datum = expr[1]
+        let constant = datum
+        if (typeof datum === "object" && datum !== null) {
+            constant = this.#quoted.get(datum)
+            if (constant === undefined) this.#quoted.set(datum, constant = normalizeExpr(datum))
+        }
+        opts.nodes.push({ k: "LoadValue", constant, dst: opts.destReg })
     }
 
     // note that the syntax transformer alr handles defines inside a lambda so

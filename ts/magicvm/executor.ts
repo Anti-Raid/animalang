@@ -232,6 +232,8 @@ export class VMExecutor {
     public entry(proc: any, cache: CallCache | null, nargs: number, depth: number, want: number = 0): DirectFn | null {
         if (proc?.constructor !== Closure || depth >= MAX_JS_DEPTH) return null;
         const code: Code = proc.tmpl.code;
+        // (code made without the compiler, see intrinsicProcedure, is compiled when first called)
+        if (code.resumeFn === null) AotCompiler.compile(code, proc.tmpl);
         if (want !== 0 && code.direct && code.wanted[want] === undefined) AotCompiler.compileWant(code, proc.tmpl, want);
         const fn = code.entry(nargs, want);
         if (fn !== null && cache !== null) code.keep(cache, proc.tmpl, fn);
@@ -254,6 +256,7 @@ export class VMExecutor {
             }
             if (target instanceof CaseLambda) target = target.select(args.length);
         }
+        if (target?.constructor === Closure && target.tmpl.code.resumeFn === null) AotCompiler.compile(target.tmpl.code, target.tmpl);
         if (target?.constructor === Closure && depth < MAX_JS_DEPTH && target.tmpl.code.direct) {
             const { code, arity } = target.tmpl;
             const fn = code.directFn!, n = arity.params;

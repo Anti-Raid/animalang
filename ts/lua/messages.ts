@@ -57,6 +57,7 @@ const word = (op: Msg, a: readonly any[], fmt: Formatter, at: SourcePos | null):
         case Msg.MissingVar: return `unbound global '${String(a[0].description ?? a[0])}'`;
         case Msg.NonProcedure: case Msg.NonProcedureWind: return `attempt to call a ${typeName(a[0])} value`;
         case Msg.ErrorInHandler: return `error in error handling: ${errorText(a[0])}`;
+        case Msg.YieldOutside: case Msg.YieldClosing: return "attempt to yield across metamethod/C-call boundary";
         default: return `internal error: ${Msg[op]}${a.length > 0 ? ` (${a.map(x => typeof x === "symbol" ? x.description : fmt(Msg.Value, [x], fmt, at)).join(", ")})` : ""}`;
     }
 };

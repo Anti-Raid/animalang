@@ -48,6 +48,24 @@ export class Imports {
 }
 const IMPORT_COPIES = new WeakMap<Map<Code, Code>, Map<Imports, Imports>>();
 
+// A procedure that is one leaf intrinsic over its arguments: what the compiler makes of
+// (%lambda args (%intcall op args)), the arguments an array and none of them required, made here from its three
+// instructions. A front end's library is hundreds of these, and compiling each one is what making an instance would
+// mostly be; this one's functions are compiled when it is first called, as any code is
+export const intrinsicProcedure = (table: Intrinsics, op: string, name: string, debug: boolean = false, reentrant: boolean = true): Closure => {
+    const entry = table.byName(op);
+    if (entry === undefined || !entry.leaf) throw new Error(`internal error: ${op} is not a leaf intrinsic`);
+    const ops: Op[] = [
+        { k: "Move", src: 0, dst: 2, ip: 0, where: null },
+        { k: "IntCall", pos: entry.pos, dst: 1, start: 2, nargs: 1, ip: 1, where: null },
+        { k: "Return", src: 1, ip: 2, where: null },
+    ];
+    const code = new Code([false, true, null, undefined], ops, 3, debug, table, [{ pos: entry.pos, name: op, leaf: true }]);
+    code.interrupts = table.interrupts;
+    code.reentrant = reentrant;
+    return new Closure(new ClosureTemplate([], Symbol("..."), code, [], name, "array", true), [], name);
+};
+
 // an intrinsic some code uses: its position in the table the code is bound to, and what it was compiled as
 export type UsedIntrinsic = { readonly pos: number, readonly name: string, readonly leaf: boolean };
 

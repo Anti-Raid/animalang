@@ -31,8 +31,11 @@ export type UnitConstant =
     // the unit's imports (code.ts, Imports): one object for the unit, made when it is loaded
     | { k: "imports"; n: number }
     // `q`: a constant the program quoted (see isQuotedConstant), marked again when loaded
-    | { k: "arr"; v: UnitConstant[]; q?: boolean }
-    | { k: "datum"; type: string; data: any; q?: boolean };
+    // `id`: the object's number among the unit's constants, by which { k: "same" } is that very object again (a
+    // constant several of the unit's functions hold)
+    | { k: "arr"; v: UnitConstant[]; q?: boolean; id?: number }
+    | { k: "datum"; type: string; data: any; q?: boolean; id?: number }
+    | { k: "same"; id: number };
 
 export type UnitSites = {
     calls: number[];

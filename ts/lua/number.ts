@@ -150,3 +150,6 @@ export const str2integer = (s: string, base: number): number | undefined => {
 };
 
 export { cstring, trailingSpace };
+
+// C's pow, where it differs from JS's **
+export const luaPow = (a: number, b: number): number => a === 1 || (a === -1 && (b === Infinity || b === -Infinity)) ? 1 : a ** b;
