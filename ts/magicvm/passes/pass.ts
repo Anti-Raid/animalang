@@ -11,6 +11,9 @@ export type PassContext = {
     // the intrinsics the optimizer folded or dropped calls of: every function compiled records them as used (see
     // Code.bind), as what it computes depends on them
     readonly assumed: Set<number>,
+    // the procedures lambda lifting left closures only because a variable they use is assigned, for its second go, when
+    // such variables are boxes (see passes/lift.ts)
+    readonly refused: Set<symbol>,
     // called with each pass's output, e.g. by tests, to see or check it
     readonly trace?: (pass: string, output: unknown) => void,
 };

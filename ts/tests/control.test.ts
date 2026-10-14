@@ -161,13 +161,45 @@ describe('Anima', () => {
                 expect(made(sum("(%intcall %catch-call/pre (lambda (w e) e) 'w p 1)"))).toBe(0)
                 // an error in it is caught as ever
                 expect(nrun(`(%call (lambda (k) (%letrec ((p (lambda () (%intcall %raise (%call list 'raised k))))) (%intcall %caught-value (%intcall %catch-call p)))) 3)`)).toBe("(raised 3)")
-                // used any other way, or using a variable that is assigned, it stays a closure
+                // used any other way, it stays a closure
                 expect(made(`(lambda (k) (%letrec ((p (lambda () k))) (%call list p (%intcall %catch-call p))))`)).toBe(1)
+                // a variable that is assigned is passed as its box: what either side assigns, the other sees
                 expect(nrun(`(%call (lambda (k) (%letrec ((p (lambda () k))) (%begin (%set! k 9) (%intcall %catch-call p)))) 1)`)).toBe("9")
-                expect(made(`(lambda (k) (%letrec ((p (lambda () k))) (%begin (%set! k 9) (%intcall %catch-call p))))`)).toBe(1)
+                expect(made(`(lambda (k) (%letrec ((p (lambda () k))) (%begin (%set! k 9) (%intcall %catch-call p))))`)).toBe(0)
+                const counting = `(lambda (k) (let loop ((i 0)) (%if (%call = i 4) k (%letrec ((p (lambda (x) (%begin (%set! k (%call + k x)) (%if (%call = x 2) (%intcall %raise 'two) k))))) (%begin (%intcall %catch-call p i) (%call loop (%call + i 1)))))))`
+                expect(nrun(`(%call ${counting} 100)`)).toBe("106")
+                expect(made(counting)).toBe(0)
+                // assigned only inside, read only outside, and the other way round
+                expect(nrun(`(%call (lambda (k) (%letrec ((p (lambda () (%set! k 'set)))) (%begin (%intcall %catch-call p) k))) 'unset)`)).toBe("set")
+                expect(nrun(`(%call (lambda (k) (%letrec ((p (lambda () k))) (%call list (%intcall %catch-call p) (%begin (%set! k 2) (%intcall %catch-call p))))) 1)`)).toBe("(1 2)")
+                // through a procedure in between, itself lifted, and from a closure that escapes
+                expect(nrun(`(%call (lambda (k) (%letrec ((p (lambda () (%set! k (%call + k 1)))) (q (lambda () (%begin (%call p) (%call p))))) (%begin (%call q) (%intcall %catch-call q) k))) 0)`)).toBe("4")
+                expect(nrun(`(%call (%call (lambda (k) (%letrec ((p (lambda () (%begin (%set! k (%call + k 1)) k)))) (lambda () (%intcall %catch-call p)))) 5))`)).toBe("6")
                 // the handler of %catch-call/pre is a value, not what is called
                 expect(made(`(lambda (k) (%letrec ((h (lambda (w e) (%call list k e)))) (%intcall %catch-call/pre h 'w + 1 2)))`)).toBe(1)
             }
+        })
+
+        it('a lifted procedure and a continuation entered again share the box of a variable both assign', () => {
+            // each time the continuation is entered again, the count the procedure keeps in the variable has gone on
+            expect(run(`(define lb-k #f)
+                        (define (lb-run)
+                          (let ((n 0) (log '()))
+                            (define (bump!) (set! n (+ n 1)) n)
+                            (call/cc (lambda (k) (set! lb-k k)))
+                            (set! log (cons (bump!) log))
+                            (if (< n 3) (lb-k #f) (list n log))))
+                        (lb-run)`)).toBe("(3 (3 2 1))")
+            expect(run(`(define (lb-acc)
+                          (let ((total 0))
+                            (define (add! x) (set! total (+ total x)))
+                            (for-each (lambda (x) (add! x)) '(1 2 3))
+                            (add! 10)
+                            total))
+                        (lb-acc)`)).toBe("16")
+            // %letrec values that are assigned are boxes from the start: passed, they are read as they are when called
+            expect(run(`(define (lb-late) (letrec ((get (lambda () v)) (v (begin (set! w 1) 5)) (w 0)) (list (get) w))) (lb-late)`)).toBe("(5 0)")
+            expect(run(`(define (lb-set) (letrec ((get (lambda () (list v w))) (v 5) (w 0)) (set! v 6) (set! w (get)) (get))) (lb-set)`)).toBe("(6 (6 0))")
         })
 
         it('calls the %catch handler in tail position', () => {

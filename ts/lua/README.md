@@ -140,8 +140,8 @@ literals, interpolated strings, if-expressions, and the operators (arithmetic, `
   values made where the call's values are bound, `local ok, v = pcall(...)`). xpcall's handler is given to the catch
   as it is, with a procedure of the library's that calls it (`%luau-library`), so nothing is allocated for a call that
   raises no error. A function written where it is given, `pcall(function() ... end)`, is bound by a `%letrec` around
-  the catching call, where the VM's lambda lifting sees a procedure that is only called: unless it assigns a variable
-  around it, it gets those it uses as arguments and no closure is made. Luau's compiler does the same (its fast
+  the catching call, where the VM's lambda lifting sees a procedure that is only called: it gets the variables it uses
+  as arguments (the box of one that is assigned) and no closure is made. Luau's compiler does the same (its fast
   pcall instruction), so there too such a call is the library's whatever the global has become. `error(v)`,
   `error(v, 0)` and `error(v, 1)` are written out when the `error` the chunk read is the library's: the value is
   raised from the call itself, a string or a number after `file:line: ` of the call, known when compiling; no error

@@ -23,7 +23,7 @@ import {
 import { AnalysisScope, VariableMetadata } from "./scope";
 import { subExprs as subExprsOf } from "./passes/lang";
 import { Worklist, run, start, type Task } from "./visitor";
-import { Lconv, SET_BOX } from "./passes/assignments";
+import { BOX_IN_PLACE, Lconv, SET_BOX, UNBOX } from "./passes/assignments";
 
 const OP_APPLY = Symbol.for("%apply");
 import { CORE_FORMS } from "./core";
@@ -138,6 +138,11 @@ export class AstAnalysis {
             case SET_BOX: {
                 scope.markMutable(ast[2]);
                 todo.add(ast[3], scope);
+                return;
+            }
+            case UNBOX:
+            case BOX_IN_PLACE: {
+                if (typeof ast[2] === "symbol") scope.readBoxed(ast[2]);
                 return;
             }
             // (%let ((x init) ...) body ...): inits are evaluated outside, body inside a block scope

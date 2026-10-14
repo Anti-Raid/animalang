@@ -254,11 +254,18 @@ describe("A function written where pcall or xpcall is given it", () => {
         return (r instanceof MultipleValues ? r.values : [r]).map(toString).join("\t");
     };
 
-    it("is no closure when it assigns none of the variables around it", () => {
+    it("is no closure: it is given the variables it uses, and the box of one that is assigned", () => {
         expect(made("local n = 0 for i = 1, 3 do local ok, v = pcall(function() return i + k end) if ok then t[i] = v end end")).toBe(0);
         expect(made("return pcall(function(a, b) return a + b + k end, 1, 2)")).toBe(0);
         expect(made("return xpcall(function() return t.x.y end, function(e) return k .. e end)")).toBe(1);
-        expect(made("local n = 0 pcall(function() n = n + k end) return n")).toBe(1);
+        expect(made("local n = 0 pcall(function() n = n + k end) return n")).toBe(0);
+        expect(made("local n = 0 for i = 1, 3 do pcall(function() n = n + i if i == 2 then error('two') end n = n + 100 end) end return n")).toBe(0);
+        expect(made("local last pcall(function() last = t.x.y end) return last")).toBe(0);
+        // one that is kept as a value is a closure as ever
+        expect(made("local n = 0 local f = function() n = n + 1 end pcall(f) return n, f")).toBe(1);
+        expect(result("local function f() local n = 0 for i = 1, 3 do pcall(function() n = n + i if i == 2 then error('two') end n = n + 100 end) end return n end return f()")).toBe("206");
+        expect(result("local function f(t) local last = 'none' local ok = pcall(function() last = t.x.y end) return ok, last end return f({}), f({ x = { y = 'y' } })")).toBe("false\ttrue\ty");
+        expect(result("local function f() local n = 0 local function inc() n = n + 1 return n end inc() pcall(inc) return n, inc() end return f()")).toBe("2\t3");
         expect(result("local function f(k) local s = 0 for i = 1, 4 do local ok, v = pcall(function() return i * k end) s = s + v end return s end return f(3)")).toBe("30");
         expect(result("local function f(k) return pcall(function(a, ...) return a + k, select('#', ...) end, 1, 2, 3) end return f(10)")).toBe("true\t11\t2");
         expect(result("local function f(k) return pcall(function() error('e' .. k, 0) end) end return f(7)")).toBe("false\te7");

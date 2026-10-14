@@ -1,5 +1,6 @@
 // Box removal: of the boxes the assignments pass made, keeps only those a variable needs (VariableMetadata.isBoxed:
-// captured by a closure, or read after a call where a continuation could be captured; see PROOFS.md, 4); the others
+// captured by a closure, or read after a call where a continuation could be captured; see PROOFS.md, 4; and one that
+// is read as it is, VariableMetadata.bare, the box given to a lifted procedure); the others
 // become plain variables again, assigned with %set!. It runs the analysis again on the program it is given (by then
 // optimized), and gives the rest parameters a closure receives as the plain array (VariableMetadata.forwardsRest)
 import { CORE_SET } from "../../common";
@@ -18,7 +19,11 @@ export const removeBoxes = (ast: any, boxes: ReadonlySet<symbol>, intrinsics: In
     // code no continuation re-enters needs a box only for what a closure captures
     if (reentrant) markLiveAcrossCalls(ast, analysis, scope, intrinsics);
     const { variables } = scope;
-    const unneeded = (sym: any) => typeof sym === "symbol" && boxes.has(sym) && variables.get(sym)?.isBoxed !== true;
+    const unneeded = (sym: any) => {
+        if (typeof sym !== "symbol" || !boxes.has(sym)) return false;
+        const meta = variables.get(sym);
+        return meta === undefined || !(meta.isBoxed || meta.bare);
+    };
     const forwards = new Set([...variables].filter(([, meta]) => meta.forwardsRest).map(([sym]) => sym));
 
     const leaf = (e: any): any => {

@@ -11,6 +11,10 @@ export class VariableMetadata {
     // set by AstAnalysis's second pass
     liveAcrossCall: boolean = false
 
+    // read as it is, not through %unbox: where the variable is a box, the box itself is what is read (it is passed to a
+    // lifted procedure, see passes/lift.ts), so it has to stay one
+    bare: boolean = false
+
     // a lambda's rest parameter, and whether it is read anywhere but spread as the last argument of an %apply
     isRestParam: boolean = false
     readOutsideApply: boolean = false
@@ -182,8 +186,14 @@ export class AnalysisScope extends Nested<AnalysisScope> {
 
     readVar(sym: symbol): boolean {
         const meta = this.#use(sym);
-        if (meta !== null) meta.readOutsideApply = true;
+        if (meta !== null) meta.readOutsideApply = meta.bare = true;
         return meta !== null;
+    }
+
+    // a read of what the variable's box holds, or the boxing of it where it is
+    readBoxed(sym: symbol) {
+        const meta = this.#use(sym);
+        if (meta !== null) meta.readOutsideApply = true;
     }
 
     // a read spread as the last argument of an %apply, which a forwarded rest parameter allows

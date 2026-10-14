@@ -13,7 +13,8 @@ import { interruptsPass, type FunctionIR } from "./passes/interrupts";
 import { renamePass } from "./passes/rename";
 import { bindOncePass } from "./passes/once";
 import { closureCaptures, type Captures } from "./passes/closures";
-import { BOX, BOX_IN_PLACE, SET_BOX, UNBOX, convertAssignments, type Converted } from "./passes/assignments";
+import { BOX, BOX_IN_PLACE, Lconv, SET_BOX, UNBOX, convertAssignments, type Converted } from "./passes/assignments";
+import { Lsrc } from "./passes/lang";
 import { removeBoxes, type Unboxed } from "./passes/unbox";
 import { INLINED, TAIL_INLINED } from "./passes/cp0";
 import { optimize } from "./passes/cp0";
@@ -47,7 +48,9 @@ const closuresPass: Pass<Unboxed, Closed> = { name: "closures", run: (unboxed, c
 // the core forms to core forms (see passes/lift.ts)
 const escapesPass: Pass<any, any> = { name: "block-escapes", run: ast => blockEscapes(ast) }
 const caseLambdasPass: Pass<any, any> = { name: "split-case-lambdas", run: ast => splitCaseLambdas(ast) }
-const liftPass: Pass<any, any> = { name: "lift-lambdas", run: ast => liftLambdas(ast) }
+const liftPass: Pass<any, any> = { name: "lift-lambdas", run: (ast, ctx) => liftLambdas(ast, Lsrc, ctx.refused) }
+// the same of the procedures that use an assigned variable, which is a box by now and passed as one
+const liftBoxesPass: Pass<Converted, Converted> = { name: "lift-boxes", run: ({ ast, boxes }, ctx) => ({ ast: liftLambdas(ast, Lconv, null, boxes, ctx.refused), boxes }) }
 // long chains of nested %lets made one %let*, so that no pass goes as deep as a function has locals (see passes/flatten.ts)
 const flattenPass: Pass<any, any> = { name: "flatten-lets", run: ast => flattenLets(ast) }
 // procedures that call one another in tail position made one, whose calls of itself are loops (see passes/merge.ts)
@@ -118,13 +121,14 @@ export class Compiler {
 
     // `trExpr`: core forms, each [op, pos, operand ...] with where it comes from (see forms.ts)
     compile(trExpr: any, debug: boolean = this.debug, optimize: boolean = this.optimize): Code {
-        const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, reentrant: this.reentrant, assumed: new Set(), trace: this.trace }
+        const ctx: PassContext = { intrinsics: this.intrinsics, debug, optimize, reentrant: this.reentrant, assumed: new Set(), refused: new Set(), trace: this.trace }
         try {
             const renamed = runPass(renamePass, runPass(flattenPass, trExpr, ctx), ctx)
             const escaped = runPass(escapesPass, runPass(bindOncePass, renamed, ctx), ctx)
             const split = runPass(caseLambdasPass, escaped, ctx)
             const lifted = runPass(liftPass, ctx.optimize ? runPass(mergePass, split, ctx) : split, ctx)
-            const converted = runPass(assignmentsPass, runPass(resolvePass, lifted, ctx), ctx)
+            const boxed = runPass(assignmentsPass, runPass(resolvePass, lifted, ctx), ctx)
+            const converted = ctx.refused.size > 0 ? runPass(liftBoxesPass, boxed, ctx) : boxed
             const unboxed = runPass(unboxPass, ctx.optimize ? runPass(cp0Pass, converted, ctx) : converted, ctx)
             const closed = runPass(closuresPass, unboxed, ctx)
             const ir = runPass(interruptsPass, runPass(this.#generatePass, closed, ctx), ctx)
