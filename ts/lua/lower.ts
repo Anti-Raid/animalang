@@ -5,6 +5,7 @@ import { CORE_BEGIN, CORE_BLOCK, CORE_CALL, CORE_ESCAPE, CORE_IF, CORE_INTAPPLY,
 import { PAD, UNNAMED, clause, isSingleLambda } from "../magicvm/lambda";
 import { predictShapes, type Shape } from "./shapes";
 import { RecordShape } from "./table";
+import { VECTOR_FAST_CALLS } from "./vector";
 import { L, isForm, offsetOf, type ParseResult } from "./syntax/ast";
 import { Lexer } from "./syntax/lexer";
 import { Tok } from "./syntax/tokens";
@@ -647,22 +648,12 @@ class Lowering {
             return [CORE_LET_STAR, pos, [[error, this.#global("error")], [v, (yield this.expr(e[2] as C.Expr))]],
                 [CORE_IF, pos, intcall(pos, "%luau-error?", error), intcall(pos, "%raise", raised), [CORE_CALL, pos, error, v, ...(e.length === 5 ? [level] : [])]]];
         }
-        if (!this.parsed.written.has("vector")) {
-            const isVectorGlobal = isForm(called) && called[0] === L.GLOBAL && called[1] === "vector";
-            const chain = isForm(called) && called[0] === L.INDEX ? this.#chain(called as C.Index) : null;
-            const args = e.slice(2, -1) as C.Expr[];
-            const last = args[args.length - 1];
-            if (last === undefined || !isMulti(last)) {
-                if (isVectorGlobal) {
-                    return intcall(pos, "%luau-vector-create", ...(yield this.#exprs(args)));
-                }
-                if (chain !== null && chain.length === 2 && chain[0] === "vector") {
-                    const method = chain[1];
-                    if (method === "create" || method === "dot" || method === "cross" || method === "magnitude" || method === "normalize") {
-                        return intcall(pos, `%luau-vector-${method}`, ...(yield this.#exprs(args)));
-                    }
-                }
-            }
+        // vector.create(...) and the others of VECTOR_FAST_CALLS, of the global, where the chunk does not assign it: the
+        // library's function over the arguments where they are, so direct code can compute on known vectors' components
+        const chain = isForm(called) && called[0] === L.INDEX ? this.#chain(called as C.Index) : null;
+        if (chain?.length === 2 && chain[0] === "vector" && (VECTOR_FAST_CALLS as readonly string[]).includes(chain[1])) {
+            const args = e.slice(2, -1) as C.Expr[], last = args[args.length - 1];
+            if (last === undefined || !isMulti(last)) return intcall(pos, `%luau-vector-${chain[1]}/args`, ...(yield this.#exprs(args)));
         }
         // (the VM makes a %call whose first value is taken a call that asks for one)
         const made = (call: any[]) => one ? intcall(pos, "%first-value", call, undefined) : call;

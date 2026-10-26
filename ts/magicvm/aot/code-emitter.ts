@@ -37,7 +37,7 @@ export class CodeEmitter {
 
 // the `d` an intrinsic's inline template gets: the local names of its deps (recorded in `used`, as only those are set up),
 // where a name it did not declare is an error
-export const inlineDeps = (entry: Intrinsic, used: Set<string>): Readonly<Record<string, string>> => new Proxy(entry.deps, {
+export const inlineDeps = (entry: Pick<Intrinsic, "name" | "deps">, used: Set<string>): Readonly<Record<string, string>> => new Proxy(entry.deps, {
     get(target, key) {
         if (typeof key !== "string") return undefined;
         if (!Object.hasOwn(target, key)) throw new Error(`the inline template of '${entry.name}' uses '${key}', which is not in its deps`);

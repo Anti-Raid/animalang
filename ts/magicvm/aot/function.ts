@@ -4,7 +4,7 @@ import { transfer, successors, type Facts, type Aliases } from "./facts";
 import { capturesOf, type AotBlock, type AotInst, type AotTerm } from "./types";
 import type { Arity } from "../arity";
 import { CORE_COUNT } from "../coreops";
-import { Intrinsics, type AggregateDescriptor, type Intrinsic } from "../intrinsics";
+import { Intrinsics, type Aggregate } from "../intrinsics";
 import { UNPACK_REST } from "../ops";
 import { MultipleValues } from "../../common";
 import type { Structure } from "./structure";
@@ -66,22 +66,39 @@ export abstract class FunctionEmitter extends CodeEmitter {
     readonly #since = new Map<number, number>();
     #stamp = 0;
 
+    // Direct code keeps a register the facts know to be of an aggregate kind (TypeSystem.aggregates) in one variable
+    // per field, r<reg>_<field>, which always hold its value there; its own variable holds it only where it is boxed for
+    // a later block. `aggregateRegs`: the registers of an aggregate kind anywhere. Of those a frame rebuilt from here
+    // reads (Liveness.entryLive), the first field is undefined where the fields do not hold the register's value
     protected get entryFacts(): Map<number, Facts> { return new Map(); }
-    protected readonly constRegs = new Map<number, any>();
+    protected aggregateRegs: ReadonlyMap<number, Aggregate> = new Map();
+    // the register whose fields the instruction just emitted set, and the constants loaded into registers in the block
+    #setFields = -1;
+    readonly #loaded = new Map<number, unknown>();
 
-    protected aggregateOf(reg: number): AggregateDescriptor | undefined {
+    protected aggregateOf(reg: number): Aggregate | undefined {
         if (!this.substitutes) return undefined;
         const kind = this.facts.get(reg);
-        if (kind === undefined) return undefined;
-        return this.table?.types?.aggregates?.[kind];
+        return kind === undefined ? undefined : this.table?.types?.aggregates?.[kind];
     }
 
-    protected materializeAggregate(reg: number): string {
-        const desc = this.aggregateOf(reg);
-        if (desc === undefined) return this.operand(reg);
-        const d = inlineDeps({ name: "the aggregate", deps: this.table!.typeDeps } as Intrinsic, this.usedDeps);
-        const boxed = desc.box(desc.fields.map(f => `r${reg}_${f}`), d);
-        return `(r${reg}_${desc.fields[0]} !== undefined ? ${boxed} : ${this.operand(reg)})`;
+    protected fieldVars(reg: number, agg: Aggregate): string[] {
+        return agg.fields.map(f => `r${reg}_${f}`);
+    }
+
+    protected boxed(reg: number, agg: Aggregate): string {
+        return agg.box(this.fieldVars(reg, agg), inlineDeps({ name: "the type system", deps: this.table!.typeDeps }, this.usedDeps));
+    }
+
+    // `reg` was just set: an aggregate's fields take its value, any other's no longer hold it
+    #settle(reg: number): void {
+        const agg = this.aggregateOf(reg);
+        if (agg !== undefined) {
+            if (this.#setFields !== reg) this.emit(agg.fields.map(f => `r${reg}_${f} = ${agg.unbox(`r${reg}`, f)};`).join(" "));
+            return;
+        }
+        const was = this.aggregateRegs.get(reg);
+        if (was !== undefined && this.liveness.entryLive.has(reg)) this.emit(`r${reg}_${was.fields[0]} = undefined;`);
     }
 
     protected startBlock(facts: Facts | undefined): void {
@@ -92,25 +109,25 @@ export abstract class FunctionEmitter extends CodeEmitter {
         this.#source.clear();
         this.#readers.clear();
         this.#since.clear();
-        this.constRegs.clear();
+        this.#loaded.clear();
     }
 
-    // the js of register `reg` where it is read
+    // the js of register `reg` where it is read (an aggregate boxed)
     protected use(reg: number): string {
-        return this.#atoms.get(reg) ?? `r${reg}`;
+        const agg = this.aggregateOf(reg);
+        return agg !== undefined ? this.boxed(reg, agg) : this.#atoms.get(reg) ?? `r${reg}`;
     }
 
     // the same, where a property of it is read or it goes into an intrinsic's template: a number is in parentheses
     protected operand(reg: number): string {
         const atom = this.#atoms.get(reg);
-        return atom === undefined ? `r${reg}` : /^[-\d]/.test(atom) ? `(${atom})` : atom;
+        return atom === undefined ? this.use(reg) : /^[-\d]/.test(atom) ? `(${atom})` : atom;
     }
 
     // what `inst` moves into its register, when that is a constant or another register
     #atomOf(inst: AotInst): string | null {
-        if (inst.k === "Move" && this.aggregateOf(inst.src) !== undefined) return null;
         switch (inst.k) {
-            case "Move": return this.use(inst.src);
+            case "Move": return this.aggregateOf(inst.src) !== undefined ? null : this.use(inst.src);
             case "LoadInt": return literal(inst.value);
             case "LoadConst": return literal(this.constants[inst.idx]) ?? `CONSTANTS[${inst.idx}]`;
             default: return null;
@@ -187,33 +204,21 @@ export abstract class FunctionEmitter extends CodeEmitter {
                     if (isOne) this.one.add(reg);
                     else this.one.delete(reg);
                 }
-                if (inst.k === "LoadConst") this.constRegs.set(inst.dst, this.constants[inst.idx]);
-                else if (inst.k === "LoadInt") this.constRegs.set(inst.dst, inst.value);
-                else if (inst.k === "Move") {
-                    if (this.constRegs.has(inst.src)) this.constRegs.set(inst.dst, this.constRegs.get(inst.src));
-                    else this.constRegs.delete(inst.dst);
-                } else {
-                    for (const r of Liveness.defs(inst)) this.constRegs.delete(r);
-                }
+                if (inst.k === "LoadConst") this.#loaded.set(inst.dst, this.constants[inst.idx]);
+                else for (const reg of Liveness.defs(inst)) this.#loaded.delete(reg);
+                if (fused === 0) for (const reg of Liveness.defs(inst)) this.#settle(reg);
+                this.#setFields = -1;
             }
         }
         // what later blocks read is in its variable from here on; a self tail call moves registers about, so all are
         const term = block.term;
         const live = this.liveness.liveOut(term);
         for (const reg of [...this.#atoms.keys()]) if (term.k === "MaybeSelfTailCall" || live.has(reg)) this.#materialise(reg);
-        if (this.substitutes && this.table?.types?.aggregates !== undefined) {
-            const succs = successors(term);
-            if (succs.length > 0) {
-                for (const reg of live) {
-                    const agg = this.aggregateOf(reg);
-                    if (agg !== undefined) {
-                        const allSuccKnow = succs.every(target => this.entryFacts.get(target)?.get(reg) === agg.kind);
-                        if (!allSuccKnow) {
-                            this.emit(`r${reg} = ${this.materializeAggregate(reg)};`);
-                        }
-                    }
-                }
-            }
+        // (and an aggregate that a later block does not know to be one is boxed)
+        const next = successors(term);
+        for (const reg of live) {
+            const agg = this.aggregateOf(reg);
+            if (agg !== undefined && next.some(b => this.entryFacts.get(b)?.get(reg) !== this.facts.get(reg))) this.emit(`r${reg} = ${this.boxed(reg, agg)};`);
         }
     }
 
@@ -345,7 +350,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
     protected abstract readonly mframeVar: string;
 
     protected argList(start: number, nargs: number): string {
-        return windowRegs(start, nargs).map(r => this.materializeAggregate(r)).join(", ");
+        return windowRegs(start, nargs).map(r => this.use(r)).join(", ");
     }
 
 
@@ -353,33 +358,20 @@ export abstract class FunctionEmitter extends CodeEmitter {
         // as bindArgs, over registers held in js variables: the rest value first, then the positionals, moving down
         // a padded closure's missing parameters are <#void>, its extra arguments dropped unless it has a rest parameter
         const { params: min, rest } = term.arity;
-        const restRegs = Array.from({ length: Math.max(term.nargs - min, 0) }, (_, i) => this.materializeAggregate(term.start + min + i));
+        const restRegs = Array.from({ length: Math.max(term.nargs - min, 0) }, (_, i) => this.use(term.start + min + i));
         const moves: string[] = [];
         if (rest === "array") moves.push(`const rest = [${restRegs.join(", ")}];`);
         if (rest === "packed") moves.push(`const rest = ${this.intrinsicCall(term.restPos, term.start + min, term.nargs - min)};`);
+        // (the arguments go boxed: the entry check and the version for their kinds take them from there)
         for (let i = 0; i < Math.min(min, term.nargs); i++) {
-            const src = term.start + i;
-            if (src !== i) {
-                const srcAgg = this.aggregateOf(src);
-                const dstKind = this.entryFacts.get(0)?.get(i);
-                const dstAgg = dstKind !== undefined && this.table?.types?.aggregates !== undefined ? this.table.types.aggregates[dstKind] : undefined;
-                if (srcAgg !== undefined && dstAgg !== undefined) {
-                    for (const f of srcAgg.fields) moves.push(`r${i}_${f} = r${src}_${f};`);
-                    moves.push(`r${i} = r${src};`);
-                } else if (dstAgg !== undefined) {
-                    const d = inlineDeps({ name: "the aggregate", deps: this.table!.typeDeps } as Intrinsic, this.usedDeps);
-                    const unboxed = dstAgg.unbox(`r${src}`, d);
-                    for (const f of dstAgg.fields) moves.push(`r${i}_${f} = ${unboxed[f]};`);
-                    moves.push(`r${i} = r${src};`);
-                } else if (srcAgg !== undefined) {
-                    moves.push(`r${i} = ${this.materializeAggregate(src)};`);
-                } else {
-                    moves.push(`r${i} = r${src};`);
-                }
-            }
+            if (term.start + i !== i || this.aggregateOf(i) !== undefined) moves.push(`r${i} = ${this.use(term.start + i)};`);
         }
         for (let i = term.nargs; i < min; i++) moves.push(`r${i} = undefined;`);
         if (rest !== "none") moves.push(`r${min} = rest;`);
+        for (let i = 0; i < min; i++) {
+            const agg = this.aggregateRegs.get(i);
+            if (agg !== undefined && this.liveness.entryLive.has(i)) moves.push(`r${i}_${agg.fields[0]} = undefined;`);
+        }
         return moves.join("\n");
     }
 
@@ -417,79 +409,36 @@ export abstract class FunctionEmitter extends CodeEmitter {
         `;
     }
 
-    protected emitAggregateIntCall(inst: { pos: number; dst: number; start: number; nargs: number }): boolean {
-        if (!this.substitutes || this.table?.types?.aggregates === undefined) return false;
-        const entry = this.table.entries[inst.pos];
-        if (entry === undefined) return false;
-
-        if (inst.nargs === 2) {
-            const objAgg = this.aggregateOf(inst.start);
-            if (objAgg !== undefined) {
-                const key = this.constRegs.get(inst.start + 1);
-                if (typeof key === "string" && key.length === 1) {
-                    const k = key.toLowerCase();
-                    if (objAgg.fields.includes(k)) {
-                        this.emit(`r${inst.dst} = r${inst.start}_${k};`);
-                        return true;
-                    }
-                }
-            }
+    // `inst` computed on its aggregates' fields, where its rule applies (see AggregateRule)
+    #aggregateCall(inst: { pos: number, dst: number, start: number, nargs: number }): boolean {
+        const entry = this.table!.entries[inst.pos], rule = entry.aggregate;
+        if (rule === undefined || !this.substitutes) return false;
+        if (rule === "field") {
+            const field = this.aggregateOf(inst.start)?.field(this.#loaded.get(inst.start + 1));
+            if (field === undefined) return false;
+            this.emit(`r${inst.dst} = r${inst.start}_${field};`);
+            return true;
         }
-
-        const rule = entry.aggregate;
-        if (rule === undefined) return false;
-        const desc = this.table.types.aggregates[rule.kind];
-        if (desc === undefined) return false;
-
-        const regs = windowRegs(inst.start, inst.nargs);
-        const kinds = regs.map(r => this.facts.get(r));
-        const d = inlineDeps(entry, this.usedDeps);
-
-        switch (rule.type) {
-            case "constructor": {
-                if (inst.nargs < desc.fields.length - 1) return false;
-                const argOperands = regs.map(r => this.operand(r));
-                const exprs = rule.emit !== undefined
-                    ? rule.emit(argOperands, d)
-                    : desc.fields.map((_, i) => i < argOperands.length ? argOperands[i] : "0");
-                for (let i = 0; i < desc.fields.length; i++) {
-                    this.emit(`r${inst.dst}_${desc.fields[i]} = ${exprs[i]};`);
-                }
-                return true;
-            }
-            case "getter": {
-                const objAgg = this.aggregateOf(inst.start);
-                if (objAgg !== undefined && objAgg.fields.includes(rule.field)) {
-                    this.emit(`r${inst.dst} = r${inst.start}_${rule.field};`);
-                    return true;
-                }
-                return false;
-            }
-            case "component-wise": {
-                if (rule.applies !== undefined && !rule.applies(kinds)) return false;
-                if (regs.every(r => this.aggregateOf(r) === undefined)) return false;
-                const argComponents = regs.map(r => {
-                    const agg = this.aggregateOf(r);
-                    return agg !== undefined ? agg.fields.map(f => `r${r}_${f}`) : [this.operand(r)];
-                });
-                const exprs = rule.emit(argComponents, d, kinds);
-                for (let i = 0; i < desc.fields.length; i++) {
-                    this.emit(`r${inst.dst}_${desc.fields[i]} = ${exprs[i]};`);
-                }
-                return true;
-            }
-            case "reduction": {
-                if (rule.applies !== undefined && !rule.applies(kinds)) return false;
-                if (regs.every(r => this.aggregateOf(r) === undefined)) return false;
-                const argComponents = regs.map(r => {
-                    const agg = this.aggregateOf(r);
-                    return agg !== undefined ? agg.fields.map(f => `r${r}_${f}`) : [this.operand(r)];
-                });
-                const expr = rule.emit(argComponents, d, kinds);
-                this.emit(`r${inst.dst} = ${expr};`);
-                return true;
-            }
+        const regs = windowRegs(inst.start, inst.nargs), kinds = regs.map(r => this.facts.get(r));
+        if (!rule.applies(kinds)) return false;
+        const args = regs.map(r => {
+            const agg = this.aggregateOf(r);
+            return agg !== undefined ? this.fieldVars(r, agg) : [this.operand(r)];
+        });
+        const made = rule.emit(args, inlineDeps(entry, this.usedDeps));
+        if (typeof made === "string") {
+            this.emit(`r${inst.dst} = ${made};`);
+            return true;
         }
+        const agg = this.table!.types!.aggregates![Intrinsics.resultKind(entry, kinds)!];
+        if (agg === undefined) throw new Error(`internal error: ${entry.name} makes the fields of no aggregate`);
+        const fields = this.fieldVars(inst.dst, agg);
+        // (the result may be in an argument's register)
+        this.emit(regs.includes(inst.dst)
+            ? `{ const ${made.map((e, i) => `f$${i} = ${e}`).join(", ")}; ${fields.map((v, i) => `${v} = f$${i};`).join(" ")} }`
+            : fields.map((v, i) => `${v} = ${made[i]};`).join(" "));
+        this.#setFields = inst.dst;
+        return true;
     }
 
     protected emitInst(inst: AotInst): void {
@@ -502,9 +451,9 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "LoadUpvar":
                 return this.emit(`r${inst.dst} = ${this.upvarRef(inst.idx)}${inst.unbox ? ".val" : ""};`);
             case "SetUpvar":
-                return this.emit(`${this.setUpvarExpr(inst.idx, inst.box ? `new Box(${this.materializeAggregate(inst.src)})` : this.materializeAggregate(inst.src))};`);
+                return this.emit(`${this.setUpvarExpr(inst.idx, inst.box ? `new Box(${this.use(inst.src)})` : this.use(inst.src))};`);
             case "FixUpvar":
-                return this.emit(`${this.operand(inst.clo)}.upvars[${inst.idx}] = ${this.materializeAggregate(inst.src)};`);
+                return this.emit(`${this.operand(inst.clo)}.upvars[${inst.idx}] = ${this.use(inst.src)};`);
             case "LoadGlobal":
                 return this.emit(this.#loadGlobal(inst));
             case "LoadImport":
@@ -520,31 +469,29 @@ export abstract class FunctionEmitter extends CodeEmitter {
             case "ImportRef":
                 return this.emit(`r${inst.dst} = iv[${inst.slot}];`);
             case "ImportSet":
-                return this.emit(`if (IM.scope === ctx.scope) IM.values[${inst.slot}] = ${this.materializeAggregate(inst.src)};`);
+                return this.emit(`if (IM.scope === ctx.scope) IM.values[${inst.slot}] = ${this.use(inst.src)};`);
             case "SetGlobal":
-                return this.emit(`ctx.scope.set(CONSTANTS[${inst.sym}], ${this.materializeAggregate(inst.src)});`);
+                return this.emit(`ctx.scope.set(CONSTANTS[${inst.sym}], ${this.use(inst.src)});`);
             case "Move": {
                 const agg = this.aggregateOf(inst.src);
-                if (agg !== undefined) {
-                    for (const f of agg.fields) this.emit(`r${inst.dst}_${f} = r${inst.src}_${f};`);
-                    return;
-                }
-                return this.emit(`r${inst.dst} = ${this.use(inst.src)};`);
+                if (agg === undefined) return this.emit(`r${inst.dst} = ${this.use(inst.src)};`);
+                this.#setFields = inst.dst;
+                return this.emit(this.fieldVars(inst.dst, agg).map((v, i) => `${v} = r${inst.src}_${agg.fields[i]};`).join(" "));
             }
             case "Box":
-                return this.emit(`r${inst.dst} = new Box(${this.materializeAggregate(inst.src)});`);
+                return this.emit(`r${inst.dst} = new Box(${this.use(inst.src)});`);
             case "Unbox":
                 return this.emit(`r${inst.dst} = ${this.operand(inst.src)}.val;`);
             case "SetBox":
-                return this.emit(`${this.operand(inst.dst)}.val = ${this.materializeAggregate(inst.src)};`);
+                return this.emit(`${this.operand(inst.dst)}.val = ${this.use(inst.src)};`);
             case "NewClosure": {
-                const captures = capturesOf(inst, this.constants).map(c => c.local ? this.materializeAggregate(c.index) : this.upvarRef(c.index)).join(", ");
+                const captures = capturesOf(inst, this.constants).map(c => c.local ? this.use(c.index) : this.upvarRef(c.index)).join(", ");
                 return this.emit(`r${inst.dst} = new Closure(CONSTANTS[${inst.tmpl}], [${captures}]);`);
             }
             case "MoveAcc":
                 return this.emit(`r${inst.dst} = ${inst.one ? this.accOne : this.accExpr};`);
             case "SetMark":
-                return this.emit(`${this.marksVar} = markSet(${this.marksVar}, ${this.mframeVar}, ${this.use(inst.key)}, ${this.materializeAggregate(inst.val)});`);
+                return this.emit(`${this.marksVar} = markSet(${this.marksVar}, ${this.mframeVar}, ${this.use(inst.key)}, ${this.use(inst.val)});`);
             case "MarkSave":
                 return this.emit(`r${inst.reg} = ${this.marksVar}; r${inst.reg + 1} = ${this.mframeVar}; ${this.mframeVar}++;`);
             case "MarkRestore":
@@ -566,7 +513,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
                 return this.emit(`tmp = unpackForBinding(${this.use(inst.src)}, ${inst.count}, ${inst.flags}); ${moves.join(" ")}`);
             }
             case "IntCall":
-                if (this.emitAggregateIntCall(inst)) return;
+                if (this.#aggregateCall(inst)) return;
                 // non-debug code does not record where each operation is: an error the intrinsic raises gets the position here
                 // (an inlined template that never calls the intrinsic cannot raise its errors, so needs none)
                 const call = this.intrinsicCall(inst.pos, inst.start, inst.nargs, inst.ip);
@@ -605,7 +552,7 @@ export abstract class FunctionEmitter extends CodeEmitter {
         const result = Intrinsics.resultKind(entry, known);
         const typedSlow = result === undefined ? slow : result === "boolean" ? `!!${slow}` : this.table?.types?.coerce?.(result, slow) ?? slow;
         const site = entry.site !== undefined && at !== undefined ? `SC${at}` : undefined;
-        const inlined = entry.inline(regs.map(r => this.materializeAggregate(r)), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known, site);
+        const inlined = entry.inline(regs.map(r => this.operand(r)), typedSlow, "tmp", inlineDeps(entry, this.usedDeps), known, site);
         return inlined ?? direct;
     }
 

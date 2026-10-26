@@ -5,7 +5,7 @@ import { Coroutine } from "../magicvm/exec";
 import { severalValues } from "../magicvm/coreops";
 import { argError, argInvalid, integerArg, optInteger, stringArg, tableArg, type Args } from "./args";
 import { NOWHERE, luauError } from "./errors";
-import type { AggregateOpRule, ArgKinds, InlineFn, Intrinsics, Returns, TypeSystem } from "../magicvm/intrinsics";
+import type { AggregateRule, ArgKinds, InlineFn, IntrinsicOptions, Intrinsics, Kind, Returns, TypeSystem } from "../magicvm/intrinsics";
 import { integer, ipow } from "./integer";
 import { toString, typeName } from "./messages";
 import { cstring, luaPow, num2str, str2integer, str2number } from "./number";
@@ -17,7 +17,7 @@ import { OS_LIBRARY } from "./oslib";
 import { BUFFER_LIBRARY, VECTOR_LIBRARY } from "./buflib";
 import { STRING_LIBRARY, gmatchNext, gmatchState } from "./strlib";
 import { LuaTable, type SlotCache } from "./table";
-import { LuaVector, vadd, vdiv, vidiv, vmul, vsub, vunm, vector, fma, dot3 } from "./vector";
+import { LuaVector, VECTOR_FAST_CALLS, dot3, fma, vadd, vdiv, vidiv, vmul, vsub, vunm } from "./vector";
 
 // a function's name in a traceback (a proto's debugname): none for a chunk or a function nothing names
 const functionName = (name: any): string | null => typeof name !== "string" || name === "lambda" || name === "top-level" || name.startsWith("lambda@") ? null : name;
@@ -217,96 +217,67 @@ export const inextOf = (args: readonly any[]): any => {
 // what a field access keeps where it is compiled: the slot its name was last found in (Luau's predicted slot)
 const slotCache = (): SlotCache => ({ slot: 0 });
 
-// Luau's kinds: numbers, integers (bigints), strings, tables, and vectors
+// Luau's kinds: numbers, integers (bigints), strings, tables, and vectors, which direct code keeps as their components
 export const LUAU_TYPES: TypeSystem = {
     ofConstant: v => typeof v === "number" ? "number" : typeof v === "bigint" ? "integer" : typeof v === "string" ? "string" : undefined,
-    guard: (kind, e, d) => kind === "number" ? `typeof ${e} === "number"` : kind === "integer" ? `typeof ${e} === "bigint"` : kind === "string" ? `typeof ${e} === "string"` : LUAU_TYPES.aggregates?.[kind]?.guard(e, d) ?? null,
+    guard: (kind, e, d) => kind === "number" ? `typeof ${e} === "number"` : kind === "integer" ? `typeof ${e} === "bigint"` : kind === "string" ? `typeof ${e} === "string"`
+        : kind === "vector" ? `${e} instanceof ${d.LuaVector}` : null,
     coerce: (kind, e) => kind === "number" ? `+${e}` : null,
+    deps: { LuaVector },
     // the lowering takes one value of a call before it binds or assigns it (a call it keeps whole is never returned
     // from a variable)
     oneValueVariables: true,
     aggregates: {
         vector: {
-            kind: "vector",
             fields: ["x", "y", "z"],
-            fieldType: "number",
             box: (fields, d) => `new ${d.LuaVector}(${fields.join(", ")})`,
-            unbox: (expr) => ({
-                x: `${expr}.x`,
-                y: `${expr}.y`,
-                z: `${expr}.z`,
-            }),
-            guard: (expr, d) => `${expr} instanceof ${d.LuaVector}`,
-            deps: { LuaVector, dot3, fma },
+            unbox: (e, field) => `${e}.${field}`,
+            // (as LuaVector.index)
+            field: key => typeof key === "string" && key.length === 1 ? "xyz"[(key.charCodeAt(0) | 32) - 120] : undefined,
         },
     },
 };
 
-const sameKind: Returns = (kinds: ArgKinds) => kinds.every(k => k === "number") ? "number" : kinds.every(k => k === "integer") ? "integer" : kinds.includes("vector") ? "vector" : undefined;
+const isVector = (k: Kind | undefined) => k === "vector";
+const vectorOrNumber = (k: Kind | undefined) => k === "vector" || k === "number";
+const sameKind: Returns = (kinds: ArgKinds) => kinds.every(k => k === "number") ? "number" : kinds.every(k => k === "integer") ? "integer"
+    : kinds.every(vectorOrNumber) ? "vector" : undefined;
 
-const VECTOR_ARITH_AGG: Partial<Record<ArithOp, AggregateOpRule>> = {
-    add: {
-        type: "component-wise",
-        kind: "vector",
-        applies: kinds => kinds[0] === "vector" && kinds[1] === "vector",
-        emit: ([a, b]) => [
-            `Math.fround(${a[0]} + ${b[0]})`,
-            `Math.fround(${a[1]} + ${b[1]})`,
-            `Math.fround(${a[2]} + ${b[2]})`,
-        ],
+// vector arithmetic on the components: each one rounded to float32, as LuaVector's are, and a number first (see `scaled`)
+const xyz = (component: (i: number) => string): string[] => [0, 1, 2].map(i => `Math.fround(${component(i)})`);
+const componentOf = (a: readonly string[], i: number) => a.length === 1 ? `Math.fround(${a[0]})` : a[i];
+const twoVectors = (kinds: ArgKinds) => kinds.length === 2 && kinds.every(isVector);
+const scaled = (kinds: ArgKinds) => kinds.every(vectorOrNumber) && kinds.some(isVector);
+const VECTOR_ARITH: Partial<Record<ArithOp, AggregateRule>> = {
+    add: { applies: twoVectors, emit: ([a, b]) => xyz(i => `${a[i]} + ${b[i]}`) },
+    sub: { applies: twoVectors, emit: ([a, b]) => xyz(i => `${a[i]} - ${b[i]}`) },
+    unm: { applies: kinds => isVector(kinds[0]), emit: ([a]) => xyz(i => `-${a[i]}`) },
+    mul: { applies: scaled, emit: ([a, b]) => xyz(i => `${componentOf(a, i)} * ${componentOf(b, i)}`) },
+    div: { applies: scaled, emit: ([a, b]) => xyz(i => `${componentOf(a, i)} / ${componentOf(b, i)}`) },
+};
+
+// the vector library's functions the lowering calls with their arguments (see VECTOR_FAST_CALLS), on known vectors' components
+const dot = (a: readonly string[], b: readonly string[], d: Readonly<Record<string, string>>) => `${d.dot3}(${a.join(", ")}, ${b.join(", ")})`;
+const VECTOR_CALLS: Record<typeof VECTOR_FAST_CALLS[number], IntrinsicOptions & { aggregate: AggregateRule }> = {
+    create: {
+        returns: "vector", wants: "number",
+        aggregate: { applies: kinds => kinds.length >= 2 && kinds.every(k => k === "number"), emit: a => xyz(i => a[i]?.[0] ?? "0") },
     },
-    sub: {
-        type: "component-wise",
-        kind: "vector",
-        applies: kinds => kinds[0] === "vector" && kinds[1] === "vector",
-        emit: ([a, b]) => [
-            `Math.fround(${a[0]} - ${b[0]})`,
-            `Math.fround(${a[1]} - ${b[1]})`,
-            `Math.fround(${a[2]} - ${b[2]})`,
-        ],
-    },
-    unm: {
-        type: "component-wise",
-        kind: "vector",
-        applies: kinds => kinds[0] === "vector",
-        emit: ([a]) => [
-            `Math.fround(-${a[0]})`,
-            `Math.fround(-${a[1]})`,
-            `Math.fround(-${a[2]})`,
-        ],
-    },
-    mul: {
-        type: "component-wise",
-        kind: "vector",
-        applies: kinds => (kinds[0] === "vector" && (kinds[1] === "vector" || kinds[1] === "number" || kinds[1] === "integer")) || (kinds[1] === "vector" && (kinds[0] === "number" || kinds[0] === "integer")),
-        emit: ([a, b]) => {
-            const ax = a.length === 3 ? a[0] : a[0];
-            const ay = a.length === 3 ? a[1] : a[0];
-            const az = a.length === 3 ? a[2] : a[0];
-            const bx = b.length === 3 ? b[0] : b[0];
-            const by = b.length === 3 ? b[1] : b[0];
-            const bz = b.length === 3 ? b[2] : b[0];
-            return [
-                `Math.fround(${ax} * ${bx})`,
-                `Math.fround(${ay} * ${by})`,
-                `Math.fround(${az} * ${bz})`,
-            ];
+    dot: { returns: "number", wants: "vector", deps: { dot3 }, aggregate: { applies: twoVectors, emit: ([a, b], d) => dot(a, b, d) } },
+    cross: {
+        returns: "vector", wants: "vector", deps: { fma },
+        aggregate: {
+            applies: twoVectors,
+            emit: ([a, b], d) => [[1, 2], [2, 0], [0, 1]].map(([j, k]) => `${d.fma}(${a[j]}, ${b[k]}, -Math.fround(${a[k]} * ${b[j]}))`),
         },
     },
-    div: {
-        type: "component-wise",
-        kind: "vector",
-        applies: kinds => kinds[0] === "vector" && (kinds[1] === "vector" || kinds[1] === "number" || kinds[1] === "integer"),
-        emit: ([a, b]) => {
-            const bx = b.length === 3 ? b[0] : b[0];
-            const by = b.length === 3 ? b[1] : b[0];
-            const bz = b.length === 3 ? b[2] : b[0];
-            return [
-                `Math.fround(${a[0]} / ${bx})`,
-                `Math.fround(${a[1]} / ${by})`,
-                `Math.fround(${a[2]} / ${bz})`,
-            ];
-        },
+    magnitude: {
+        returns: "number", wants: "vector", deps: { dot3 },
+        aggregate: { applies: kinds => kinds.length === 1 && isVector(kinds[0]), emit: ([a], d) => `Math.fround(Math.sqrt(${dot(a, a, d)}))` },
+    },
+    normalize: {
+        returns: "vector", wants: "vector", deps: { dot3 },
+        aggregate: { applies: kinds => kinds.length === 1 && isVector(kinds[0]), emit: ([a], d) => xyz(i => `${a[i]} * Math.fround(1 / Math.fround(Math.sqrt(${dot(a, a, d)})))`) },
     },
 };
 
@@ -345,7 +316,7 @@ export const registerLuauOps = (table: Intrinsics, library: LuauLibrary): void =
         table.register(`%luau-${op}`, unary ? (regs, s) => arith(op, regs[s], regs[s]) : (regs, s) => arith(op, regs[s], regs[s + 1]), {
             args: unary ? [1, 1] : [2, 2], leaf: true, foldable: true, oneValue: true,
             inline: arithInline(op), deps: { luaPow }, returns: sameKind, wants: "number",
-            aggregate: VECTOR_ARITH_AGG[op],
+            aggregate: VECTOR_ARITH[op],
         });
     }
     table.register("%luau-concat", (regs, s) => concat(regs[s], regs[s + 1]), {
@@ -460,81 +431,10 @@ export const registerLuauOps = (table: Intrinsics, library: LuauLibrary): void =
         return new MultipleValues([false, died.error]);
     }, { args: [1, 1], leaf: true });
     for (const [name, fn] of Object.entries(BUFFER_LIBRARY)) table.register(`%luau-buffer-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true });
-    table.register("%luau-vector-create", (regs, s, n) => {
-        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.create(regs[s]);
-        return vector.create(regs[s], regs[s + 1], n >= 3 ? regs[s + 2] : 0);
-    }, {
-        args: [1, 3], leaf: true, oneValue: true, returns: "vector",
-        aggregate: {
-            type: "constructor",
-            kind: "vector",
-            emit: args => [
-                `Math.fround(${args[0]})`,
-                `Math.fround(${args[1]})`,
-                `Math.fround(${args[2] ?? 0})`,
-            ],
-        },
-    });
-    table.register("%luau-vector-dot", (regs, s, n) => {
-        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.dot(regs[s]);
-        return vector.dot(regs[s], regs[s + 1]);
-    }, {
-        args: [1, 2], leaf: true, oneValue: true, returns: "number", deps: { dot3 },
-        aggregate: {
-            type: "reduction",
-            kind: "vector",
-            emit: ([a, b], d) => `${d.dot3}(${a[0]}, ${a[1]}, ${a[2]}, ${b[0]}, ${b[1]}, ${b[2]})`,
-        },
-    });
-    table.register("%luau-vector-cross", (regs, s, n) => {
-        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.cross(regs[s]);
-        return vector.cross(regs[s], regs[s + 1]);
-    }, {
-        args: [1, 2], leaf: true, oneValue: true, returns: "vector", deps: { fma },
-        aggregate: {
-            type: "component-wise",
-            kind: "vector",
-            emit: ([a, b], d) => [
-                `${d.fma}(${a[1]}, ${b[2]}, -Math.fround(${a[2]} * ${b[1]}))`,
-                `${d.fma}(${a[2]}, ${b[0]}, -Math.fround(${a[0]} * ${b[2]}))`,
-                `${d.fma}(${a[0]}, ${b[1]}, -Math.fround(${a[1]} * ${b[0]}))`,
-            ],
-        },
-    });
-    table.register("%luau-vector-magnitude", (regs, s, n) => {
-        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.magnitude(regs[s]);
-        return vector.magnitude(regs[s]);
-    }, {
-        args: [1, 1], leaf: true, oneValue: true, returns: "number", deps: { dot3 },
-        aggregate: {
-            type: "reduction",
-            kind: "vector",
-            emit: ([a], d) => `Math.fround(Math.sqrt(${d.dot3}(${a[0]}, ${a[1]}, ${a[2]}, ${a[0]}, ${a[1]}, ${a[2]})))`,
-        },
-    });
-    table.register("%luau-vector-normalize", (regs, s, n) => {
-        if (n === 1 && Array.isArray(regs[s])) return VECTOR_LIBRARY.normalize(regs[s]);
-        return vector.normalize(regs[s]);
-    }, {
-        args: [1, 1], leaf: true, oneValue: true, returns: "vector", deps: { dot3 },
-        aggregate: {
-            type: "component-wise",
-            kind: "vector",
-            emit: ([a], d) => {
-                const dot = `${d.dot3}(${a[0]}, ${a[1]}, ${a[2]}, ${a[0]}, ${a[1]}, ${a[2]})`;
-                const inv = `Math.fround(1 / Math.fround(Math.sqrt(${dot})))`;
-                return [
-                    `Math.fround(${a[0]} * ${inv})`,
-                    `Math.fround(${a[1]} * ${inv})`,
-                    `Math.fround(${a[2]} * ${inv})`,
-                ];
-            },
-        },
-    });
-    for (const [name, fn] of Object.entries(VECTOR_LIBRARY)) {
-        if (!["create", "dot", "cross", "magnitude", "normalize"].includes(name)) {
-            table.register(`%luau-vector-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
-        }
+    for (const [name, fn] of Object.entries(VECTOR_LIBRARY)) table.register(`%luau-vector-${name}`, (regs, s) => fn(regs[s]), { args: [1, 1], leaf: true, oneValue: true });
+    for (const [name, options] of Object.entries(VECTOR_CALLS)) {
+        const fn = VECTOR_LIBRARY[name as keyof typeof VECTOR_CALLS];
+        table.register(`%luau-vector-${name}/args`, (regs, s, n) => fn(regs.slice(s, s + n)), { leaf: true, oneValue: true, ...options });
     }
     const tableOps = { lessThan, rawequal };
     for (const [name, fn] of Object.entries(TABLE_LIBRARY)) table.register(`%luau-table-${name}`, (regs, s) => fn(regs[s], tableOps), { args: [1, 1], leaf: !TABLE_CALLERS.has(name) });
@@ -739,7 +639,7 @@ export const registerLuauOps = (table: Intrinsics, library: LuauLibrary): void =
     // looks for first where the same code last found it
     table.register("%luau-field", (regs, s) => index(strings, regs[s], regs[s + 1]), {
         args: [2, 2], leaf: true, oneValue: true, deps: { LuaTable }, site: slotCache,
-        returns: (kinds: ArgKinds) => kinds[0] === "vector" ? "number" : undefined,
+        returns: (kinds: ArgKinds) => kinds[0] === "vector" ? "number" : undefined, aggregate: "field",
         inline: ([t, k], slow, _tmp, d, known, site) => {
             const get = site === undefined ? `${t}.rawget(${k})` : `${t}.getfield(${k}, ${site})`;
             return known[0] === "table" ? get : `(${isTable(t, d)} ? ${get} : ${slow})`;

@@ -237,8 +237,7 @@ export const paramKinds = (blocks: AotBlock[], table: Intrinsics | null, params:
         if (entry[i] === undefined) continue;
         const holds = new Map(entry[i]!);
         for (const inst of blocks[i].insts) {
-            const entry = inst.k === "IntCall" || inst.k === "IntApply" ? table.entries[inst.pos] : undefined;
-            const kind = entry?.wants ?? (entry?.aggregate !== undefined && entry.aggregate.type !== "constructor" ? entry.aggregate.kind : undefined);
+            const kind = inst.k === "IntCall" || inst.k === "IntApply" ? table.entries[inst.pos]?.wants : undefined;
             if (kind !== undefined && holds.size > 0) {
                 for (const reg of windowRegs((inst as { start: number }).start, (inst as { nargs: number }).nargs)) {
                     for (let held = holds.get(reg) ?? 0, param = 0; held !== 0; held >>>= 1, param++) {

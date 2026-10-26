@@ -1,11 +1,11 @@
 // The direct entry of a compiled function: no frames, entered at its start
 import { windowRegs } from "./liveness";
-import { blockFacts, paramKinds, transfer, type Facts, type Aliases } from "./facts";
+import { blockFacts, paramKinds, transfer, type Facts } from "./facts";
 import { MAX_STRUCTURED_NESTING, STRUCTURE_MISMATCH, capturesOf } from "./types";
 import type { AotBlock, AotTerm } from "./types";
 import { corePos } from "../coreops";
 import type { Arity } from "../arity";
-import { type Intrinsic, type Kind, type AggregateDescriptor } from "../intrinsics";
+import { type Aggregate, type Intrinsic, type Kind } from "../intrinsics";
 import { inlineDeps } from "./code-emitter";
 import { FunctionEmitter } from "./function";
 
@@ -51,33 +51,30 @@ export class DirectEmitter extends FunctionEmitter {
     protected get entryFacts(): Map<number, Facts> {
         return this.#entryFacts ??= blockFacts(this.blocks, this.table, this.constants, this.#seed);
     }
-
-    protected aggregateRegisters(paramAggs?: Iterable<[number, Kind]>): Map<number, AggregateDescriptor> {
-        const aggRegs = new Map<number, AggregateDescriptor>();
-        const aggregates = this.table?.types?.aggregates;
-        if (!aggregates) return aggRegs;
-        if (paramAggs !== undefined) {
-            for (const [r, k] of paramAggs) {
-                const desc = aggregates[k];
-                if (desc !== undefined) aggRegs.set(r, desc);
+    // the registers of an aggregate kind anywhere in the versions entered knowing `seeds` (see FunctionEmitter)
+    #aggregateRegs(seeds: (Facts | null)[]): Map<number, Aggregate> {
+        const regs = new Map<number, Aggregate>(), aggregates = this.table?.types?.aggregates;
+        if (aggregates === undefined) return regs;
+        const note = (facts: Facts) => {
+            for (const [reg, kind] of facts) {
+                const agg = aggregates[kind];
+                if (agg === undefined) continue;
+                if ((regs.get(reg) ?? agg) !== agg) throw new Error("internal error: a register holds two kinds of aggregate");
+                regs.set(reg, agg);
             }
-        }
-        for (const block of this.blocks) {
-            const facts = new Map(this.entryFacts.get(block.start) ?? []);
-            const aliases: Aliases = new Map();
-            for (const [r, k] of facts) {
-                const desc = aggregates[k];
-                if (desc !== undefined) aggRegs.set(r, desc);
-            }
-            for (const inst of block.insts) {
-                transfer(inst, facts, this.table, this.constants, aliases);
-                for (const [r, k] of facts) {
-                    const desc = aggregates[k];
-                    if (desc !== undefined) aggRegs.set(r, desc);
+        };
+        for (const seed of seeds) {
+            const entry = blockFacts(this.blocks, this.table, this.constants, seed);
+            for (const block of this.blocks) {
+                const facts = new Map(entry.get(block.start) ?? []), aliases = new Map();
+                note(facts);
+                for (const inst of block.insts) {
+                    transfer(inst, facts, this.table, this.constants, aliases);
+                    note(facts);
                 }
             }
         }
-        return aggRegs;
+        return regs;
     }
     // in the version for number parameters, what it knows on entry; and the check that picks that version, made again
     // on every self tail call (its new arguments may not be numbers)
@@ -126,6 +123,9 @@ export class DirectEmitter extends FunctionEmitter {
         const arity = closureArity.params + (closureArity.rest === "none" ? 0 : 1);
         const params = Array.from({ length: arity }, (_, i) => `, a${i}`).join("");
         const locals = Array.from({ length: this.numReg }, (_, i) => i < arity ? `r${i} = a${i}` : `r${i}`);
+        // a frame rebuilt from here resumes in heap code, which reads only the registers live where it can resume: reading
+        // the others here would make V8 keep every temporary boxed wherever the function could throw (a float loop ran
+        // three times slower)
         const resumeLive = this.liveness.entryLive;
         const usedUpvars = new Set<number>();
         for (const b of this.blocks) {
@@ -151,43 +151,23 @@ export class DirectEmitter extends FunctionEmitter {
         }
         const numeric = [...guards.keys()];
         this.#specCheck = numeric.length > 0 ? numeric.map(i => `(${guards.get(i)})`).join(" && ") : null;
+        const seed = this.#specCheck !== null ? new Map(numeric.map(i => [i, kinds.get(i)!])) : null;
+        this.aggregateRegs = this.#aggregateRegs(seed === null ? [null] : [null, seed]);
+        for (const [reg, agg] of this.aggregateRegs) locals.push(...this.fieldVars(reg, agg));
         const structured = this.#structuredBody();
         if (structured === null) return false;
-        const special = this.#specCheck !== null ? this.#structuredBody(new Map(numeric.map(i => [i, kinds.get(i)!]))) : null;
+        const special = seed !== null ? this.#structuredBody(seed) : null;
         if (special === null) this.#specCheck = null;
-
-        const aggRegs = this.aggregateRegisters(kinds);
-        const aggLocals: string[] = [];
-        for (const [reg, desc] of aggRegs) {
-            for (const f of desc.fields) aggLocals.push(`r${reg}_${f}`);
-        }
-        if (aggLocals.length > 0) locals.push(...aggLocals);
-
-        let unboxParams = "";
-        if (special !== null && types?.aggregates !== undefined) {
-            const unboxes: string[] = [];
-            const d = inlineDeps({ name: "the type system", deps: this.table!.typeDeps } as Intrinsic, this.usedDeps);
-            for (const i of numeric) {
-                const kind = kinds.get(i);
-                const desc = kind !== undefined ? types.aggregates[kind] : undefined;
-                if (desc !== undefined) {
-                    const unboxed = desc.unbox(`r${i}`, d);
-                    for (const f of desc.fields) unboxes.push(`r${i}_${f} = ${unboxed[f]};`);
-                }
-            }
-            if (unboxes.length > 0) unboxParams = unboxes.join(" ") + "\n";
-        }
-
+        // (that version's parameters of an aggregate kind are unboxed as it starts)
+        const unboxed = numeric.flatMap(i => {
+            const agg = types?.aggregates?.[kinds.get(i)!];
+            return agg === undefined ? [] : agg.fields.map(f => `r${i}_${f} = ${agg.unbox(`r${i}`, f)};`);
+        }).join(" ");
         const allRegs = Array.from({ length: this.numReg }, (_, i) => {
             if (!resumeLive.has(i)) return "undefined";
-            const desc = aggRegs.get(i);
-            if (desc !== undefined) {
-                const d = inlineDeps({ name: "the aggregate", deps: this.table!.typeDeps } as Intrinsic, this.usedDeps);
-                return `(r${i}_${desc.fields[0]} !== undefined ? ${desc.box(desc.fields.map(f => `r${i}_${f}`), d)} : r${i})`;
-            }
-            return `r${i}`;
+            const agg = this.aggregateRegs.get(i);
+            return agg === undefined ? `r${i}` : `(r${i}_${agg.fields[0]} !== undefined ? ${this.boxed(i, agg)} : r${i})`;
         }).join(", ");
-
         this.emit(`
             function direct$(ctx, closure, executor, depth, marks, mframe${params}) {
                 let rip = 0, tip = -1, ic = 255, acc, tmp${this.debug ? ", dip = 0" : ", dip = -1, derr"}${this.#hasSites ? ", isite = -1" : ""};
@@ -197,12 +177,12 @@ export class DirectEmitter extends FunctionEmitter {
         `);
         this.emit(`
                 ${special !== null ? `let spec = ${this.#specCheck};` : ""}
-                ${unboxParams !== "" ? `if (spec) { ${unboxParams} }` : ""}
                 try {
         `);
         this.emit(`
                     top: for (;;) {
                         ${special !== null ? `if (spec) {
+                            ${unboxed}
                             ${special}
                             return undefined;
                         }` : ""}
@@ -230,6 +210,7 @@ export class DirectEmitter extends FunctionEmitter {
         body.#params = this.#params;
         body.#seed = seed;
         body.#specCheck = this.#specCheck;
+        body.aggregateRegs = this.aggregateRegs;
         const index = new Map(this.blocks.map((b, i) => [b.start, i]));
         try {
             body.#walk(index, 0, this.structure.size);
@@ -363,8 +344,8 @@ export class DirectEmitter extends FunctionEmitter {
         const inst = block.insts[index];
         if (this.#want === 0 || inst.k !== "IntCall" || inst.pos !== VALUES_POS || inst.nargs === 1 || index !== block.insts.length - 1) return 0;
         const given = windowRegs(inst.start, Math.min(inst.nargs, this.#want));
-        const returns = given.length === 0 ? "return undefined;" : this.#want === 1 ? `return ${this.materializeAggregate(given[0])};`
-            : `${given.map((r, i) => `VB[${i}] = ${this.materializeAggregate(r)};`).join(" ")} return MULTI;`;
+        const returns = given.length === 0 ? "return undefined;" : this.#want === 1 ? `return ${this.use(given[0])};`
+            : `${given.map((r, i) => `VB[${i}] = ${this.use(r)};`).join(" ")} return MULTI;`;
         if (block.term.k === "Return" && block.term.reg === inst.dst) {
             this.#valuesReturn = returns;
             return 1;
@@ -418,7 +399,7 @@ export class DirectEmitter extends FunctionEmitter {
     }
 
     #args(term: { start: number, nargs: number }): string[] {
-        return windowRegs(term.start, term.nargs).map(r => this.materializeAggregate(r));
+        return windowRegs(term.start, term.nargs).map(r => this.use(r));
     }
 
     // how a block ends that does not end in a jump, a branch, a block or a loop (those are #walkRegion's)
@@ -482,7 +463,7 @@ export class DirectEmitter extends FunctionEmitter {
                 this.#valuesReturn = null;
                 if (made !== null) return this.emit(made);
                 // an entry for one value returns the first of several: nothing to do where the register holds one
-                const value = this.materializeAggregate(term.reg);
+                const value = this.use(term.reg);
                 if (this.#want === 0 || this.holdsOne(term.reg, this.#params)) return this.emit(`return ${value};`);
                 if (this.#want === 1) return this.emit(`return ${this.oneOf(value)};`);
                 // multiple values made elsewhere: the first few are moved here (as manyValues does), without a call

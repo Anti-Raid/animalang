@@ -10,27 +10,28 @@ export type ArgKinds = readonly (Kind | undefined)[];
 // what an intrinsic returns (or else it throws): always a kind, or a kind given what is known of its arguments' kinds
 export type Returns = Kind | ((kinds: ArgKinds) => Kind | undefined);
 
+// A kind whose values direct code keeps as one variable per field (scalar replacement): `box` makes a value of the
+// fields' expressions, `unbox` reads one field of a value, `field` is the field a constant key names, if any. `d`: the
+// type system's deps
+export type Aggregate = {
+    readonly fields: readonly string[],
+    box(fields: readonly string[], d: Readonly<Record<string, string>>): string,
+    unbox(expr: string, field: string): string,
+    field(key: unknown): string | undefined,
+};
+
+// An intrinsic computed on aggregates' fields where `applies` to its arguments' kinds: `emit` gets each argument as
+// its fields (one expression for any other kind) and gives the result's fields if it returns an aggregate, else its
+// expression. "field": (value, constant key) reads the field the key names
+export type AggregateRule = "field" | {
+    readonly applies: (kinds: ArgKinds) => boolean,
+    readonly emit: (args: readonly (readonly string[])[], d: Readonly<Record<string, string>>) => string | readonly string[],
+};
+
 // A front end's kinds: `ofConstant` gives a literal's kind; `guard` a js test that `expr` is of `kind` (a version of a
 // function for parameters of that kind checks them with it), or null; `coerce` wraps an expression known to give a
-// A front end's kinds: `ofConstant` gives a literal's kind; `guard` a js test that `expr` is of `kind` (a version of a
-// function for parameters of that kind checks them with it), or null; `coerce` wraps an expression known to give a
-// value of `kind` so V8 sees that kind too (a template's slow path), or null. `deps`: values `guard` refers to, as ${d.name}
-export interface AggregateDescriptor {
-    readonly kind: Kind;
-    readonly fields: readonly string[];
-    readonly fieldType?: Kind;
-    readonly box: (fields: readonly string[], d: Readonly<Record<string, string>>) => string;
-    readonly unbox: (expr: string, d: Readonly<Record<string, string>>) => Record<string, string>;
-    readonly guard: (expr: string, d: Readonly<Record<string, string>>) => string;
-    readonly deps?: Record<string, unknown>;
-}
-
-export type AggregateOpRule =
-    | { readonly type: "constructor"; readonly kind: Kind; readonly emit?: (args: string[], d: Readonly<Record<string, string>>) => string[] }
-    | { readonly type: "getter"; readonly kind: Kind; readonly field: string }
-    | { readonly type: "component-wise"; readonly kind: Kind; readonly emit: (args: string[][], d: Readonly<Record<string, string>>, kinds: ArgKinds) => string[]; readonly applies?: (kinds: ArgKinds) => boolean }
-    | { readonly type: "reduction"; readonly kind: Kind; readonly emit: (args: string[][], d: Readonly<Record<string, string>>, kinds: ArgKinds) => string; readonly applies?: (kinds: ArgKinds) => boolean };
-
+// value of `kind` so V8 sees that kind too (a template's slow path), or null. `deps`: values `guard` and the
+// aggregates refer to, as ${d.name}
 export type TypeSystem = {
     ofConstant(value: any): Kind | undefined,
     guard(kind: Kind, expr: string, d: Readonly<Record<string, string>>): string | null,
@@ -39,8 +40,7 @@ export type TypeSystem = {
     // the front end's code never keeps multiple values in a variable (a parameter, a local, a global): what it reads
     // from one is one value, which a procedure entered for one value may return as it is (see Code.wanted)
     oneValueVariables?: boolean,
-    // aggregates (structs) that can be scalar-replaced in AOT code
-    aggregates?: Readonly<Record<Kind, AggregateDescriptor>>,
+    aggregates?: Readonly<Record<Kind, Aggregate>>,
 };
 
 // `known`: for each argument, its kind when certain (see aot/facts.ts), so the template may skip checking it
@@ -98,8 +98,7 @@ export type IntrinsicOptions = {
     effectFree?: boolean,
     // it never returns multiple values (as one that declares the kind it returns does not either)
     oneValue?: boolean,
-    // SROA: aggregate / struct rule for this intrinsic
-    aggregate?: AggregateOpRule,
+    aggregate?: AggregateRule,
 }
 
 export type Intrinsic = {
@@ -124,7 +123,7 @@ export type Intrinsic = {
     readonly foldable: boolean,
     readonly effectFree: boolean,
     readonly oneValue: boolean,
-    readonly aggregate?: AggregateOpRule,
+    readonly aggregate?: AggregateRule,
 }
 
 // The intrinsics a compiler and VM are extended with: host functions called over a register window, inlined by AOT
@@ -208,9 +207,9 @@ export class Intrinsics {
             deps[dep] = `D${slot}`
         }
         const entry: Intrinsic = Object.freeze({
-            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? (options.aggregate !== undefined ? true : false), context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, site: options.site, deps: Object.freeze(deps),
+            name, pos: this.entries.length, fn, min, max, leaf: options.leaf ?? false, context: options.context ?? false, tail: options.tail ?? true, fresh: (options.fresh ?? false) || options.sequence === "spread", returns: options.returns, wants: options.wants, inline: options.inline, site: options.site, deps: Object.freeze(deps),
             refineArgs: options.refineArgs, branchNarrow: options.branchNarrow, invertBranch: options.invertBranch,
-            foldable: options.foldable ?? false, effectFree: options.effectFree ?? false, oneValue: options.oneValue ?? (options.aggregate !== undefined ? true : false),
+            foldable: options.foldable ?? false, effectFree: options.effectFree ?? false, oneValue: options.oneValue ?? false,
             aggregate: options.aggregate,
         })
         this.entries.push(entry)
@@ -246,16 +245,10 @@ export class Intrinsics {
     setTypes(types: TypeSystem): this {
         if (this.#frozen) throw new Error("cannot set the type system: the intrinsics are frozen")
         const deps: Record<string, string> = {}
-        const recordDep = (value: unknown, dep: string) => {
+        for (const [dep, value] of Object.entries(types.deps ?? {})) {
             let slot = this.deps.indexOf(value)
             if (slot === -1) slot = this.deps.push(value) - 1
             deps[dep] = `D${slot}`
-        }
-        for (const [dep, value] of Object.entries(types.deps ?? {})) recordDep(value, dep)
-        if (types.aggregates !== undefined) {
-            for (const agg of Object.values(types.aggregates)) {
-                for (const [dep, value] of Object.entries(agg.deps ?? {})) recordDep(value, dep)
-            }
         }
         this.#types = types
         this.#typeDeps = Object.freeze(deps)
@@ -290,13 +283,6 @@ export class Intrinsics {
 
     // what an intrinsic returns given its arguments' kinds, if certain
     static resultKind(entry: Intrinsic, kinds: ArgKinds | null): Kind | undefined {
-        if (entry.aggregate !== undefined) {
-            const rule = entry.aggregate;
-            if (rule.type === "constructor") return rule.kind;
-            if (rule.type === "component-wise" && (kinds === null || rule.applies === undefined || rule.applies(kinds))) {
-                return rule.kind;
-            }
-        }
         const returns = entry.returns
         if (typeof returns !== "function") return returns
         return kinds === null ? undefined : returns(kinds)

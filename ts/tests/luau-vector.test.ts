@@ -178,6 +178,35 @@ describe("Luau vector SROA in VM", () => {
         expect(run(src)).toBe("2\t4\t6\t11\t12\t13");
     });
 
+    it("checks the library's arguments as Luau does", () => {
+        expect(run("return vector(1, 2, 3)")).toBe("error: t:1: attempt to call a table value");
+        expect(run("return vector.create({}, 2)")).toBe("error: t:1: invalid argument #1 to 'create' (number expected, got table)");
+        expect(run("return vector.create(5)")).toBe("error: t:1: missing argument #2 to 'create' (number expected)");
+        expect(run("local function g(b) return vector.cross(vector.create(1, 0, 0), b) end; g(vector.create(0, 1, 0)); return pcall(g, 5)"))
+            .toBe("false\tt:1: invalid argument #2 to 'cross' (vector expected, got number)");
+    });
+
+    it("reads a field only by a constant name", () => {
+        expect(run("local v = vector.create(1, 2, 3); return v + 'x'")).toBe("error: t:1: attempt to perform arithmetic (add) on vector and string");
+        expect(run("local v = vector.create(1, 2, 3); return v .. 'y'")).toBe("error: t:1: attempt to concatenate vector with string");
+        expect(run("local v = vector.create(1, 2, 3); return v.X, v.y, v.Z")).toBe("1\t2\t3");
+        expect(run("local v = vector.create(1, 2, 3); return v.w")).toBe("error: t:1: attempt to index vector with 'w'");
+    });
+
+    it("unboxes the vectors other operations make", () => {
+        expect(run("local t = {v = vector.create(3, 4, 0)}; local n = vector.normalize(t.v); return n.x, n")).toBe("0.6000000238418579\t0.6000000238418579, 0.800000011920929, 0");
+        expect(run("local t = {v = vector.create(1, 2, 3)}; local a = vector.create(1, 1, 1); for i = 1, 3 do if i == 2 then a = vector.normalize(t.v) else a = a + a end end; return a"))
+            .toBe("0.5345224738121033, 1.0690449476242065, 1.603567361831665");
+        expect(run("local function step(p, vel, dt) return p + vel * dt end local p, vel = vector.create(0, 0, 0), vector.create(1, 2, 3) for i = 1, 3 do p = step(p, vel, 0.001) end return p"))
+            .toBe("0.003000000026077032, 0.006000000052154064, 0.008999999612569809");
+        expect(run("local v, w = vector.create(1, 2, 3), vector.create(4, 5, 6); v = vector.cross(v, w); return v")).toBe("-3, 6, -3");
+    });
+
+    it("rounds a number to float32 before scaling by it", () => {
+        expect(run("local v = vector.create(16777215, 3, 7) return v * 1.0000001, 1.0000001 * v, 3 / v"))
+            .toBe("16777216, 3.000000476837158, 7.000000953674316\t16777216, 3.000000476837158, 7.000000953674316\t1.788139485370266e-07, 1, 0.4285714328289032");
+    });
+
     it("unwinds and restores vector registers across coroutine yield/resume", () => {
         const src = `
             local co = coroutine.create(function(start)

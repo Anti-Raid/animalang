@@ -141,3 +141,7 @@ const clamp = (v: number, min: number, max: number) => {
     const r = v < min ? min : v;
     return r > max ? max : r;
 };
+
+// the library's functions a call of the global's is lowered to (see Lowering.call), whose arguments' components direct
+// code computes on
+export const VECTOR_FAST_CALLS = ["create", "dot", "cross", "magnitude", "normalize"] as const;
