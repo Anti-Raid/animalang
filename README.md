@@ -6,16 +6,18 @@ Anima is the custom (Scheme-inspired) language used in settings v2 in antiraid f
 
 The host API changed. Host functions now go through intrinsics only: there are no host callbacks anymore (`BuiltinFunction` is gone), and a JS function placed in scope is not a procedure Anima code can call.
 
-- **Creating an instance**: `new Anima(implRvm)` is now `createScheme(implRvm)` (or `implRvmAot`). `new Anima(options)` still exists, but makes a bare instance with no language: no reader, builtins or prelude.
+- **Creating an instance**: `new Anima(implRvm)` is now `createScheme(implRvm)` (or `implRvmDebug` for exact error positions and tail calls in tracebacks). Code always runs compiled to JS: there is no interpreter and no `implRvmAot`. `new Anima(options)` still exists, but makes a bare instance with no language: no reader, builtins or prelude.
 - **Registering host functions**: the global `registerHostIntrinsic(name, fn, options)` is now `anima.registerIntrinsic(name, fn, options)`. Each instance has its own intrinsics. Names start with `%`, and a name only works in code compiled after it is registered. `anima.freeze()` stops further registrations.
 - **The function signature is `fn(regs, start, nargs)`**: the arguments are `regs[start]` to `regs[start + nargs - 1]`. `registerHostIntrinsic` functions took `(...args)` and need porting; `BuiltinFunction` callbacks already had this signature. Do not keep `regs` after the call returns.
 - **Options**: `{ args: [min, max], leaf, inline, deps }`. The argument count is checked when code compiles. Set `leaf: true` for a function that only computes a value; it is cheaper to call and can have an inline template for AOT code.
 - **Calling back into Anima**: an intrinsic that is not a leaf calls an Anima procedure by returning `hostTail(proc, ...args)` (or `hostTailFrom(proc, regs, from, count)`) instead of calling it itself. The call then runs in the VM, so the procedure can yield, capture continuations and raise.
-- **Host functions as values**: an intrinsic is not a value. Wrap it in a procedure, e.g. `(define (clamp . args) (%apply %clamp args))` for a leaf, or a fixed-arity `(lambda (f x) (%with-double f x))` for any intrinsic.
-- **Serialized code** records the intrinsics it uses by name: load it with `readFull(bytes, anima.intrinsics)` into an instance that has registered them.
+- **Yielding from the host**: an intrinsic that is not a leaf yields the coroutine running it by returning `hostYield(...values)`; the values the coroutine is resumed with are the value of the call.
+- **Calling host functions from Scheme**: Scheme code cannot name intrinsics: a `%` name in Scheme source is an ordinary identifier, so `(%clamp x 0 10)` no longer calls the intrinsic. Define a procedure for each in native-scheme (`compileNative`): `(define-intrinsic clamp %clamp)`, or one written out with intrinsic calls like `%[%clamp x lo hi]`, and call that from Scheme. Such a procedure is also how an intrinsic becomes a value.
+- **Calling back into Anima, and continuing**: `hostCall(proc, args, then)` calls `proc` and goes on with `then(value)`, as often as an intrinsic needs (a sort with a comparator, say); the callback can yield, raise and capture continuations.
+- **Serialized code is gone**: `dumpFull` / `readFull` no longer exist. Compile from source in each instance.
 
 ```ts
-import { createScheme, implRvm, hostTail } from "animalang";
+import { createScheme, compileNative, implRvm, hostTail } from "animalang";
 
 const anima = createScheme(implRvm); // was: new Anima(implRvm)
 
@@ -24,13 +26,16 @@ anima.registerIntrinsic("%clamp", (regs, start) => Math.min(Math.max(regs[start]
 // not a leaf: calls an Anima procedure by returning a tail request
 anima.registerIntrinsic("%with-double", (regs, start) => hostTail(regs[start], regs[start + 1] * 2), { args: [2, 2] });
 
+// Scheme reaches them through procedures defined in native-scheme
+anima.evaluateRaw(compileNative(anima, `
+  (define-intrinsic clamp %clamp)
+  (define-intrinsic with-double %with-double)`));
+
 anima.evaluateRaw(anima.compileRaw(`
-  (define (clamp . args) (%apply %clamp args))
-  (define (with-double f x) (%with-double f x))
   (list (map (lambda (x) (clamp x 0 10)) '(-5 5 50)) (with-double (lambda (y) (+ y 1)) 5))`)); // ((0 5 10) 11)
 ```
 
-See `ts/bytecode-rvm/README.md` (intrinsics) and `ts/scheme/README.md` (the Scheme front end) for the details.
+See `ts/magicvm/README.md` (intrinsics), `ts/scheme/README.md` (the Scheme front end) and `ts/native/README.md` (native-scheme) for the details.
 
 ## Specification
 
@@ -66,7 +71,7 @@ to achieve this is to parse multiple top-level expressions expr1 expr2... in a b
 
 ### Other Rules
 
-1. Like Scheme, Anima makes use of lexical scoping. Nested scopes inherit parent variables and can 'shadow' parent variables of the same name.
+1. Like Scheme, Anima makes use of lexical scoping. Nested scopes inherit parent variables and can 'shadow' parent variables of the same name. Builtin procedures (`car`, `map`, `list`, ...) can be shadowed too, locally or by a top-level `define`; special forms (`if`, `lambda`, `cond`, ...) and `%` intrinsics cannot.
 `define` strictly mutates or initializes within the local execution scope and never the parent scope and variables in the outermost scope 
 cannot be reassigned or mutated whatsoever for sandboxing purposes.
 
@@ -76,7 +81,7 @@ cannot be reassigned or mutated whatsoever for sandboxing purposes.
 
 4. Anima does not support macros/custom syntax currently. Although compliant implementations *may* choose to additionally support this for future use, code written in Anima must *not* assume support for macros/custom syntax.
 
-5. It is not allowed for user-code to override a builtin using define. Compliant implementations of Anima should error if an attempt to do so is detected
+5. A top-level `define` of a builtin procedure's name redefines it from then on (see rule 1), and the name cannot be read before that definition has run. Special forms and `%` intrinsics cannot be redefined: compliant implementations of Anima should error if an attempt to do so is detected
 
 6. Like Scheme, all procedures in Anima (including builtin procedures that are *not* special forms) must be first class. Furthermore, both builtin
 and user-defined procedures must return `procedure` if type? is called on it.
@@ -112,7 +117,7 @@ conditions match, returns `#<void>`. Throws an error if any clause is malformed.
 
 #### Table Operations
 
-Tables are first-class associative maps with freezing support for safe FFI boundaries. Like Lua tables, keys `1..n` are stored densely in an array part and every other key in a hash part (a JavaScript `Map`). A table never holds `<#void>`: storing `<#void>` under a key removes it. Keys cannot be `<#void>` or NaN; `1` and `1.0` are the same key, and so are `0` and `-0`. Iteration visits `1..n` in order, then the other keys in insertion order.
+Tables are first-class associative maps (a JavaScript `Map`) with freezing support for safe FFI boundaries. Keys compare as `Map` keys do: `1` and `1.0` are the same key, and so are `0` and `-0`. A table never holds `<#void>`: storing `<#void>` under a key removes it. Iteration visits keys in insertion order.
 
 - `{key1 val1 key2 val2 ...}`: Literal syntax for tables. Desugars at read time to `(table key1 val1 key2 val2 ...)`. Empty table literal `{}` desugars to `(table)`. Keys and values evaluate dynamically at runtime.
 - `(table? val)`: Returns `#t` if `val` is an instance of `Table`, `#f` otherwise. Arity: 1.
@@ -123,7 +128,6 @@ Tables are first-class associative maps with freezing support for safe FFI bound
 - `(table-delete! tbl key)`: Deletes `key` and its associated value from `tbl`. Throws an error if `tbl` is frozen. Returns `#t` if the key was present and removed, `#f` otherwise. Arity: 2.
 - `(table-clear! tbl)`: Removes all entries from `tbl`. Throws an error if `tbl` is frozen. Returns `#<void>`. Arity: 1.
 - `(table-size tbl)`: Returns the number of entries stored in `tbl`. Arity: 1.
-- `(table-border tbl)`: Returns a border of `tbl`, like Lua's `#t`: the `n` such that keys `1..n` are all set and `n + 1` is not (`0` if key `1` is not set). O(1). Arity: 1.
 - `(table-empty? tbl)`: Returns `#t` if `tbl` is empty (`size === 0`), `#f` otherwise. Arity: 1.
 - `(empty? val)`: Generic empty predicate also returns `#t` for empty tables.
 - `(table-keys tbl)`: Returns a vector (native JavaScript array) containing all keys in `tbl`. Arity: 1.
@@ -139,9 +143,11 @@ Tables are first-class associative maps with freezing support for safe FFI bound
 The `Table` class exported from `animalang` provides clean integration with host TypeScript / JavaScript environments:
 
 - **Constructor**: `new Table(frozen = false)`
-- **Methods**: `.get(key)` (`undefined` when missing), `.lookup(key, missing)`, `.set(key, val)` (`undefined` removes the key), `.has(key)`, `.delete(key)`, `.clear()`, `.copy()`
-- **Properties**: `.size`, `.frozen` (getter & setter: `tbl.frozen = true`), and `.border()` (see `table-border`)
+- **Methods**: `.get(key)` (`undefined` when missing), `.lookup(key, missing)`, `.set(key, val)` (`undefined` removes the key), `.has(key)`, `.delete(key)`, `.clear()`, `.clone()` (a shallow copy)
+- **Properties**: `.size`, `.frozen` (`tbl.frozen = true`)
 - **Iteration**: Implements `Iterable<[any, any]>` (`for (const [k, v] of tbl)`), `.entries()`, `.keys()`, `.values()`
+
+`LuaTable` (also exported, from `ts/lua/table.ts`) is the Lua front end's table: keys `1..n` live densely in an array part and the rest in a hash part, `.border()` is Lua's `#t`, and keys cannot be `<#void>` or NaN. It has the same methods.
 
 Global environments are a separate class, `Env` (`anima.scope`), with `.get`, `.set`, `.has` and `.lookup`; an `Env` chains to its parent environment (user globals over the builtins).
 

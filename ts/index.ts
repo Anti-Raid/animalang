@@ -1,14 +1,23 @@
 export * from './anima';
+export { createNativeScheme, compileNative, readNative, transformNative, NativeReadError, NativeSyntaxError, type NativeReadOptions } from './native';
 export { createScheme } from './scheme';
-export { impl as implRvm, implAot as implRvmAot } from './bytecode-rvm/meta'
-export { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions, type InlineFn } from './bytecode-rvm/intrinsics'
-export { hostTail, hostTailFrom, HostTail } from './bytecode-rvm/exec'
-export type { ByteCode } from './bytecode-rvm/exec'
-export { dumpFull, readFull } from './bytecode-rvm/utils'
-export { Table } from './table';
+export { impl as implRvm, implDebug as implRvmDebug } from './magicvm/meta'
+export { Intrinsics, type Intrinsic, type IntrinsicFn, type IntrinsicOptions, type InlineFn } from './magicvm/intrinsics'
+export { hostCall, hostTail, hostTailFrom, hostYield, HostTail, hostInterruptError, InterruptError } from './magicvm/exec'
+export type { Code } from './magicvm/exec'
+export { Table } from './scheme/table';
+export { LuaTable } from './lua/table';
 export { Env } from './env';
 export { ASP, ASPParseError, ASPTokenError } from './scheme/reader';
-export { Cons } from './list';
+export { Cons, MCons } from './scheme/list';
+export { ASTStringifier } from './scheme/printer';
 
 export * as common from './common'
-export { isTruthy, ErrorObject } from './common'
+export { ErrorObject, TRY_CALL, isQuotedConstant, type SourcePos, type TryCall } from './common'
+export { posOf, isPosSlot } from './magicvm/forms'
+import { UnitSerializer, registerDatumSerializer } from './magicvm/aot/serializer';
+import { UnitLoader, registerDatumDeserializer } from './magicvm/loader';
+
+export { UnitSerializer, registerDatumSerializer };
+export { UnitLoader, registerDatumDeserializer };
+export type { AnimaExecutionUnit, UnitMeta, UnitArity, UnitConstant, UnitSites, UnitSources, UnitTemplate, UnitIntrinsic } from './magicvm/unit-types';

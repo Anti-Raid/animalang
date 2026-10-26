@@ -1,16 +1,19 @@
-import { ASTStringifier, isDeepEqual, Table, BS, BSReader } from '../common';
+import { isDeepEqual } from '../common';
+import { Table } from '../scheme/table';
+import { LuaTable } from '../lua/table';
+import { ASTStringifier } from '../scheme/printer';
 import { ASPParseError } from '../scheme/reader';
+import { compileNative } from '../native';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Cons } from '../list';
+import { Cons } from '../scheme/list';
 import { createScheme } from '../scheme';
-import { ByteCode } from '../bytecode-rvm/vm';
+import { Code } from '../magicvm/vm';
 import { Anima } from '../anima';
-import { impl, implAot } from '../bytecode-rvm/meta';
-import { dumpFull, readFull, BYTECODE_VERSION } from '../bytecode-rvm/utils';
+import { impl } from '../magicvm/meta';
 import { registerTestIntrinsics } from './helpers';
 
-describe("Table internals", () => {
-    it('border() is always a valid border and contents match a plain Map under random edits', () => {
+describe("LuaTable internals", () => {
+    it('rawlen() is always a valid border and contents match a plain Map under random edits', () => {
         let seed = 12345
         const rand = (n: number) => {
             seed = (seed * 1103515245 + 12345) % 2147483648
@@ -18,7 +21,7 @@ describe("Table internals", () => {
         }
         const problems: string[] = []
         for (let round = 0; round < 20; round++) {
-            const t = new Table()
+            const t = new LuaTable()
             const model = new Map<any, any>()
             for (let step = 0; step < 150; step++) {
                 const key = rand(10) === 0 ? `s${rand(3)}` : rand(12) + 1
@@ -30,13 +33,25 @@ describe("Table internals", () => {
                     t.set(key, val)
                     model.set(key, val)
                 }
-                const n = t.border()
+                const n = t.rawlen()
                 if ((n > 0 && !t.has(n)) || t.has(n + 1)) problems.push(`round ${round} step ${step}: ${n} is not a border`)
                 if (t.size !== model.size) problems.push(`round ${round} step ${step}: size ${t.size} != ${model.size}`)
             }
             for (const [k, v] of model) if (t.get(k) !== v) problems.push(`round ${round}: ${k} is ${t.get(k)}, expected ${v}`)
         }
         expect(problems).toEqual([])
+    });
+});
+describe("tables as data", () => {
+    it('compare and print themselves', () => {
+        for (const make of [() => new Table(), () => new LuaTable()]) {
+            const a = make().set(1, "x").set("k", make().set("n", 2))
+            const b = make().set(1, "x").set("k", make().set("n", 2))
+            expect(isDeepEqual(a, b)).toBe(true)
+            expect(isDeepEqual(a, make().set(1, "x"))).toBe(false)
+            expect(new ASTStringifier().stringify(a)).toBe('{1 "x" "k" {"n" 2}}')
+        }
+        expect(isDeepEqual(new Table().set(1, "x"), new LuaTable().set(1, "x"))).toBe(false)
     });
 });
 describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
@@ -95,8 +110,9 @@ describe("isDeepEqual: Improper Lists (Dotted Pairs)", () => {
         expect(isDeepEqual(a, b)).toBe(false);
     });
 });
-describe.each([["interp", impl], ["aot", implAot]] as const)("%s", (_mode, vmImpl) => {
-let bcCache: Record<string, ByteCode> = {}
+describe("vm", () => {
+    const vmImpl = impl
+let bcCache: Record<string, Code> = {}
 describe('Vectors (using JS Arrays)', () => {
     let evaluator: Anima;
     beforeEach(() => { evaluator = createScheme(vmImpl) });
@@ -460,32 +476,6 @@ describe('Tables (using Table class)', () => {
         expect(rawT.get("count")).toBe(5);
     });
 
-    it('stores keys 1..n in an array part and treats <#void> as absent', () => {
-        const t = new Table();
-        t.set(2, "b"); t.set(1, "a"); t.set("k", "v"); t.set(3, "c");
-        expect(t.border()).toBe(3);
-        expect([...t.entries()]).toEqual([[1, "a"], [2, "b"], [3, "c"], ["k", "v"]]);
-
-        // removing from the middle keeps the array part dense; the rest stays reachable
-        t.set(2, undefined);
-        expect(t.border()).toBe(1);
-        expect(t.has(2)).toBe(false);
-        expect(t.get(3)).toBe("c");
-        expect(t.size).toBe(3);
-        t.set(2, "B");
-        expect(t.border()).toBe(3);
-        expect([...t.keys()]).toEqual([1, 2, 3, "k"]);
-
-        // 1.0 and 1 are the same key, and so are 0 and -0
-        t.set(1.0, "one"); t.set(-0, "zero");
-        expect(t.get(1)).toBe("one");
-        expect(t.get(0)).toBe("zero");
-
-        expect(() => t.set(NaN, 1)).toThrow("table key cannot be NaN");
-        expect(() => t.set(undefined, 1)).toThrow("table key cannot be <#void>");
-        expect(t.get(NaN)).toBeUndefined();
-    });
-
     it('table-set! of <#void> removes the key in Scheme', () => {
         expect(run(`(let ((t {"a" 1 "b" 2})) (table-set! t "a" <#void>) (list (table-has? t "a") (table-size t) (table-ref t "a" 'gone)))`)).toBe("(#f 1 gone)")
         expect(run(`(let ((t {1 "x" 2 "y" 3 "z"})) (table-set! t 2 <#void>) (list (table-size t) (table-ref t 3) (vector-length (table-entries t))))`)).toBe(`(2 "z" 2)`)
@@ -644,103 +634,22 @@ describe('Floats, Infinities & NaNs', () => {
         expect(run('(equal? {"x" +inf.0} {"x" +inf.0})')).toBe("#t");
     });
 
-    it('serializes and deserializes floats and infinities in ByteCode (BS / BSReader)', () => {
-        // Direct BS / BSReader F64 serde
-        const bs = new BS();
-        bs.writeF64(3.141592653589793);
-        bs.writeF64(Infinity);
-        bs.writeF64(-Infinity);
-        bs.writeF64(NaN);
-        bs.writeValue(2.71828);
-        bs.writeValue(Infinity);
-        bs.writeValue(-Infinity);
-        bs.writeValue(100);
-
-        const buf = bs.finalize();
-        const reader = new BSReader(buf);
-
-        expect(reader.readF64()).toBe(3.141592653589793);
-        expect(reader.readF64()).toBe(Infinity);
-        expect(reader.readF64()).toBe(-Infinity);
-        expect(Number.isNaN(reader.readF64())).toBe(true);
-
-        expect(reader.read()).toBe(2.71828);
-        expect(reader.read()).toBe(Infinity);
-        expect(reader.read()).toBe(-Infinity);
-        expect(reader.read()).toBe(100);
-
-        // ByteCode serialization containing floats and infinities
-        const bc = evaluator.compileRaw('(+ 3.14 2.71 +inf.0)');
-        const bcBs = new BS();
-        bcBs.writeSerializable(bc as ByteCode);
-
-        const dumped = bcBs.finalize();
-        const bcReader = new BSReader(dumped);
-        ByteCode.register(bcReader, evaluator.intrinsics);
-        const deserializedBc = bcReader.read() as ByteCode;
-
-        expect(deserializedBc instanceof ByteCode).toBe(true);
-        expect(s.stringify(evaluator.evaluateRaw(deserializedBc))).toBe("+inf.0");
-
-        // ByteCode serialization with float result
-        const bcFloat = evaluator.compileRaw('(* 2.5 1.5)');
-        const bcFloatBs = new BS();
-        bcFloatBs.writeSerializable(bcFloat as ByteCode);
-        const floatDumped = bcFloatBs.finalize();
-        const floatReader = new BSReader(floatDumped);
-        ByteCode.register(floatReader, evaluator.intrinsics);
-        const deserializedFloatBc = floatReader.read() as ByteCode;
-        expect(s.stringify(evaluator.evaluateRaw(deserializedFloatBc))).toBe("3.75");
-
-        // Quoted list constants (proper, nested, improper)
-        for (const [src, expected] of [
-            ["'(1 2 3)", "(1 2 3)"],
-            ["(car '(1 2))", "1"],
-            ["'((a b) (c . d) \"s\")", "((a b) (c . d) \"s\")"],
-            ["'(1 2 . 3)", "(1 2 . 3)"],
-        ]) {
-            const listBs = new BS();
-            listBs.writeSerializable(evaluator.compileRaw(src) as ByteCode);
-            const listReader = new BSReader(listBs.finalize());
-            ByteCode.register(listReader, evaluator.intrinsics);
-            expect(s.stringify(evaluator.evaluateRaw(listReader.read() as ByteCode))).toBe(expected);
-        }
-
-        const longList = Cons.fromArray(Array.from({ length: 100000 }, (_, i) => i));
-        const longBs = new BS();
-        longBs.writeValue(longList);
-        const longBack = new BSReader(longBs.finalize()).read() as Cons;
-        expect(longBack instanceof Cons).toBe(true);
-        expect(longBack.length).toBe(100000);
-
-        const full = dumpFull(evaluator.compileRaw("(list 1 '(2 3))") as ByteCode);
-        expect(full[1]).toBe(BYTECODE_VERSION);
-        expect(s.stringify(evaluator.evaluateRaw(readFull(full) as ByteCode))).toBe("(1 (2 3))");
-        const wrongVersion = full.slice();
-        wrongVersion[1] = BYTECODE_VERSION + 1;
-        expect(() => readFull(wrongVersion)).toThrow(`bytecode version ${BYTECODE_VERSION + 1} is not supported`);
-        expect(() => readFull(full.subarray(2))).toThrow("not anima bytecode");
-    });
-
-    it("serializes intrinsics by name and binds them to the loading table", () => {
-        const bc = evaluator.compileRaw("(list (%test-add 1 2) (%test-call-or (lambda (x) x) 4))") as ByteCode;
-        // core operations (here %list) are recorded like any other
+    it("records intrinsics by name and binds copies to another table", () => {
+        const bc = compileNative(evaluator, "(%intcall %list (%intcall %test-add 1 2) (%intcall %test-call-or (lambda (x) x) 4))") as Code;
+        // the front end's (here %list) are recorded like any other
         expect(bc.intrinsics.map(used => used.name).sort()).toEqual(["%list", "%test-add", "%test-call-or"]);
-        const dumped = dumpFull(bc);
-        expect(s.stringify(evaluator.evaluateRaw(readFull(dumped, evaluator.intrinsics) as ByteCode))).toBe("(3 4)");
 
-        // the same intrinsics at other positions: operands are remapped by name
+        // the same intrinsics at other positions: a copy's instructions are remapped by name
         const other = createScheme(vmImpl);
         other.registerIntrinsic("%test-first", (regs, s) => regs[s], { args: [1, 1], leaf: true });
         registerTestIntrinsics(other);
         expect(other.intrinsics.byName("%test-add")!.pos).not.toBe(evaluator.intrinsics.byName("%test-add")!.pos);
-        expect(s.stringify(other.evaluateRaw(readFull(dumped, other.intrinsics) as ByteCode))).toBe("(3 4)");
-        expect(s.stringify(other.evaluateRaw((bc as ByteCode).fresh(new Map(), other.intrinsics)))).toBe("(3 4)");
+        expect(s.stringify(other.evaluateRaw(bc.fresh(new Map(), other.intrinsics)))).toBe("(3 4)");
         // the original still runs with its own positions
         expect(s.stringify(evaluator.evaluateRaw(bc))).toBe("(3 4)");
 
         // the same name at the same position with other bounds: applying it checks the count against the bound table's,
-        // as the interpreter does (AOT copies of the code must not share source that has the first table's bounds)
+        // (copies of the code must not share source that has the first table's bounds)
         const bounded = (max: number) => {
             const inst = createScheme(vmImpl);
             inst.registerIntrinsic("%test-count", (regs, st, n) => n, { args: [0, max], leaf: true });
@@ -748,22 +657,21 @@ describe('Floats, Infinities & NaNs', () => {
         };
         const wide = bounded(3), narrow = bounded(1);
         expect(narrow.intrinsics.byName("%test-count")!.pos).toBe(wide.intrinsics.byName("%test-count")!.pos);
-        const applied = wide.compileRaw("(%apply %test-count '(1 2))") as ByteCode;
+        const applied = compileNative(wide, "(%intapply %test-count (%intcall %spread '(1 2)))") as Code;
         expect(s.stringify(wide.evaluateRaw(applied))).toBe("2");
         expect(() => narrow.evaluateRaw(applied.fresh(new Map(), narrow.intrinsics))).toThrow("%test-count: expected 0 to 1 args, got 2");
         expect(s.stringify(wide.evaluateRaw(applied.fresh(new Map(), wide.intrinsics)))).toBe("2");
 
-        expect(() => readFull(dumped, createScheme(vmImpl).intrinsics)).toThrow("'%test-add', which is not registered");
-        expect(() => readFull(dumped)).toThrow("needs an intrinsics table");
+        expect(() => bc.fresh(new Map(), createScheme(vmImpl).intrinsics)).toThrow("'%test-add', which is not registered");
     });
 
-    it("refuses to load code whose intrinsics changed from leaf to not a leaf, or back", () => {
-        const leafCode = dumpFull(evaluator.compileRaw("(%test-add 1 2)") as ByteCode);
+    it("refuses to bind code whose intrinsics changed from leaf to not a leaf, or back", () => {
+        const leafCode = compileNative(evaluator, "(%intcall %test-add 1 2)") as Code;
         const other = createScheme(vmImpl);
         other.registerIntrinsic("%test-add", (regs, s) => regs[s] + regs[s + 1], { args: [2, 2] });
-        expect(() => readFull(leafCode, other.intrinsics)).toThrow("compiled with '%test-add' as a leaf, but it is registered as not a leaf");
-        const nonLeafCode = dumpFull(other.compileRaw("(%test-add 1 2)") as ByteCode);
-        expect(() => readFull(nonLeafCode, evaluator.intrinsics)).toThrow("compiled with '%test-add' as not a leaf, but it is registered as a leaf");
+        expect(() => leafCode.fresh(new Map(), other.intrinsics)).toThrow("compiled with '%test-add' as a leaf, but it is registered as not a leaf");
+        const nonLeafCode = compileNative(other, "(%intcall %test-add 1 2)") as Code;
+        expect(() => nonLeafCode.fresh(new Map(), evaluator.intrinsics)).toThrow("compiled with '%test-add' as not a leaf, but it is registered as a leaf");
     });
 });
 })
